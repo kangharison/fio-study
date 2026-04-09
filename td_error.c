@@ -1,9 +1,27 @@
-#include "fio.h"
-#include "io_ddir.h"
-#include "td_error.h"
+/*
+ * [한국어] td_error.c - 스레드 에러 처리 모듈
+ *
+ * fio 작업 스레드에서 발생하는 I/O 에러를 분류하고 처리하는 기능을 담당한다.
+ * continue_on_error 옵션과 함께 사용되어 특정 에러를 무시하고 계속 실행할 수 있다.
+ *
+ * 주요 기능:
+ *   1) td_error_type()      - 에러를 읽기/쓰기/검증 유형으로 분류
+ *   2) td_non_fatal_error() - 해당 에러가 치명적이지 않은지(무시 가능한지) 판별
+ *   3) update_error_count() - 에러 카운터 업데이트 및 첫 번째 에러 기록
+ */
 
+#include "fio.h"       /* fio 핵심 구조체 및 매크로 */
+#include "io_ddir.h"   /* I/O 방향 정의 (DDIR_READ, DDIR_WRITE 등) */
+#include "td_error.h"  /* 에러 타입 열거형 및 함수 선언 */
+
+/* [한국어] 기본 비치명적 에러 목록 - ignore_error가 설정되지 않은 경우 사용
+ * EIO: 일반 I/O 에러, EILSEQ: 시퀀스 에러 (검증 실패) */
 static int __NON_FATAL_ERR[] = { EIO, EILSEQ };
 
+/* [한국어] I/O 방향과 에러 코드로부터 에러 유형(비트)을 결정
+ * - EILSEQ: 항상 검증(VERIFY) 에러로 분류
+ * - DDIR_READ: 읽기 에러로 분류
+ * - 그 외: 쓰기 에러로 분류 */
 enum error_type_bit td_error_type(enum fio_ddir ddir, int err)
 {
 	if (err == EILSEQ)
@@ -13,25 +31,36 @@ enum error_type_bit td_error_type(enum fio_ddir ddir, int err)
 	return ERROR_TYPE_WRITE_BIT;
 }
 
+/* [한국어] 해당 에러가 비치명적(무시 가능)인지 판별
+ * - continue_on_error 비트가 해당 에러 유형에 설정되어 있어야 함
+ * - ignore_error 배열에 해당 에러 코드가 포함되어 있으면 비치명적(1 반환)
+ * - ignore_error가 설정되지 않은 경우 기본 목록(__NON_FATAL_ERR) 사용
+ * 반환값: 1 = 비치명적 (무시 가능), 0 = 치명적 (작업 중단) */
 int td_non_fatal_error(struct thread_data *td, enum error_type_bit etype,
 		       int err)
 {
 	unsigned int i;
 
+	/* [한국어] ignore_error가 미설정이면 기본 비치명적 에러 목록 사용 */
 	if (!td->o.ignore_error[etype]) {
 		td->o.ignore_error[etype] = __NON_FATAL_ERR;
 		td->o.ignore_error_nr[etype] = FIO_ARRAY_SIZE(__NON_FATAL_ERR);
 	}
 
+	/* [한국어] continue_on_error에 해당 에러 유형 비트가 없으면 치명적 */
 	if (!(td->o.continue_on_error & (1 << etype)))
 		return 0;
+	/* [한국어] ignore_error 목록에서 해당 에러 코드 검색 */
 	for (i = 0; i < td->o.ignore_error_nr[etype]; i++)
 		if (td->o.ignore_error[etype][i] == err)
-			return 1;
+			return 1;  /* 목록에 있으면 비치명적 */
 
-	return 0;
+	return 0;  /* 목록에 없으면 치명적 */
 }
 
+/* [한국어] 에러 카운터 업데이트
+ * - 총 에러 수 증가
+ * - 첫 번째 에러인 경우 에러 코드를 기록 (이후 보고에 사용) */
 void update_error_count(struct thread_data *td, int err)
 {
 	td->total_err_count++;

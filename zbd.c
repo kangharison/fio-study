@@ -3,7 +3,32 @@
  *
  * This file is released under the GPL.
  */
-
+/*
+ * [한국어] zbd.c - Zoned Block Device(ZBD) 지원 구현
+ *
+ * 이 파일은 NVMe ZNS, SMR HDD 등 존 기반 블록 디바이스를 위한 fio 확장을 구현한다.
+ * 주요 기능:
+ *
+ *   Part 1: 유틸리티 및 존 관리 (26~500줄)
+ *     - zbd_offset_to_zone_idx(): 오프셋 → 존 인덱스 변환
+ *     - zone_lock()/zone_unlock(): 존 뮤텍스 관리 (데드락 방지 순서 보장)
+ *     - zbd_reset_zone(): 개별 존 리셋 (쓰기 포인터를 존 시작으로)
+ *     - zbd_finish_zone(): 존을 Full 상태로 전환
+ *     - zbd_write_zone_get/put(): 쓰기 대상 존 획득/반환 (활성 존 제한 관리)
+ *
+ *   Part 2: 초기화 (500~1400줄)
+ *     - zbd_init_files(): ZBD 모델 감지 및 존 정보 로드
+ *     - parse_zone_info(): 디바이스에서 존 리포트를 읽어 fio_zone_info에 저장
+ *     - zbd_setup_files(): 존 상태 확인, 쓰기 범위 검증, 존 정렬 확인
+ *     - zbd_file_reset(): 파일의 모든 존 리셋 (잡 시작 시)
+ *
+ *   Part 3: I/O 조정 (1400~2510줄)
+ *     - zbd_adjust_block(): I/O 오프셋/크기를 존 제약에 맞게 조정 (핵심 함수)
+ *     - zbd_convert_to_write_zone(): 랜덤 쓰기 시 적절한 쓰기 존 선택
+ *     - zbd_adjust_ddir(): I/O 방향 조정 (빈 존 읽기 → 쓰기로 전환)
+ *     - zbd_queue_io()/zbd_put_io(): I/O 후처리 (WP 업데이트, 존 상태 추적)
+ *     - zbd_recover_write_error(): 쓰기 실패 시 존 상태 복구
+ */
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
@@ -11,23 +36,25 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "compiler/compiler.h"
-#include "os/os.h"
-#include "file.h"
-#include "fio.h"
-#include "lib/pow2.h"
-#include "log.h"
-#include "oslib/asprintf.h"
-#include "smalloc.h"
-#include "verify.h"
-#include "pshared.h"
-#include "zbd.h"
+#include "compiler/compiler.h"  /* 컴파일러 매크로 */
+#include "os/os.h"              /* OS 추상화 레이어 */
+#include "file.h"               /* fio_file 구조체 */
+#include "fio.h"                /* fio 핵심 구조체 */
+#include "lib/pow2.h"           /* 2의 거듭제곱 유틸리티 */
+#include "log.h"                /* 로깅 */
+#include "oslib/asprintf.h"     /* asprintf 호환 */
+#include "smalloc.h"            /* 공유 메모리 할당기 */
+#include "verify.h"             /* 데이터 검증 */
+#include "pshared.h"            /* 프로세스 간 공유 뮤텍스 */
+#include "zbd.h"                /* ZBD 헤더 */
 
+/* [한국어] 오프셋이 파일의 I/O 범위 내인지 확인 */
 static bool is_valid_offset(const struct fio_file *f, uint64_t offset)
 {
 	return (uint64_t)(offset - f->file_offset) < f->io_size;
 }
 
+/* [한국어] fio_zone_info 포인터 → 존 인덱스 변환 (포인터 연산) */
 static inline unsigned int zbd_zone_idx(const struct fio_file *f,
 					struct fio_zone_info *zone)
 {
@@ -92,6 +119,7 @@ static inline uint64_t zbd_zone_remainder(struct fio_zone_info *z)
  *
  * The caller must hold z->mutex.
  */
+/* [한국어] 존이 꽉 찼는지 확인 — WP가 용량 끝에 도달했거나 write_zone_remainder 고려 */
 static bool zbd_zone_full(const struct thread_data *td, struct fio_zone_info *z,
 			  uint64_t required)
 {
@@ -103,6 +131,11 @@ static bool zbd_zone_full(const struct thread_data *td, struct fio_zone_info *z,
 	return required > zbd_zone_remainder(z);
 }
 
+/*
+ * [한국어] 존 뮤텍스 잠금 — 데드락 방지를 위해 항상 낮은 인덱스부터 잠금
+ * 이미 잠긴 존보다 낮은 인덱스의 존을 잠그려 하면 trylock 후 실패 시
+ * 기존 잠금을 풀고 순서대로 재획득한다.
+ */
 static void zone_lock(struct thread_data *td, const struct fio_file *f,
 		      struct fio_zone_info *z)
 {
@@ -147,6 +180,7 @@ zbd_offset_to_zone(const struct fio_file *f,  uint64_t offset)
 	return zbd_get_zone(f, zbd_offset_to_zone_idx(f, offset));
 }
 
+/* [한국어] verify_data_bytes 추적이 필요한지 판단 — 읽기 작업이 WP 이후에서 발생하지 않도록 */
 static bool accounting_vdb(struct thread_data *td, const struct fio_file *f)
 {
 	return td->o.zrt.u.f && td_write(td);
@@ -157,6 +191,7 @@ static bool accounting_vdb(struct thread_data *td, const struct fio_file *f)
  * @td: FIO thread data
  * @f: FIO file for which to get model information
  */
+/* [한국어] 디바이스의 ZBD 모델 감지 — none, host-aware, host-managed */
 static int zbd_get_zoned_model(struct thread_data *td, struct fio_file *f,
 			       enum zbd_zoned_model *model)
 {
@@ -201,6 +236,7 @@ static int zbd_get_zoned_model(struct thread_data *td, struct fio_file *f,
  * upon failure. If the zone report is empty, always assume an error (device
  * problem) and return -EIO.
  */
+/* [한국어] 디바이스에서 존 리포트 가져오기 — OS의 report_zones API 호출 */
 static int zbd_report_zones(struct thread_data *td, struct fio_file *f,
 			    uint64_t offset, struct zbd_zone *zones,
 			    unsigned int nr_zones)
@@ -235,6 +271,7 @@ static int zbd_report_zones(struct thread_data *td, struct fio_file *f,
  * Reset the write pointer of all zones in the range @offset...@offset+@length.
  * Returns 0 upon success and a negative error code upon failure.
  */
+/* [한국어] 존 쓰기 포인터 리셋 — OS의 reset_wp API 호출 */
 static int zbd_reset_wp(struct thread_data *td, struct fio_file *f,
 			uint64_t offset, uint64_t length)
 {
@@ -262,6 +299,10 @@ static int zbd_reset_wp(struct thread_data *td, struct fio_file *f,
  * Returns 0 upon success and a negative error code upon failure.
  *
  * The caller must hold z->mutex.
+ */
+/*
+ * [한국어] 개별 존 리셋 구현 — WP를 존 시작으로 되돌리고 상태를 EMPTY로 변경
+ * 존 리셋 카운트를 추적하고, 쓰기 대상에서 제거한다.
  */
 static int __zbd_reset_zone(struct thread_data *td, struct fio_file *f,
 			    struct fio_zone_info *z)
@@ -311,6 +352,7 @@ static int __zbd_reset_zone(struct thread_data *td, struct fio_file *f,
  *
  * The caller must hold f->zbd_info->mutex.
  */
+/* [한국어] 쓰기 대상 존 반환 — 활성 존 제한 관리에서 슬롯 해제 */
 static void zbd_write_zone_put(struct thread_data *td, const struct fio_file *f,
 			       struct fio_zone_info *z)
 {
@@ -373,6 +415,7 @@ static int zbd_reset_zone(struct thread_data *td, struct fio_file *f,
  *
  * Finish the zone at @offset with open or close status.
  */
+/* [한국어] 존을 Full 상태로 전환 — 활성 존 슬롯을 비우기 위해 사용 */
 static int zbd_finish_zone(struct thread_data *td, struct fio_file *f,
 			   struct fio_zone_info *z)
 {
@@ -412,6 +455,7 @@ static int zbd_finish_zone(struct thread_data *td, struct fio_file *f,
  *
  * Returns 0 upon success and 1 upon failure.
  */
+/* [한국어] 범위 내 모든 순차 존 리셋 — zone_reset_frequency 옵션과 연동 */
 static int zbd_reset_zones(struct thread_data *td, struct fio_file *f,
 			   struct fio_zone_info *const zb,
 			   struct fio_zone_info *const ze)
@@ -550,6 +594,11 @@ static unsigned int zbd_get_max_active_zones(struct thread_data *td,
  * Do same operation as @zbd_write_zone_get, except it adds the zone at
  * @zone_idx to write target zones array even when it does not have remainder
  * space to write one block.
+ */
+/*
+ * [한국어] 쓰기 대상 존 획득 (내부 구현)
+ * max_write_zones 제한 내에서 새 존을 쓰기 대상으로 등록한다.
+ * 슬롯이 부족하면 기존 존을 finish하여 빈 슬롯을 만든다.
  */
 static bool __zbd_write_zone_get(struct thread_data *td,
 				 const struct fio_file *f,
@@ -823,6 +872,10 @@ static int ilog2(uint64_t i)
  * Initialize f->zbd_info for devices that are not zoned block devices. This
  * allows to execute a ZBD workload against a non-ZBD device.
  */
+/*
+ * [한국어] zonemode=strided 시 가상 존 정보 초기화
+ * 실제 ZBD가 아닌 일반 디바이스에서 존 기반 I/O 패턴을 에뮬레이션한다.
+ */
 static int init_zone_info(struct thread_data *td, struct fio_file *f)
 {
 	uint32_t nr_zones;
@@ -897,6 +950,10 @@ static int init_zone_info(struct thread_data *td, struct fio_file *f)
 /*
  * Parse the device zone report and store it in f->zbd_info. Must be called
  * only for devices that are zoned, namely those with a model != ZBD_NONE.
+ */
+/*
+ * [한국어] 실제 ZBD에서 존 리포트를 읽어 fio_zone_info 배열에 저장
+ * report_zones()를 반복 호출하여 모든 존의 타입, 상태, WP, 용량을 수집한다.
  */
 static int parse_zone_info(struct thread_data *td, struct fio_file *f)
 {
@@ -1167,6 +1224,10 @@ static int zbd_init_zone_info(struct thread_data *td, struct fio_file *file)
 	return ret;
 }
 
+/*
+ * [한국어] ZBD 파일 초기화 — 각 파일의 ZBD 모델 감지 후 존 정보 로드
+ * init.c에서 파일 셋업 단계에 호출된다.
+ */
 int zbd_init_files(struct thread_data *td)
 {
 	struct fio_file *f;
@@ -1180,6 +1241,7 @@ int zbd_init_files(struct thread_data *td)
 	return 0;
 }
 
+/* [한국어] 옵션 값을 존 경계에 맞게 재조정 — zone_size/zone_capacity로 정렬 */
 void zbd_recalc_options_with_zone_granularity(struct thread_data *td)
 {
 	struct fio_file *f;
@@ -1254,6 +1316,10 @@ static uint64_t zbd_verify_and_set_vdb(struct thread_data *td,
 	return wp_vdb;
 }
 
+/*
+ * [한국어] ZBD 파일 셋업 — 잡 시작 전 최종 검증 및 설정
+ * 존 크기 정렬, 쓰기 범위 확인, 초기 존 상태 동기화를 수행한다.
+ */
 int zbd_setup_files(struct thread_data *td)
 {
 	struct fio_file *f;
@@ -1411,6 +1477,7 @@ static bool zbd_dec_and_reset_write_cnt(const struct thread_data *td,
 	return write_cnt == 0;
 }
 
+/* [한국어] 파일의 쓰기 범위 내 모든 존 리셋 — 잡 시작 시 호출 */
 void zbd_file_reset(struct thread_data *td, struct fio_file *f)
 {
 	struct fio_zone_info *zb, *ze;
@@ -1505,6 +1572,16 @@ static bool any_io_in_flight(void)
  * This algorithm can only work correctly if all write pointers are
  * a multiple of the fio block size. The caller must not hold
  * f->zbd_info->mutex. Returns with z->mutex held upon success.
+ */
+/*
+ * [한국어] 랜덤 쓰기 시 적절한 쓰기 존 선택 — ZBD I/O 조정의 핵심 함수
+ *
+ * 랜덤 오프셋이 가리키는 존이 쓰기에 적합하지 않으면(Full, 다른 스레드가 사용 중 등)
+ * 다음 절차로 대체 존을 찾는다:
+ *   1) 기존 쓰기 대상 존 중 빈 공간이 있는 존 선택
+ *   2) 없으면 랜덤 존을 새로 선택
+ *   3) 활성 존 제한에 걸리면 기존 존을 finish하여 슬롯 확보
+ *   4) 필요 시 존 리셋 후 사용
  */
 static struct fio_zone_info *zbd_convert_to_write_zone(struct thread_data *td,
 						       struct io_u *io_u,
@@ -1861,6 +1938,10 @@ static void zbd_end_zone_io(struct thread_data *td, const struct io_u *io_u,
  * For write and trim operations, update the write pointer of the I/O unit
  * target zone.
  */
+/*
+ * [한국어] I/O 큐잉 후처리 — 쓰기 성공 시 WP 업데이트, 존 상태 추적
+ * io_u->zbd_queue_io 콜백으로 등록되어 td_io_queue() 후 호출된다.
+ */
 static void zbd_queue_io(struct thread_data *td, struct io_u *io_u, int *q)
 {
 	const struct fio_file *f = io_u->file;
@@ -1932,6 +2013,7 @@ unlock:
  * zbd_put_io - Unlock an I/O unit target zone lock
  * @io_u: I/O unit
  */
+/* [한국어] I/O 완료/취소 시 정리 — writes_in_flight 감소, 존 뮤텍스 해제 */
 static void zbd_put_io(struct thread_data *td, const struct io_u *io_u)
 {
 	const struct fio_file *f = io_u->file;
@@ -1967,6 +2049,7 @@ static void zbd_put_io(struct thread_data *td, const struct io_u *io_u)
 #define EREMOTEIO	121	/* POSIX value */
 #endif
 
+/* [한국어] 에러 코드가 비정렬 쓰기(WP 불일치)인지 판별 */
 bool zbd_unaligned_write(int error_code)
 {
 	switch (error_code) {
@@ -1988,6 +2071,10 @@ bool zbd_unaligned_write(int error_code)
  *   the zone or the zone write position (when td->o.read_beyond_wp is false).
  * - For write workloads, zoneskip is applied when the zone is full.
  * This applies only to read and write operations.
+ */
+/*
+ * [한국어] zonemode=strided 시 I/O 범위를 존 경계에 맞게 제한
+ * zonerange 내에서만 I/O하고, zoneskip만큼 건너뛰는 패턴을 적용한다.
  */
 void setup_zbd_zone_mode(struct thread_data *td, struct io_u *io_u)
 {
@@ -2061,6 +2148,11 @@ void setup_zbd_zone_mode(struct thread_data *td, struct io_u *io_u)
  *
  * Return adjusted I/O direction.
  */
+/*
+ * [한국어] I/O 방향 조정
+ * 빈 존(WP=시작)에 대한 읽기를 쓰기로 전환하여 유효한 데이터를 먼저 채운다.
+ * verify 모드에서는 읽기가 의미 있는 데이터를 읽도록 보장한다.
+ */
 enum fio_ddir zbd_adjust_ddir(struct thread_data *td, struct io_u *io_u,
 			      enum fio_ddir ddir)
 {
@@ -2089,6 +2181,18 @@ enum fio_ddir zbd_adjust_ddir(struct thread_data *td, struct io_u *io_u,
  * Locking strategy: returns with z->mutex locked if and only if z refers
  * to a sequential zone and if io_u_accept is returned. z is the zone that
  * corresponds to io_u->offset at the end of this function.
+ */
+/*
+ * [한국어] zbd_adjust_block() — ZBD I/O 조정의 최상위 함수
+ *
+ * get_io_u()에서 호출되어 I/O 오프셋/크기를 존 제약에 맞게 조정한다:
+ *   - 읽기: WP 이전 영역에서만 읽기 (유효한 데이터 보장)
+ *   - 쓰기: 반드시 WP 위치에서 쓰기 (순차 쓰기 제약)
+ *   - 트림: 존 리셋으로 변환
+ *   - 존 경계를 넘는 I/O는 크기를 줄임
+ *   - 활성 존 제한을 초과하면 기존 존을 finish
+ *
+ * 반환: io_u_accept(수행), io_u_eof(더 이상 불가), io_u_completed(이미 처리됨)
  */
 enum io_u_action zbd_adjust_block(struct thread_data *td, struct io_u *io_u)
 {
@@ -2387,6 +2491,7 @@ eof:
 }
 
 /* Return a string with ZBD statistics */
+/* [한국어] ZBD 쓰기 상태 요약 문자열 생성 — 통계 출력에 사용 */
 char *zbd_write_status(const struct thread_stat *ts)
 {
 	char *res;
@@ -2406,6 +2511,7 @@ char *zbd_write_status(const struct thread_stat *ts)
  * Return io_u_completed when reset zone succeeds. Return 0 when the target zone
  * does not have write pointer. On error, return negative errno.
  */
+/* [한국어] 트림 I/O를 존 리셋으로 수행 — 존 전체를 리셋하여 트림 효과 */
 int zbd_do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 {
 	struct fio_file *f = io_u->file;
@@ -2429,6 +2535,7 @@ int zbd_do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 	return io_u_completed;
 }
 
+/* [한국어] ZBD I/O 에러 로깅 — 존 상태, WP 위치 등 디버그 정보 출력 */
 void zbd_log_err(const struct thread_data *td, const struct io_u *io_u)
 {
 	const struct fio_file *f = io_u->file;
@@ -2441,6 +2548,11 @@ void zbd_log_err(const struct thread_data *td, const struct io_u *io_u)
 			f->file_name);
 }
 
+/*
+ * [한국어] 쓰기 실패 후 존 상태 복구
+ * 비정렬 쓰기 에러 시 존의 WP를 재동기화하고, 존을 리셋하거나
+ * WP 위치로 다음 쓰기를 조정한다.
+ */
 void zbd_recover_write_error(struct thread_data *td, struct io_u *io_u)
 {
 	struct fio_file *f = io_u->file;

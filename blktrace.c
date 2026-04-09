@@ -1,28 +1,56 @@
 /*
  * blktrace support code for fio
  */
+/*
+ * [한국어] blktrace.c - blktrace 지원 코드
+ *
+ * 이 파일은 Linux blktrace 바이너리 파일을 읽고 재생하는 기능을 구현한다.
+ * blktrace는 블록 레이어의 I/O 이벤트를 기록하는 도구이며, fio는 이 데이터를
+ * 읽어 실제 I/O 패턴을 재현(replay)할 수 있다.
+ *
+ * 주요 기능:
+ *   1) is_blktrace()        - 파일이 blktrace 바이너리 형식인지 매직 넘버로 판별
+ *   2) init_blktrace_read() - blktrace 파일을 열고 io_piece 리스트로 로드
+ *   3) read_blktrace()      - 트레이스 항목을 순차적으로 읽어 I/O 작업(io_piece)으로 변환
+ *   4) merge_blktrace_iologs() - 여러 blktrace 파일을 시간순으로 병합
+ *
+ * 트레이스 재생 흐름:
+ *   blk_io_trace 읽기 -> 바이트 스왑(필요시) -> 매직/버전 검증 ->
+ *   queue_trace()로 I/O 유형 분류 -> store_ipo()로 io_piece 저장 ->
+ *   fio 메인 루프에서 순차 재생
+ */
+
+/* 표준 라이브러리 헤더 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/sysmacros.h>
+#include <sys/sysmacros.h>   /* major/minor 매크로 */
 
-#include "flist.h"
-#include "fio.h"
-#include "iolog.h"
-#include "blktrace.h"
-#include "blktrace_api.h"
-#include "oslib/linux-dev-lookup.h"
+/* fio 내부 헤더 */
+#include "flist.h"           /* fio 연결 리스트 */
+#include "fio.h"             /* fio 핵심 구조체 */
+#include "iolog.h"           /* I/O 로그 관련 */
+#include "blktrace.h"        /* blktrace API 선언 */
+#include "blktrace_api.h"    /* blk_io_trace 구조체, 매직 넘버 */
+#include "oslib/linux-dev-lookup.h" /* 디바이스 이름 조회 */
 
+/*
+ * [한국어] file_cache - 디바이스 파일 번호 캐시 구조체
+ *
+ * 동일한 디바이스에 대한 반복적인 탐색을 피하기 위해
+ * 마지막으로 조회한 major/minor 번호와 파일 번호를 캐시한다.
+ */
 struct file_cache {
-	unsigned int maj;
-	unsigned int min;
-	unsigned int fileno;
+	unsigned int maj;      /* 마지막 조회한 major 디바이스 번호 */
+	unsigned int min;      /* 마지막 조회한 minor 디바이스 번호 */
+	unsigned int fileno;   /* 해당 디바이스의 fio 파일 인덱스 */
 };
 
 /*
  * Just discard the pdu by seeking past it.
  */
+/* [한국어] PDU(Protocol Data Unit)를 건너뜀. blk_io_trace 뒤에 붙는 추가 데이터를 무시 */
 static int discard_pdu(FILE* f, struct blk_io_trace *t)
 {
 	if (t->pdu_len == 0)
@@ -39,6 +67,7 @@ static int discard_pdu(FILE* f, struct blk_io_trace *t)
  * Check if this is a blktrace binary data file. We read a single trace
  * into memory and check for the magic signature.
  */
+/* [한국어] 파일이 blktrace 바이너리 형식인지 매직 넘버(BLK_IO_TRACE_MAGIC)로 확인 */
 bool is_blktrace(const char *filename, int *need_swap)
 {
 	struct blk_io_trace t;
@@ -59,6 +88,7 @@ bool is_blktrace(const char *filename, int *need_swap)
 		return false;
 	}
 
+	/* 매직 넘버의 상위 24비트가 일치하면 blktrace 파일 */
 	if ((t.magic & 0xffffff00) == BLK_IO_TRACE_MAGIC) {
 		*need_swap = 0;
 		return true;
@@ -67,6 +97,7 @@ bool is_blktrace(const char *filename, int *need_swap)
 	/*
 	 * Maybe it needs to be endian swapped...
 	 */
+	/* [한국어] 엔디안이 다른 시스템에서 생성된 파일일 수 있으므로 바이트 스왑 후 재확인 */
 	t.magic = fio_swap32(t.magic);
 	if ((t.magic & 0xffffff00) == BLK_IO_TRACE_MAGIC) {
 		*need_swap = 1;
@@ -76,11 +107,13 @@ bool is_blktrace(const char *filename, int *need_swap)
 	return false;
 }
 
+/* [한국어] 디바이스 번호에서 major/minor를 추출하는 매크로 (커널과 다른 비트 레이아웃 사용) */
 #define FMINORBITS	20
 #define FMINORMASK	((1U << FMINORBITS) - 1)
 #define FMAJOR(dev)	((unsigned int) ((dev) >> FMINORBITS))
 #define FMINOR(dev)	((unsigned int) ((dev) & FMINORMASK))
 
+/* [한국어] 파일 열기/닫기 이벤트를 io_piece로 추가하여 재생 시 파일 관리에 사용 */
 static void trace_add_open_close_event(struct thread_data *td, int fileno, enum file_log_act action)
 {
 	struct io_piece *ipo;
@@ -94,6 +127,13 @@ static void trace_add_open_close_event(struct thread_data *td, int fileno, enum 
 	flist_add_tail(&ipo->list, &td->io_log_list);
 }
 
+/*
+ * [한국어] 트레이스에 나온 디바이스를 fio의 파일 목록에 추가
+ *
+ * 캐시를 먼저 확인하고, 캐시 미스 시 기존 파일 목록을 탐색한다.
+ * 없으면 디바이스 이름을 조회하여 새 파일로 등록한다.
+ * replay_redirect 옵션이 설정되면 원본 디바이스 대신 지정된 디바이스로 리다이렉트한다.
+ */
 static int trace_add_file(struct thread_data *td, __u32 device,
 			  struct file_cache *cache)
 {
@@ -103,6 +143,7 @@ static int trace_add_file(struct thread_data *td, __u32 device,
 	char dev[256];
 	unsigned int i;
 
+	/* 캐시 히트: 동일한 디바이스면 바로 반환 */
 	if (cache->maj == maj && cache->min == min)
 		return cache->fileno;
 
@@ -112,6 +153,7 @@ static int trace_add_file(struct thread_data *td, __u32 device,
 	/*
 	 * check for this file in our list
 	 */
+	/* [한국어] 이미 등록된 파일인지 major/minor로 탐색 */
 	for_each_file(td, f, i)
 		if (f->major == maj && f->minor == min) {
 			cache->fileno = f->fileno;
@@ -141,6 +183,7 @@ static int trace_add_file(struct thread_data *td, __u32 device,
 	return cache->fileno;
 }
 
+/* [한국어] I/O 크기를 replay_align 옵션에 맞게 정렬(올림) */
 static void t_bytes_align(struct thread_options *o, struct blk_io_trace *t)
 {
 	if (!o->replay_align)
@@ -152,6 +195,12 @@ static void t_bytes_align(struct thread_options *o, struct blk_io_trace *t)
 /*
  * Store blk_io_trace data in an ipo for later retrieval.
  */
+/*
+ * [한국어] blk_io_trace 데이터를 io_piece(ipo)로 변환하여 저장
+ *
+ * 섹터 번호를 바이트 오프셋으로 변환하고, replay_scale로 축소하며,
+ * 시간 지연(delay)을 나노초에서 마이크로초로 변환한다.
+ */
 static void store_ipo(struct thread_data *td, unsigned long long offset,
 		      unsigned int bytes, int rw, unsigned long long ttime,
 		      int fileno)
@@ -161,12 +210,12 @@ static void store_ipo(struct thread_data *td, unsigned long long offset,
 	ipo = calloc(1, sizeof(*ipo));
 	init_ipo(ipo);
 
-	ipo->offset = offset * 512;
+	ipo->offset = offset * 512;           /* 섹터 -> 바이트 변환 */
 	if (td->o.replay_scale)
-		ipo->offset = ipo->offset / td->o.replay_scale;
+		ipo->offset = ipo->offset / td->o.replay_scale; /* 오프셋 스케일링 */
 	ipo_bytes_align(td->o.replay_align, ipo);
 	ipo->len = bytes;
-	ipo->delay = ttime / 1000;
+	ipo->delay = ttime / 1000;            /* 나노초 -> 마이크로초 변환 */
 	if (rw)
 		ipo->ddir = DDIR_WRITE;
 	else
@@ -179,6 +228,7 @@ static void store_ipo(struct thread_data *td, unsigned long long offset,
 	queue_io_piece(td, ipo);
 }
 
+/* [한국어] 알림(notify) 타입 트레이스 처리 - 프로세스/타임스탬프/메시지 알림을 디버그 로깅 */
 static bool handle_trace_notify(struct blk_io_trace *t)
 {
 	switch (t->action) {
@@ -199,6 +249,7 @@ static bool handle_trace_notify(struct blk_io_trace *t)
 	return false;
 }
 
+/* [한국어] DISCARD(TRIM) 트레이스 처리 - TRIM 요청을 io_piece로 저장 */
 static bool handle_trace_discard(struct thread_data *td,
 				 struct blk_io_trace *t,
 				 unsigned long long ttime,
@@ -208,6 +259,7 @@ static bool handle_trace_discard(struct thread_data *td,
 	struct io_piece *ipo;
 	int fileno;
 
+	/* replay_skip 비트마스크로 TRIM 건너뛰기 설정 확인 */
 	if (td->o.replay_skip & (1u << DDIR_TRIM))
 		return false;
 
@@ -217,13 +269,13 @@ static bool handle_trace_discard(struct thread_data *td,
 
 	ios[DDIR_TRIM]++;
 	if (t->bytes > bs[DDIR_TRIM])
-		bs[DDIR_TRIM] = t->bytes;
+		bs[DDIR_TRIM] = t->bytes;  /* 최대 블록 크기 갱신 */
 
 	td->o.size += t->bytes;
 
 	INIT_FLIST_HEAD(&ipo->list);
 
-	ipo->offset = t->sector * 512;
+	ipo->offset = t->sector * 512;       /* 섹터 -> 바이트 */
 	if (td->o.replay_scale)
 		ipo->offset = ipo->offset / td->o.replay_scale;
 	ipo_bytes_align(td->o.replay_align, ipo);
@@ -239,11 +291,18 @@ static bool handle_trace_discard(struct thread_data *td,
 	return true;
 }
 
+/* [한국어] 크기가 0인 트레이스를 무시하면서 경고 출력 */
 static void dump_trace(struct blk_io_trace *t)
 {
 	log_err("blktrace: ignoring zero byte trace: action=%x\n", t->action);
 }
 
+/*
+ * [한국어] 파일시스템(읽기/쓰기) 트레이스 처리
+ *
+ * BLK_TC_WRITE 플래그로 읽기/쓰기를 구분하고,
+ * replay_skip으로 건너뛰기 여부를 확인한 뒤 store_ipo()로 저장한다.
+ */
 static bool handle_trace_fs(struct thread_data *td, struct blk_io_trace *t,
 			    unsigned long long ttime, unsigned long *ios,
 			    unsigned long long *bs, struct file_cache *cache)
@@ -270,7 +329,7 @@ static bool handle_trace_fs(struct thread_data *td, struct blk_io_trace *t,
 	}
 
 	if (t->bytes > bs[rw])
-		bs[rw] = t->bytes;
+		bs[rw] = t->bytes;   /* 방향별 최대 블록 크기 갱신 */
 
 	ios[rw]++;
 	td->o.size += t->bytes;
@@ -278,6 +337,7 @@ static bool handle_trace_fs(struct thread_data *td, struct blk_io_trace *t,
 	return true;
 }
 
+/* [한국어] FLUSH(동기화) 트레이스 처리 - 캐시 플러시 요청을 io_piece로 저장 */
 static bool handle_trace_flush(struct thread_data *td, struct blk_io_trace *t,
 			       unsigned long long ttime, unsigned long *ios,
 			       struct file_cache *cache)
@@ -299,6 +359,7 @@ static bool handle_trace_flush(struct thread_data *td, struct blk_io_trace *t,
 	ios[DDIR_SYNC]++;
 	dprint(FD_BLKTRACE, "store flush delay=%lu\n", ipo->delay);
 
+	/* TD_F_SYNCS 플래그 설정: 이 작업에 sync 연산이 포함됨을 표시 */
 	if (!(td->flags & TD_F_SYNCS))
 		td->flags |= TD_F_SYNCS;
 
@@ -310,6 +371,14 @@ static bool handle_trace_flush(struct thread_data *td, struct blk_io_trace *t,
  * We only care for queue traces, most of the others are side effects
  * due to internal workings of the block layer.
  */
+/*
+ * [한국어] 트레이스 항목을 큐잉 단계에서 처리
+ *
+ * __BLK_TA_QUEUE 액션만 처리한다. 블록 레이어의 다른 액션(merge, complete 등)은
+ * 내부 동작의 부수효과이므로 무시한다.
+ * 이전 트레이스와의 시간 차이(delay)를 계산하고, 트레이스 유형에 따라
+ * notify/discard/flush/fs 핸들러로 분기한다.
+ */
 static bool queue_trace(struct thread_data *td, struct blk_io_trace *t,
 			 unsigned long *ios, unsigned long long *bs,
 			 struct file_cache *cache)
@@ -320,6 +389,7 @@ static bool queue_trace(struct thread_data *td, struct blk_io_trace *t,
 	if ((t->action & 0xffff) != __BLK_TA_QUEUE)
 		return false;
 
+	/* notify가 아닌 경우에만 시간 지연 계산 */
 	if (!(t->action & BLK_TC_ACT(BLK_TC_NOTIFY))) {
 		delay = delay_since_ttime(td, t->time);
 		*last_ttime = t->time;
@@ -327,6 +397,7 @@ static bool queue_trace(struct thread_data *td, struct blk_io_trace *t,
 
 	t_bytes_align(&td->o, t);
 
+	/* 트레이스 유형별 핸들러로 분기 */
 	if (t->action & BLK_TC_ACT(BLK_TC_NOTIFY))
 		return handle_trace_notify(t);
 	else if (t->action & BLK_TC_ACT(BLK_TC_DISCARD))
@@ -337,6 +408,7 @@ static bool queue_trace(struct thread_data *td, struct blk_io_trace *t,
 		return handle_trace_fs(td, t, delay, ios, bs, cache);
 }
 
+/* [한국어] blk_io_trace 구조체의 모든 필드를 엔디안 바이트 스왑 */
 static void byteswap_trace(struct blk_io_trace *t)
 {
 	t->magic = fio_swap32(t->magic);
@@ -352,11 +424,13 @@ static void byteswap_trace(struct blk_io_trace *t)
 	t->pdu_len = fio_swap16(t->pdu_len);
 }
 
+/* [한국어] 트레이스가 쓰기 또는 DISCARD 연산인지 확인 */
 static bool t_is_write(struct blk_io_trace *t)
 {
 	return (t->action & BLK_TC_ACT(BLK_TC_WRITE | BLK_TC_DISCARD)) != 0;
 }
 
+/* [한국어] 트레이스의 I/O 방향(READ/WRITE/TRIM)을 fio_ddir로 변환 */
 static enum fio_ddir t_get_ddir(struct blk_io_trace *t)
 {
 	if (t->action & BLK_TC_ACT(BLK_TC_READ))
@@ -369,6 +443,7 @@ static enum fio_ddir t_get_ddir(struct blk_io_trace *t)
 	return DDIR_INVAL;
 }
 
+/* [한국어] I/O 큐잉 시 해당 방향의 큐 깊이(depth) 증가 */
 static void depth_inc(struct blk_io_trace *t, int *depth)
 {
 	enum fio_ddir ddir;
@@ -378,6 +453,7 @@ static void depth_inc(struct blk_io_trace *t, int *depth)
 		depth[ddir]++;
 }
 
+/* [한국어] I/O 병합(merge) 시 해당 방향의 큐 깊이 감소 */
 static void depth_dec(struct blk_io_trace *t, int *depth)
 {
 	enum fio_ddir ddir;
@@ -387,6 +463,7 @@ static void depth_dec(struct blk_io_trace *t, int *depth)
 		depth[ddir]--;
 }
 
+/* [한국어] I/O 완료(complete) 시 최대 큐 깊이를 갱신하고 현재 깊이를 리셋 */
 static void depth_end(struct blk_io_trace *t, int *this_depth, int *depth)
 {
 	enum fio_ddir ddir = DDIR_INVAL;
@@ -401,6 +478,12 @@ static void depth_end(struct blk_io_trace *t, int *this_depth, int *depth)
 /*
  * Load a blktrace file by reading all the blk_io_trace entries, and storing
  * them as io_pieces like the fio text version would do.
+ */
+/*
+ * [한국어] blktrace 파일 읽기 초기화
+ *
+ * 파일을 열고, read_blktrace()를 호출하여 모든 트레이스를 io_piece로 변환한다.
+ * 성공하면 td->files_index에 디바이스 파일들이 등록된 상태가 된다.
  */
 bool init_blktrace_read(struct thread_data *td, const char *filename, int need_swap)
 {
@@ -440,23 +523,38 @@ err:
 	return false;
 }
 
+/*
+ * [한국어] blktrace 파일에서 트레이스 항목들을 읽어 I/O 작업으로 변환
+ *
+ * 메인 읽기 루프:
+ *   1) fread()로 blk_io_trace 구조체를 읽음
+ *   2) 바이트 스왑 적용 (필요시)
+ *   3) 매직 넘버와 버전 검증
+ *   4) PDU 건너뛰기
+ *   5) 큐 깊이 추적 (queue/merge/complete 이벤트)
+ *   6) queue_trace()로 I/O 작업 분류 및 저장
+ *
+ * read_iolog_chunked 모드: 대용량 트레이스를 청크 단위로 나누어 읽음
+ * 완료 후: td_ddir, max_bs, iodepth를 트레이스 데이터에서 자동 설정
+ */
 bool read_blktrace(struct thread_data* td)
 {
 	struct blk_io_trace t;
 	struct file_cache cache = {
-		.maj = ~0U,
+		.maj = ~0U,           /* 캐시 무효화를 위해 불가능한 값으로 초기화 */
 		.min = ~0U,
 	};
-	unsigned long ios[DDIR_RWDIR_SYNC_CNT] = { };
-	unsigned long long rw_bs[DDIR_RWDIR_CNT] = { };
+	unsigned long ios[DDIR_RWDIR_SYNC_CNT] = { };    /* 방향별 I/O 카운트 */
+	unsigned long long rw_bs[DDIR_RWDIR_CNT] = { };   /* 방향별 최대 블록 크기 */
 	unsigned long skipped_writes;
 	FILE *f = td->io_log_rfile;
 	int i, max_depth;
 	struct fio_file *fiof;
-	int this_depth[DDIR_RWDIR_CNT] = { };
-	int depth[DDIR_RWDIR_CNT] = { };
+	int this_depth[DDIR_RWDIR_CNT] = { };  /* 현재 진행 중인 I/O 깊이 */
+	int depth[DDIR_RWDIR_CNT] = { };       /* 관찰된 최대 I/O 깊이 */
 	int64_t items_to_fetch = 0;
 
+	/* 청크 모드: 한 번에 읽을 항목 수 결정 */
 	if (td->o.read_iolog_chunked) {
 		items_to_fetch = iolog_items_to_fetch(td);
 		if (!items_to_fetch)
@@ -477,14 +575,17 @@ bool read_blktrace(struct thread_data* td)
 			break;
 		}
 
+		/* 필요시 엔디안 바이트 스왑 적용 */
 		if (td->io_log_blktrace_swap)
 			byteswap_trace(&t);
 
+		/* 매직 넘버 검증 */
 		if ((t.magic & 0xffffff00) != BLK_IO_TRACE_MAGIC) {
 			log_err("fio: bad magic in blktrace data: %x\n",
 								t.magic);
 			goto err;
 		}
+		/* 버전 검증 */
 		if ((t.magic & 0xff) != BLK_IO_TRACE_VERSION) {
 			log_err("fio: bad blktrace version %d\n",
 								t.magic & 0xff);
@@ -495,15 +596,18 @@ bool read_blktrace(struct thread_data* td)
 			td_verror(td, -ret, "blktrace lseek");
 			goto err;
 		}
+
+		/* notify가 아닌 경우 큐 깊이 추적 */
 		if ((t.action & BLK_TC_ACT(BLK_TC_NOTIFY)) == 0) {
 			if ((t.action & 0xffff) == __BLK_TA_QUEUE)
-				depth_inc(&t, this_depth);
+				depth_inc(&t, this_depth);     /* 큐잉: 깊이 증가 */
 			else if (((t.action & 0xffff) == __BLK_TA_BACKMERGE) ||
 				((t.action & 0xffff) == __BLK_TA_FRONTMERGE))
-				depth_dec(&t, this_depth);
+				depth_dec(&t, this_depth);     /* 병합: 깊이 감소 */
 			else if ((t.action & 0xffff) == __BLK_TA_COMPLETE)
-				depth_end(&t, this_depth, depth);
+				depth_end(&t, this_depth, depth); /* 완료: 최대값 갱신 */
 
+			/* 읽기 전용 모드에서 쓰기 건너뛰기 */
 			if (t_is_write(&t) && read_only) {
 				skipped_writes++;
 				continue;
@@ -513,6 +617,7 @@ bool read_blktrace(struct thread_data* td)
 		if (!queue_trace(td, &t, ios, rw_bs, &cache))
 			continue;
 
+		/* 청크 모드: 할당량 소진 시 중단 */
 		if (td->o.read_iolog_chunked) {
 			td->io_log_current++;
 			items_to_fetch--;
@@ -521,6 +626,7 @@ bool read_blktrace(struct thread_data* td)
 		}
 	} while (1);
 
+	/* 청크 모드: 하이워터마크/체크마크 갱신 */
 	if (td->o.read_iolog_chunked) {
 		td->io_log_highmark = td->io_log_current;
 		td->io_log_checkmark = (td->io_log_highmark + 1) / 2;
@@ -531,6 +637,7 @@ bool read_blktrace(struct thread_data* td)
 		log_err("fio: %s skips replay of %lu writes due to read-only\n",
 						td->o.name, skipped_writes);
 
+	/* 청크 모드 완료 처리: 방향 설정 및 버퍼 재할당 */
 	if (td->o.read_iolog_chunked) {
 		if (td->io_log_current == 0) {
 			return false;
@@ -552,6 +659,7 @@ bool read_blktrace(struct thread_data* td)
 		return true;
 	}
 
+	/* 비청크 모드: 모든 파일에 닫기 이벤트 추가 */
 	for_each_file(td, fiof, i)
 		trace_add_open_close_event(td, fiof->fileno, FIO_LOG_CLOSE_FILE);
 
@@ -562,6 +670,7 @@ bool read_blktrace(struct thread_data* td)
 	 * For stacked devices, we don't always get a COMPLETE event so
 	 * the depth grows to insane values. Limit it to something sane(r).
 	 */
+	/* [한국어] 스택형 디바이스에서는 COMPLETE 이벤트가 누락될 수 있어 깊이를 1024로 제한 */
 	max_depth = 0;
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
 		if (depth[i] > 1024)
@@ -577,6 +686,7 @@ bool read_blktrace(struct thread_data* td)
 		return false;
 	}
 
+	/* 트레이스에서 관찰된 I/O 방향 및 최대 블록 크기 설정 */
 	td->o.td_ddir = 0;
 	if (ios[DDIR_READ]) {
 		td->o.td_ddir |= TD_DDIR_READ;
@@ -594,6 +704,7 @@ bool read_blktrace(struct thread_data* td)
 	/*
 	 * If depth wasn't manually set, use probed depth
 	 */
+	/* [한국어] iodepth가 수동 설정되지 않았으면 트레이스에서 관찰된 최대 깊이 사용 */
 	if (!fio_option_is_set(&td->o, iodepth))
 		td->o.iodepth = td->o.iodepth_low = max_depth;
 
@@ -603,6 +714,12 @@ err:
 	return false;
 }
 
+/*
+ * [한국어] 병합 파라미터(스칼라/반복횟수) 리스트 초기화
+ *
+ * vals 배열의 값을 각 blktrace_cursor의 지정된 오프셋 필드에 설정한다.
+ * vals가 비어있으면 기본값(def)을 사용하고, 개수가 로그 수와 불일치하면 에러를 반환한다.
+ */
 static int init_merge_param_list(fio_fp64_t *vals, struct blktrace_cursor *bcs,
 				 int nr_logs, int def, size_t off)
 {
@@ -625,6 +742,7 @@ static int init_merge_param_list(fio_fp64_t *vals, struct blktrace_cursor *bcs,
 
 }
 
+/* [한국어] 여러 blktrace 커서 중 타임스탬프가 가장 빠른 항목의 인덱스를 찾음 */
 static int find_earliest_io(struct blktrace_cursor *bcs, int nr_logs)
 {
 	__u64 time = ~(__u64)0;
@@ -640,6 +758,12 @@ static int find_earliest_io(struct blktrace_cursor *bcs, int nr_logs)
 	return idx;
 }
 
+/*
+ * [한국어] 파일 읽기 완료 처리
+ *
+ * 반복 횟수가 남아있으면 파일을 처음으로 되감고,
+ * 모든 반복이 끝나면 파일을 닫고 활성 로그 배열을 압축한다.
+ */
 static void merge_finish_file(struct blktrace_cursor *bcs, int i, int *nr_logs)
 {
 	bcs[i].iter++;
@@ -654,9 +778,17 @@ static void merge_finish_file(struct blktrace_cursor *bcs, int i, int *nr_logs)
 	fclose(bcs[i].f);
 
 	/* keep active files contiguous */
+	/* [한국어] 닫힌 파일 슬롯을 마지막 활성 파일로 덮어써서 배열을 연속으로 유지 */
 	memmove(&bcs[i], &bcs[*nr_logs], sizeof(bcs[i]));
 }
 
+/*
+ * [한국어] 단일 blktrace 커서에서 다음 유효한 트레이스 항목을 읽음
+ *
+ * fio가 관심 있는 __BLK_TA_QUEUE 액션만 반환하고,
+ * 나머지 액션은 PDU를 건너뛴 뒤 다시 읽기를 시도한다(read_skip 레이블).
+ * 반복(iter) 시 시간을 누적하여 연속적인 시간 흐름을 만든다.
+ */
 static int read_trace(struct thread_data *td, struct blktrace_cursor *bc)
 {
 	int ret = 0;
@@ -670,7 +802,7 @@ read_skip:
 		return ret;
 	} else if (feof(bc->f)) {
 		if (!bc->length)
-			bc->length = bc->t.time;
+			bc->length = bc->t.time;  /* 트레이스 전체 길이 기록 */
 		return ret;
 	} else if (ret < (int) sizeof(*t)) {
 		log_err("fio: iolog short read\n");
@@ -681,6 +813,7 @@ read_skip:
 		byteswap_trace(t);
 
 	/* skip over actions that fio does not care about */
+	/* [한국어] QUEUE가 아니거나 유효하지 않은 방향의 액션은 건너뜀 */
 	if ((t->action & 0xffff) != __BLK_TA_QUEUE ||
 	    t_get_ddir(t) == DDIR_INVAL) {
 		ret = discard_pdu(bc->f, t);
@@ -691,11 +824,13 @@ read_skip:
 		goto read_skip;
 	}
 
+	/* 반복 횟수와 스칼라를 적용하여 시간 조정 */
 	t->time = (t->time + bc->iter * bc->length) * bc->scalar / 100;
 
 	return ret;
 }
 
+/* [한국어] blk_io_trace를 출력 파일에 기록 (PDU는 포함하지 않음) */
 static int write_trace(FILE *fp, struct blk_io_trace *t)
 {
 	/* pdu is not used so just write out only the io trace */
@@ -703,6 +838,19 @@ static int write_trace(FILE *fp, struct blk_io_trace *t)
 	return fwrite((void *)t, sizeof(*t), 1, fp);
 }
 
+/*
+ * [한국어] 여러 blktrace 파일을 시간순으로 병합
+ *
+ * 흐름:
+ *   1) 병합 파라미터(scalar, nr_iter) 초기화
+ *   2) 출력 파일 및 입력 파일들 열기
+ *   3) 각 입력 파일에서 첫 번째 트레이스 읽기
+ *   4) 가장 빠른 타임스탬프를 가진 트레이스를 출력 파일에 쓰기 (반복)
+ *   5) 병합된 파일을 read_iolog_file로 설정
+ *
+ * merge_blktrace_scalars: 각 파일의 시간 스케일링 비율 (%)
+ * merge_blktrace_iters: 각 파일의 반복 횟수
+ */
 int merge_blktrace_iologs(struct thread_data *td)
 {
 	int nr_logs = get_max_str_idx(td->o.read_iolog_file);
@@ -713,6 +861,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 	char *str, *ptr, *name, *merge_buf;
 	int i, ret;
 
+	/* 스칼라(시간 배율) 파라미터 초기화 (기본값: 100%) */
 	ret = init_merge_param_list(td->o.merge_blktrace_scalars, bcs, nr_logs,
 				    100, offsetof(struct blktrace_cursor,
 						  scalar));
@@ -722,6 +871,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 		goto err_param;
 	}
 
+	/* 반복 횟수 파라미터 초기화 (기본값: 1회) */
 	ret = init_merge_param_list(td->o.merge_blktrace_iters, bcs, nr_logs,
 				    1, offsetof(struct blktrace_cursor,
 						nr_iter));
@@ -732,6 +882,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 	}
 
 	/* setup output file */
+	/* [한국어] 병합 결과를 쓸 출력 파일 열기 (128KB 버퍼링) */
 	merge_fp = fopen(td->o.merge_blktrace_file, "w");
 	merge_buf = malloc(128 * 1024);
 	if (!merge_buf)
@@ -741,6 +892,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 		goto err_merge_buf;
 
 	/* setup input files */
+	/* [한국어] 콤마로 구분된 입력 파일 목록을 파싱하여 각각 열기 */
 	str = ptr = strdup(td->o.read_iolog_file);
 	nr_logs = 0;
 	for (i = 0; (name = get_next_str(&ptr)) != NULL; i++) {
@@ -759,6 +911,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 			goto err_file;
 		}
 
+		/* 각 파일에서 첫 번째 유효 트레이스 읽기 */
 		ret = read_trace(td, &bcs[i]);
 		if (ret < 0) {
 			free(str);
@@ -771,6 +924,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 	free(str);
 
 	/* merge files */
+	/* [한국어] 모든 파일이 소진될 때까지 가장 빠른 트레이스를 선택하여 출력 */
 	while (nr_logs) {
 		i = find_earliest_io(bcs, nr_logs);
 		bc = &bcs[i];
@@ -790,6 +944,7 @@ int merge_blktrace_iologs(struct thread_data *td)
 	}
 
 	/* set iolog file to read from the newly merged file */
+	/* [한국어] 병합된 파일을 iolog 입력 파일로 설정하여 이후 재생에 사용 */
 	td->o.read_iolog_file = td->o.merge_blktrace_file;
 	ret = 0;
 

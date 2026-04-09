@@ -1,16 +1,38 @@
 /*
  * Memory helpers
  */
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+/*
+ * [한국어] memory.c - I/O 버퍼 메모리 할당/해제
+ *
+ * 이 파일은 fio의 I/O 작업에 사용되는 버퍼 메모리를 다양한 방식으로
+ * 할당하고 해제하는 기능을 구현한다.
+ *
+ * 지원하는 메모리 할당 방식:
+ *   - MEM_MALLOC:     일반 malloc()
+ *   - MEM_MMAP:       익명 mmap (MAP_PRIVATE)
+ *   - MEM_MMAPHUGE:   hugepage 파일 또는 MAP_HUGETLB 사용 mmap
+ *   - MEM_MMAPSHARED: MAP_SHARED mmap (파일 백업)
+ *   - MEM_SHM:        System V 공유 메모리 (shmget/shmat)
+ *   - MEM_SHMHUGE:    hugepage 기반 System V 공유 메모리
+ *   - MEM_CUDA_MALLOC: GPU 메모리 할당 (GPUDirect RDMA용)
+ *
+ * 또한 fio_pin_memory()/fio_unpin_memory()로 메모리를 물리 RAM에
+ * 고정(mlock)하여 I/O 성능 측정 시 스왑 영향을 배제할 수 있다.
+ */
 
-#include "fio.h"
+/* 시스템 헤더 */
+#include <fcntl.h>       /* open, O_RDWR, O_CREAT */
+#include <unistd.h>      /* close, unlink, ftruncate, access */
+#include <sys/mman.h>    /* mmap, munmap, mlock, munlock */
+#include <sys/stat.h>    /* 파일 권한 상수 (S_IRUSR 등) */
+
+/* fio 내부 헤더 */
+#include "fio.h"         /* fio 핵심 구조체 및 매크로 */
 #ifndef FIO_NO_HAVE_SHM_H
-#include <sys/shm.h>
+#include <sys/shm.h>     /* System V 공유 메모리 (shmget, shmat, shmdt, shmctl) */
 #endif
 
+/* [한국어] 고정(mlock)된 메모리를 해제 — munlock 후 munmap으로 매핑 제거 */
 void fio_unpin_memory(struct thread_data *td)
 {
 	if (td->pinned_mem) {
@@ -22,6 +44,8 @@ void fio_unpin_memory(struct thread_data *td)
 	}
 }
 
+/* [한국어] 메모리를 물리 RAM에 고정(mlock) — 스왑 방지로 I/O 측정 정확도 향상
+ *   물리 메모리의 총량 - 128MiB를 초과하지 않도록 제한 */
 int fio_pin_memory(struct thread_data *td)
 {
 	unsigned long long phys_mem;
@@ -60,6 +84,8 @@ int fio_pin_memory(struct thread_data *td)
 	return 0;
 }
 
+/* [한국어] System V 공유 메모리(shmget/shmat)로 I/O 버퍼 할당
+ *   MEM_SHMHUGE인 경우 hugepage 크기로 정렬하고 SHM_HUGETLB 플래그 사용 */
 static int alloc_mem_shm(struct thread_data *td, unsigned int total_mem)
 {
 #ifndef CONFIG_NO_SHM
@@ -110,6 +136,7 @@ static int alloc_mem_shm(struct thread_data *td, unsigned int total_mem)
 #endif
 }
 
+/* [한국어] System V 공유 메모리 해제 — 분리(shmdt) 후 제거(shmctl IPC_RMID) */
 static void free_mem_shm(struct thread_data *td)
 {
 #ifndef CONFIG_NO_SHM
@@ -121,6 +148,10 @@ static void free_mem_shm(struct thread_data *td)
 #endif
 }
 
+/* [한국어] mmap으로 I/O 버퍼 할당
+ *   MEM_MMAP: 익명 MAP_PRIVATE, MEM_MMAPHUGE: hugepage mmap,
+ *   MEM_MMAPSHARED: 파일 기반 MAP_SHARED (다른 프로세스와 공유 가능)
+ *   mmapfile 옵션 지정 시 파일 기반 매핑 사용 */
 static int alloc_mem_mmap(struct thread_data *td, size_t total_mem)
 {
 	int flags = 0;
@@ -181,6 +212,7 @@ static int alloc_mem_mmap(struct thread_data *td, size_t total_mem)
 	return 0;
 }
 
+/* [한국어] mmap 메모리 해제 — munmap 후 매핑 파일 닫기/삭제 */
 static void free_mem_mmap(struct thread_data *td, size_t total_mem)
 {
 	dprint(FD_MEM, "munmap %llu %p\n", (unsigned long long) total_mem,
@@ -195,6 +227,7 @@ static void free_mem_mmap(struct thread_data *td, size_t total_mem)
 	}
 }
 
+/* [한국어] 일반 malloc()으로 I/O 버퍼 할당 — 가장 단순한 방식 */
 static int alloc_mem_malloc(struct thread_data *td, size_t total_mem)
 {
 	td->orig_buffer = malloc(total_mem);
@@ -204,12 +237,15 @@ static int alloc_mem_malloc(struct thread_data *td, size_t total_mem)
 	return td->orig_buffer == NULL;
 }
 
+/* [한국어] malloc 메모리 해제 */
 static void free_mem_malloc(struct thread_data *td)
 {
 	dprint(FD_MEM, "free malloc mem %p\n", td->orig_buffer);
 	free(td->orig_buffer);
 }
 
+/* [한국어] CUDA GPU 메모리 할당 — GPUDirect RDMA를 위해 GPU 디바이스 메모리를 확보
+ *   CUDA 드라이버 API로 디바이스 초기화 -> 컨텍스트 생성 -> cuMemAlloc */
 static int alloc_mem_cudamalloc(struct thread_data *td, size_t total_mem)
 {
 #ifdef CONFIG_CUDA
@@ -278,6 +314,7 @@ static int alloc_mem_cudamalloc(struct thread_data *td, size_t total_mem)
 #endif
 }
 
+/* [한국어] CUDA GPU 메모리 해제 — cuMemFree 후 CUDA 컨텍스트 파괴 */
 static void free_mem_cudamalloc(struct thread_data *td)
 {
 #ifdef CONFIG_CUDA
@@ -292,6 +329,9 @@ static void free_mem_cudamalloc(struct thread_data *td)
 /*
  * Set up the buffer area we need for io.
  */
+/* [한국어] I/O 버퍼 메모리 할당 — mem_type 옵션에 따라 적절한 할당 방식을 선택
+ *   odirect/mem_align 사용 시 페이지 정렬을 위한 추가 공간 확보
+ *   I/O 엔진이 자체 할당 훅(iomem_alloc)을 제공하면 그것을 우선 사용 */
 int allocate_io_mem(struct thread_data *td)
 {
 	size_t total_mem;
@@ -343,6 +383,8 @@ int allocate_io_mem(struct thread_data *td)
 	return ret;
 }
 
+/* [한국어] I/O 버퍼 메모리 해제 — allocate_io_mem()에서 할당한 메모리를 방식별로 해제
+ *   해제 후 orig_buffer를 NULL로, orig_buffer_size를 0으로 초기화 */
 void free_io_mem(struct thread_data *td)
 {
 	unsigned int total_mem;

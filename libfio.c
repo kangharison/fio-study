@@ -21,28 +21,47 @@
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  *
  */
+/*
+ * [한국어] libfio.c - fio 라이브러리 핵심 초기화/정리 및 유틸리티 함수 모음
+ *
+ * 이 파일은 fio의 전역 상태 관리 및 초기화/종료를 담당한다.
+ * 주요 기능:
+ *   1) reset_io_counters()  - I/O 카운터 초기화
+ *   2) clear_io_state()     - 스레드의 I/O 상태를 완전히 초기화 (파일 닫기, 시드 재설정 등)
+ *   3) reset_all_stats()    - 모든 통계 카운터 리셋 (ramp time 이후 호출됨)
+ *   4) td_set_runstate()    - 스레드 실행 상태 전이 (CREATED -> RUNNING -> EXITED 등)
+ *   5) fio_terminate_threads() - 지정된 그룹/전체 스레드에 종료 신호 전달
+ *   6) initialize_fio()     - fio 전체 초기화 (엔디안 검사, 메모리, 파일잠금, 로케일 등)
+ *   7) deinitialize_fio()   - fio 종료 정리
+ */
 
-#include <string.h>
-#include <signal.h>
-#include <stdint.h>
-#include <locale.h>
-#include <fcntl.h>
+/* 표준 라이브러리 및 시스템 헤더 */
+#include <string.h>    /* 문자열 처리 함수 (memcpy, memset 등) */
+#include <signal.h>    /* 시그널 처리 (SIGTERM 등) */
+#include <stdint.h>    /* 고정 크기 정수 타입 (uint8_t, uint64_t 등) */
+#include <locale.h>    /* 로케일 설정 (숫자 출력 형식) */
+#include <fcntl.h>     /* 파일 제어 (O_NONBLOCK 등) */
 
-#include "fio.h"
-#include "smalloc.h"
-#include "os/os.h"
-#include "filelock.h"
-#include "helper_thread.h"
-#include "filehash.h"
+/* fio 내부 헤더 파일들 */
+#include "fio.h"           /* fio 핵심 구조체 및 매크로 */
+#include "smalloc.h"       /* 공유 메모리 할당기 */
+#include "os/os.h"         /* OS별 추상화 계층 */
+#include "filelock.h"      /* 파일 잠금 서브시스템 */
+#include "helper_thread.h" /* 헬퍼 스레드 (통계, 디스크 유틸 등) */
+#include "filehash.h"      /* 파일 해시 테이블 */
 
+/* [한국어] 전역 디스크 목록 - 시스템의 디스크 장치 추적 */
 FLIST_HEAD(disk_list);
 
+/* [한국어] 아키텍처별 플래그 (예: TSC 지원 여부 등) */
 unsigned long arch_flags = 0;
 
-uintptr_t page_mask = 0;
-uintptr_t page_size = 0;
+/* [한국어] 페이지 크기 관련 전역 변수 - 메모리 정렬에 사용 */
+uintptr_t page_mask = 0;  /* 페이지 마스크 (page_size - 1), 정렬 검사에 사용 */
+uintptr_t page_size = 0;  /* 시스템 페이지 크기 (일반적으로 4096) */
 
 /* see os/os.h */
+/* [한국어] OS 이름 문자열 배열 - 지원하는 운영체제 목록 */
 static const char *fio_os_strings[os_nr] = {
 	"Invalid",
 	"Linux",
@@ -59,6 +78,7 @@ static const char *fio_os_strings[os_nr] = {
 };
 
 /* see arch/arch.h */
+/* [한국어] 아키텍처 이름 문자열 배열 - 지원하는 CPU 아키텍처 목록 */
 static const char *fio_arch_strings[arch_nr] = {
 	"Invalid",
 	"x86-64",
@@ -79,37 +99,45 @@ static const char *fio_arch_strings[arch_nr] = {
 	"generic"
 };
 
+/* [한국어] I/O 카운터 초기화 - 바이트/블록 카운터, rate 관련 카운터를 0으로 리셋
+ * all=1이면 모든 방향(read/write/trim)의 카운터를 리셋,
+ * all=0이면 zone_bytes, rwmix_issues, nr_done_files만 리셋 */
 static void reset_io_counters(struct thread_data *td, int all)
 {
 	int ddir;
 
 	if (all) {
 		for (ddir = 0; ddir < DDIR_RWDIR_CNT; ddir++) {
-			td->stat_io_bytes[ddir] = 0;
-			td->this_io_bytes[ddir] = 0;
-			td->stat_io_blocks[ddir] = 0;
-			td->this_io_blocks[ddir] = 0;
-			td->last_rate_check_bytes[ddir] = 0;
-			td->last_rate_check_blocks[ddir] = 0;
-			td->bytes_done[ddir] = 0;
-			td->rate_io_issue_bytes[ddir] = 0;
-			td->rate_next_io_time[ddir] = 0;
-			td->last_usec[ddir] = 0;
+			td->stat_io_bytes[ddir] = 0;     /* 통계용 I/O 바이트 */
+			td->this_io_bytes[ddir] = 0;     /* 현재 루프의 I/O 바이트 */
+			td->stat_io_blocks[ddir] = 0;    /* 통계용 I/O 블록 수 */
+			td->this_io_blocks[ddir] = 0;    /* 현재 루프의 I/O 블록 수 */
+			td->last_rate_check_bytes[ddir] = 0;  /* rate 검사 기준 바이트 */
+			td->last_rate_check_blocks[ddir] = 0; /* rate 검사 기준 블록 */
+			td->bytes_done[ddir] = 0;        /* 완료된 바이트 수 */
+			td->rate_io_issue_bytes[ddir] = 0;    /* rate 제어용 발행 바이트 */
+			td->rate_next_io_time[ddir] = 0;      /* 다음 I/O 예정 시각 */
+			td->last_usec[ddir] = 0;         /* 마지막 I/O 시간(마이크로초) */
 		}
-		td->bytes_verified = 0;
+		td->bytes_verified = 0;  /* 검증 완료 바이트 수 리셋 */
 	}
 
-	td->zone_bytes = 0;
+	td->zone_bytes = 0;     /* 현재 존(zone)에서 수행한 바이트 */
 
-	td->rwmix_issues = 0;
+	td->rwmix_issues = 0;   /* 읽기/쓰기 혼합 비율 카운터 */
 
 	/*
 	 * reset file done count if we are to start over
 	 */
+	/* [한국어] time_based, 루프 반복, 또는 검증 모드일 때 완료 파일 수 리셋 */
 	if (td->o.time_based || td->loops > 1 || td->o.do_verify)
 		td->nr_done_files = 0;
 }
 
+/* [한국어] 스레드의 I/O 상태를 완전히 초기화
+ * - 카운터 리셋, 파일 닫기, 파일 오프셋 재설정
+ * - rand_repeatable이면 난수 시드도 재설정
+ * - 진행 중인(inflight) I/O도 클리어 */
 void clear_io_state(struct thread_data *td, int all)
 {
 	struct fio_file *f;
@@ -135,6 +163,9 @@ void clear_io_state(struct thread_data *td, int all)
 /*
  * Update thinktime block counter
  */
+/* [한국어] thinktime 블록 카운터 업데이트
+ * - thinktime은 I/O 사이의 지연 시간을 시뮬레이션하는 기능
+ * - 오프로드 워커는 thinktime 카운터가 없으므로 조기 반환 */
 static void update_thinktime_blocks_counter(struct thread_data *td)
 {
 	unsigned long long b;
@@ -147,6 +178,8 @@ static void update_thinktime_blocks_counter(struct thread_data *td)
 	td->last_thinktime_blocks -= b;
 }
 
+/* [한국어] 모든 통계 카운터를 리셋 - ramp time 이후 또는 통계 리셋 요청 시 호출
+ * I/O 카운터, 바이트/블록/이슈 카운터, 런타임, 에포크 시간 등을 모두 초기화 */
 void reset_all_stats(struct thread_data *td)
 {
 	int i;
@@ -156,13 +189,14 @@ void reset_all_stats(struct thread_data *td)
 	update_thinktime_blocks_counter(td);
 
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
-		td->io_bytes[i] = 0;
-		td->io_blocks[i] = 0;
-		td->io_issues[i] = 0;
-		td->ts.total_io_u[i] = 0;
-		td->ts.runtime[i] = 0;
+		td->io_bytes[i] = 0;           /* 총 I/O 바이트 */
+		td->io_blocks[i] = 0;          /* 총 I/O 블록 */
+		td->io_issues[i] = 0;          /* 총 I/O 발행 횟수 */
+		td->ts.total_io_u[i] = 0;      /* 총 io_u 사용 수 */
+		td->ts.runtime[i] = 0;         /* 각 방향별 런타임 */
 	}
 
+	/* [한국어] 에포크 시간을 현재 시간으로 재설정하고, 각 샘플링 시간도 동기화 */
 	set_epoch_time(td, td->o.log_alternate_epoch_clock_id, td->o.job_start_clock_id);
 	memcpy(&td->start, &td->epoch, sizeof(td->epoch));
 	memcpy(&td->iops_sample_time, &td->epoch, sizeof(td->epoch));
@@ -171,24 +205,26 @@ void reset_all_stats(struct thread_data *td)
 
 	td->last_thinktime = td->epoch;
 
-	lat_target_reset(td);
-	clear_rusage_stat(td);
-	helper_reset();
+	lat_target_reset(td);       /* 레이턴시 타겟 리셋 */
+	clear_rusage_stat(td);      /* 리소스 사용량 통계 클리어 */
+	helper_reset();             /* 헬퍼 스레드 리셋 */
 }
 
+/* [한국어] fio 전역 상태 리셋 - 새로운 실행을 위해 그룹/스레드/세그먼트 카운터를 초기화 */
 void reset_fio_state(void)
 {
 	int i;
 
-	groupid = 0;
-	thread_number = 0;
-	cur_segment = 0;
+	groupid = 0;        /* 그룹 ID 카운터 리셋 */
+	thread_number = 0;  /* 스레드 번호 카운터 리셋 */
+	cur_segment = 0;    /* 현재 세그먼트 인덱스 리셋 */
 	for (i = 0; i < nr_segments; i++)
-		segments[i].nr_threads = 0;
-	stat_number = 0;
-	done_secs = 0;
+		segments[i].nr_threads = 0;  /* 각 세그먼트의 스레드 수 리셋 */
+	stat_number = 0;    /* 통계 번호 리셋 */
+	done_secs = 0;      /* 완료 시간(초) 리셋 */
 }
 
+/* [한국어] OS 이름 문자열 반환 - 인덱스로 OS 이름을 조회 */
 const char *fio_get_os_string(int nr)
 {
 	if (nr < os_nr)
@@ -197,6 +233,7 @@ const char *fio_get_os_string(int nr)
 	return NULL;
 }
 
+/* [한국어] 아키텍처 이름 문자열 반환 - 인덱스로 아키텍처 이름을 조회 */
 const char *fio_get_arch_string(int nr)
 {
 	if (nr < arch_nr)
@@ -205,21 +242,23 @@ const char *fio_get_arch_string(int nr)
 	return NULL;
 }
 
+/* [한국어] 스레드 실행 상태 문자열 배열 - 각 상태의 이름 매핑 */
 static const char *td_runstates[] = {
-	"NOT_CREATED",
-	"CREATED",
-	"INITIALIZED",
-	"RAMP",
-	"SETTING_UP",
-	"RUNNING",
-	"PRE_READING",
-	"VERIFYING",
-	"FSYNCING",
-	"FINISHING",
-	"EXITED",
-	"REAPED",
+	"NOT_CREATED",   /* 스레드 미생성 */
+	"CREATED",       /* 스레드 생성됨 */
+	"INITIALIZED",   /* 초기화 완료 */
+	"RAMP",          /* 램프업(워밍업) 중 */
+	"SETTING_UP",    /* 설정 중 */
+	"RUNNING",       /* I/O 실행 중 */
+	"PRE_READING",   /* 사전 읽기 중 */
+	"VERIFYING",     /* 데이터 검증 중 */
+	"FSYNCING",      /* fsync 수행 중 */
+	"FINISHING",     /* 마무리 중 */
+	"EXITED",        /* 종료됨 */
+	"REAPED",        /* 회수됨 (자원 해제 완료) */
 };
 
+/* [한국어] 실행 상태 번호를 문자열 이름으로 변환 */
 const char *runstate_to_name(int runstate)
 {
 	compiletime_assert(TD_LAST == 12, "td runstate list");
@@ -229,6 +268,7 @@ const char *runstate_to_name(int runstate)
 	return "invalid";
 }
 
+/* [한국어] 스레드 실행 상태 설정 - 상태 전이를 수행하고 디버그 로그 출력 */
 void td_set_runstate(struct thread_data *td, int runstate)
 {
 	if (td->runstate == runstate)
@@ -240,6 +280,8 @@ void td_set_runstate(struct thread_data *td, int runstate)
 	td->runstate = runstate;
 }
 
+/* [한국어] 스레드 실행 상태를 새 상태로 변경하고, 이전 상태를 반환
+ * td_restore_runstate()와 함께 사용하여 임시 상태 변경 후 복원 가능 */
 int td_bump_runstate(struct thread_data *td, int new_state)
 {
 	int old_state = td->runstate;
@@ -248,11 +290,14 @@ int td_bump_runstate(struct thread_data *td, int new_state)
 	return old_state;
 }
 
+/* [한국어] 스레드 실행 상태를 이전 상태로 복원 */
 void td_restore_runstate(struct thread_data *td, int old_state)
 {
 	td_set_runstate(td, old_state);
 }
 
+/* [한국어] 스레드에 종료 표시 - 종료 시간 기록 후 terminate 플래그 설정
+ * write_barrier()로 메모리 순서 보장 */
 void fio_mark_td_terminate(struct thread_data *td)
 {
 	fio_gettime(&td->terminate_time, NULL);
@@ -260,6 +305,12 @@ void fio_mark_td_terminate(struct thread_data *td)
 	td->terminate = true;
 }
 
+/* [한국어] 지정된 그룹 또는 전체 스레드에 종료 신호 전달
+ * terminate 모드에 따라:
+ *   - TERMINATE_GROUP: 특정 그룹만 종료
+ *   - TERMINATE_STONEWALL: 실행 중인 스레드만 종료
+ *   - TERMINATE_ALL: 모든 스레드 종료
+ * 실행 중인 스레드는 자연 종료를 기다리고, 시작 전 스레드는 SIGTERM 전송 */
 void fio_terminate_threads(unsigned int group_id, unsigned int terminate)
 {
 	pid_t pid = getpid();
@@ -286,10 +337,11 @@ void fio_terminate_threads(unsigned int group_id, unsigned int terminate)
 			if (!td->pid || pid == td->pid)
 				continue;
 			else if (td->runstate < TD_RAMP)
-				kill(td->pid, SIGTERM);
+				kill(td->pid, SIGTERM);  /* 아직 시작 안 한 스레드에게 SIGTERM */
 			else {
 				struct ioengine_ops *ops = td->io_ops;
 
+				/* [한국어] I/O 엔진에 terminate 콜백이 있으면 호출 */
 				if (ops && ops->terminate)
 					ops->terminate(td);
 			}
@@ -297,6 +349,9 @@ void fio_terminate_threads(unsigned int group_id, unsigned int terminate)
 	} end_for_each();
 }
 
+/* [한국어] 실행 중이거나 대기 중인 I/O 스레드가 있는지 확인
+ * 반환값: 1 = 아직 실행 중인 스레드 있음, 0 = 모든 스레드 종료됨
+ *        -1 = cpuio 스레드만 있었음 (실제 I/O 스레드 없음) */
 int fio_running_or_pending_io_threads(void)
 {
 	int nr_io_threads = 0;
@@ -314,6 +369,8 @@ int fio_running_or_pending_io_threads(void)
 	return 0;
 }
 
+/* [한국어] 파일 디스크립터를 논블로킹 모드로 설정
+ * 이전 플래그를 반환하여 나중에 복원할 수 있게 함 */
 int fio_set_fd_nonblocking(int fd, const char *who)
 {
 	int flags;
@@ -332,13 +389,16 @@ int fio_set_fd_nonblocking(int fd, const char *who)
 	return flags;
 }
 
+/* [한국어] 엔디안 검사 에러 코드 */
 enum {
-	ENDIAN_INVALID_BE = 1,
-	ENDIAN_INVALID_LE,
-	ENDIAN_INVALID_CONFIG,
-	ENDIAN_BROKEN,
+	ENDIAN_INVALID_BE = 1,      /* 빅엔디안이 감지되었으나 리틀엔디안으로 설정됨 */
+	ENDIAN_INVALID_LE,          /* 리틀엔디안이 감지되었으나 빅엔디안으로 설정됨 */
+	ENDIAN_INVALID_CONFIG,      /* 엔디안 설정이 없음 */
+	ENDIAN_BROKEN,              /* 엔디안 감지 실패 */
 };
 
+/* [한국어] 시스템의 엔디안 설정이 컴파일 시 설정과 일치하는지 검사
+ * 64비트 정수에 0x12를 저장하고 바이트 위치를 확인하여 엔디안 판별 */
 static int endian_check(void)
 {
 	union {
@@ -369,6 +429,17 @@ static int endian_check(void)
 	return 0;
 }
 
+/* [한국어] fio 전체 초기화 함수 - 프로그램 시작 시 한 번 호출
+ * 수행 작업:
+ *   1) 구조체 정렬 검사 (compiletime_assert) - ARM 등에서 정렬 오류 방지
+ *   2) 엔디안 설정 일치 여부 검사
+ *   3) 아키텍처 초기화 (arch_init)
+ *   4) 공유 메모리 할당기 초기화 (sinit)
+ *   5) 파일 잠금 서브시스템 초기화
+ *   6) 파일 해시 초기화
+ *   7) 로케일 설정 (숫자 출력 형식)
+ *   8) 시스템 페이지 크기 조회
+ *   9) 키워드 초기화 */
 int initialize_fio(char *envp[])
 {
 	long ps;
@@ -379,6 +450,7 @@ int initialize_fio(char *envp[])
 	 * can run into problems on archs that fault on unaligned fp
 	 * access (ARM).
 	 */
+	/* [한국어] 컴파일 타임 정렬 검사 - 구조체 멤버가 올바르게 정렬되었는지 확인 */
 	compiletime_assert((offsetof(struct thread_data, ts) % sizeof(void *)) == 0, "ts");
 	compiletime_assert((offsetof(struct thread_stat, percentile_list) % 8) == 0, "stat percentile_list");
 	compiletime_assert((offsetof(struct thread_stat, total_run_time) % 8) == 0, "total_run_time");
@@ -395,6 +467,7 @@ int initialize_fio(char *envp[])
 	compiletime_assert((__TD_F_LAST + __FIO_IOENGINE_F_LAST) <= 8*sizeof(((struct thread_data *)0)->flags), "td->flags");
 	compiletime_assert(BSSPLIT_MAX <= ZONESPLIT_MAX, "bsssplit/zone max");
 
+	/* [한국어] 엔디안 설정 검증 */
 	err = endian_check();
 	if (err) {
 		log_err("fio: endianness settings appear wrong.\n");
@@ -419,24 +492,26 @@ int initialize_fio(char *envp[])
 		return 1;
 	}
 
-	arch_init(envp);
+	arch_init(envp);  /* 아키텍처별 초기화 (TSC 등) */
 
-	sinit();
+	sinit();  /* 공유 메모리(smalloc) 풀 초기화 */
 
 	if (fio_filelock_init()) {
 		log_err("fio: failed initializing filelock subsys\n");
 		return 1;
 	}
 
-	file_hash_init();
+	file_hash_init();  /* 파일 해시 테이블 초기화 */
 
 	/*
 	 * We need locale for number printing, if it isn't set then just
 	 * go with the US format.
 	 */
+	/* [한국어] LC_NUMERIC이 설정되지 않았으면 미국 형식(콤마 구분) 사용 */
 	if (!getenv("LC_NUMERIC"))
 		setlocale(LC_NUMERIC, "en_US");
 
+	/* [한국어] 시스템 페이지 크기 조회 - 메모리 정렬 및 I/O 크기 계산에 사용 */
 	ps = sysconf(_SC_PAGESIZE);
 	if (ps < 0) {
 		log_err("Failed to get page size\n");
@@ -446,10 +521,11 @@ int initialize_fio(char *envp[])
 	page_size = ps;
 	page_mask = ps - 1;
 
-	fio_keywords_init();
+	fio_keywords_init();  /* 설정 키워드 파서 초기화 */
 	return 0;
 }
 
+/* [한국어] fio 종료 정리 함수 - 키워드 파서 해제 */
 void deinitialize_fio(void)
 {
 	fio_keywords_exit();
