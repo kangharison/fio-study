@@ -1,14 +1,36 @@
+/*
+ * [한국어] idletime.c - CPU 유휴 시간 프로파일링
+ *
+ * 이 파일은 fio 실행 중 각 CPU의 유휴율(idleness)을 측정하는 기능을 구현한다.
+ * 주요 원리:
+ *   - 각 CPU에 SCHED_IDLE 우선순위의 스레드를 배치하여 단위 작업을 반복 수행
+ *   - 유휴 시간이 많을수록 더 많은 루프를 실행하므로, 완료 루프 수로 유휴율 추정
+ *   - 보정(calibration) 단계에서 단위 작업의 기준 시간을 측정
+ *
+ * 주요 함수:
+ *   1) calibrate_unit()      - 단위 작업의 기준 실행 시간 측정
+ *   2) idle_prof_thread_fn() - 유휴 프로파일링 스레드 메인 함수
+ *   3) fio_idle_prof_init()  - 프로파일링 초기화 (스레드 생성, 보정)
+ *   4) fio_idle_prof_start() - 프로파일링 시작 (스레드 잠금 해제)
+ *   5) fio_idle_prof_stop()  - 프로파일링 중지 및 유휴율 계산
+ *   6) show_idle_prof_stats() - 결과 출력 (텍스트 및 JSON)
+ */
 #include <math.h>
 #include "fio.h"
 #include "json.h"
 #include "idletime.h"
 
+/* [한국어] ipc - 유휴 프로파일링 전역 공유 상태.
+ *          volatile로 선언하여 스레드 간 가시성을 보장한다. */
 static volatile struct idle_prof_common ipc;
 
 /*
  * Get time to complete an unit work on a particular cpu.
  * The minimum number in CALIBRATE_RUNS runs is returned.
  */
+/* [한국어] calibrate_unit - 특정 CPU에서 단위 작업(page_size 바이트 쓰기)의 최소 실행 시간 측정.
+ *          CALIBRATE_RUNS회 반복 중 최솟값을 반환한다.
+ *          CALIBRATE_SCALE을 곱하여 분산을 줄인다. */
 static double calibrate_unit(unsigned char *data)
 {
 	unsigned long t, i, j, k;
@@ -44,6 +66,7 @@ static double calibrate_unit(unsigned char *data)
 	return tunit / CALIBRATE_SCALE;
 }
 
+/* [한국어] free_cpu_affinity - CPU 친화성 마스크 해제 */
 static void free_cpu_affinity(struct idle_prof_thread *ipt)
 {
 #if defined(FIO_HAVE_CPU_AFFINITY)
@@ -51,6 +74,8 @@ static void free_cpu_affinity(struct idle_prof_thread *ipt)
 #endif
 }
 
+/* [한국어] set_cpu_affinity - 스레드를 지정된 CPU에 바인딩.
+ *          CPU 친화성 마스크를 초기화하고 해당 CPU 비트를 설정한 뒤 적용한다. */
 static int set_cpu_affinity(struct idle_prof_thread *ipt)
 {
 #if defined(FIO_HAVE_CPU_AFFINITY)
@@ -74,6 +99,12 @@ static int set_cpu_affinity(struct idle_prof_thread *ipt)
 #endif
 }
 
+/* [한국어] idle_prof_thread_fn - 유휴 프로파일링 스레드의 메인 함수.
+ *          동작 흐름:
+ *          1) init_lock 대기 -> CPU 친화성 설정 -> 보정(calibration) 수행
+ *          2) SCHED_IDLE 우선순위 설정 -> 초기화 완료 신호
+ *          3) start_lock 대기 -> 프로파일링 루프 진입 (PROF_STOP까지 반복)
+ *          4) 완료된 루프 수(ipt->loops)를 기록하여 유휴율 계산에 사용 */
 static void *idle_prof_thread_fn(void *data)
 {
 	int retval;
@@ -96,6 +127,7 @@ static void *idle_prof_thread_fn(void *data)
 		return NULL;
         }
 
+	/* 보정 수행: 단위 작업의 기준 시간 측정 */
 	ipt->cali_time = calibrate_unit(ipt->data);
 
 	/* delay to set IDLE class till now for better calibration accuracy */
@@ -133,6 +165,7 @@ static void *idle_prof_thread_fn(void *data)
 		goto do_exit;
 	}
 
+	/* 프로파일링 루프 시작: PROF_STOP 신호까지 단위 작업 반복 */
 	fio_gettime(&ipt->tps, NULL);
 	ipt->state = TD_RUNNING;
 
@@ -150,6 +183,7 @@ static void *idle_prof_thread_fn(void *data)
 
 idle_prof_done:
 
+	/* 완료된 루프 수 기록 (정수부 + 부분 루프) */
 	ipt->loops = j + (double) k / page_size;
 	ipt->state = TD_EXITED;
 	pthread_mutex_unlock(&ipt->start_lock);
@@ -160,6 +194,8 @@ do_exit:
 }
 
 /* calculate mean and standard deviation to complete an unit of work */
+/* [한국어] calibration_stats - 모든 CPU의 보정 시간으로 평균과 표준편차를 계산.
+ *          이 통계는 유휴율 계산의 기준이 된다. */
 static void calibration_stats(void)
 {
 	int i;
@@ -181,6 +217,12 @@ static void calibration_stats(void)
 	ipc.cali_stddev = sqrt(var/(ipc.nr_cpus-1));
 }
 
+/* [한국어] fio_idle_prof_init - 유휴 프로파일링 초기화.
+ *          각 CPU별로 스레드를 생성하고, 보정(calibration)을 수행한다.
+ *          동작 흐름:
+ *          1) CPU 수 확인 및 메모리 할당 (스레드 구조체 + 데이터 버퍼)
+ *          2) 각 CPU별 뮤텍스/조건변수 초기화 후 스레드 생성
+ *          3) init_lock 해제 -> 보정 완료 대기 -> 통계 계산 */
 void fio_idle_prof_init(void)
 {
 	int i, ret;
@@ -211,12 +253,14 @@ void fio_idle_prof_init(void)
 		return;
 	}
 
+	/* 각 CPU별 프로파일링 스레드 구조체 할당 */
 	ipc.ipts = malloc(ipc.nr_cpus * sizeof(struct idle_prof_thread));
 	if (!ipc.ipts) {
 		log_err("fio: malloc failed\n");
 		return;
 	}
 
+	/* 모든 스레드가 공유할 데이터 버퍼 할당 (CPU별 page_size씩) */
 	ipc.buf = malloc(ipc.nr_cpus * page_size);
 	if (!ipc.buf) {
 		log_err("fio: malloc failed\n");
@@ -231,7 +275,7 @@ void fio_idle_prof_init(void)
 	for (i = 0; i < ipc.nr_cpus; i++) {
 		ipt = &ipc.ipts[i];
 
-		ipt->cpu = i;	
+		ipt->cpu = i;
 		ipt->state = TD_NOT_CREATED;
 		ipt->data = (unsigned char *)(ipc.buf + page_size * i);
 
@@ -276,15 +320,18 @@ void fio_idle_prof_init(void)
 	 * let good threads continue so that they can exit
 	 * if errors on other threads occurred previously.
 	 */
+	/* [한국어] 모든 스레드의 init_lock을 해제하여 보정을 시작시킨다.
+	 *          에러 발생 시에도 해제하여 스레드가 정상 종료할 수 있게 한다. */
 	for (i = 0; i < ipc.nr_cpus; i++) {
 		ipt = &ipc.ipts[i];
 		pthread_mutex_unlock(&ipt->init_lock);
 	}
-	
+
 	if (ipc.status == IDLE_PROF_STATUS_ABORT)
 		return;
-	
+
 	/* wait for calibration to finish */
+	/* [한국어] 각 스레드의 보정 완료를 대기. 1초 타임아웃으로 조건변수 대기한다. */
 	for (i = 0; i < ipc.nr_cpus; i++) {
 		ipt = &ipc.ipts[i];
 		pthread_mutex_lock(&ipt->init_lock);
@@ -299,15 +346,16 @@ void fio_idle_prof_init(void)
 			pthread_cond_timedwait(&ipt->cond, &ipt->init_lock, &ts);
 		}
 		pthread_mutex_unlock(&ipt->init_lock);
-	
+
 		/*
 		 * any thread failed to initialize would abort other threads
-		 * later after fio_idle_prof_start. 
-		 */	
+		 * later after fio_idle_prof_start.
+		 */
 		if (ipt->state == TD_EXITED)
 			ipc.status = IDLE_PROF_STATUS_ABORT;
 	}
 
+	/* 보정 성공 시 평균/표준편차 계산, 실패 시 0으로 초기화 */
 	if (ipc.status != IDLE_PROF_STATUS_ABORT)
 		calibration_stats();
 	else
@@ -317,6 +365,8 @@ void fio_idle_prof_init(void)
 		ipc.status = IDLE_PROF_STATUS_CALI_STOP;
 }
 
+/* [한국어] fio_idle_prof_start - 프로파일링 시작.
+ *          모든 스레드의 start_lock을 해제하여 프로파일링 루프에 진입시킨다. */
 void fio_idle_prof_start(void)
 {
 	int i;
@@ -332,6 +382,10 @@ void fio_idle_prof_start(void)
 	}
 }
 
+/* [한국어] fio_idle_prof_stop - 프로파일링 중지 및 유휴율 계산.
+ *          PROF_STOP 신호를 보내고 모든 스레드 종료를 대기한 뒤,
+ *          각 CPU의 유휴율을 계산한다:
+ *            idleness = (완료 루프 수 * 보정 기준 시간) / 실제 경과 시간 */
 void fio_idle_prof_stop(void)
 {
 	int i;
@@ -361,6 +415,8 @@ void fio_idle_prof_stop(void)
 		pthread_mutex_unlock(&ipt->start_lock);
 
 		/* calculate idleness */
+		/* [한국어] 유휴율 = (루프 수 * 단위 작업 시간) / 총 경과 시간
+		 *          1.0이면 100% 유휴, 0.0이면 CPU가 완전히 사용 중이었음 */
 		if (ipc.cali_mean != 0.0) {
 			runt = utime_since(&ipt->tps, &ipt->tpe);
 			if (runt)
@@ -373,7 +429,7 @@ void fio_idle_prof_stop(void)
 
 	/*
 	 * memory allocations are freed via explicit fio_idle_prof_cleanup
-	 * after profiling stats are collected by apps.  
+	 * after profiling stats are collected by apps.
 	 */
 }
 
@@ -381,6 +437,9 @@ void fio_idle_prof_stop(void)
  * return system idle percentage when cpu is -1;
  * return one cpu idle percentage otherwise.
  */
+/* [한국어] fio_idle_prof_cpu_stat - CPU별 또는 시스템 전체 유휴율 반환.
+ *          cpu == -1이면 전체 CPU의 평균 유휴율, 그 외에는 해당 CPU의 유휴율.
+ *          반환 값은 백분율 (0.0 ~ 100.0) */
 static double fio_idle_prof_cpu_stat(int cpu)
 {
 	int i, nr_cpus = ipc.nr_cpus;
@@ -409,6 +468,8 @@ static double fio_idle_prof_cpu_stat(int cpu)
 	return p * 100.0;
 }
 
+/* [한국어] fio_idle_prof_cleanup - 프로파일링 리소스 해제.
+ *          스레드 구조체 배열과 데이터 버퍼를 해제한다. */
 void fio_idle_prof_cleanup(void)
 {
 	if (ipc.ipts) {
@@ -422,6 +483,10 @@ void fio_idle_prof_cleanup(void)
 	}
 }
 
+/* [한국어] fio_idle_prof_parse_opt - 유휴 프로파일링 옵션 문자열 파싱.
+ *          "calibrate": 보정만 수행하고 결과 출력 후 종료
+ *          "system":    시스템 전체 유휴율 측정
+ *          "percpu":    CPU별 유휴율 측정 */
 int fio_idle_prof_parse_opt(const char *args)
 {
 	ipc.opt = IDLE_PROF_OPT_NONE; /* default */
@@ -429,7 +494,7 @@ int fio_idle_prof_parse_opt(const char *args)
 	if (!args) {
 		log_err("fio: empty idle-prof option string\n");
 		return -1;
-	}	
+	}
 
 #if defined(FIO_HAVE_CPU_AFFINITY) && defined(CONFIG_SCHED_IDLE)
 	if (strcmp("calibrate", args) == 0) {
@@ -448,13 +513,16 @@ int fio_idle_prof_parse_opt(const char *args)
 	} else {
 		log_err("fio: incorrect idle-prof option: %s\n", args);
 		return -1;
-	}	
+	}
 #else
 	log_err("fio: idle-prof not supported on this platform\n");
 	return -1;
 #endif
 }
 
+/* [한국어] show_idle_prof_stats - 유휴 프로파일링 결과를 출력.
+ *          FIO_OUTPUT_NORMAL: 텍스트 형식으로 시스템/CPU별 유휴율 및 보정 통계 출력
+ *          FIO_OUTPUT_JSON:  JSON 객체에 cpu_idleness 키로 결과 추가 */
 void show_idle_prof_stats(int output, struct json_object *parent,
 			  struct buf_output *out)
 {
@@ -486,6 +554,7 @@ void show_idle_prof_stats(int output, struct json_object *parent,
 		return;
 	}
 
+	/* JSON 출력: cpu_idleness 객체에 시스템/CPU별 유휴율 추가 */
 	if ((ipc.opt != IDLE_PROF_OPT_NONE) && (output & FIO_OUTPUT_JSON)) {
 		if (!parent)
 			return;

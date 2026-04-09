@@ -1,8 +1,24 @@
+/*
+ * [한국어] pshared.c - 프로세스 간 공유 뮤텍스/조건변수 초기화 구현
+ *
+ * PTHREAD_PROCESS_SHARED 속성을 설정하여 fork된 프로세스 간에
+ * 공유할 수 있는 뮤텍스와 조건변수를 초기화한다.
+ *
+ * 주요 기능:
+ *   cond_init_pshared()              - 공유 조건변수 초기화 (MONOTONIC 클럭 지원)
+ *   mutex_init_pshared_with_type()   - 지정 타입의 공유 뮤텍스 초기화
+ *   mutex_init_pshared()             - 기본 타입 공유 뮤텍스 초기화
+ *   mutex_cond_init_pshared()        - 뮤텍스 + 조건변수 한 번에 초기화
+ *
+ * 참고: CONFIG_PSHARED가 정의되지 않은 플랫폼(NetBSD/OpenBSD)에서는
+ *       PTHREAD_PROCESS_SHARED 설정을 건너뛴다.
+ */
 #include <string.h>
 
 #include "log.h"
 #include "pshared.h"
 
+/* [한국어] 프로세스 간 공유 가능한 조건변수 초기화 */
 int cond_init_pshared(pthread_cond_t *cond)
 {
 	pthread_condattr_t cattr;
@@ -14,6 +30,7 @@ int cond_init_pshared(pthread_cond_t *cond)
 		return ret;
 	}
 
+	/* [한국어] 프로세스 간 공유 속성 설정 (지원 플랫폼에서만) */
 #ifdef CONFIG_PSHARED
 	ret = pthread_condattr_setpshared(&cattr, PTHREAD_PROCESS_SHARED);
 	if (ret) {
@@ -22,6 +39,7 @@ int cond_init_pshared(pthread_cond_t *cond)
 	}
 #endif
 
+	/* [한국어] MONOTONIC 클럭 설정 - 시스템 시간 변경에 영향받지 않는 타이머 */
 #ifdef CONFIG_PTHREAD_CONDATTR_SETCLOCK
 	ret = pthread_condattr_setclock(&cattr, CLOCK_MONOTONIC);
 	if (ret) {
@@ -43,6 +61,7 @@ int cond_init_pshared(pthread_cond_t *cond)
  * 'type' must be a mutex type, e.g. PTHREAD_MUTEX_NORMAL,
  * PTHREAD_MUTEX_ERRORCHECK, PTHREAD_MUTEX_RECURSIVE or PTHREAD_MUTEX_DEFAULT.
  */
+/* [한국어] 지정된 타입으로 프로세스 간 공유 뮤텍스 초기화 */
 int mutex_init_pshared_with_type(pthread_mutex_t *mutex, int type)
 {
 	pthread_mutexattr_t mattr;
@@ -57,6 +76,7 @@ int mutex_init_pshared_with_type(pthread_mutex_t *mutex, int type)
 	/*
 	 * Not all platforms support process shared mutexes (NetBSD/OpenBSD)
 	 */
+	/* [한국어] 프로세스 간 공유 속성 설정 (NetBSD/OpenBSD 등 미지원 플랫폼은 건너뜀) */
 #ifdef CONFIG_PSHARED
 	ret = pthread_mutexattr_setpshared(&mattr, PTHREAD_PROCESS_SHARED);
 	if (ret) {
@@ -64,6 +84,7 @@ int mutex_init_pshared_with_type(pthread_mutex_t *mutex, int type)
 		return ret;
 	}
 #endif
+	/* [한국어] 뮤텍스 타입 설정 (NORMAL, ERRORCHECK, RECURSIVE, DEFAULT) */
 	ret = pthread_mutexattr_settype(&mattr, type);
 	if (ret) {
 		log_err("pthread_mutexattr_settype: %s\n", strerror(ret));
@@ -79,11 +100,13 @@ int mutex_init_pshared_with_type(pthread_mutex_t *mutex, int type)
 	return 0;
 }
 
+/* [한국어] 기본 타입(PTHREAD_MUTEX_DEFAULT)으로 프로세스 공유 뮤텍스 초기화 */
 int mutex_init_pshared(pthread_mutex_t *mutex)
 {
 	return mutex_init_pshared_with_type(mutex, PTHREAD_MUTEX_DEFAULT);
 }
 
+/* [한국어] 프로세스 공유 뮤텍스와 조건변수를 한 번에 초기화하는 편의 함수 */
 int mutex_cond_init_pshared(pthread_mutex_t *mutex, pthread_cond_t *cond)
 {
 	int ret;

@@ -1,8 +1,34 @@
-#include <string.h>
+/*
+ * [한국어] cconv.c - 클라이언트/서버 thread_options 변환 (바이트 오더 변환)
+ *
+ * fio 클라이언트-서버 모드에서 thread_options 구조체를 네트워크로 전송할 때
+ * 호스트 바이트 오더(CPU)와 네트워크 바이트 오더(리틀 엔디안) 간의 변환을 수행한다.
+ *
+ * 주요 함수:
+ *   1) convert_thread_options_to_cpu()  - 네트워크(pack) -> CPU(호스트) 변환
+ *   2) convert_thread_options_to_net()  - CPU(호스트) -> 네트워크(pack) 변환
+ *   3) fio_test_cconv()                 - 변환 왕복(roundtrip) 테스트
+ *
+ * 보조 함수:
+ *   - string_to_cpu()  : 네트워크 패킷의 고정 크기 문자열을 CPU측 동적 문자열로 복사
+ *   - string_to_net()  : CPU측 동적 문자열을 네트워크 패킷의 고정 크기 버퍼로 복사
+ *   - free_thread_options_to_cpu() : CPU측에서 할당된 문자열 메모리 해제
+ *   - thread_options_pack_size()   : 패킷 크기 계산 (가변 길이 패턴 포함)
+ *
+ * 변환 방식:
+ *   - 정수: le32_to_cpu / cpu_to_le32, le64_to_cpu / cpu_to_le64 등
+ *   - 부동소수점: fio_uint64_to_double / fio_double_to_uint64 (IEEE 754 변환)
+ *   - 문자열: strdup (to_cpu) / snprintf (to_net)
+ *   - 배열(bssplit, zone_split 등): 원소별 개별 변환
+ */
 
-#include "log.h"
-#include "thread_options.h"
+#include <string.h>  /* 문자열 처리 함수 */
 
+#include "log.h"             /* 로깅 유틸리티 */
+#include "thread_options.h"  /* thread_options / thread_options_pack 구조체 */
+
+/* [한국어] 네트워크 패킷의 고정 크기 문자열을 CPU측 동적 문자열로 복사 (strdup)
+ * 빈 문자열이면 복사하지 않는다. */
 static void string_to_cpu(char **dst, const uint8_t *src)
 {
 	const char *__src = (const char *) src;
@@ -11,6 +37,8 @@ static void string_to_cpu(char **dst, const uint8_t *src)
 		*dst = strdup(__src);
 }
 
+/* [한국어] CPU측 문자열을 네트워크 패킷의 고정 크기 버퍼로 복사 (snprintf)
+ * src가 NULL이면 빈 문자열로 설정한다. */
 static void __string_to_net(uint8_t *dst, const char *src, size_t dst_size)
 {
 	if (src)
@@ -21,6 +49,8 @@ static void __string_to_net(uint8_t *dst, const char *src, size_t dst_size)
 
 #define string_to_net(dst, src)	__string_to_net((dst), (src), sizeof(dst))
 
+/* [한국어] CPU측 thread_options에서 동적 할당된 문자열 메모리를 모두 해제
+ * convert_thread_options_to_cpu()가 strdup()으로 할당한 메모리를 정리한다. */
 static void free_thread_options_to_cpu(struct thread_options *o)
 {
 	int i;
@@ -58,21 +88,32 @@ static void free_thread_options_to_cpu(struct thread_options *o)
 	}
 }
 
+/* [한국어] thread_options_pack의 전체 크기를 계산
+ * 기본 구조체 크기에 가변 길이인 verify_pattern과 buffer_pattern 크기를 더한다. */
 size_t thread_options_pack_size(struct thread_options *o)
 {
 	return sizeof(struct thread_options_pack) + o->verify_pattern_bytes +
 		o->buffer_pattern_bytes;
 }
 
+/* [한국어] 네트워크 패킷(thread_options_pack) -> CPU(thread_options) 변환
+ *
+ * 리틀 엔디안으로 직렬화된 네트워크 패킷의 각 필드를 호스트 바이트 오더로 변환하고,
+ * 문자열은 strdup()으로 동적 할당하며, 배열(bssplit, zone_split)은 원소별로 변환한다.
+ * 가변 길이 패턴(verify_pattern, buffer_pattern)은 패킷 끝에 위치한 patterns[]에서 복사한다.
+ *
+ * 반환값: 0=성공, -EINVAL=패턴 크기 검증 실패 */
 int convert_thread_options_to_cpu(struct thread_options *o,
 				  struct thread_options_pack *top,
 				  size_t top_sz)
 {
 	int i, j;
 
+	/* 옵션 설정 비트맵 변환 */
 	for (i = 0; i < NR_OPTS_SZ; i++)
 		o->set_options[i] = le64_to_cpu(top->set_options[i]);
 
+	/* 문자열 필드 변환 (네트워크 고정 크기 -> CPU 동적 할당) */
 	string_to_cpu(&o->description, top->description);
 	string_to_cpu(&o->name, top->name);
 	string_to_cpu(&o->wait_for, top->wait_for);
@@ -98,6 +139,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	string_to_cpu(&o->cgroup, top->cgroup);
 	string_to_cpu(&o->dp_scheme_file, top->dp_scheme_file);
 
+	/* 32비트/64비트 정수 필드 변환 (리틀 엔디안 -> 호스트) */
 	o->allow_create = le32_to_cpu(top->allow_create);
 	o->allow_mounted_write = le32_to_cpu(top->allow_mounted_write);
 	o->td_ddir = le32_to_cpu(top->td_ddir);
@@ -125,6 +167,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->start_offset_align = le64_to_cpu(top->start_offset_align);
 	o->start_offset_percent = le32_to_cpu(top->start_offset_percent);
 
+	/* 방향별(읽기/쓰기/트림) 배열 필드 변환 */
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
 		o->bs[i] = le64_to_cpu(top->bs[i]);
 		o->ba[i] = le64_to_cpu(top->ba[i]);
@@ -132,6 +175,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 		o->max_bs[i] = le64_to_cpu(top->max_bs[i]);
 		o->bssplit_nr[i] = le32_to_cpu(top->bssplit_nr[i]);
 
+		/* bssplit 배열 변환 (블록 크기 분할 설정) */
 		if (o->bssplit_nr[i]) {
 			o->bssplit[i] = malloc(o->bssplit_nr[i] * sizeof(struct bssplit));
 			for (j = 0; j < o->bssplit_nr[i]; j++) {
@@ -140,6 +184,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 			}
 		}
 
+		/* zone_split 배열 변환 (존 분할 설정) */
 		o->zone_split_nr[i] = le32_to_cpu(top->zone_split_nr[i]);
 
 		if (o->zone_split_nr[i]) {
@@ -189,6 +234,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->verify_write_sequence = le32_to_cpu(top->verify_write_sequence);
 	o->verify_header_seed = le32_to_cpu(top->verify_header_seed);
 
+	/* 가변 길이 패턴 크기 변환 및 유효성 검사 */
 	o->verify_pattern_bytes = le32_to_cpu(top->verify_pattern_bytes);
 	o->verify_pattern_interval = le32_to_cpu(top->verify_pattern_interval);
 	o->buffer_pattern_bytes = le32_to_cpu(top->buffer_pattern_bytes);
@@ -197,6 +243,7 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	    thread_options_pack_size(o) > top_sz)
 		return -EINVAL;
 
+	/* 가변 길이 패턴 데이터를 패킷 끝의 patterns[]에서 복사 */
 	o->verify_pattern = realloc(o->verify_pattern,
 				    o->verify_pattern_bytes);
 	o->buffer_pattern = realloc(o->buffer_pattern,
@@ -240,6 +287,8 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->bs_is_seq_rand = le32_to_cpu(top->bs_is_seq_rand);
 	o->random_distribution = le32_to_cpu(top->random_distribution);
 	o->exitall_error = le32_to_cpu(top->exitall_error);
+
+	/* 부동소수점 필드: 리틀 엔디안 정수 -> IEEE 754 double 변환 */
 	o->zipf_theta.u.f = fio_uint64_to_double(le64_to_cpu(top->zipf_theta.u.i));
 	o->pareto_h.u.f = fio_uint64_to_double(le64_to_cpu(top->pareto_h.u.i));
 	o->gauss_dev.u.f = fio_uint64_to_double(le64_to_cpu(top->gauss_dev.u.i));
@@ -360,15 +409,19 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	o->rate_process = le32_to_cpu(top->rate_process);
 	o->rate_ign_think = le32_to_cpu(top->rate_ign_think);
 
+	/* 백분위 리스트 배열 변환 (부동소수점) */
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		o->percentile_list[i].u.f = fio_uint64_to_double(le64_to_cpu(top->percentile_list[i].u.i));
 
+	/* blktrace 병합 스칼라 배열 변환 (부동소수점) */
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		o->merge_blktrace_scalars[i].u.f = fio_uint64_to_double(le64_to_cpu(top->merge_blktrace_scalars[i].u.i));
 
+	/* blktrace 병합 반복 배열 변환 (부동소수점) */
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		o->merge_blktrace_iters[i].u.f = fio_uint64_to_double(le64_to_cpu(top->merge_blktrace_iters[i].u.i));
 
+	/* FDP(데이터 배치) 관련 필드 변환 */
 	o->fdp = le32_to_cpu(top->fdp);
 	o->dp_type = le32_to_cpu(top->dp_type);
 	o->dp_id_select = le32_to_cpu(top->dp_id_select);
@@ -384,14 +437,20 @@ int convert_thread_options_to_cpu(struct thread_options *o,
 	return 0;
 }
 
+/* [한국어] CPU(thread_options) -> 네트워크 패킷(thread_options_pack) 변환
+ *
+ * 호스트 바이트 오더의 각 필드를 리틀 엔디안으로 변환하여 네트워크 전송용 패킷을 생성한다.
+ * convert_thread_options_to_cpu()의 역변환이다. */
 void convert_thread_options_to_net(struct thread_options_pack *top,
 				   struct thread_options *o)
 {
 	int i, j;
 
+	/* 옵션 설정 비트맵 변환 */
 	for (i = 0; i < NR_OPTS_SZ; i++)
 		top->set_options[i] = cpu_to_le64(o->set_options[i]);
 
+	/* 문자열 필드 변환 (CPU 동적 문자열 -> 네트워크 고정 크기 버퍼) */
 	string_to_net(top->description, o->description);
 	string_to_net(top->name, o->name);
 	string_to_net(top->wait_for, o->wait_for);
@@ -417,6 +476,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	string_to_net(top->cgroup, o->cgroup);
 	string_to_net(top->dp_scheme_file, o->dp_scheme_file);
 
+	/* 32비트/64비트 정수 필드 변환 (호스트 -> 리틀 엔디안) */
 	top->allow_create = cpu_to_le32(o->allow_create);
 	top->allow_mounted_write = cpu_to_le32(o->allow_mounted_write);
 	top->td_ddir = cpu_to_le32(o->td_ddir);
@@ -496,6 +556,8 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->bs_is_seq_rand = cpu_to_le32(o->bs_is_seq_rand);
 	top->random_distribution = cpu_to_le32(o->random_distribution);
 	top->exitall_error = cpu_to_le32(o->exitall_error);
+
+	/* 부동소수점 필드: IEEE 754 double -> 리틀 엔디안 정수 변환 */
 	top->zipf_theta.u.i = __cpu_to_le64(fio_double_to_uint64(o->zipf_theta.u.f));
 	top->pareto_h.u.i = __cpu_to_le64(fio_double_to_uint64(o->pareto_h.u.f));
 	top->gauss_dev.u.i = __cpu_to_le64(fio_double_to_uint64(o->gauss_dev.u.f));
@@ -587,6 +649,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->write_iops_log = cpu_to_le32(o->write_iops_log);
 	top->write_hist_log = cpu_to_le32(o->write_hist_log);
 
+	/* 방향별(읽기/쓰기/트림) 배열 필드 변환 */
 	for (i = 0; i < DDIR_RWDIR_CNT; i++) {
 		top->bs[i] = __cpu_to_le64(o->bs[i]);
 		top->ba[i] = __cpu_to_le64(o->ba[i]);
@@ -594,6 +657,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 		top->max_bs[i] = __cpu_to_le64(o->max_bs[i]);
 		top->bssplit_nr[i] = cpu_to_le32(o->bssplit_nr[i]);
 
+		/* bssplit 배열 변환 */
 		if (o->bssplit_nr[i]) {
 			unsigned int bssplit_nr = o->bssplit_nr[i];
 
@@ -607,6 +671,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 			}
 		}
 
+		/* zone_split 배열 변환 */
 		top->zone_split_nr[i] = cpu_to_le32(o->zone_split_nr[i]);
 
 		if (o->zone_split_nr[i]) {
@@ -633,6 +698,7 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 		top->max_latency[i] = __cpu_to_le64(o->max_latency[i]);
 	}
 
+	/* 가변 길이 패턴 데이터를 패킷 끝의 patterns[]에 복사 */
 	memcpy(top->patterns, o->verify_pattern, o->verify_pattern_bytes);
 	memcpy(&top->patterns[o->verify_pattern_bytes], o->buffer_pattern,
 	       o->buffer_pattern_bytes);
@@ -674,15 +740,18 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
 	top->rate_process = cpu_to_le32(o->rate_process);
 	top->rate_ign_think = cpu_to_le32(o->rate_ign_think);
 
+	/* 백분위 리스트 배열 변환 */
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		top->percentile_list[i].u.i = __cpu_to_le64(fio_double_to_uint64(o->percentile_list[i].u.f));
 
+	/* blktrace 병합 스칼라/반복 배열 변환 */
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		top->merge_blktrace_scalars[i].u.i = __cpu_to_le64(fio_double_to_uint64(o->merge_blktrace_scalars[i].u.f));
 
 	for (i = 0; i < FIO_IO_U_LIST_MAX_LEN; i++)
 		top->merge_blktrace_iters[i].u.i = __cpu_to_le64(fio_double_to_uint64(o->merge_blktrace_iters[i].u.f));
 
+	/* FDP(데이터 배치) 관련 필드 변환 */
 	top->fdp = cpu_to_le32(o->fdp);
 	top->dp_type = cpu_to_le32(o->dp_type);
 	top->dp_id_select = cpu_to_le32(o->dp_id_select);
@@ -701,6 +770,10 @@ void convert_thread_options_to_net(struct thread_options_pack *top,
  * to have a thorough test. Even better, we should auto-generate the
  * converter functions...
  */
+/* [한국어] 변환 왕복(roundtrip) 테스트 - CPU -> 네트 -> CPU -> 네트 후 결과 비교
+ * 옵션을 네트워크 형식으로 변환한 뒤 다시 CPU 형식으로 역변환하고,
+ * 다시 네트워크 형식으로 변환하여 두 네트워크 패킷이 동일한지 memcmp()로 검증한다.
+ * 반환값: 0=일치(성공), 비0=불일치(실패) */
 int fio_test_cconv(struct thread_options *__o)
 {
 	struct thread_options o1 = *__o, o2;
@@ -708,6 +781,7 @@ int fio_test_cconv(struct thread_options *__o)
 	size_t top_sz;
 	int ret;
 
+	/* 테스트용 패턴 데이터 설정 */
 	o1.verify_pattern_bytes = 61;
 	o1.verify_pattern = malloc(o1.verify_pattern_bytes);
 	memset(o1.verify_pattern, 'V', o1.verify_pattern_bytes);
@@ -719,13 +793,17 @@ int fio_test_cconv(struct thread_options *__o)
 	top1 = calloc(1, top_sz);
 	top2 = calloc(1, top_sz);
 
+	/* 1차 변환: CPU -> 네트워크 */
 	convert_thread_options_to_net(top1, &o1);
 	memset(&o2, 0, sizeof(o2));
+	/* 역변환: 네트워크 -> CPU */
 	ret = convert_thread_options_to_cpu(&o2, top1, top_sz);
 	if (ret)
 		goto out;
 
+	/* 2차 변환: CPU -> 네트워크 (역변환된 결과에서) */
 	convert_thread_options_to_net(top2, &o2);
+	/* 두 네트워크 패킷이 동일한지 비교 */
 	ret = memcmp(top1, top2, top_sz);
 
 out:

@@ -1,3 +1,9 @@
+/*
+ * [한국어] diskutil.h - 디스크 유틸리티 통계 헤더
+ *
+ * /proc/diskstats 및 /sys/block/에서 디스크 I/O 활용도를 수집하기 위한
+ * 구조체 및 함수를 정의한다. iostat과 유사한 디스크 통계를 fio 내부에서 제공한다.
+ */
 #ifndef FIO_DISKUTIL_H
 #define FIO_DISKUTIL_H
 #define FIO_DU_NAME_SZ		64
@@ -5,10 +11,10 @@
 #include <stdint.h>
 #include <limits.h>
 
-#include "helper_thread.h"
-#include "fio_sem.h"
-#include "flist.h"
-#include "lib/ieee754.h"
+#include "helper_thread.h"  /* 헬퍼 스레드 인터페이스 */
+#include "fio_sem.h"        /* fio 세마포어 */
+#include "flist.h"          /* fio 연결 리스트 */
+#include "lib/ieee754.h"    /* IEEE 754 부동소수점 변환 */
 
 /**
  * @ios: Number of I/O operations that have been completed successfully.
@@ -20,54 +26,60 @@
  *
  * For the array members, index 0 refers to reads and index 1 refers to writes.
  */
+/* [한국어] 디스크 I/O 통계 원시 데이터 - /sys/block/<dev>/stat에서 읽은 값
+ * 배열 인덱스: [0]=읽기, [1]=쓰기 */
 struct disk_util_stats {
-	uint64_t ios[2];
-	uint64_t merges[2];
-	uint64_t sectors[2];
-	uint64_t ticks[2];
-	uint64_t io_ticks;
-	uint64_t time_in_queue;
-	uint64_t msec;
+	uint64_t ios[2];           /* 완료된 I/O 연산 수 */
+	uint64_t merges[2];        /* 병합된 I/O 연산 수 */
+	uint64_t sectors[2];       /* 전송된 섹터 수 (512바이트 단위) */
+	uint64_t ticks[2];         /* I/O 처리에 소요된 시간 (밀리초) */
+	uint64_t io_ticks;         /* I/O가 활성 상태였던 시간 (밀리초) */
+	uint64_t time_in_queue;    /* I/O 큐에서 대기한 가중 시간 (밀리초) */
+	uint64_t msec;             /* 측정 경과 시간 (밀리초) */
 };
 
 /*
  * Disk utilization as read from /sys/block/<dev>/stat
  */
+/* [한국어] 디스크 유틸리티 통계 - 디바이스 이름과 통계 데이터를 포함 */
 struct disk_util_stat {
-	uint8_t name[FIO_DU_NAME_SZ];
-	struct disk_util_stats s;
+	uint8_t name[FIO_DU_NAME_SZ];  /* 디바이스 이름 (예: "sda") */
+	struct disk_util_stats s;       /* I/O 통계 데이터 */
 };
 
+/* [한국어] 디스크 유틸리티 집계 구조체 - 여러 슬레이브 디바이스의 통계를 집계 */
 struct disk_util_agg {
-	uint64_t ios[2];
-	uint64_t merges[2];
-	uint64_t sectors[2];
-	uint64_t ticks[2];
-	uint64_t io_ticks;
-	uint64_t time_in_queue;
-	uint32_t slavecount;
-	uint32_t pad;
-	fio_fp64_t max_util;
+	uint64_t ios[2];           /* 집계된 I/O 연산 수 */
+	uint64_t merges[2];        /* 집계된 병합 I/O 수 */
+	uint64_t sectors[2];       /* 집계된 섹터 전송량 */
+	uint64_t ticks[2];         /* 집계된 I/O 시간 */
+	uint64_t io_ticks;         /* 집계된 활성 I/O 시간 */
+	uint64_t time_in_queue;    /* 집계된 큐 대기 시간 */
+	uint32_t slavecount;       /* 슬레이브 디바이스 수 */
+	uint32_t pad;              /* 패딩 (정렬용) */
+	fio_fp64_t max_util;       /* 최대 활용률 (%) */
 };
 
 /*
  * Per-device disk util management
  */
+/* [한국어] 디바이스별 디스크 유틸리티 관리 구조체
+ * sysfs에서 디바이스 통계를 읽고, 마스터-슬레이브 관계(소프트웨어 RAID)를 관리한다. */
 struct disk_util {
-	struct flist_head list;
+	struct flist_head list;       /* 전역 disk_list에 연결되는 노드 */
 	/* If this disk is a slave, hook it into the master's
 	 * list using this head.
 	 */
-	struct flist_head slavelist;
+	struct flist_head slavelist;  /* 마스터의 slaves 리스트에 연결되는 노드 */
 
-	char *sysfs_root;
-	char path[PATH_MAX];
-	int major, minor;
+	char *sysfs_root;             /* sysfs 디바이스 경로 (예: /sys/block/sda) */
+	char path[PATH_MAX];          /* stat 파일 경로 (예: /sys/block/sda/stat) */
+	int major, minor;             /* 디바이스 major/minor 번호 */
 
-	struct disk_util_stat dus;
-	struct disk_util_stat last_dus;
+	struct disk_util_stat dus;      /* 누적 통계 */
+	struct disk_util_stat last_dus; /* 이전 폴링의 통계 (델타 계산용) */
 
-	struct disk_util_agg agg;
+	struct disk_util_agg agg;     /* 슬레이브 집계 통계 */
 
 	/* For software raids, this entry maintains pointers to the
 	 * entries for the slave devices. The disk_util entries for
@@ -76,14 +88,15 @@ struct disk_util {
 	 * de-allocation, etc. Whereas this list should be used only
 	 * for aggregating a software RAID's disk util figures.
 	 */
-	struct flist_head slaves;
+	struct flist_head slaves;     /* 소프트웨어 RAID의 슬레이브 디바이스 리스트 */
 
-	struct timespec time;
+	struct timespec time;         /* 마지막 통계 폴링 시각 */
 
-	struct fio_sem *lock;
-	unsigned long users;
+	struct fio_sem *lock;         /* 동시 접근 보호용 세마포어 */
+	unsigned long users;          /* 이 디바이스를 사용하는 스레드 수 */
 };
 
+/* [한국어] 디스크 유틸리티 사용자 수 변경 - 슬레이브 디바이스의 사용자 수도 함께 변경 */
 static inline void disk_util_mod(struct disk_util *du, int val)
 {
 	if (du) {
@@ -101,28 +114,31 @@ static inline void disk_util_mod(struct disk_util *du, int val)
 		fio_sem_up(du->lock);
 	}
 }
+
+/* [한국어] 디스크 유틸리티 사용자 증가 */
 static inline void disk_util_inc(struct disk_util *du)
 {
 	disk_util_mod(du, 1);
 }
 
+/* [한국어] 디스크 유틸리티 사용자 감소 */
 static inline void disk_util_dec(struct disk_util *du)
 {
 	disk_util_mod(du, -1);
 }
 
-#define DISK_UTIL_MSEC	(250)
+#define DISK_UTIL_MSEC	(250)  /* 디스크 유틸리티 폴링 주기 (밀리초) */
 
-extern struct flist_head disk_list;
+extern struct flist_head disk_list;  /* 전역 디스크 유틸리티 리스트 */
 
 /*
  * disk util stuff
  */
 #ifdef FIO_HAVE_DISK_UTIL
-extern void init_disk_util(struct thread_data *);
-extern int update_io_ticks(void);
-extern void setup_disk_util(void);
-extern void disk_util_prune_entries(void);
+extern void init_disk_util(struct thread_data *);   /* 디스크 유틸리티 초기화 */
+extern int update_io_ticks(void);                    /* I/O 통계 갱신 (주기적 호출) */
+extern void setup_disk_util(void);                   /* 전역 세마포어 초기화 */
+extern void disk_util_prune_entries(void);           /* 모든 디스크 유틸 항목 제거 */
 #else
 /* keep this as a function to avoid a warning in handle_du() */
 #define disk_util_prune_entries()

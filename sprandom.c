@@ -3,6 +3,26 @@
  *
  * Copyright (c) 2025 Sandisk Corporation or its affiliates.
  */
+/*
+ * [한국어] sprandom.c - SSD 정상 상태(Steady-State) 데이터 분포 기반 랜덤 쓰기 생성기
+ *
+ * 이 파일은 SSD의 정상 상태에서의 데이터 유효성 분포를 모델링하여
+ * 실제 SSD 워크로드와 유사한 랜덤 쓰기 패턴을 생성한다.
+ *
+ * 주요 기능:
+ *   1) compute_validity_dist() - Desnoyers 모델 기반 유효성 분포 계산
+ *   2) sprandom_setup()        - 리전(region) 파라미터 초기화
+ *   3) sprandom_get_next_offset() - 다음 쓰기 오프셋 생성 (무효화 관리 포함)
+ *   4) sprandom_init()         - 전체 초기화 (스레드/파일별)
+ *   5) sprandom_free()         - 리소스 해제
+ *
+ * 핵심 원리:
+ *   - Desnoyers의 연구에 기반: i * f(i) = k (유효 페이지 수 * 블록 비율 = 상수)
+ *   - Over-Provisioning(OP)으로부터 Write Amplification Factor(WAF) 계산
+ *   - WAF로부터 GC 블록의 유효성 비율 결정
+ *   - 리전별 유효성 분포를 생성하고, 등간격으로 리샘플링
+ *   - 무효화 버퍼(2-phase circular buffer)로 이전 리전의 무효 블록을 재기록
+ */
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
@@ -21,7 +41,7 @@
  *
  * P. Desnoyers, "Analytic Models of SSD Write Performance,"
  * ACM Transactions on Storage,
- * vol. 8, no. 2, pp. 1–18, Jun. 2012, doi: 10.1145/2133360.2133364.
+ * vol. 8, no. 2, pp. 1-18, Jun. 2012, doi: 10.1145/2133360.2133364.
  *
  * The Core Principle
  * ==================
@@ -96,23 +116,28 @@
  * equal-sized region of the drive, completing the model.
  */
 
+/* [한국어] 무효화 확률 정밀도 (10000 = 소수점 4자리 정밀도) */
 #define PCT_PRECISION 10000
 
+/* [한국어] double 배열 할당 헬퍼 (calloc으로 0 초기화) */
 static inline double *d_alloc(size_t n)
 {
 	return calloc(n, sizeof(double));
 }
 
+/* [한국어] 2D 좌표 점 구조체 (리샘플링용) */
 struct point {
-	double x;
-	double y;
+	double x;  /* x축 값 (누적 블록 비율) */
+	double y;  /* y축 값 (유효성) */
 };
 
+/* [한국어] point 배열 할당 헬퍼 */
 static inline struct point *p_alloc(size_t n)
 {
 	return calloc(n, sizeof(struct point));
 }
 
+/* [한국어] print_d_array - double 배열을 디버그 로그로 출력 */
 static void print_d_array(const char *hdr, double *darray, size_t len)
 {
 	struct buf_output out;
@@ -132,6 +157,7 @@ static void print_d_array(const char *hdr, double *darray, size_t len)
 	buf_output_free(&out);
 }
 
+/* [한국어] print_d_points - point 배열을 디버그 로그로 출력 */
 static void print_d_points(struct point *parray, size_t len)
 {
 	struct buf_output out;
@@ -149,6 +175,7 @@ static void print_d_points(struct point *parray, size_t len)
 }
 
 /* Comparison function for qsort to sort points by x-value */
+/* [한국어] compare_points - qsort용 비교 함수. x값 기준 오름차순 정렬 */
 static int compare_points(const void *a, const void *b)
 {
 	/* Cast void pointers to struct point pointers */
@@ -169,6 +196,7 @@ static int compare_points(const void *a, const void *b)
  * @arr: pointer to the array of doubles to be reversed.
  * @size: number of elements in the array.
  */
+/* [한국어] reverse - double 배열을 제자리에서 뒤집는다 (양 끝에서 교환) */
 static void reverse(double arr[], size_t size)
 {
 	size_t left = 0;
@@ -198,6 +226,8 @@ static void reverse(double arr[], size_t size)
  *
  * Return: allocated array, or NULL on allocation failure or if @num is 0.
  */
+/* [한국어] linspace - 등간격 배열 생성 (numpy의 linspace와 동일).
+ *          start에서 end까지 num개의 등간격 값을 생성하여 반환한다. */
 static double *linspace(double start, double end, unsigned int num)
 {
 	double *arr;
@@ -241,6 +271,9 @@ static double *linspace(double start, double end, unsigned int num)
  * Handles edge cases for zero or one point, and avoids division by zero
  * if two x-values are nearly identical.
  */
+/* [한국어] linear_interp - 선형 보간(또는 외삽).
+ *          주어진 x 값에 대응하는 y 값을 선형 보간으로 계산한다.
+ *          범위 밖이면 가장 가까운 끝점의 y 값을 반환한다. */
 static double linear_interp(double new_x, const double *x_arr,
 			    const double *y_arr, unsigned int num)
 {
@@ -299,6 +332,9 @@ static double linear_interp(double new_x, const double *x_arr,
  *
  * Return: 0 on success, negative error code on failure.
  */
+/* [한국어] sample_curve_equally_on_x - 곡선을 x축 등간격으로 리샘플링.
+ *          불균등 간격의 입력 점들을 등간격 x 값으로 변환한다.
+ *          선형 보간으로 새로운 y 값을 계산한다. */
 static int sample_curve_equally_on_x(struct point *points, unsigned int num,
 				     unsigned int num_resampled,
 				     struct point **resampled_points)
@@ -323,6 +359,7 @@ static int sample_curve_equally_on_x(struct point *points, unsigned int num,
 		return 0;
 	}
 
+	/* x 값 기준으로 정렬 */
 	qsort(points, num, sizeof(struct point), compare_points);
 
 	/* Check if x-values are strictly increasing and sort them */
@@ -348,6 +385,7 @@ static int sample_curve_equally_on_x(struct point *points, unsigned int num,
 	}
 
 	/* 4. Generate new_x values using linspace */
+	/* [한국어] 등간격 x 값 생성 */
 	new_x_arr = linspace(x_orig[0], x_orig[num - 1], num_resampled);
 	if (new_x_arr == NULL) {
 		ret = -ENOMEM;
@@ -363,6 +401,7 @@ static int sample_curve_equally_on_x(struct point *points, unsigned int num,
 	}
 
 	/* 6. Perform linear interpolation for each new_x to get new_y */
+	/* [한국어] 각 등간격 x에 대해 선형 보간으로 y 값 계산 */
 	for (i = 0; i < num_resampled; i++) {
 		new_points_arr[i].x = new_x_arr[i];
 		new_points_arr[i].y = linear_interp(new_x_arr[i], x_orig, y_orig, num);
@@ -390,6 +429,8 @@ cleanup:
  *
  * Return: The computed write amplification factor as a double.
  */
+/* [한국어] compute_waf - Over-Provisioning 비율로부터 쓰기 증폭 계수(WAF) 계산.
+ *          근사식: WAF = 0.5 / OP + 0.7 */
 static inline double compute_waf(double over_provisioning)
 {
 	return 0.5 / over_provisioning + 0.7;
@@ -402,6 +443,8 @@ static inline double compute_waf(double over_provisioning)
  *
  * Return: The computed gavalidity;
  */
+/* [한국어] compute_gc_validity - GC 대상 블록의 유효성 비율 계산.
+ *          valid_frac_gc = 1 - 1/WAF */
 static inline double compute_gc_validity(double waf)
 {
 	assert(waf > 1.0); /* Ensure WAF is greater than 1.0 */
@@ -428,6 +471,14 @@ static inline double compute_gc_validity(double waf)
  *
  * Return: resampled and reversed validity distribution array or NULL on error.
  */
+/* [한국어] compute_validity_dist - 리전별 유효성 분포 계산.
+ *          동작 흐름:
+ *          1) WAF, GC 유효성 계산
+ *          2) 1.0 ~ validity 범위를 n_regions개로 등분 (유효성 분포)
+ *          3) 각 유효성에 대해 블록 비율 계산: f(i) = 1/valid_frac(i)
+ *          4) 누적 비율 계산 후 (누적 비율, 유효성) 곡선 생성
+ *          5) x축 등간격 리샘플링으로 균등 크기 리전의 유효성 결정
+ *          6) 결과를 역순으로 뒤집어 반환 (높은 유효성 -> 낮은 유효성) */
 static double *compute_validity_dist(unsigned int n_regions, double over_provisioning)
 {
 	double waf = compute_waf(over_provisioning);
@@ -450,6 +501,7 @@ static double *compute_validity_dist(unsigned int n_regions, double over_provisi
 	 * Use linspace to get equally distributed validity values,
 	 * along the y-axis of the curve we want to generate.
 	 */
+	/* [한국어] 유효성 값을 1.0에서 GC 유효성까지 등분 */
 	validity_distribution = linspace(1.0, validity, n_regions);
 
 	blocks_ratio = d_alloc(n_regions);
@@ -458,6 +510,7 @@ static double *compute_validity_dist(unsigned int n_regions, double over_provisi
 		goto out;
 	}
 
+	/* [한국어] 블록 비율 = 1/유효성 (낮은 유효성일수록 더 많은 공간 차지) */
 	for (i = 0; i < n_regions; i++)
 		blocks_ratio[i] = 1.0 / validity_distribution[i];
 
@@ -467,6 +520,7 @@ static double *compute_validity_dist(unsigned int n_regions, double over_provisi
 		goto out;
 	}
 
+	/* [한국어] 누적 블록 비율 계산 (x축 좌표로 사용) */
 	acc = 0.0;
 	for (i = 0; i < n_regions; i++) {
 		acc_ratio[i] = acc + blocks_ratio[i];
@@ -477,6 +531,7 @@ static double *compute_validity_dist(unsigned int n_regions, double over_provisi
 	print_d_array("blocks ratio", blocks_ratio, n_regions);
 	print_d_array("accumulated ratio:", acc_ratio, n_regions);
 
+	/* [한국어] (누적 비율, 유효성) 쌍으로 곡선의 점 생성 */
 	points = p_alloc(n_regions);
 
 	for (i = 0; i < n_regions; i++) {
@@ -490,6 +545,7 @@ static double *compute_validity_dist(unsigned int n_regions, double over_provisi
 	 * and then interpolate the curve to find the validity at those
 	 * uniformly distributed x-values.
 	 */
+	/* [한국어] x축 등간격 리샘플링으로 균등 크기 리전의 유효성 결정 */
 	ret = sample_curve_equally_on_x(points, n_regions, n_regions,
 					&points_resampled);
 
@@ -513,6 +569,7 @@ out:
 	free(blocks_ratio);
 	free(acc_ratio);
 
+	/* [한국어] 결과를 뒤집어서 높은 유효성(=적은 무효화)부터 시작 */
 	reverse(validity_distribution, n_regions);
 
 	return validity_distribution;
@@ -527,6 +584,8 @@ out:
  *
  * return: Physical size in bytes, including over-provisioning and aligned to align_bs
  */
+/* [한국어] sprandom_physical_size - 논리 크기와 OP로 물리 크기 계산.
+ *          물리 크기 = 논리 크기 * (1 + OP), align_bs 단위로 정렬 */
 static uint64_t sprandom_physical_size(double over_provisioning, uint64_t logical_sz,
 				       uint64_t align_bs)
 {
@@ -546,6 +605,9 @@ static uint64_t sprandom_physical_size(double over_provisioning, uint64_t logica
  *
  * Returns: Estimated invalid capacity
  */
+/* [한국어] estimate_inv_capacity - 리전의 무효화 용량 추정.
+ *          기대 무효화 수 + 6*표준편차(sigma)의 여유를 두어
+ *          통계적 변동에 대비한다. (이항분포 근사) */
 static uint64_t estimate_inv_capacity(uint64_t region_cnt, double validity)
 {
 	double sigma = sqrt((double)region_cnt * validity * (1.0 - validity));
@@ -566,6 +628,9 @@ static uint64_t estimate_inv_capacity(uint64_t region_cnt, double validity)
  *
  * Returns 0 on success, enagative value on failure.
  */
+/* [한국어] sprandom_setup - sprandom_info 구조체 초기화 및 설정.
+ *          물리 크기/리전 크기 계산, 유효성 분포 생성,
+ *          무효화 비율 배열 초기화, 무효화 버퍼 할당을 수행한다. */
 static int sprandom_setup(struct sprandom_info *spr_info, uint64_t logical_size,
 			  uint64_t align_bs)
 {
@@ -593,6 +658,7 @@ static int sprandom_setup(struct sprandom_info *spr_info, uint64_t logical_size,
 	/* Initialize validity_distribution */
 	print_d_array("validity resampled:", validity_dist, spr_info->num_regions);
 
+	/* [한국어] 리전별 무효화 확률 배열 초기화 (PCT_PRECISION 스케일) */
 	/* Precompute invalidity percentage array */
 	spr_info->invalid_pct = calloc(spr_info->num_regions,
 				       sizeof(spr_info->invalid_pct[0]));
@@ -611,6 +677,7 @@ static int sprandom_setup(struct sprandom_info *spr_info, uint64_t logical_size,
 	region_sz = physical_size / spr_info->num_regions;
 	region_write_count = region_sz / align_bs;
 
+	/* [한국어] 캐시 크기 검증: 캐시가 리전보다 크면 안 됨 */
 	if ((spr_info->cache_sz) && (spr_info->cache_sz > region_sz)) {
 		log_err("fio: sprandom: spr_cs [%"PRIu64"] must be smaller than"
 			" region_sz [%"PRIu64"] which means [%"PRIu64"] regions"
@@ -620,6 +687,8 @@ static int sprandom_setup(struct sprandom_info *spr_info, uint64_t logical_size,
 		goto err;
 	}
 
+	/* [한국어] 무효화 버퍼 용량 추정.
+	 *          캐시 모드에서는 다음 리전까지 무효화를 지연하므로 2배 필요 */
 	if (spr_info->cache_sz) {
 		/* Need 2x size to be safe since we wait to invalidate until after next region */
 		invalid_capacity = estimate_inv_capacity(region_write_count,
@@ -631,6 +700,7 @@ static int sprandom_setup(struct sprandom_info *spr_info, uint64_t logical_size,
 
 	spr_info->invalid_capacity = invalid_capacity;
 
+	/* [한국어] 2-phase 순환 버퍼 할당 (무효화 오프셋 저장용) */
 	spr_info->invalid_buf = pcb_alloc(invalid_capacity);
 
 	total_alloc += invalid_capacity * sizeof(uint64_t);
@@ -684,6 +754,9 @@ err:
  * decides whether to add the offset to the invalid buffer.
  * If the buffer is full, ogs an error and asserts failure.
  */
+/* [한국어] sprandom_add_with_probability - 확률적으로 오프셋을 무효화 버퍼에 추가.
+ *          현재 리전의 무효화 비율(invalid_pct)에 따라 난수로 결정한다.
+ *          버퍼가 가득 차면 assert 실패 (설계상 발생하면 안 됨) */
 static void sprandom_add_with_probability(struct sprandom_info *info,
 					  uint64_t offset, unsigned int phase)
 {
@@ -701,6 +774,8 @@ static void sprandom_add_with_probability(struct sprandom_info *info,
 	}
 }
 
+/* [한국어] dprint_invalidation - 현재 리전의 무효화 통계를 디버그 출력.
+ *          목표 무효화율과 실제 무효화율을 비교하여 표시한다. */
 static void dprint_invalidation(const struct sprandom_info *info)
 {
 	uint32_t phase = info->curr_phase;
@@ -737,6 +812,14 @@ static void dprint_invalidation(const struct sprandom_info *info)
  *   0 if a valid offset is found and stored in @b,
  *   1 if no more offsets are available (end of regions or LFSR exhausted).
  */
+/* [한국어] sprandom_get_next_offset - 다음 쓰기 오프셋을 생성하는 핵심 함수.
+ *          동작 흐름:
+ *          1) 비캐시 모드: 이전 리전의 무효화 오프셋을 먼저 재기록
+ *          2) writes_remaining == 0이면 다음 리전으로 전환
+ *             - 캐시 모드: 리전 끝에서 무효화 재기록 (캐시 영향 방지)
+ *             - phase 전환 및 무효화 카운터 리셋
+ *          3) LFSR에서 새 오프셋을 가져와 확률적으로 무효화 버퍼에 저장
+ *          반환: 0=성공(오프셋 저장됨), 1=더 이상 오프셋 없음 */
 int sprandom_get_next_offset(struct sprandom_info *info, struct fio_file *f, uint64_t *b)
 {
 	uint64_t offset = 0;
@@ -755,6 +838,7 @@ int sprandom_get_next_offset(struct sprandom_info *info, struct fio_file *f, uin
 	}
 
 	/* Move to next region */
+	/* [한국어] 현재 리전의 쓰기가 완료되면 다음 리전으로 전환 */
 	if (info->writes_remaining == 0) {
 		if (info->cache_sz) {
 			/* replay invalidation for previous region at end of this
@@ -768,6 +852,7 @@ int sprandom_get_next_offset(struct sprandom_info *info, struct fio_file *f, uin
 			}
 		}
 
+		/* [한국어] 마지막 리전을 초과하면 종료 */
 		if (info->current_region >= info->num_regions) {
 			dprint(FD_SPRANDOM, "End: Last Region %d cur%d\n",
 			       info->current_region, info->num_regions);
@@ -776,6 +861,7 @@ int sprandom_get_next_offset(struct sprandom_info *info, struct fio_file *f, uin
 
 		dprint_invalidation(info);
 
+		/* [한국어] phase를 전환하고 다음 리전의 쓰기 수 설정 */
 		info->invalid_count[phase] = 0;
 
 		info->current_region++;
@@ -787,6 +873,7 @@ int sprandom_get_next_offset(struct sprandom_info *info, struct fio_file *f, uin
 	}
 
 	/* Fetch new offset */
+	/* [한국어] LFSR에서 새 오프셋을 가져옴. 소진 시 종료 */
 	if (lfsr_next(&f->lfsr, &offset)) {
 		if (info->cache_sz) {
 			/* Since we defer invalidation to the end of next region we
@@ -812,6 +899,7 @@ int sprandom_get_next_offset(struct sprandom_info *info, struct fio_file *f, uin
 	if (info->writes_remaining > 0)
 		info->writes_remaining--;
 
+	/* [한국어] 새 오프셋을 확률적으로 무효화 버퍼에 추가 (다음 phase용) */
 	sprandom_add_with_probability(info, offset,  phase ^ 1);
 	dprint(FD_SPRANDOM, "Write %"PRIu64" lfsr %d\n", offset, info->current_region);
 out:
@@ -829,6 +917,9 @@ out:
  *
  * Return: 0 on success, negative error code on failure.
  */
+/* [한국어] sprandom_init - 파일/스레드별 sprandom 초기화.
+ *          블록 크기 검증, sprandom_info 할당, 논리/물리 크기 계산,
+ *          sprandom_setup()으로 리전 파라미터를 설정한다. */
 int sprandom_init(struct thread_data *td, struct fio_file *f)
 {
 	struct sprandom_info *info = NULL;
@@ -855,6 +946,7 @@ int sprandom_init(struct thread_data *td, struct fio_file *f)
 	info->num_regions = td->o.spr_num_regions;
 	info->over_provisioning = over_provisioning;
 	info->cache_sz = td->o.spr_cache_size;
+	/* [한국어] io_size를 물리 크기(OP 포함)로 재설정하여 LFSR 범위 확장 */
 	td->o.io_size = sprandom_physical_size(over_provisioning,
 					       logical_size, align_bs);
 	info->rand_state = &td->sprandom_state;
@@ -876,6 +968,8 @@ err:
  * Releases memory allocated for validity_dist, invalid_buf, and the spr_info
  * structure itself. Does nothing if @spr_info is NULL.
  */
+/* [한국어] sprandom_free - sprandom 리소스 해제.
+ *          무효화 비율 배열, 무효화 버퍼, 구조체 자체를 해제한다. */
 void sprandom_free(struct sprandom_info *info)
 {
 	if (!info)

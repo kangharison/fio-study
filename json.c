@@ -1,3 +1,16 @@
+/*
+ * [한국어] json.c - fio JSON 출력 라이브러리 구현
+ *
+ * fio 통계 결과를 JSON 형식으로 출력하는 기능을 구현한다.
+ * 주요 기능:
+ *   1) json_create_*()        - JSON 객체/배열/값/쌍 생성
+ *   2) json_free_*()          - JSON 트리 메모리 해제 (재귀적)
+ *   3) json_object_add_*()    - 객체에 키-값 쌍 추가
+ *   4) json_array_add_*()     - 배열에 값 추가
+ *   5) json_print_*()         - JSON 트리를 문자열로 출력 (들여쓰기 포함)
+ */
+
+/* 표준 라이브러리 헤더 */
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -5,16 +18,20 @@
 #include "json.h"
 #include "log.h"
 
+/* [한국어] json_create_object - 빈 JSON 객체를 생성하여 반환 */
 struct json_object *json_create_object(void)
 {
 	return calloc(1, sizeof(struct json_object));
 }
 
+/* [한국어] json_create_array - 빈 JSON 배열을 생성하여 반환 */
 struct json_array *json_create_array(void)
 {
 	return calloc(1, sizeof(struct json_array));
 }
 
+/* [한국어] json_create_pair - 이름과 값으로 JSON 키-값 쌍을 생성.
+ *          값의 부모 타입을 PAIR로 설정한다. */
 static struct json_pair *json_create_pair(const char *name, struct json_value *value)
 {
 	struct json_pair *pair = malloc(sizeof(struct json_pair));
@@ -28,6 +45,7 @@ static struct json_pair *json_create_pair(const char *name, struct json_value *v
 	return pair;
 }
 
+/* [한국어] json_create_value_int - 정수 타입의 JSON 값 생성 */
 static struct json_value *json_create_value_int(long long number)
 {
 	struct json_value *value = malloc(sizeof(struct json_value));
@@ -39,6 +57,7 @@ static struct json_value *json_create_value_int(long long number)
 	return value;
 }
 
+/* [한국어] json_create_value_float - 실수 타입의 JSON 값 생성 */
 static struct json_value *json_create_value_float(double number)
 {
 	struct json_value *value = malloc(sizeof(struct json_value));
@@ -50,6 +69,8 @@ static struct json_value *json_create_value_float(double number)
 	return value;
 }
 
+/* [한국어] strdup_escape - 문자열을 복제하면서 '\' 와 '"' 문자를 이스케이프 처리.
+ *          JSON 표준에 맞게 특수 문자 앞에 백슬래시를 추가한다. */
 static char *strdup_escape(const char *str)
 {
 	const char *input = str;
@@ -76,6 +97,8 @@ static char *strdup_escape(const char *str)
 /*
  * Valid JSON strings must escape '"' and '/' with a preceding '/'
  */
+/* [한국어] json_create_value_string - 문자열 타입의 JSON 값 생성.
+ *          문자열은 strdup_escape()로 이스케이프 처리된 복사본이 저장된다. */
 static struct json_value *json_create_value_string(const char *str)
 {
 	struct json_value *value = malloc(sizeof(struct json_value));
@@ -91,6 +114,8 @@ static struct json_value *json_create_value_string(const char *str)
 	return value;
 }
 
+/* [한국어] json_create_value_object - 객체 타입의 JSON 값 생성.
+ *          객체의 parent를 이 값으로 설정하여 트리 관계를 형성한다. */
 static struct json_value *json_create_value_object(struct json_object *obj)
 {
 	struct json_value *value = malloc(sizeof(struct json_value));
@@ -103,6 +128,8 @@ static struct json_value *json_create_value_object(struct json_object *obj)
 	return value;
 }
 
+/* [한국어] json_create_value_array - 배열 타입의 JSON 값 생성.
+ *          배열의 parent를 이 값으로 설정한다. */
 static struct json_value *json_create_value_array(struct json_array *array)
 {
 	struct json_value *value = malloc(sizeof(struct json_value));
@@ -115,9 +142,11 @@ static struct json_value *json_create_value_array(struct json_array *array)
 	return value;
 }
 
+/* 전방 선언: 상호 재귀적 해제 함수들 */
 static void json_free_pair(struct json_pair *pair);
 static void json_free_value(struct json_value *value);
 
+/* [한국어] json_free_object - JSON 객체와 소속된 모든 쌍을 재귀적으로 해제 */
 void json_free_object(struct json_object *obj)
 {
 	int i;
@@ -128,6 +157,7 @@ void json_free_object(struct json_object *obj)
 	free(obj);
 }
 
+/* [한국어] json_free_array - JSON 배열과 소속된 모든 값을 재귀적으로 해제 */
 static void json_free_array(struct json_array *array)
 {
 	int i;
@@ -138,6 +168,7 @@ static void json_free_array(struct json_array *array)
 	free(array);
 }
 
+/* [한국어] json_free_pair - JSON 쌍의 값과 이름을 해제 */
 static void json_free_pair(struct json_pair *pair)
 {
 	json_free_value(pair->value);
@@ -145,6 +176,8 @@ static void json_free_pair(struct json_pair *pair)
 	free(pair);
 }
 
+/* [한국어] json_free_value - JSON 값을 타입에 따라 재귀적으로 해제.
+ *          문자열이면 문자열 메모리, 객체/배열이면 하위 트리 전체를 해제한다. */
 static void json_free_value(struct json_value *value)
 {
 	switch (value->type) {
@@ -161,6 +194,8 @@ static void json_free_value(struct json_value *value)
 	free(value);
 }
 
+/* [한국어] json_array_add_value - 배열에 값을 추가.
+ *          realloc으로 배열 포인터를 확장하고 부모 관계를 설정한다. */
 static int json_array_add_value(struct json_array *array, struct json_value *value)
 {
 	struct json_value **values = realloc(array->values,
@@ -177,6 +212,8 @@ static int json_array_add_value(struct json_array *array, struct json_value *val
 	return 0;
 }
 
+/* [한국어] json_object_add_pair - 객체에 키-값 쌍을 추가.
+ *          realloc으로 쌍 배열을 확장하고 부모 관계를 설정한다. */
 static int json_object_add_pair(struct json_object *obj, struct json_pair *pair)
 {
 	struct json_pair **pairs = realloc(obj->pairs,
@@ -191,6 +228,9 @@ static int json_object_add_pair(struct json_object *obj, struct json_pair *pair)
 	return 0;
 }
 
+/* [한국어] json_object_add_value_type - 객체에 임의 타입의 값을 추가하는 범용 함수.
+ *          arg의 타입에 따라 적절한 json_value를 생성하고 pair로 묶어 추가한다.
+ *          실패 시 생성된 중간 객체들을 정리한다. */
 int json_object_add_value_type(struct json_object *obj, const char *name,
 			       const struct json_value *arg)
 {
@@ -233,6 +273,8 @@ int json_object_add_value_type(struct json_object *obj, const char *name,
 	return 0;
 }
 
+/* [한국어] json_array_add_value_type - 배열에 임의 타입의 값을 추가하는 범용 함수.
+ *          arg의 타입에 따라 적절한 json_value를 생성하고 배열에 추가한다. */
 int json_array_add_value_type(struct json_array *array,
 			      const struct json_value *arg)
 {
@@ -269,6 +311,11 @@ int json_array_add_value_type(struct json_array *array,
 	return 0;
 }
 
+/*
+ * [한국어] 아래 함수들은 JSON 트리의 들여쓰기 레벨을 계산한다.
+ *          상호 재귀적으로 부모를 따라 올라가며 깊이를 구한다.
+ *          루트 객체(parent==NULL)의 레벨은 0이다.
+ */
 static int json_value_level(struct json_value *value);
 static int json_pair_level(struct json_pair *pair);
 static int json_array_level(struct json_array *array);
@@ -297,15 +344,19 @@ static int json_value_level(struct json_value *value)
 		return json_array_level(value->parent_array) + 1;
 }
 
+/* [한국어] json_print_level - 들여쓰기 레벨만큼 공백(2칸씩)을 출력 */
 static void json_print_level(int level, struct buf_output *out)
 {
 	while (level-- > 0)
 		log_buf(out, "  ");
 }
 
+/* 전방 선언: 상호 재귀적 출력 함수들 */
 static void json_print_pair(struct json_pair *pair, struct buf_output *);
 static void json_print_value(struct json_value *value, struct buf_output *);
 
+/* [한국어] json_print_object - JSON 객체를 "{...}" 형태로 출력.
+ *          각 쌍 사이에 쉼표와 줄바꿈을 삽입한다. */
 void json_print_object(struct json_object *obj, struct buf_output *out)
 {
 	int i;
@@ -321,6 +372,7 @@ void json_print_object(struct json_object *obj, struct buf_output *out)
 	log_buf(out, "}");
 }
 
+/* [한국어] json_print_pair - JSON 쌍을 "키" : 값 형태로 출력 */
 static void json_print_pair(struct json_pair *pair, struct buf_output *out)
 {
 	json_print_level(json_pair_level(pair), out);
@@ -328,6 +380,8 @@ static void json_print_pair(struct json_pair *pair, struct buf_output *out)
 	json_print_value(pair->value, out);
 }
 
+/* [한국어] json_print_array - JSON 배열을 "[...]" 형태로 출력.
+ *          각 값 사이에 쉼표와 줄바꿈을 삽입한다. */
 static void json_print_array(struct json_array *array, struct buf_output *out)
 {
 	int i;
@@ -344,6 +398,8 @@ static void json_print_array(struct json_array *array, struct buf_output *out)
 	log_buf(out, "]");
 }
 
+/* [한국어] json_print_value - JSON 값을 타입에 따라 출력.
+ *          문자열은 큰따옴표로 감싸고, 객체/배열은 재귀적으로 출력한다. */
 static void json_print_value(struct json_value *value, struct buf_output *out)
 {
 	switch (value->type) {
