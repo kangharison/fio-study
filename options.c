@@ -1,3 +1,28 @@
+/*
+ * [한국어] options.c - fio 옵션 정의 및 파싱 콜백 구현
+ *
+ * 이 파일은 fio의 모든 옵션을 정의하는 핵심 파일이다.
+ * 주요 구성:
+ *
+ *   Part 1: 콜백 함수들 (1~1991줄)
+ *     - str_bssplit_cb(): bssplit 옵션 파싱 (블록 크기 분포)
+ *     - str_rw_cb(): I/O 패턴(rw) 옵션 파싱
+ *     - str_filename_cb(): 파일명 옵션 파싱
+ *     - str_random_distribution_cb(): 랜덤 분포 설정
+ *     - str_steadystate_cb(): steady state 옵션 파싱
+ *     - 기타 30여 개의 커스텀 파싱/검증 콜백
+ *
+ *   Part 2: fio_options[] 배열 (1992~5754줄)
+ *     - 약 300개 이상의 fio 옵션 정의
+ *     - 각 옵션의 이름, 타입, 오프셋, 기본값, 도움말, posval 등
+ *     - 주요 카테고리: I/O, 파일, 통계, 로그, 검증, CPU, 메모리 등
+ *
+ *   Part 3: API 함수들 (5755~끝)
+ *     - fio_options_parse(): 잡 파일의 옵션 목록 파싱
+ *     - fio_option_dup_subs(): $pagesize 등 키워드 치환
+ *     - add_option(): I/O 엔진의 동적 옵션 추가
+ *     - fio_option_is_set(): 옵션 설정 여부 확인
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -8,18 +33,28 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 
-#include "fio.h"
-#include "verify.h"
-#include "parse.h"
-#include "lib/pattern.h"
-#include "options.h"
-#include "optgroup.h"
-#include "zbd.h"
+#include "fio.h"             /* fio 핵심 구조체 및 매크로 */
+#include "verify.h"          /* 데이터 검증 관련 */
+#include "parse.h"           /* 옵션 파싱 프레임워크 */
+#include "lib/pattern.h"     /* 버퍼 패턴 처리 */
+#include "options.h"         /* 옵션 API 선언 */
+#include "optgroup.h"        /* 옵션 그룹/카테고리 */
+#include "zbd.h"             /* Zoned Block Device */
 
+/* [한국어] --client 옵션에 사용되는 서버 소켓 주소 문자열 */
 char client_sockaddr_str[INET6_ADDRSTRLEN] = { 0 };
 
+/*
+ * [한국어] 콜백 데이터(thread_options 포인터) → thread_data 포인터 변환 매크로
+ * 파싱 콜백은 data로 &td->o를 받으므로, container_of로 td를 역산한다.
+ */
 #define cb_data_to_td(data)	container_of(data, struct thread_data, o)
 
+/*
+ * [한국어] 버퍼 패턴 포맷 디스크립터
+ * "%o"는 I/O 오프셋을 버퍼 패턴에 삽입하는 데 사용된다.
+ * 예: buffer_pattern="%o" → 각 블록의 오프셋이 데이터로 채워짐
+ */
 static const struct pattern_fmt_desc fmt_desc[] = {
 	{
 		.fmt   = "%o",
@@ -30,7 +65,8 @@ static const struct pattern_fmt_desc fmt_desc[] = {
 };
 
 /*
- * Check if mmap/mmaphuge has a :/foo/bar/file at the end. If so, return that.
+ * [한국어] mmap/mmaphuge 옵션에서 ":"으로 구분된 파일 경로를 추출
+ * 예: "mmap:/tmp/hugefile" → "/tmp/hugefile" 반환
  */
 static char *get_opt_postfix(const char *str)
 {
@@ -45,6 +81,10 @@ static char *get_opt_postfix(const char *str)
 	return strdup(p);
 }
 
+/*
+ * [한국어] 분포 파라미터 파싱: "값:중심" 형식에서 값과 중심점을 분리
+ * 예: "1.2:50" → val=1.2, center=50.0
+ */
 static bool split_parse_distr(const char *str, double *val, double *center)
 {
 	char *cp, *p;
@@ -66,6 +106,7 @@ static bool split_parse_distr(const char *str, double *val, double *center)
 	return r;
 }
 
+/* [한국어] bssplit 퍼센트 기준 정렬 비교 함수 */
 static int bs_cmp(const void *p1, const void *p2)
 {
 	const struct bssplit *bsp1 = p1;
@@ -74,6 +115,14 @@ static int bs_cmp(const void *p1, const void *p2)
 	return (int) bsp1->perc - (int) bsp2->perc;
 }
 
+/*
+ * [한국어] "값/퍼센트:값/퍼센트:..." 형식의 분할 문자열 파싱
+ * bssplit, cmdprio_bssplit 등에서 사용된다.
+ * 예: "4k/50:8k/30:16k/20" → 4K 50%, 8K 30%, 16K 20%
+ *
+ * @absolute: true이면 퍼센트 대신 절대값으로 해석
+ * @max_splits: 최대 분할 항목 수
+ */
 int split_parse_ddir(struct thread_options *o, struct split *split,
 			    char *str, bool absolute, unsigned int max_splits)
 {
@@ -133,6 +182,12 @@ int split_parse_ddir(struct thread_options *o, struct split *split,
 	return 0;
 }
 
+/*
+ * [한국어] 특정 방향(읽기/쓰기/트림)에 대한 bssplit 파싱
+ * split_parse_ddir()로 파싱 후 퍼센트 합계를 검증하고,
+ * 미지정 항목에 나머지 퍼센트를 균등 분배한다.
+ * 최종적으로 퍼센트 기준으로 정렬하여 런타임 조회를 최적화한다.
+ */
 static int bssplit_ddir(struct thread_options *o, void *eo,
 			enum fio_ddir ddir, char *str, bool data)
 {
@@ -206,6 +261,16 @@ static int bssplit_ddir(struct thread_options *o, void *eo,
 	return 0;
 }
 
+/*
+ * [한국어] 읽기/쓰기/트림 방향별 분할 파싱 드라이버
+ *
+ * "읽기값,쓰기값,트림값" 형식의 문자열을 분리하여
+ * 각 방향(DDIR_READ, DDIR_WRITE, DDIR_TRIM)에 대해 fn 콜백을 호출한다.
+ * 콤마가 없으면 동일한 값을 세 방향 모두에 적용한다.
+ *
+ * 예: bssplit=4k/50:8k/50,16k/100
+ *     → READ: 4k(50%)+8k(50%), WRITE: 16k(100%), TRIM: 16k(100%)
+ */
 int str_split_parse(struct thread_data *td, char *str,
 		    split_parse_fn *fn, void *eo, bool data)
 {
@@ -252,6 +317,7 @@ int str_split_parse(struct thread_data *td, char *str,
 	return ret;
 }
 
+/* [한국어] FDP(Flexible Data Placement) ID 정렬 비교 함수 */
 static int fio_fdp_cmp(const void *p1, const void *p2)
 {
 	const uint16_t *t1 = p1;
@@ -260,6 +326,11 @@ static int fio_fdp_cmp(const void *p1, const void *p2)
 	return *t1 - *t2;
 }
 
+/*
+ * [한국어] FDP placement ID 리스트 파싱 콜백
+ * "1,2,3-5" 형식으로 단일 ID와 범위를 모두 지원한다.
+ * 최대 FIO_MAX_DP_IDS개까지 허용, 파싱 후 오름차순 정렬한다.
+ */
 static int str_fdp_pli_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -323,8 +394,10 @@ static int str_fdp_pli_cb(void *data, const char *input)
 	return ret;
 }
 
-/* str_dp_scheme_cb() is a callback function for parsing the fdp_scheme option
-	This function validates the fdp_scheme filename. */
+/*
+ * [한국어] FDP scheme 파일 검증 콜백
+ * dp_scheme_file 옵션으로 지정된 파일이 실제로 존재하는 일반 파일인지 확인한다.
+ */
 static int str_dp_scheme_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -360,6 +433,11 @@ out:
 	return ret;
 }
 
+/*
+ * [한국어] bssplit 옵션 파싱 콜백
+ * "4k/50:8k/50,16k/100" 같은 블록 크기 분포를 파싱한다.
+ * str_split_parse()를 통해 읽기/쓰기/트림 방향별로 분리 처리한다.
+ */
 static int str_bssplit_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -387,6 +465,11 @@ static int str_bssplit_cb(void *data, const char *input)
 	return ret;
 }
 
+/*
+ * [한국어] cmdprio_bssplit 개별 항목 파싱
+ * "bs/perc/class/level/hint" 형식을 파싱한다.
+ * 예: "4k/50/1/2/0" → 4K 블록의 50%에 대해 class=1, level=2, hint=0 우선순위 적용
+ */
 static int parse_cmdprio_bssplit_entry(struct thread_options *o,
 				       struct split_prio *entry, char *str)
 {
@@ -458,6 +541,10 @@ static int fio_split_prio_cmp(const void *p1, const void *p2)
 	return 0;
 }
 
+/*
+ * [한국어] cmdprio_bssplit 방향별 파싱 — 콜론 구분 항목들을 순회하며
+ * parse_cmdprio_bssplit_entry()로 각 항목을 파싱하고 정렬한다.
+ */
 int split_parse_prio_ddir(struct thread_options *o, struct split_prio **entries,
 			  int *nr_entries, char *str)
 {
@@ -516,6 +603,11 @@ int split_parse_prio_ddir(struct thread_options *o, struct split_prio **entries,
 	return 0;
 }
 
+/*
+ * [한국어] errno 이름 문자열을 숫자로 변환
+ * 예: "EINVAL" → 22, "ENOENT" → 2
+ * ignore_error, continue_on_error 옵션에서 사용된다.
+ */
 static int str2error(char *str)
 {
 	const char *err[] = { "EPERM", "ENOENT", "ESRCH", "EINTR", "EIO",
@@ -626,6 +718,7 @@ static int ignore_error_type(struct thread_data *td, enum error_type_bit etype,
 
 }
 
+/* [한국어] replay_skip 옵션 콜백: blktrace 재생 시 건너뛸 I/O 방향 지정 */
 static int str_replay_skip_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -665,6 +758,10 @@ static int str_replay_skip_cb(void *data, const char *input)
 	return ret;
 }
 
+/*
+ * [한국어] ignore_error 옵션 콜백: 무시할 errno 목록 파싱
+ * 방향별(읽기/쓰기/트림)로 콤마 구분된 errno 이름/번호를 파싱한다.
+ */
 static int str_ignore_error_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -696,6 +793,12 @@ static int str_ignore_error_cb(void *data, const char *input)
 	return ret;
 }
 
+/*
+ * [한국어] rw(readwrite) 옵션 콜백
+ * "read", "write", "randread", "randrw" 등의 I/O 패턴 설정.
+ * 콤마 뒤에 시퀀셜 I/O의 시작 오프셋을 지정할 수 있다.
+ * 예: "rw=write,4k" → 순차 쓰기를 4K 오프셋부터 시작
+ */
 static int str_rw_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -742,6 +845,10 @@ static int str_rw_cb(void *data, const char *str)
 	return 0;
 }
 
+/*
+ * [한국어] mem(iomem) 옵션 콜백: 메모리 할당 방법 설정
+ * "mmap:/path" 형식에서 ":"뒤의 파일 경로를 추출한다.
+ */
 static int str_mem_cb(void *data, const char *mem)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -753,6 +860,7 @@ static int str_mem_cb(void *data, const char *mem)
 	return 0;
 }
 
+/* [한국어] clocksource 옵션 콜백: 시간 소스 설정 후 시간 보정 수행 */
 static int fio_clock_source_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -763,6 +871,7 @@ static int fio_clock_source_cb(void *data, const char *str)
 	return 0;
 }
 
+/* [한국어] rwmixread 콜백: 읽기 비율 설정 시 쓰기 비율 자동 계산 (100-val) */
 static int str_rwmix_read_cb(void *data, long long *val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -772,6 +881,7 @@ static int str_rwmix_read_cb(void *data, long long *val)
 	return 0;
 }
 
+/* [한국어] rwmixwrite 콜백: 쓰기 비율 설정 시 읽기 비율 자동 계산 (100-val) */
 static int str_rwmix_write_cb(void *data, long long *val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -781,6 +891,7 @@ static int str_rwmix_write_cb(void *data, long long *val)
 	return 0;
 }
 
+/* [한국어] exitall 콜백: 하나의 잡이 끝나면 모든 잡을 종료하는 플래그 설정 */
 static int str_exitall_cb(void)
 {
 	exitall_on_terminate = true;
@@ -813,6 +924,7 @@ int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu_index)
 	return fio_cpu_count(mask);
 }
 
+/* [한국어] cpumask 콜백: CPU 친화성 마스크를 비트맵으로 설정 */
 static int str_cpumask_cb(void *data, unsigned long long *val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -913,6 +1025,7 @@ static int set_cpus_allowed(struct thread_data *td, os_cpu_mask_t *mask,
 	return ret;
 }
 
+/* [한국어] cpus_allowed 콜백: "0,2-4,6" 형식의 CPU 목록을 CPU 마스크로 변환 */
 static int str_cpus_allowed_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -925,6 +1038,7 @@ static int str_cpus_allowed_cb(void *data, const char *input)
 	return set_cpus_allowed(td, &td->o.cpumask, input);
 }
 
+/* [한국어] verify_cpus_allowed 콜백: 검증 스레드의 CPU 친화성 설정 */
 static int str_verify_cpus_allowed_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -938,6 +1052,7 @@ static int str_verify_cpus_allowed_cb(void *data, const char *input)
 }
 
 #ifdef CONFIG_ZLIB
+/* [한국어] log_cpus_allowed 콜백: 로그 스레드의 CPU 친화성 설정 */
 static int str_log_cpus_allowed_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -954,6 +1069,7 @@ static int str_log_cpus_allowed_cb(void *data, const char *input)
 #endif /* FIO_HAVE_CPU_AFFINITY */
 
 #ifdef CONFIG_LIBNUMA
+/* [한국어] numa_cpu_nodes 콜백: NUMA CPU 노드 설정 (libnuma 사용) */
 static int str_numa_cpunodes_cb(void *data, char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -979,6 +1095,11 @@ static int str_numa_cpunodes_cb(void *data, char *input)
 	return 0;
 }
 
+/*
+ * [한국어] numa_mem_policy 콜백: NUMA 메모리 정책 설정
+ * "interleave:0-1", "bind:2", "prefer:1" 등의 형식을 파싱하여
+ * 메모리 할당 시 NUMA 정책을 적용한다.
+ */
 static int str_numa_mpol_cb(void *data, char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1090,6 +1211,11 @@ out:
 }
 #endif
 
+/*
+ * [한국어] file_service_type 콜백: 파일 서비스 순서 설정
+ * "random", "roundrobin", "sequential", "gauss", "zipf" 등
+ * 콜론 뒤에 분포 파라미터를 지정할 수 있다.
+ */
 static int str_fst_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1177,6 +1303,10 @@ static int str_fst_cb(void *data, const char *str)
 }
 
 #ifdef CONFIG_SYNC_FILE_RANGE
+/*
+ * [한국어] server_file_remove 콜백: 서버 모드에서 파일 삭제 정책 설정
+ * 대기, 완료 후 삭제 등의 정책을 파싱한다.
+ */
 static int str_sfr_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1340,6 +1470,16 @@ static int parse_zoned_distribution(struct thread_data *td, const char *input,
 	return ret;
 }
 
+/*
+ * [한국어] random_distribution 콜백: 랜덤 I/O 오프셋의 분포 설정
+ *
+ * 지원 분포: random(균등), zipf, pareto, gauss(정규), zoned, zoned_abs
+ * 각 분포별 파라미터를 콜론 뒤에 지정한다:
+ *   - zipf:theta (예: zipf:1.2) — 지프 분포, theta가 클수록 편향
+ *   - pareto:input (예: pareto:0.5) — 파레토 분포
+ *   - gauss:dev (예: gauss:4.0) — 정규 분포, dev는 표준편차
+ *   - zoned:ratio/size (예: zoned:60/10:30/20:10/70)
+ */
 static int str_random_distribution_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1411,6 +1551,12 @@ static bool is_valid_steadystate(unsigned int state)
 		state == FIO_SS_LAT || state == FIO_SS_LAT_SLOPE);
 }
 
+/*
+ * [한국어] steadystate 콜백: Steady State 감지 기준 파싱
+ * "iops:10%" — IOPS 변동이 10% 이내면 안정 상태로 판단
+ * "bw:5%" — 대역폭 변동이 5% 이내면 안정 상태
+ * "iops_slope:0.1%" — IOPS 기울기 기준
+ */
 static int str_steadystate_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1605,6 +1751,11 @@ char* get_name_by_idx(char *input, int index)
 	return fname;
 }
 
+/*
+ * [한국어] filename 옵션 콜백: 대상 파일/디바이스 경로 설정
+ * 콜론으로 여러 파일을 지정할 수 있다: filename=/dev/sda:/dev/sdb
+ * nrfiles를 자동 설정한다.
+ */
 static int str_filename_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1634,6 +1785,7 @@ static int str_filename_cb(void *data, const char *input)
 	return 0;
 }
 
+/* [한국어] directory 콜백: 작업 디렉토리 검증 (존재 여부 확인) */
 static int str_directory_cb(void *data, const char fio_unused *unused)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1665,6 +1817,7 @@ out:
 	return ret;
 }
 
+/* [한국어] opendir 콜백: 디렉토리 내 모든 파일을 재귀적으로 대상에 추가 */
 static int str_opendir_cb(void *data, const char fio_unused *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1678,6 +1831,10 @@ static int str_opendir_cb(void *data, const char fio_unused *str)
 	return add_dir_files(td, td->o.opendir);
 }
 
+/*
+ * [한국어] buffer_pattern 콜백: I/O 버퍼에 채울 패턴 설정
+ * 문자열, 16진수, "%o"(오프셋 삽입) 등 다양한 형식을 지원한다.
+ */
 static int str_buffer_pattern_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1711,6 +1868,7 @@ static int str_buffer_pattern_cb(void *data, const char *input)
 	return 0;
 }
 
+/* [한국어] buffer_compress_percentage 콜백: 압축 가능한 데이터 비율 설정 */
 static int str_buffer_compress_cb(void *data, unsigned long long *il)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1720,6 +1878,7 @@ static int str_buffer_compress_cb(void *data, unsigned long long *il)
 	return 0;
 }
 
+/* [한국어] dedupe_percentage 콜백: 중복 제거 가능 데이터 비율 설정 */
 static int str_dedupe_cb(void *data, unsigned long long *il)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1730,6 +1889,7 @@ static int str_dedupe_cb(void *data, unsigned long long *il)
 	return 0;
 }
 
+/* [한국어] verify_pattern 콜백: 데이터 검증에 사용할 패턴 설정 */
 static int str_verify_pattern_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1756,6 +1916,10 @@ static int str_verify_pattern_cb(void *data, const char *input)
 	return 0;
 }
 
+/*
+ * [한국어] gtod_reduce 콜백: gettimeofday 호출 최소화 모드
+ * 활성화하면 상세 레이턴시 통계를 비활성화하여 오버헤드를 줄인다.
+ */
 static int str_gtod_reduce_cb(void *data, int *il)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1779,6 +1943,7 @@ static int str_gtod_reduce_cb(void *data, int *il)
 	return 0;
 }
 
+/* [한국어] offset 콜백: I/O 시작 오프셋을 읽기/쓰기/트림 방향별로 설정 */
 static int str_offset_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1800,6 +1965,7 @@ static int str_offset_cb(void *data, long long *__val)
 	return 0;
 }
 
+/* [한국어] offset_increment 콜백: 다중 스레드 시 각 스레드의 오프셋 증분 */
 static int str_offset_increment_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1821,6 +1987,7 @@ static int str_offset_increment_cb(void *data, long long *__val)
 	return 0;
 }
 
+/* [한국어] size 콜백: 각 스레드의 총 I/O 크기 설정 (퍼센트 지원) */
 static int str_size_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1841,6 +2008,7 @@ static int str_size_cb(void *data, long long *__val)
 	return 0;
 }
 
+/* [한국어] io_size 콜백: 실제 수행할 I/O 양 설정 (size와 독립) */
 static int str_io_size_cb(void *data, unsigned long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1865,6 +2033,7 @@ static int str_io_size_cb(void *data, unsigned long long *__val)
 	return 0;
 }
 
+/* [한국어] zoneskip 콜백: 존(zone) 경계에서 건너뛸 바이트 수 설정 */
 static int str_zoneskip_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1879,6 +2048,7 @@ static int str_zoneskip_cb(void *data, long long *__val)
 	return 0;
 }
 
+/* [한국어] write_bw_log 콜백: 대역폭 로그 파일명 설정 */
 static int str_write_bw_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1890,6 +2060,7 @@ static int str_write_bw_log_cb(void *data, const char *str)
 	return 0;
 }
 
+/* [한국어] write_lat_log 콜백: 레이턴시 로그 파일명 설정 */
 static int str_write_lat_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1901,6 +2072,7 @@ static int str_write_lat_log_cb(void *data, const char *str)
 	return 0;
 }
 
+/* [한국어] write_iops_log 콜백: IOPS 로그 파일명 설정 */
 static int str_write_iops_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1912,6 +2084,7 @@ static int str_write_iops_log_cb(void *data, const char *str)
 	return 0;
 }
 
+/* [한국어] write_hist_log 콜백: 히스토그램 로그 파일명 설정 */
 static int str_write_hist_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1924,13 +2097,15 @@ static int str_write_hist_log_cb(void *data, const char *str)
 }
 
 /*
- * str is supposed to be a substring of the strdup'd original string,
- * and is valid only if it's a regular file path.
- * This function keeps the pointer to the path as needed later.
+ * [한국어] 외부 I/O 엔진 콜백: "external:/path/to/engine.so" 파싱
  *
- * "external:/path/to/so\0" <- original pointer updated with strdup'd
- * "external\0"             <- above pointer after parsed, i.e. ->ioengine
- *          "/path/to/so\0" <- str argument, i.e. ->ioengine_so_path
+ * ioengine=external:/path/to/so 형식에서 공유 라이브러리 경로를 추출하여
+ * ioengine_so_path에 저장한다. dlopen()으로 런타임에 로드된다.
+ *
+ * 메모리 레이아웃:
+ *   "external:/path/to/so\0" ← strdup된 원본
+ *   "external\0"             ← parse 후 ->ioengine
+ *            "/path/to/so\0" ← str 인자 = ->ioengine_so_path
  */
 static int str_ioengine_external_cb(void *data, const char *str)
 {
@@ -1987,9 +2162,30 @@ static int gtod_cpu_verify(const struct fio_option *o, void *data)
 }
 
 /*
- * Map of job/command line options
+ * [한국어] fio_options[] — fio의 모든 옵션 정의 배열
+ *
+ * 이 배열은 약 300개 이상의 fio 옵션을 정의한다.
+ * 각 항목은 fio_option 구조체로, 다음 정보를 포함한다:
+ *   - name/lname: 옵션 이름 (잡 파일 및 커맨드라인에서 사용)
+ *   - type: 값의 타입 (문자열, 정수, 불린, 범위 등)
+ *   - off1~off6: thread_options 구조체 내 대상 변수의 오프셋
+ *   - def: 기본값
+ *   - cb: 커스텀 파싱 콜백 (위에서 정의된 str_*_cb 함수들)
+ *   - posval[]: 허용 가능한 문자열 값 목록
+ *   - category/group: 옵션 분류 (도움말/GUI용)
+ *
+ * 주요 옵션 카테고리:
+ *   FIO_OPT_C_GENERAL  — 일반 (name, description, wait_for 등)
+ *   FIO_OPT_C_FILE     — 파일 (filename, directory, filesize 등)
+ *   FIO_OPT_C_IO       — I/O (rw, bs, iodepth, ioengine 등)
+ *   FIO_OPT_C_STAT     — 통계 (write_bw_log, percentile_list 등)
+ *   FIO_OPT_C_LOG      — 로깅
+ *   FIO_OPT_C_VERIFY   — 검증 (verify, verify_pattern 등)
+ *   FIO_OPT_C_ENGINE   — 엔진별 옵션
+ *   FIO_OPT_C_PROFILE  — 프로파일별 옵션
  */
 struct fio_option fio_options[FIO_MAX_OPTS] = {
+	/* ===== [한국어] 일반 옵션 (General) ===== */
 	{
 		.name	= "description",
 		.lname	= "Description of job",
@@ -2114,8 +2310,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_FILE,
 		.group	= FIO_OPT_G_FILENAME,
 	},
+	/* ===== [한국어] I/O 패턴 및 엔진 옵션 ===== */
 	{
-		.name	= "rw",
+		.name	= "rw",        /* I/O 방향: read, write, randread, randwrite, randrw 등 */
 		.lname	= "Read/write",
 		.alias	= "readwrite",
 		.type	= FIO_OPT_STR,
@@ -2360,8 +2557,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 #endif
 		},
 	},
+	/* ===== [한국어] I/O 깊이(큐잉) 옵션 ===== */
 	{
-		.name	= "iodepth",
+		.name	= "iodepth",   /* 비동기 I/O 큐 깊이 (libaio, io_uring 등에서 핵심) */
 		.lname	= "IO Depth",
 		.type	= FIO_OPT_INT,
 		.off1	= offsetof(struct thread_options, iodepth),
@@ -2568,8 +2766,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_INVALID,
 	},
+	/* ===== [한국어] 블록 크기(Block Size) 옵션 ===== */
 	{
-		.name	= "bs",
+		.name	= "bs",        /* 블록 크기: 기본 4k. 읽기,쓰기,트림 별도 지정 가능 */
 		.lname	= "Block size",
 		.alias	= "blocksize",
 		.type	= FIO_OPT_ULL,
@@ -3056,8 +3255,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.help	= "Your platform does not support sync_file_range",
 	},
 #endif
+	/* ===== [한국어] 버퍼링/캐시 옵션 ===== */
 	{
-		.name	= "direct",
+		.name	= "direct",    /* O_DIRECT 사용 여부: 1이면 커널 페이지 캐시 우회 */
 		.lname	= "Direct I/O",
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct thread_options, odirect),
@@ -3112,8 +3312,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_GENERAL,
 		.group	= FIO_OPT_G_RUNTIME,
 	},
+	/* ===== [한국어] 실행 제어 옵션 ===== */
 	{
-		.name	= "numjobs",
+		.name	= "numjobs",   /* 이 잡의 복제 수 (병렬 워커 수) */
 		.lname	= "Number of jobs",
 		.type	= FIO_OPT_INT,
 		.off1	= offsetof(struct thread_options, numjobs),
@@ -3280,8 +3481,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_INVALID,
 	},
+	/* ===== [한국어] 데이터 검증(Verify) 옵션 ===== */
 	{
-		.name	= "verify",
+		.name	= "verify",    /* 검증 알고리즘: md5, crc32, sha256 등 */
 		.lname	= "Verify",
 		.type	= FIO_OPT_STR,
 		.off1	= offsetof(struct thread_options, verify),
@@ -3825,8 +4027,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.help	= "Your platform does not support IO scheduler switching",
 	},
 #endif
+	/* ===== [한국어] 존(Zone) 관련 옵션 ===== */
 	{
-		.name	= "zonemode",
+		.name	= "zonemode",  /* 존 모드: none, strided, zbd */
 		.lname	= "Zone mode",
 		.help	= "Mode for the zonesize, zonerange and zoneskip parameters",
 		.type	= FIO_OPT_STR,
@@ -3979,8 +4182,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_ZONE,
 	},
+	/* ===== [한국어] FDP(Flexible Data Placement) 옵션 ===== */
 	{
-		.name   = "fdp",
+		.name   = "fdp",       /* FDP 활성화 (NVMe 데이터 배치 기능) */
 		.lname  = "Flexible data placement",
 		.type   = FIO_OPT_BOOL,
 		.off1   = offsetof(struct thread_options, fdp),
@@ -4279,8 +4483,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_IO,
 		.group	= FIO_OPT_G_THINKTIME,
 	},
+	/* ===== [한국어] 속도 제한(Rate Limiting) 옵션 ===== */
 	{
-		.name	= "rate",
+		.name	= "rate",      /* I/O 속도 상한 (바이트/초) */
 		.lname	= "I/O rate",
 		.type	= FIO_OPT_ULL,
 		.off1	= offsetof(struct thread_options, rate[DDIR_READ]),
@@ -4386,8 +4591,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_IO,
 		.group = FIO_OPT_G_LATPROF,
 	},
+	/* ===== [한국어] 레이턴시 목표 옵션 ===== */
 	{
-		.name	= "latency_target",
+		.name	= "latency_target",  /* 목표 레이턴시 (us): 이를 만족하는 최대 큐 깊이를 자동 탐색 */
 		.lname	= "Latency Target (usec)",
 		.type	= FIO_OPT_STR_VAL_TIME,
 		.off1	= offsetof(struct thread_options, latency_target),
@@ -4566,9 +4772,10 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_FILE,
 		.group	= FIO_OPT_G_INVALID,
 	},
+	/* ===== [한국어] CPU 친화성 및 NUMA 옵션 ===== */
 #ifdef FIO_HAVE_CPU_AFFINITY
 	{
-		.name	= "cpumask",
+		.name	= "cpumask",   /* CPU 친화성 비트마스크 */
 		.lname	= "CPU mask",
 		.type	= FIO_OPT_INT,
 		.cb	= str_cpumask_cb,
@@ -4818,8 +5025,9 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 		.category = FIO_OPT_C_LOG,
 		.group	= FIO_OPT_G_INVALID,
 	},
+	/* ===== [한국어] 로깅 및 통계 옵션 ===== */
 	{
-		.name	= "write_bw_log",
+		.name	= "write_bw_log",  /* 대역폭 로그 파일 기록 */
 		.lname	= "Write bandwidth log",
 		.type	= FIO_OPT_STR,
 		.off1	= offsetof(struct thread_options, bw_log_file),
@@ -5723,6 +5931,11 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
 	},
 };
 
+/*
+ * [한국어] ===== Part 3: API 함수들 =====
+ */
+
+/* [한국어] fio 옵션을 getopt_long의 option 구조체로 변환 */
 static void add_to_lopt(struct option *lopt, struct fio_option *o,
 			const char *name, int val)
 {
@@ -5734,6 +5947,7 @@ static void add_to_lopt(struct option *lopt, struct fio_option *o,
 		lopt->has_arg = required_argument;
 }
 
+/* [한국어] fio_option 배열 전체를 getopt_long 옵션 배열로 변환 */
 static void options_to_lopts(struct fio_option *opts,
 			      struct option *long_options,
 			      int i, int option_type)
@@ -5752,6 +5966,10 @@ static void options_to_lopts(struct fio_option *opts,
 	}
 }
 
+/*
+ * [한국어] I/O 엔진 전용 옵션을 getopt_long 배열에 설정
+ * 엔진이 변경되면 이전 엔진 옵션을 지우고 새 엔진 옵션을 추가한다.
+ */
 void fio_options_set_ioengine_opts(struct option *long_options,
 				   struct thread_data *td)
 {
@@ -5776,6 +5994,7 @@ void fio_options_set_ioengine_opts(struct option *long_options,
 			 FIO_GETOPT_IOENGINE);
 }
 
+/* [한국어] fio_options 초기화 후 getopt_long 배열에 추가 */
 void fio_options_dup_and_init(struct option *long_options)
 {
 	unsigned int i;
@@ -5789,10 +6008,16 @@ void fio_options_dup_and_init(struct option *long_options)
 	options_to_lopts(fio_options, long_options, i, FIO_GETOPT_JOB);
 }
 
+/*
+ * [한국어] 키워드 치환 시스템
+ * 잡 파일에서 $pagesize, $mb_memory, $ncpus 등의 변수를
+ * 실제 시스템 값으로 치환한다.
+ * 예: size=$mb_memory → size=16384 (16GB 시스템에서)
+ */
 struct fio_keyword {
-	const char *word;
-	const char *desc;
-	char *replace;
+	const char *word;      /* 키워드 (예: "$pagesize") */
+	const char *desc;      /* 설명 */
+	char *replace;         /* 치환될 실제 값 문자열 */
 };
 
 static struct fio_keyword fio_keywords[] = {
@@ -5813,6 +6038,7 @@ static struct fio_keyword fio_keywords[] = {
 	},
 };
 
+/* [한국어] 키워드 치환 문자열 메모리 해제 */
 void fio_keywords_exit(void)
 {
 	struct fio_keyword *kw;
@@ -5825,6 +6051,7 @@ void fio_keywords_exit(void)
 	}
 }
 
+/* [한국어] 키워드 치환 값 초기화: 페이지 크기, 메모리 용량, CPU 수 */
 void fio_keywords_init(void)
 {
 	unsigned long long mb_memory;
@@ -5845,6 +6072,11 @@ void fio_keywords_init(void)
 
 #define BC_APP		"bc"
 
+/*
+ * [한국어] bc(1) 계산기를 사용한 산술 표현식 계산
+ * 옵션 값에 +, -, *, / 연산자가 포함되면 bc로 계산한다.
+ * 예: size=1024*1024 → bc가 1048576으로 계산
+ */
 static char *bc_calc(char *str)
 {
 	char buf[128], *tmp;
@@ -5898,10 +6130,9 @@ static char *bc_calc(char *str)
 }
 
 /*
- * Return a copy of the input string with substrings of the form ${VARNAME}
- * substituted with the value of the environment variable VARNAME.  The
- * substitution always occurs, even if VARNAME is empty or the corresponding
- * environment variable undefined.
+ * [한국어] 환경 변수 치환: ${VARNAME} → 환경 변수 값으로 대체
+ * 예: filename=${FIO_DEVICE} → filename=/dev/nvme0n1
+ * VARNAME이 미정의면 빈 문자열로 치환된다.
  */
 char *fio_option_dup_subs(const char *opt)
 {
@@ -5951,7 +6182,8 @@ char *fio_option_dup_subs(const char *opt)
 }
 
 /*
- * Look for reserved variable names and replace them with real values
+ * [한국어] 예약 키워드 치환: $pagesize, $mb_memory, $ncpus → 실제 값
+ * 치환 후 산술 연산이 포함되었으면 bc로 계산한다.
  */
 static char *fio_keyword_replace(char *opt)
 {
@@ -6003,6 +6235,7 @@ static char *fio_keyword_replace(char *opt)
 	return opt;
 }
 
+/* [한국어] 옵션 배열을 복사하면서 환경 변수 및 키워드 치환 적용 */
 static char **dup_and_sub_options(char **opts, int num_opts)
 {
 	int i;
@@ -6016,6 +6249,7 @@ static char **dup_and_sub_options(char **opts, int num_opts)
 	return opts_copy;
 }
 
+/* [한국어] 알 수 없는 옵션에 대해 가장 유사한 옵션명을 추천 (레벤슈타인 거리) */
 static void show_closest_option(const char *opt)
 {
 	int best_option, best_distance;
@@ -6050,6 +6284,15 @@ static void show_closest_option(const char *opt)
 	free(name);
 }
 
+/*
+ * [한국어] 잡 파일의 옵션 목록 전체 파싱 — 메인 파싱 드라이버
+ *
+ * 1) 옵션을 우선순위(prio)로 정렬
+ * 2) 환경 변수/키워드 치환 적용
+ * 3) 각 옵션을 parse_option()으로 파싱
+ * 4) 인식 못한 옵션은 I/O 엔진 옵션으로 재시도
+ * 5) 여전히 인식 못하면 유사 옵션 추천 후 에러
+ */
 int fio_options_parse(struct thread_data *td, char **opts, int num_opts)
 {
 	int i, ret, unknown;
@@ -6110,6 +6353,7 @@ int fio_options_parse(struct thread_data *td, char **opts, int num_opts)
 	return ret;
 }
 
+/* [한국어] 커맨드라인 옵션 파싱 (--name val) */
 int fio_cmd_option_parse(struct thread_data *td, const char *opt, char *val)
 {
 	int ret;
@@ -6126,6 +6370,7 @@ int fio_cmd_option_parse(struct thread_data *td, const char *opt, char *val)
 	return ret;
 }
 
+/* [한국어] I/O 엔진 전용 커맨드라인 옵션 파싱 */
 int fio_cmd_ioengine_option_parse(struct thread_data *td, const char *opt,
 				char *val)
 {
@@ -6133,19 +6378,23 @@ int fio_cmd_ioengine_option_parse(struct thread_data *td, const char *opt,
 					&td->opt_list);
 }
 
+/* [한국어] thread_data에 모든 옵션의 기본값 적용 */
 void fio_fill_default_options(struct thread_data *td)
 {
 	td->o.magic = OPT_MAGIC;
 	fill_default_options(&td->o, fio_options);
 }
 
+/* [한국어] 옵션 도움말 표시 (fio --cmdhelp=옵션명) */
 int fio_show_option_help(const char *opt)
 {
 	return show_cmd_help(fio_options, opt);
 }
 
 /*
- * dupe FIO_OPT_STR_STORE options
+ * [한국어] 문자열 옵션 메모리 복제
+ * fork/clone 시 자식이 독립적인 문자열 복사본을 가지도록 한다.
+ * I/O 엔진 옵션(eo)도 함께 복제한다.
  */
 void fio_options_mem_dupe(struct thread_data *td)
 {
@@ -6163,6 +6412,11 @@ void fio_options_mem_dupe(struct thread_data *td)
 	}
 }
 
+/*
+ * [한국어] kb_base 값 조회: 1024(이진) 또는 1000(십진)
+ * 옵션 파싱 시 k/m/g 접미사의 배수를 결정한다.
+ * data가 유효한 thread_options가 아닐 수 있어 magic 검사를 한다.
+ */
 unsigned int fio_get_kb_base(void *data)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -6186,6 +6440,10 @@ unsigned int fio_get_kb_base(void *data)
 	return kb_base;
 }
 
+/*
+ * [한국어] fio_options[] 배열에 옵션을 동적으로 추가
+ * I/O 엔진이 자체 옵션을 등록할 때 사용한다.
+ */
 int add_option(const struct fio_option *o)
 {
 	struct fio_option *__o;
@@ -6207,6 +6465,7 @@ int add_option(const struct fio_option *o)
 	return 0;
 }
 
+/* [한국어] 지정된 프로파일의 옵션을 INVALID로 무효화 */
 void invalidate_profile_options(const char *prof_name)
 {
 	struct fio_option *o;
@@ -6221,6 +6480,7 @@ void invalidate_profile_options(const char *prof_name)
 	}
 }
 
+/* [한국어] 옵션의 posval에 새로운 허용 값을 동적 추가 (엔진 등록용) */
 void add_opt_posval(const char *optname, const char *ival, const char *help)
 {
 	struct fio_option *o;
@@ -6240,6 +6500,7 @@ void add_opt_posval(const char *optname, const char *ival, const char *help)
 	}
 }
 
+/* [한국어] 옵션의 posval에서 특정 허용 값을 삭제 */
 void del_opt_posval(const char *optname, const char *ival)
 {
 	struct fio_option *o;
@@ -6260,6 +6521,7 @@ void del_opt_posval(const char *optname, const char *ival)
 	}
 }
 
+/* [한국어] 스레드의 모든 옵션 문자열 및 엔진 옵션 메모리 해제 */
 void fio_options_free(struct thread_data *td)
 {
 	options_free(fio_options, &td->o);
@@ -6275,6 +6537,7 @@ void fio_options_free(struct thread_data *td)
 	}
 }
 
+/* [한국어] 옵션 덤프 리스트(print_option) 메모리 해제 */
 void fio_dump_options_free(struct thread_data *td)
 {
 	while (!flist_empty(&td->opt_list)) {
@@ -6288,11 +6551,13 @@ void fio_dump_options_free(struct thread_data *td)
 	}
 }
 
+/* [한국어] 이름으로 fio_options[]에서 옵션 검색 */
 struct fio_option *fio_option_find(const char *name)
 {
 	return find_option(fio_options, name);
 }
 
+/* [한국어] 동일한 off1을 가진 다음 옵션을 찾는다 (여러 옵션이 같은 변수를 가리킬 수 있음) */
 static struct fio_option *find_next_opt(struct fio_option *from,
 					unsigned int off1)
 {
@@ -6315,6 +6580,10 @@ static struct fio_option *find_next_opt(struct fio_option *from,
 	return opt;
 }
 
+/*
+ * [한국어] 특정 옵션이 설정되었는지 비트맵에서 확인
+ * set_options[]는 uint64_t 배열로, 각 비트가 fio_options[] 인덱스에 대응한다.
+ */
 static int opt_is_set(struct thread_options *o, struct fio_option *opt)
 {
 	unsigned int opt_off, index, offset;
@@ -6325,6 +6594,10 @@ static int opt_is_set(struct thread_options *o, struct fio_option *opt)
 	return (o->set_options[index] & ((uint64_t)1 << offset)) != 0;
 }
 
+/*
+ * [한국어] 특정 오프셋에 해당하는 옵션이 사용자에 의해 명시적으로 설정되었는지 확인
+ * 같은 off1을 가진 모든 옵션을 순회하여 하나라도 설정되었으면 true 반환.
+ */
 bool __fio_option_is_set(struct thread_options *o, unsigned int off1)
 {
 	struct fio_option *opt, *next;
@@ -6340,6 +6613,7 @@ bool __fio_option_is_set(struct thread_options *o, unsigned int off1)
 	return false;
 }
 
+/* [한국어] 옵션이 설정되었음을 비트맵에 마킹 — 파싱 성공 후 호출 */
 void fio_option_mark_set(struct thread_options *o, const struct fio_option *opt)
 {
 	unsigned int opt_off, index, offset;
