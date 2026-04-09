@@ -1,80 +1,109 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <signal.h>
+/*
+ * [한국어] client.c - fio 클라이언트 모드 구현
+ *
+ * 이 파일은 fio의 클라이언트-서버 모드에서 클라이언트 측 로직을 구현한다.
+ * fio --client=<host> 명령으로 원격 서버에 잡(job)을 전송하고 결과를 수집한다.
+ *
+ * 주요 함수:
+ *   1) fio_client_add()          - 클라이언트 객체를 생성하고 리스트에 추가
+ *   2) fio_client_connect()      - 서버에 TCP/소켓 연결 수립, probe 전송
+ *   3) fio_clients_send_ini()    - 모든 클라이언트에 잡 설정 파일 전송
+ *   4) fio_start_all_clients()   - 모든 클라이언트에 실행 명령 전송
+ *   5) fio_handle_clients()      - 메인 이벤트 루프 (poll 기반), 결과 수신 및 처리
+ *   6) fio_handle_client()       - 개별 클라이언트의 수신 명령을 opcode별로 분기 처리
+ *
+ * 통신 흐름:
+ *   connect → probe → send_ini(잡 파일) → start(실행) → poll 루프(ETA/통계/로그 수신) → 종료
+ *
+ * 바이트 오더:
+ *   네트워크에서 수신한 데이터는 리틀엔디안으로 인코딩되어 있으며,
+ *   convert_ts(), convert_gs() 등의 함수로 호스트 바이트 오더로 변환한다.
+ */
+
+/* 표준 라이브러리 및 시스템 헤더 */
+#include <stdio.h>        /* 표준 입출력 */
+#include <stdlib.h>       /* 메모리 할당, 종료 등 */
+#include <unistd.h>       /* POSIX 시스템 호출 (read, write, close 등) */
+#include <errno.h>        /* 에러 번호 정의 */
+#include <fcntl.h>        /* 파일 제어 (open 플래그) */
+#include <poll.h>         /* poll() 기반 I/O 다중화 */
+#include <sys/types.h>    /* 기본 시스템 데이터 타입 */
+#include <sys/stat.h>     /* 파일 상태 (stat, fstat) */
+#include <sys/socket.h>   /* 소켓 API */
+#include <sys/un.h>       /* Unix 도메인 소켓 */
+#include <netinet/in.h>   /* IPv4/IPv6 소켓 주소 */
+#include <arpa/inet.h>    /* IP 주소 변환 (inet_ntop 등) */
+#include <netdb.h>        /* 네트워크 데이터베이스 (호스트 해석) */
+#include <signal.h>       /* 시그널 처리 */
 #ifdef CONFIG_ZLIB
-#include <zlib.h>
+#include <zlib.h>         /* zlib 압축 해제 (서버가 압축한 I/O 로그용) */
 #endif
 
-#include "fio.h"
-#include "client.h"
-#include "server.h"
-#include "flist.h"
-#include "hash.h"
-#include "verify-state.h"
+/* fio 내부 헤더 파일들 */
+#include "fio.h"          /* fio 핵심 구조체 및 매크로 */
+#include "client.h"       /* 클라이언트 구조체 및 API 선언 */
+#include "server.h"       /* 서버 프로토콜 (명령 opcode, 송수신 함수) */
+#include "flist.h"        /* 이중 연결 리스트 */
+#include "hash.h"         /* 해시 함수 */
+#include "verify-state.h" /* 검증 상태 저장/복원 */
 
-static void handle_du(struct fio_client *client, struct fio_net_cmd *cmd);
-static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd);
-static void handle_gs(struct fio_client *client, struct fio_net_cmd *cmd);
-static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd);
-static void handle_text(struct fio_client *client, struct fio_net_cmd *cmd);
-static void handle_stop(struct fio_client *client);
-static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd);
+/* [한국어] 전방 선언 - 서버 명령 핸들러 함수들 */
+static void handle_du(struct fio_client *client, struct fio_net_cmd *cmd);    /* 디스크 유틸리티 처리 */
+static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd);    /* 스레드 통계 처리 */
+static void handle_gs(struct fio_client *client, struct fio_net_cmd *cmd);    /* 그룹 통계 처리 */
+static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd); /* probe 응답 처리 */
+static void handle_text(struct fio_client *client, struct fio_net_cmd *cmd);  /* 텍스트 메시지 처리 */
+static void handle_stop(struct fio_client *client);                           /* 잡 정지 처리 */
+static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd); /* 잡 시작 처리 */
 
-static void convert_text(struct fio_net_cmd *cmd);
-static void client_display_thread_status(struct jobs_eta *je);
+static void convert_text(struct fio_net_cmd *cmd);           /* 텍스트 PDU 바이트 오더 변환 */
+static void client_display_thread_status(struct jobs_eta *je); /* ETA 화면 출력 */
 
+/* [한국어] CLI 모드 기본 콜백 테이블 - 터미널 출력용 핸들러들을 등록 */
 struct client_ops const fio_client_ops = {
-	.text		= handle_text,
-	.disk_util	= handle_du,
-	.thread_status	= handle_ts,
-	.group_stats	= handle_gs,
-	.stop		= handle_stop,
-	.start		= handle_start,
-	.eta		= client_display_thread_status,
-	.probe		= handle_probe,
-	.eta_msec	= FIO_CLIENT_DEF_ETA_MSEC,
-	.client_type	= FIO_CLIENT_TYPE_CLI,
+	.text		= handle_text,                  /* 서버 텍스트 메시지 → 터미널 출력 */
+	.disk_util	= handle_du,                    /* 디스크 유틸리티 통계 처리 */
+	.thread_status	= handle_ts,                /* 스레드별 I/O 통계 처리 */
+	.group_stats	= handle_gs,                /* 그룹 실행 통계 처리 */
+	.stop		= handle_stop,                  /* 잡 정지 알림 처리 */
+	.start		= handle_start,                 /* 잡 시작 알림 처리 */
+	.eta		= client_display_thread_status, /* ETA 화면 표시 */
+	.probe		= handle_probe,                 /* 서버 정보(OS, 아키텍처 등) 표시 */
+	.eta_msec	= FIO_CLIENT_DEF_ETA_MSEC,      /* ETA 요청 주기: 900ms */
+	.client_type	= FIO_CLIENT_TYPE_CLI,          /* CLI 타입 */
 };
 
-static struct timespec eta_ts;
+/* [한국어] 전역 변수들 - 클라이언트 관리 및 통계 집계 */
+static struct timespec eta_ts;             /* 마지막 ETA 요청 시각 */
 
-static FLIST_HEAD(client_list);
-static FLIST_HEAD(eta_list);
+static FLIST_HEAD(client_list);            /* 모든 클라이언트 객체의 전역 리스트 */
+static FLIST_HEAD(eta_list);               /* ETA 응답 대기 중인 클라이언트 리스트 */
 
-static FLIST_HEAD(arg_list);
+static FLIST_HEAD(arg_list);               /* 공유 인자 그룹 리스트 */
 
-struct thread_stat client_ts;
-struct group_run_stats client_gs;
-int sum_stat_clients;
+struct thread_stat client_ts;              /* 전체 클라이언트 합산 스레드 통계 */
+struct group_run_stats client_gs;          /* 전체 클라이언트 합산 그룹 통계 */
+int sum_stat_clients;                      /* 통계를 합산할 총 클라이언트 수 */
 
-static int sum_stat_nr;
-static struct buf_output allclients;
-static struct json_object *root = NULL;
-static struct json_object *global_opt_object = NULL;
-static struct json_array *global_opt_array = NULL;
-static struct json_array *clients_array = NULL;
-static struct json_array *du_array = NULL;
+static int sum_stat_nr;                    /* 현재까지 통계를 수신한 클라이언트 수 */
+static struct buf_output allclients;       /* "All clients" 합산 통계 출력 버퍼 */
+static struct json_object *root = NULL;           /* JSON 출력 최상위 객체 */
+static struct json_object *global_opt_object = NULL; /* 단일 서버 전역 옵션 JSON */
+static struct json_array *global_opt_array = NULL;   /* 다중 서버 전역 옵션 JSON 배열 */
+static struct json_array *clients_array = NULL;      /* 클라이언트 통계 JSON 배열 */
+static struct json_array *du_array = NULL;           /* 디스크 유틸리티 JSON 배열 */
 
-static int error_clients;
+static int error_clients;                  /* 에러로 종료한 클라이언트 수 */
 
-#define FIO_CLIENT_HASH_BITS	7
-#define FIO_CLIENT_HASH_SZ	(1 << FIO_CLIENT_HASH_BITS)
-#define FIO_CLIENT_HASH_MASK	(FIO_CLIENT_HASH_SZ - 1)
-static struct flist_head client_hash[FIO_CLIENT_HASH_SZ];
+/* [한국어] fd 기반 해시 테이블 - 파일 디스크립터로 클라이언트를 빠르게 검색 */
+#define FIO_CLIENT_HASH_BITS	7                              /* 해시 비트 수 */
+#define FIO_CLIENT_HASH_SZ	(1 << FIO_CLIENT_HASH_BITS)        /* 해시 버킷 수: 128 */
+#define FIO_CLIENT_HASH_MASK	(FIO_CLIENT_HASH_SZ - 1)      /* 해시 마스크 */
+static struct flist_head client_hash[FIO_CLIENT_HASH_SZ];      /* 해시 버킷 배열 */
 
-static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *, bool *);
+static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *, bool *); /* I/O 로그 바이트 오더 변환 */
 
+/* [한국어] 해시 테이블에 클라이언트 추가 - fd를 키로 사용 */
 static void fio_client_add_hash(struct fio_client *client)
 {
 	int bucket = hash_long(client->fd, FIO_CLIENT_HASH_BITS);
@@ -83,12 +112,14 @@ static void fio_client_add_hash(struct fio_client *client)
 	flist_add(&client->hash_list, &client_hash[bucket]);
 }
 
+/* [한국어] 해시 테이블에서 클라이언트 제거 */
 static void fio_client_remove_hash(struct fio_client *client)
 {
 	if (!flist_empty(&client->hash_list))
 		flist_del_init(&client->hash_list);
 }
 
+/* [한국어] 해시 테이블 초기화 - fio_init 속성으로 프로그램 시작 시 자동 호출 */
 static void fio_init fio_client_hash_init(void)
 {
 	int i;
@@ -97,6 +128,7 @@ static void fio_init fio_client_hash_init(void)
 		INIT_FLIST_HEAD(&client_hash[i]);
 }
 
+/* [한국어] 소켓/파일에서 지정된 크기만큼 데이터를 완전히 읽는 함수 (부분 읽기 재시도) */
 static int read_data(int fd, void *data, size_t size)
 {
 	ssize_t ret;
@@ -121,6 +153,7 @@ static int read_data(int fd, void *data, size_t size)
 	return 0;
 }
 
+/* [한국어] 잡 설정 파일(ini)을 읽으면서 변수 치환($옵션)을 수행하는 함수 */
 static int read_ini_data(int fd, void *data, size_t size)
 {
 	char *p = data;
@@ -173,6 +206,7 @@ out:
 	return ret;
 }
 
+/* [한국어] JSON 출력 초기화 - 루트 객체 생성, 타임스탬프/버전 정보 추가 */
 static void fio_client_json_init(void)
 {
 	char time_buf[32];
@@ -203,6 +237,7 @@ static void fio_client_json_init(void)
 	json_object_add_value_array(root, "disk_util", du_array);
 }
 
+/* [한국어] JSON 출력 완료 - JSON 트리를 문자열로 출력하고 메모리 해제 */
 static void fio_client_json_fini(void)
 {
 	struct buf_output out;
@@ -227,6 +262,7 @@ static void fio_client_json_fini(void)
 	du_array = NULL;
 }
 
+/* [한국어] 파일 디스크립터로 클라이언트 검색 - 해시 테이블에서 fd에 해당하는 클라이언트 반환 */
 static struct fio_client *find_client_by_fd(int fd)
 {
 	int bucket = hash_long(fd, FIO_CLIENT_HASH_BITS) & FIO_CLIENT_HASH_MASK;
@@ -245,6 +281,7 @@ static struct fio_client *find_client_by_fd(int fd)
 	return NULL;
 }
 
+/* [한국어] 클라이언트 참조 카운트 감소 - 0이 되면 모든 자원을 해제 */
 void fio_put_client(struct fio_client *client)
 {
 	if (--client->refs)
@@ -277,6 +314,7 @@ void fio_put_client(struct fio_client *client)
 	free(client);
 }
 
+/* [한국어] ETA 대기 카운트 감소 - 모든 클라이언트가 응답하면 ETA를 표시하고 메모리 해제 */
 static int fio_client_dec_jobs_eta(struct client_eta *eta, client_eta_op eta_fn)
 {
 	if (!--eta->pending) {
@@ -288,6 +326,7 @@ static int fio_client_dec_jobs_eta(struct client_eta *eta, client_eta_op eta_fn)
 	return 1;
 }
 
+/* [한국어] 클라이언트의 미처리 텍스트 메시지를 모두 소진(drain)하여 출력 */
 static void fio_drain_client_text(struct fio_client *client)
 {
 	do {
@@ -307,6 +346,7 @@ static void fio_drain_client_text(struct fio_client *client)
 	} while (1);
 }
 
+/* [한국어] 클라이언트 제거 - 텍스트 소진, 리스트/해시 제거, 소켓 닫기, 참조 해제 */
 static void remove_client(struct fio_client *client)
 {
 	assert(client->refs);
@@ -335,12 +375,14 @@ static void remove_client(struct fio_client *client)
 	fio_put_client(client);
 }
 
+/* [한국어] 클라이언트 참조 카운트 증가 - 참조를 유지하는 동안 해제 방지 */
 struct fio_client *fio_get_client(struct fio_client *client)
 {
 	client->refs++;
 	return client;
 }
 
+/* [한국어] 단일 클라이언트에 커맨드라인 옵션 추가 (argv 배열 확장) */
 static void __fio_client_add_cmd_option(struct fio_client *client,
 					const char *opt)
 {
@@ -352,6 +394,7 @@ static void __fio_client_add_cmd_option(struct fio_client *client,
 	dprint(FD_NET, "client: add cmd %d: %s\n", index, opt);
 }
 
+/* [한국어] 클라이언트와 공유 인자 그룹에 커맨드라인 옵션 추가 */
 void fio_client_add_cmd_option(void *cookie, const char *opt)
 {
 	struct fio_client *client = cookie;
@@ -372,6 +415,7 @@ void fio_client_add_cmd_option(void *cookie, const char *opt)
 	}
 }
 
+/* [한국어] 새 클라이언트 객체 할당 및 리스트 헤드 초기화 */
 static struct fio_client *get_new_client(void)
 {
 	struct fio_client *client;
@@ -389,6 +433,7 @@ static struct fio_client *get_new_client(void)
 	return client;
 }
 
+/* [한국어] 명시적 클라이언트 추가 - 호스트명, 연결타입, 포트를 직접 지정 (gfio 등에서 사용) */
 struct fio_client *fio_client_add_explicit(struct client_ops *ops,
 					   const char *hostname, int type,
 					   int port)
@@ -428,6 +473,7 @@ err:
 	return NULL;
 }
 
+/* [한국어] 클라이언트에 잡 설정 파일 추가 - 나중에 서버로 전송됨 */
 int fio_client_add_ini_file(void *cookie, const char *ini_file, bool remote)
 {
 	struct fio_client *client = cookie;
@@ -453,6 +499,7 @@ int fio_client_add_ini_file(void *cookie, const char *ini_file, bool remote)
 	return 0;
 }
 
+/* [한국어] 클라이언트 추가 - 호스트명 문자열을 파싱하여 IP/소켓/포트를 결정하고 리스트에 추가 */
 int fio_client_add(struct client_ops const *ops, const char *hostname, void **cookie)
 {
 	struct fio_client *existing = *cookie;
@@ -496,6 +543,7 @@ int fio_client_add(struct client_ops const *ops, const char *hostname, void **co
 	return 0;
 }
 
+/* [한국어] 서버 이름 문자열 반환 - IPv4/IPv6 주소를 문자열로 변환, 소켓이면 "sock" 반환 */
 static const char *server_name(struct fio_client *client, char *buf,
 			       size_t bufsize)
 {
@@ -511,6 +559,7 @@ static const char *server_name(struct fio_client *client, char *buf,
 	return from;
 }
 
+/* [한국어] 서버에 probe 명령 전송 - 서버의 OS, 아키텍처, fio 버전 등을 질의 */
 static void probe_client(struct fio_client *client)
 {
 	struct cmd_client_probe_pdu pdu;
@@ -533,6 +582,7 @@ static void probe_client(struct fio_client *client)
 	fio_net_send_cmd(client->fd, FIO_NET_CMD_PROBE, &pdu, sizeof(pdu), &tag, &client->cmd_list);
 }
 
+/* [한국어] IP(IPv4/IPv6) 기반 TCP 연결 수립 - 소켓 생성 후 connect() */
 static int fio_client_connect_ip(struct fio_client *client)
 {
 	struct sockaddr *addr;
@@ -574,6 +624,7 @@ static int fio_client_connect_ip(struct fio_client *client)
 	return fd;
 }
 
+/* [한국어] Unix 도메인 소켓 연결 수립 - 로컬 서버와의 연결에 사용 */
 static int fio_client_connect_sock(struct fio_client *client)
 {
 	struct sockaddr_un *addr = &client->addr_un;
@@ -605,6 +656,7 @@ static int fio_client_connect_sock(struct fio_client *client)
 	return fd;
 }
 
+/* [한국어] 클라이언트 연결 - 소켓/IP 자동 선택, 해시 등록, 상태 변경, probe 전송 */
 int fio_client_connect(struct fio_client *client)
 {
 	int fd;
@@ -629,11 +681,13 @@ int fio_client_connect(struct fio_client *client)
 	return 0;
 }
 
+/* [한국어] 단일 클라이언트에 종료 명령(QUIT) 전송 */
 int fio_client_terminate(struct fio_client *client)
 {
 	return fio_net_send_quit(client->fd);
 }
 
+/* [한국어] 모든 클라이언트에 종료 명령 전송 - 시그널 핸들러에서 호출 */
 static void fio_clients_terminate(void)
 {
 	struct flist_head *entry;
@@ -647,12 +701,14 @@ static void fio_clients_terminate(void)
 	}
 }
 
+/* [한국어] SIGINT/SIGTERM 시그널 핸들러 - 모든 클라이언트에 종료 명령 전송 */
 static void sig_int(int sig)
 {
 	dprint(FD_NET, "client: got signal %d\n", sig);
 	fio_clients_terminate();
 }
 
+/* [한국어] 시그널 핸들러 등록 - SIGINT, SIGTERM, SIGUSR1 (상태 출력) 설정 */
 static void client_signal_handler(void)
 {
 	struct sigaction act;
@@ -681,6 +737,7 @@ static void client_signal_handler(void)
 	sigaction(SIGUSR1, &act, NULL);
 }
 
+/* [한국어] 커맨드라인 인자를 서버에 전송 - 각 인자를 PDU로 직렬화하여 전송 */
 static int send_client_cmd_line(struct fio_client *client)
 {
 	struct cmd_single_line_pdu *cslp;
@@ -729,6 +786,7 @@ static int send_client_cmd_line(struct fio_client *client)
 	return ret;
 }
 
+/* [한국어] 모든 클라이언트 연결 수립 - 시그널 핸들러 설정 후 각 클라이언트에 connect + cmdline 전송 */
 int fio_clients_connect(void)
 {
 	struct fio_client *client;
@@ -760,12 +818,14 @@ int fio_clients_connect(void)
 	return !nr_clients;
 }
 
+/* [한국어] 단일 클라이언트에 잡 실행(RUN) 명령 전송 */
 int fio_start_client(struct fio_client *client)
 {
 	dprint(FD_NET, "client: start %s\n", client->hostname);
 	return fio_net_send_simple_cmd(client->fd, FIO_NET_CMD_RUN, 0, NULL);
 }
 
+/* [한국어] 모든 클라이언트에 잡 실행 명령 전송 - JSON 초기화 후 각 클라이언트에 RUN 전송 */
 int fio_start_all_clients(void)
 {
 	struct fio_client *client;
@@ -789,6 +849,7 @@ int fio_start_all_clients(void)
 	return flist_empty(&client_list);
 }
 
+/* [한국어] 서버에 원격 파일 로드 요청 - 파일명만 전송, 서버가 자체적으로 파일을 읽음 */
 static int __fio_client_send_remote_ini(struct fio_client *client,
 					const char *filename)
 {
@@ -814,6 +875,7 @@ static int __fio_client_send_remote_ini(struct fio_client *client,
  * Send file contents to server backend. We could use sendfile(), but to remain
  * more portable lets just read/write the darn thing.
  */
+/* [한국어] 로컬 잡 파일을 읽어서 서버에 전송 - 변수 치환 후 파일 내용을 네트워크로 전송 */
 static int __fio_client_send_local_ini(struct fio_client *client,
 				       const char *filename)
 {
@@ -868,6 +930,7 @@ static int __fio_client_send_local_ini(struct fio_client *client,
 	return ret;
 }
 
+/* [한국어] 잡 파일 전송 - remote 플래그에 따라 원격/로컬 전송 방식 선택 */
 int fio_client_send_ini(struct fio_client *client, const char *filename,
 			bool remote)
 {
@@ -884,12 +947,14 @@ int fio_client_send_ini(struct fio_client *client, const char *filename,
 	return ret;
 }
 
+/* [한국어] client_file 구조체를 통한 잡 파일 전송 래퍼 */
 static int fio_client_send_cf(struct fio_client *client,
 			      struct client_file *cf)
 {
 	return fio_client_send_ini(client, cf->file, cf->remote);
 }
 
+/* [한국어] 모든 클라이언트에 잡 파일 전송 - 각 클라이언트별 파일 또는 공통 파일 전송 */
 int fio_clients_send_ini(const char *filename)
 {
 	struct fio_client *client;
@@ -924,6 +989,7 @@ int fio_clients_send_ini(const char *filename)
 	return !nr_clients;
 }
 
+/* [한국어] 서버에 잡 옵션 업데이트 전송 - thread_options를 네트워크 형식으로 변환하여 전송 */
 int fio_client_update_options(struct fio_client *client,
 			      struct thread_options *o, uint64_t *tag)
 {
@@ -943,6 +1009,7 @@ int fio_client_update_options(struct fio_client *client,
 	return ret;
 }
 
+/* [한국어] I/O 통계 바이트 오더 변환 - 리틀엔디안 → 호스트 오더, IEEE 754 float 복원 */
 static void convert_io_stat(struct io_stat *dst, struct io_stat *src)
 {
 	dst->max_val	= le64_to_cpu(src->max_val);
@@ -956,6 +1023,10 @@ static void convert_io_stat(struct io_stat *dst, struct io_stat *src)
 	dst->S.u.f	= fio_uint64_to_double(le64_to_cpu(dst->S.u.i));
 }
 
+/*
+ * [한국어] 스레드 통계 바이트 오더 변환 - thread_stat의 모든 필드를 호스트 오더로 변환
+ * IOPS, 대역폭, 지연시간, 백분위수, steady-state 데이터 등 포함
+ */
 static void convert_ts(struct thread_stat *dst, struct thread_stat *src)
 {
 	int i, j, k;
@@ -1087,6 +1158,7 @@ static void convert_ts(struct thread_stat *dst, struct thread_stat *src)
 	dst->cachemiss		= le64_to_cpu(src->cachemiss);
 }
 
+/* [한국어] 그룹 실행 통계 바이트 오더 변환 - 최대/최소 실행 시간, 대역폭, I/O 바이트 등 */
 static void convert_gs(struct group_run_stats *dst, struct group_run_stats *src)
 {
 	int i;
@@ -1107,6 +1179,7 @@ static void convert_gs(struct group_run_stats *dst, struct group_run_stats *src)
 	dst->unified_rw_rep	= le32_to_cpu(src->unified_rw_rep);
 }
 
+/* [한국어] JSON 객체에 클라이언트 식별 정보(호스트명, 포트) 추가 */
 static void json_object_add_client_info(struct json_object *obj,
 					struct fio_client *client)
 {
@@ -1116,6 +1189,10 @@ static void json_object_add_client_info(struct json_object *obj,
 	json_object_add_value_int(obj, "port", client->port);
 }
 
+/*
+ * [한국어] 스레드 통계 수신 처리 - 개별 통계 출력 및 다중 클라이언트 합산
+ * 모든 클라이언트 통계가 수신되면 "All clients" 합산 통계도 출력
+ */
 static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_ts_pdu *p = (struct cmd_ts_pdu *) cmd->payload;
@@ -1166,6 +1243,7 @@ static void handle_ts(struct fio_client *client, struct fio_net_cmd *cmd)
 	}
 }
 
+/* [한국어] 그룹 통계 수신 처리 - 일반 출력 모드일 때 그룹 통계 표시 */
 static void handle_gs(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct group_run_stats *gs = (struct group_run_stats *) cmd->payload;
@@ -1174,6 +1252,7 @@ static void handle_gs(struct fio_client *client, struct fio_net_cmd *cmd)
 		show_group_stats(gs, &client->buf);
 }
 
+/* [한국어] 잡 옵션 수신 처리 - 전역/그룹별 옵션을 JSON 객체 또는 리스트에 저장 */
 static void handle_job_opt(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_job_option *pdu = (struct cmd_job_option *) cmd->payload;
@@ -1220,6 +1299,7 @@ static void handle_job_opt(struct fio_client *client, struct fio_net_cmd *cmd)
 	}
 }
 
+/* [한국어] 텍스트 메시지 수신 처리 - 서버가 보낸 로그/에러 메시지를 화면에 출력 */
 static void handle_text(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_text_pdu *pdu = (struct cmd_text_pdu *) cmd->payload;
@@ -1240,6 +1320,7 @@ static void handle_text(struct fio_client *client, struct fio_net_cmd *cmd)
 	client->skip_newline = strchr(buf, '\n') == NULL;
 }
 
+/* [한국어] 디스크 유틸리티 집계 통계 바이트 오더 변환 */
 static void convert_agg(struct disk_util_agg *agg)
 {
 	int i;
@@ -1257,6 +1338,7 @@ static void convert_agg(struct disk_util_agg *agg)
 	agg->max_util.u.f	= fio_uint64_to_double(le64_to_cpu(agg->max_util.u.i));
 }
 
+/* [한국어] 디스크 유틸리티 통계 바이트 오더 변환 - I/O 횟수, 병합, 섹터, 틱 등 */
 static void convert_dus(struct disk_util_stat *dus)
 {
 	int i;
@@ -1273,6 +1355,7 @@ static void convert_dus(struct disk_util_stat *dus)
 	dus->s.msec		= le64_to_cpu(dus->s.msec);
 }
 
+/* [한국어] 디스크 유틸리티 수신 처리 - JSON/일반/terse 형식으로 디스크 통계 출력 */
 static void handle_du(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_du_pdu *du = (struct cmd_du_pdu *) cmd->payload;
@@ -1297,6 +1380,7 @@ static void handle_du(struct fio_client *client, struct fio_net_cmd *cmd)
 	}
 }
 
+/* [한국어] ETA 데이터 바이트 오더 변환 - 실행 중/대기/설정 중 스레드 수, 속도, 경과 시간 등 */
 static void convert_jobs_eta(struct jobs_eta *je)
 {
 	int i;
@@ -1324,6 +1408,7 @@ static void convert_jobs_eta(struct jobs_eta *je)
 	je->sig_figs		= le32_to_cpu(je->sig_figs);
 }
 
+/* [한국어] 여러 클라이언트의 ETA 합산 - 실행 중 스레드, 속도, IOPS 등을 누적 */
 void fio_client_sum_jobs_eta(struct jobs_eta *dst, struct jobs_eta *je)
 {
 	int i;
@@ -1357,6 +1442,7 @@ void fio_client_sum_jobs_eta(struct jobs_eta *dst, struct jobs_eta *je)
 	strcpy((char *) dst->run_str, (char *) je->run_str);
 }
 
+/* [한국어] 응답 대기 리스트에서 태그가 일치하는 명령 제거 - 응답과 요청을 매칭 */
 static bool remove_reply_cmd(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct fio_net_cmd_reply *reply = NULL;
@@ -1382,6 +1468,7 @@ static bool remove_reply_cmd(struct fio_client *client, struct fio_net_cmd *cmd)
 	return true;
 }
 
+/* [한국어] 특정 태그의 응답을 동기적으로 대기 - 1ms 간격으로 폴링 */
 int fio_client_wait_for_reply(struct fio_client *client, uint64_t tag)
 {
 	do {
@@ -1406,6 +1493,7 @@ int fio_client_wait_for_reply(struct fio_client *client, uint64_t tag)
 	return 0;
 }
 
+/* [한국어] ETA 응답 수신 처리 - 클라이언트별 ETA를 집계 구조체에 합산 */
 static void handle_eta(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct jobs_eta *je = (struct jobs_eta *) cmd->payload;
@@ -1426,6 +1514,7 @@ static void handle_eta(struct fio_client *client, struct fio_net_cmd *cmd)
 	fio_client_dec_jobs_eta(eta, client->ops->eta);
 }
 
+/* [한국어] 히스토그램 I/O 샘플을 파일에 기록 - 지연시간 분포 히스토그램 데이터 출력 */
 static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *samples,
 				      uint64_t sample_size)
 {
@@ -1466,6 +1555,11 @@ static void client_flush_hist_samples(FILE *f, int hist_coarseness, void *sample
 	}
 }
 
+/*
+ * [한국어] I/O 로그 수신 처리 - 서버에서 전송된 I/O 로그를 파일로 저장
+ * 압축된 로그는 직접 저장, 비압축 로그는 디코딩 후 텍스트 형태로 저장
+ * 호스트명을 붙여 고유한 로그 파일명을 생성 (예: jobname.log.hostname)
+ */
 static int fio_client_handle_iolog(struct fio_client *client,
 				   struct fio_net_cmd *cmd)
 {
@@ -1557,6 +1651,7 @@ out:
 	return ret;
 }
 
+/* [한국어] probe 응답 처리 - 서버의 OS, 아키텍처, fio 버전 등을 화면에 표시 */
 static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_probe_reply_pdu *probe = (struct cmd_probe_reply_pdu *) cmd->payload;
@@ -1584,6 +1679,7 @@ static void handle_probe(struct fio_client *client, struct fio_net_cmd *cmd)
 		client->name = strdup((char *) probe->hostname);
 }
 
+/* [한국어] 잡 시작 처리 - 잡 수와 통계 출력 수를 기록하고, 잡별 옵션 리스트 할당 */
 static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd)
 {
 	struct cmd_start_pdu *pdu = (struct cmd_start_pdu *) cmd->payload;
@@ -1606,12 +1702,14 @@ static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd)
 	sum_stat_clients += client->nr_stat;
 }
 
+/* [한국어] 잡 정지 처리 - 에러가 있으면 에러 코드와 함께 로그 출력 */
 static void handle_stop(struct fio_client *client)
 {
 	if (client->error)
 		log_info("client <%s>: exited with error %d\n", client->hostname, client->error);
 }
 
+/* [한국어] 정지 PDU 바이트 오더 변환 */
 static void convert_stop(struct fio_net_cmd *cmd)
 {
 	struct cmd_end_pdu *pdu = (struct cmd_end_pdu *) cmd->payload;
@@ -1619,6 +1717,7 @@ static void convert_stop(struct fio_net_cmd *cmd)
 	pdu->error = le32_to_cpu(pdu->error);
 }
 
+/* [한국어] 텍스트 PDU 바이트 오더 변환 - 로그 레벨, 버퍼 길이, 타임스탬프 */
 static void convert_text(struct fio_net_cmd *cmd)
 {
 	struct cmd_text_pdu *pdu = (struct cmd_text_pdu *) cmd->payload;
@@ -1629,6 +1728,7 @@ static void convert_text(struct fio_net_cmd *cmd)
 	pdu->log_usec	= le64_to_cpu(pdu->log_usec);
 }
 
+/* [한국어] zlib 압축된 I/O 로그 해제 - inflate로 압축 해제하여 원본 샘플 복원 */
 static struct cmd_iolog_pdu *convert_iolog_gz(struct fio_net_cmd *cmd,
 					      struct cmd_iolog_pdu *pdu)
 {
@@ -1711,6 +1811,11 @@ err:
  * This has been compressed on the server side, since it can be big.
  * Uncompress here.
  */
+/*
+ * [한국어] I/O 로그 변환 - 압축 해제(필요시) 및 바이트 오더 변환
+ * 압축 방식: XMIT_COMPRESSED(zlib 해제), STORE_COMPRESSED(바이너리 직접 저장), 비압축
+ * 각 샘플의 시간, 값, 방향, 블록 크기, 우선순위, 오프셋 등을 호스트 오더로 변환
+ */
 static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *cmd,
 					   bool *store_direct)
 {
@@ -1791,6 +1896,7 @@ static struct cmd_iolog_pdu *convert_iolog(struct fio_net_cmd *cmd,
 	return ret;
 }
 
+/* [한국어] 파일 전송 응답을 서버에 전송 */
 static void sendfile_reply(int fd, struct cmd_sendfile_reply *rep,
 			   size_t size, uint64_t tag)
 {
@@ -1798,6 +1904,7 @@ static void sendfile_reply(int fd, struct cmd_sendfile_reply *rep,
 	fio_net_send_cmd(fd, FIO_NET_CMD_SENDFILE, rep, size, &tag, NULL);
 }
 
+/* [한국어] 서버 요청에 따라 로컬 파일을 읽어서 전송 - 서버가 필요한 파일을 클라이언트에 요청 */
 static int fio_send_file(struct fio_client *client, struct cmd_sendfile *pdu,
 			 uint64_t tag)
 {
@@ -1832,6 +1939,23 @@ fail:
 	return 0;
 }
 
+/*
+ * [한국어] 단일 클라이언트의 수신 명령 처리 - opcode에 따라 적절한 핸들러로 분기
+ *
+ * 주요 opcode 처리:
+ *   QUIT       → 클라이언트 제거
+ *   TEXT       → 텍스트 메시지 출력
+ *   DU         → 디스크 유틸리티 통계
+ *   TS         → 스레드 통계 (steady-state 데이터 포함)
+ *   GS         → 그룹 실행 통계
+ *   ETA        → 예상 완료 시간
+ *   PROBE      → 서버 정보 응답
+ *   START/STOP → 잡 시작/정지
+ *   IOLOG      → I/O 로그 데이터
+ *   VTRIGGER   → 검증 트리거
+ *   SENDFILE   → 파일 전송 요청
+ *   JOB_OPT    → 잡 옵션 정보
+ */
 int fio_handle_client(struct fio_client *client)
 {
 	struct client_ops const *ops = client->ops;
@@ -1992,6 +2116,7 @@ int fio_handle_client(struct fio_client *client)
 	return 1;
 }
 
+/* [한국어] 모든 클라이언트에 검증 트리거 명령 전송 - verify_trigger 옵션과 연동 */
 int fio_clients_send_trigger(const char *cmd)
 {
 	struct flist_head *entry;
@@ -2022,6 +2147,11 @@ int fio_clients_send_trigger(const char *cmd)
 	return 0;
 }
 
+/*
+ * [한국어] 모든 실행 중인 클라이언트에 ETA 요청 전송
+ * client_eta 구조체를 할당하고, 각 클라이언트에 SEND_ETA 명령을 보낸다.
+ * 이미 ETA 요청 중인 클라이언트는 건너뛰고 pending 카운트를 감소시킨다.
+ */
 static void request_client_etas(struct client_ops const *ops)
 {
 	struct fio_client *client;
@@ -2065,6 +2195,7 @@ static void request_client_etas(struct client_ops const *ops)
 /*
  * A single SEND_ETA timeout isn't fatal. Attempt to recover.
  */
+/* [한국어] 명령 타임아웃 처리 - ETA 타임아웃은 5회까지 복구 시도, 그 외 명령은 즉시 실패 */
 static int handle_cmd_timeout(struct fio_client *client,
 			      struct fio_net_cmd_reply *reply)
 {
@@ -2093,6 +2224,7 @@ static int handle_cmd_timeout(struct fio_client *client,
 	return 0;
 }
 
+/* [한국어] 클라이언트의 모든 대기 명령에 대해 타임아웃 검사 */
 static int client_check_cmd_timeout(struct fio_client *client,
 				    struct timespec *now)
 {
@@ -2120,6 +2252,7 @@ static int client_check_cmd_timeout(struct fio_client *client,
 	return flist_empty(&client->cmd_list) && ret;
 }
 
+/* [한국어] 모든 클라이언트의 명령 타임아웃 검사 - 타임아웃된 클라이언트를 제거 */
 static int fio_check_clients_timed_out(void)
 {
 	struct fio_client *client;
@@ -2154,6 +2287,17 @@ static int fio_check_clients_timed_out(void)
 	return ret;
 }
 
+/*
+ * [한국어] 메인 클라이언트 이벤트 루프 - 모든 클라이언트가 종료될 때까지 poll()로 대기
+ *
+ * 동작 흐름:
+ *   1) 잡 미전송 + 비연결 유지 클라이언트 제거
+ *   2) poll()로 소켓 읽기 이벤트 대기 (타임아웃: min(100ms, eta_msec))
+ *   3) ETA 주기 도래 시 request_client_etas() 호출
+ *   4) 타임아웃 검사 및 타임아웃 클라이언트 제거
+ *   5) 데이터 수신 시 fio_handle_client()로 명령 처리
+ *   6) 모든 클라이언트 종료 후 합산 통계 출력 및 JSON 마무리
+ */
 int fio_handle_clients(struct client_ops const *ops)
 {
 	struct pollfd *pfds;
@@ -2247,6 +2391,7 @@ int fio_handle_clients(struct client_ops const *ops)
 	return retval || error_clients;
 }
 
+/* [한국어] ETA 화면 표시 - JSON 출력 모드가 아닐 때만 ETA 정보를 터미널에 출력 */
 static void client_display_thread_status(struct jobs_eta *je)
 {
 	if (!(output_format & FIO_OUTPUT_JSON))

@@ -1,3 +1,33 @@
+/*
+ * [한국어] stat.c - fio 통계 수집, 계산, 출력 엔진
+ *
+ * 이 파일은 fio의 성능 측정 결과를 수집하고 출력하는 핵심 파일이다.
+ * 주요 기능:
+ *
+ *   Part 1: 퍼센타일 계산 (74~280줄)
+ *     - plat_val_to_idx(): 레이턴시 값 → 로그 스케일 버킷 인덱스 변환
+ *     - plat_idx_to_val(): 버킷 인덱스 → 대표 레이턴시 값 변환
+ *     - calc_clat_percentiles(): 버킷 히스토그램에서 퍼센타일 계산
+ *
+ *   Part 2: 통계 출력 (280~2040줄)
+ *     - show_ddir_status(): 방향별 상세 통계 출력 (normal 형식)
+ *     - show_thread_status_normal(): 스레드 통계 전체 출력
+ *     - show_thread_status_terse(): terse(간결) 형식 출력
+ *     - add_ddir_status_json(): JSON 형식 출력
+ *     - show_group_stats(): 그룹 집계 통계 출력
+ *     - print_disk_util(): 디스크 유틸리티 통계 출력
+ *
+ *   Part 3: 통계 집계 (2040~2520줄)
+ *     - sum_thread_stats(): 여러 스레드의 통계를 합산
+ *     - __show_run_stats(): 최종 통계 보고서 생성
+ *
+ *   Part 4: 샘플 수집 (3067~끝)
+ *     - add_clat_sample(): 완료 레이턴시 샘플 추가
+ *     - add_slat_sample(): 제출 레이턴시 샘플 추가
+ *     - add_bw_sample(): 대역폭 샘플 추가
+ *     - add_iops_sample(): IOPS 샘플 추가
+ *     - calc_log_samples(): 주기적 로그 샘플 계산
+ */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -5,36 +35,39 @@
 #include <sys/stat.h>
 #include <math.h>
 
-#include "fio.h"
-#include "diskutil.h"
-#include "lib/ieee754.h"
-#include "json.h"
-#include "lib/getrusage.h"
-#include "idletime.h"
-#include "lib/pow2.h"
-#include "lib/output_buffer.h"
-#include "helper_thread.h"
-#include "smalloc.h"
-#include "zbd.h"
-#include "oslib/asprintf.h"
+#include "fio.h"               /* fio 핵심 구조체 */
+#include "diskutil.h"          /* 디스크 유틸리티 통계 */
+#include "lib/ieee754.h"       /* IEEE 754 부동소수점 */
+#include "json.h"              /* JSON 출력 */
+#include "lib/getrusage.h"     /* 리소스 사용량 조회 */
+#include "idletime.h"          /* 유휴 시간 프로파일링 */
+#include "lib/pow2.h"          /* 2의 거듭제곱 유틸리티 */
+#include "lib/output_buffer.h" /* 출력 버퍼 */
+#include "helper_thread.h"     /* 헬퍼 스레드 */
+#include "smalloc.h"           /* 공유 메모리 할당기 */
+#include "zbd.h"               /* Zoned Block Device */
+#include "oslib/asprintf.h"    /* asprintf 호환 */
 
 #ifdef WIN32
-#define LOG_MSEC_SLACK	2
+#define LOG_MSEC_SLACK	2      /* Windows 타이머 해상도 보정 */
 #else
 #define LOG_MSEC_SLACK	1
 #endif
 
+/* [한국어] 로그 샘플 구조체 — 하나의 I/O 이벤트에 대한 통계 데이터 */
 struct log_sample {
-	union io_sample_data data;
-	uint32_t ddir;
-	uint64_t bs;
-	uint64_t offset;
-	uint16_t priority;
-	uint64_t issue_time;
+	union io_sample_data data;  /* 값 (레이턴시, 대역폭, 또는 IOPS) */
+	uint32_t ddir;              /* I/O 방향 */
+	uint64_t bs;                /* 블록 크기 */
+	uint64_t offset;            /* I/O 오프셋 */
+	uint16_t priority;          /* I/O 우선순위 */
+	uint64_t issue_time;        /* 발행 시각 */
 };
 
+/* [한국어] 통계 출력 동기화 세마포어 — 여러 스레드가 동시에 통계를 출력하지 않도록 */
 struct fio_sem *stat_sem;
 
+/* [한국어] 리소스 사용량 통계 초기화 — 잡 시작 시점의 rusage를 기록 */
 void clear_rusage_stat(struct thread_data *td)
 {
 	struct thread_stat *ts = &td->ts;
@@ -45,6 +78,7 @@ void clear_rusage_stat(struct thread_data *td)
 	ts->minf = ts->majf = 0;
 }
 
+/* [한국어] 리소스 사용량 업데이트 — 시작 시점과의 차이로 CPU 시간, 컨텍스트 스위치 등 누적 */
 void update_rusage_stat(struct thread_data *td)
 {
 	struct thread_stat *ts = &td->ts;
@@ -70,6 +104,15 @@ void update_rusage_stat(struct thread_data *td)
  * belongs to by looking at its MSB. (2) find the bucket number in the
  * group by looking at the index bits.
  *
+ */
+/*
+ * [한국어] 레이턴시 값 → 히스토그램 버킷 인덱스 변환
+ *
+ * 로그 스케일 버킷 시스템의 핵심 함수.
+ * MSB(최상위 비트)로 그룹을 결정하고, 다음 M비트로 버킷 인덱스를 결정한다.
+ * 예: val=1000(ns) → MSB=9, 그룹=4, 인덱스=4*64+error_bits=...
+ *
+ * 이 함수와 plat_idx_to_val()은 역함수 관계이다.
  */
 static unsigned int plat_val_to_idx(unsigned long long val)
 {
@@ -111,6 +154,10 @@ static unsigned int plat_val_to_idx(unsigned long long val)
  * Convert the given index of the bucket array to the value
  * represented by the bucket
  */
+/*
+ * [한국어] 히스토그램 버킷 인덱스 → 대표 레이턴시 값 변환
+ * 버킷의 중앙값을 반환하여 오차를 최소화한다.
+ */
 static unsigned long long plat_idx_to_val(unsigned int idx)
 {
 	unsigned int error_bits;
@@ -148,6 +195,17 @@ static int double_cmp(const void *a, const void *b)
 	return cmp;
 }
 
+/*
+ * [한국어] 퍼센타일 계산 — 히스토그램 버킷에서 지정된 퍼센타일 값을 추출
+ *
+ * io_u_plat[]: 각 버킷에 속한 샘플 수
+ * nr: 총 샘플 수
+ * plist[]: 계산할 퍼센타일 목록 (예: 50.0, 90.0, 99.0, 99.9)
+ * output: 결과 배열 (퍼센타일별 레이턴시 값)
+ *
+ * 알고리즘: 버킷을 순회하며 누적 카운트가 목표 퍼센타일에 도달하면
+ * plat_idx_to_val()로 해당 버킷의 대표값을 반환한다.
+ */
 unsigned int calc_clat_percentiles(const uint64_t *io_u_plat, unsigned long long nr,
 				   fio_fp64_t *plist, unsigned long long **output,
 				   unsigned long long *maxv, unsigned long long *minv)
@@ -212,6 +270,7 @@ unsigned int calc_clat_percentiles(const uint64_t *io_u_plat, unsigned long long
 /*
  * Find and display the p-th percentile of clat
  */
+/* [한국어] 퍼센타일 결과를 사람이 읽기 좋은 형식으로 출력 */
 static void show_clat_percentiles(const uint64_t *io_u_plat, unsigned long long nr,
 				  fio_fp64_t *plist, unsigned int precision,
 				  const char *pre, struct buf_output *out)
@@ -287,6 +346,10 @@ static int get_nr_prios_with_samples(struct thread_stat *ts, enum fio_ddir ddir)
 	return nr_prios_with_samples;
 }
 
+/*
+ * [한국어] io_stat에서 최소/최대/평균/표준편차 계산
+ * Welford의 온라인 알고리즘으로 누적된 S 값에서 표준편차를 도출한다.
+ */
 bool calc_lat(const struct io_stat *is, unsigned long long *min,
 	      unsigned long long *max, double *mean, double *dev)
 {
@@ -348,6 +411,7 @@ static void show_mixed_group_stats(const struct group_run_stats *rs, struct buf_
 	free(maxalt);
 }
 
+/* [한국어] 그룹 집계 통계 출력 — 그룹 내 모든 잡의 대역폭 합계/최소/최대 */
 void show_group_stats(const struct group_run_stats *rs, struct buf_output *out)
 {
 	char *io, *agg, *min, *max;
@@ -392,6 +456,7 @@ void show_group_stats(const struct group_run_stats *rs, struct buf_output *out)
 		show_mixed_group_stats(rs, out);
 }
 
+/* [한국어] 분포 비율 계산 — 각 버킷의 카운트를 전체 대비 퍼센트로 변환 */
 void stat_calc_dist(const uint64_t *map, unsigned long total, double *io_u_dist)
 {
 	int i;
@@ -527,6 +592,10 @@ static double convert_agg_kbytes_percent(const struct group_run_stats *rs,
 	return p_of_agg;
 }
 
+/*
+ * [한국어] 방향별(읽기/쓰기/트림) 상세 통계 출력 (normal 형식)
+ * 대역폭, IOPS, 레이턴시(slat/clat/lat), 퍼센타일 등을 출력한다.
+ */
 static void show_ddir_status(const struct group_run_stats *rs, struct thread_stat *ts,
 			     enum fio_ddir ddir, struct buf_output *out)
 {
@@ -777,6 +846,7 @@ static void show_lat_m(const double *io_u_lat_m, struct buf_output *out)
 	show_lat(io_u_lat_m, FIO_IO_U_LAT_M_NR, ranges, "msec", out);
 }
 
+/* [한국어] 레이턴시 분포 출력 — ns/us/ms 구간별 퍼센트 분포 */
 static void show_latencies(const struct thread_stat *ts, struct buf_output *out)
 {
 	double io_u_lat_n[FIO_IO_U_LAT_N_NR];
@@ -934,6 +1004,7 @@ static void show_block_infos(int nr_block_infos, uint32_t *block_infos,
 			 i == BLOCK_STATE_COUNT - 1 ? '\n' : ',');
 }
 
+/* [한국어] Steady State 결과 출력 — 달성 여부, 기울기, 편차 등 */
 static void show_ss_normal(const struct thread_stat *ts, struct buf_output *out)
 {
 	char *p1, *p1alt, *p2, *p3 = NULL;
@@ -1051,6 +1122,7 @@ static void aggregate_slaves_stats(struct disk_util *masterdu)
 		agg->max_util.u.f = 100.0;
 }
 
+/* [한국어] 디스크 유틸리티 통계 출력 — /proc/diskstats 기반 I/O 활용도 */
 void print_disk_util(const struct disk_util_stat *dus, const struct disk_util_agg *agg,
 		     int terse, struct buf_output *out)
 {
@@ -1226,6 +1298,11 @@ static double scale_down_ns(unsigned long long val, const char **unit)
 	return retval;
 }
 
+/*
+ * [한국어] 스레드 통계를 normal(사람이 읽는) 형식으로 출력
+ * fio의 기본 출력 형식 — 잡 이름, 방향별 통계, 레이턴시 분포,
+ * I/O 깊이 분포, CPU 사용량, I/O 패턴 등 전체 보고서를 생성한다.
+ */
 static void show_thread_status_normal(struct thread_stat *ts,
 				      const struct group_run_stats *rs,
 				      struct buf_output *out)
@@ -1347,6 +1424,7 @@ static void show_thread_status_normal(struct thread_stat *ts,
 		show_ss_normal(ts, out);
 }
 
+/* [한국어] 방향별 통계를 terse(간결) 형식으로 출력 — 세미콜론 구분 */
 static void show_ddir_status_terse(struct thread_stat *ts,
 				   const struct group_run_stats *rs,
 				   enum fio_ddir ddir, int ver,
@@ -1505,6 +1583,7 @@ static struct json_object *add_ddir_lat_json(struct thread_stat *ts,
 	return lat_object;
 }
 
+/* [한국어] 방향별 통계를 JSON 객체에 추가 */
 static void add_ddir_status_json(struct thread_stat *ts,
 				 const struct group_run_stats *rs, enum fio_ddir ddir,
 				 struct json_object *parent)
@@ -2022,6 +2101,10 @@ static void show_thread_status_terse(struct thread_stat *ts,
 		log_err("fio: bad terse version!? %d\n", terse_version);
 }
 
+/*
+ * [한국어] 스레드 통계 출력 — 출력 형식(normal/terse/json/json+)에 따라 분기
+ * 모든 형식의 통계 출력을 위한 최상위 함수.
+ */
 struct json_object *show_thread_status(struct thread_stat *ts,
 				       struct group_run_stats *rs,
 				       struct flist_head *opt_list,
@@ -2039,6 +2122,10 @@ struct json_object *show_thread_status(struct thread_stat *ts,
 	return ret;
 }
 
+/*
+ * [한국어] io_stat 합산 — 두 io_stat의 min/max/mean/S를 병합
+ * Welford 온라인 알고리즘의 병합 공식을 사용하여 정확한 합산 통계를 유지한다.
+ */
 static void __sum_stat(struct io_stat *dst, const struct io_stat *src, bool first)
 {
 	double mean, S;
@@ -2105,6 +2192,7 @@ static void sum_stat(struct io_stat *dst, const struct io_stat *src, bool pure_s
 	}
 }
 
+/* [한국어] 그룹 통계 합산 — 대역폭, I/O 바이트, 실행 시간 등 집계 */
 void sum_group_stats(struct group_run_stats *dst, const struct group_run_stats *src)
 {
 	unsigned int i;
@@ -2343,6 +2431,10 @@ static int sum_clat_prio_stats(struct thread_stat *dst, const struct thread_stat
 	return sum_clat_prio_stats_src_multi_prio(dst, src, dst_ddir, src_ddir);
 }
 
+/*
+ * [한국어] 스레드 통계 합산 — group_reporting 시 여러 스레드의 통계를 하나로 병합
+ * 레이턴시 통계, 퍼센타일 버킷, I/O 카운터, 에러 카운터 등을 합산한다.
+ */
 void sum_thread_stats(struct thread_stat *dst, const struct thread_stat *src)
 {
 	int k, l, m;
@@ -2431,6 +2523,7 @@ void sum_thread_stats(struct thread_stat *dst, const struct thread_stat *src)
 	dst->cachemiss += src->cachemiss;
 }
 
+/* [한국어] 그룹 통계 초기화 — min을 최대값으로 설정 */
 void init_group_run_stat(struct group_run_stats *gs)
 {
 	int i;
@@ -2454,6 +2547,7 @@ void init_thread_stat_min_vals(struct thread_stat *ts)
 	ts->sync_stat.min_val = ULONG_MAX;
 }
 
+/* [한국어] 스레드 통계 구조체 초기화 */
 void init_thread_stat(struct thread_stat *ts)
 {
 	memset(ts, 0, sizeof(*ts));
@@ -2513,6 +2607,16 @@ static void init_per_prio_stats(struct thread_stat *threadstats, int nr_ts)
 	}
 }
 
+/*
+ * [한국어] 최종 실행 통계 보고서 생성 — fio 실행 완료 후 호출
+ *
+ * 1) 모든 스레드의 thread_stat를 수집
+ * 2) group_reporting이면 같은 그룹의 통계를 합산
+ * 3) 그룹별 대역폭 집계 계산
+ * 4) 각 스레드/그룹의 통계를 출력 형식에 맞게 출력
+ * 5) 디스크 유틸리티 통계 출력
+ * 6) 서버 모드면 결과를 클라이언트에 전송
+ */
 void __show_run_stats(void)
 {
 	struct group_run_stats *runstats, *rs;
@@ -2816,6 +2920,10 @@ void __show_run_stats(void)
 	free(opt_lists);
 }
 
+/*
+ * [한국어] 실행 중 중간 통계 출력 — USR1 시그널 또는 status-interval에 의해 호출
+ * 현재까지의 통계를 스냅샷으로 출력하고, 이전 통계는 보존한다.
+ */
 int __show_running_run_stats(void)
 {
 	unsigned long long *rt;
@@ -2924,6 +3032,7 @@ static int check_status_file(void)
 	return 1;
 }
 
+/* [한국어] 통계 출력 필요 여부 확인 — status_interval 또는 시그널에 의한 트리거 */
 void check_for_running_stats(void)
 {
 	if (check_status_file()) {
@@ -3064,6 +3173,7 @@ disable:
 	return NULL;
 }
 
+/* [한국어] I/O 로그 버퍼 확장 — 로그가 가득 차면 두 배로 확장 */
 void regrow_logs(struct thread_data *td)
 {
 	regrow_log(td->slat_log);
@@ -3183,6 +3293,10 @@ static inline void reset_clat_prio_stats(struct thread_stat *ts)
 	}
 }
 
+/*
+ * [한국어] I/O 통계 리셋 — 레이턴시 목표 자동 탐색 시 이전 결과를 초기화
+ * 퍼센타일 버킷, 분포 카운터, io_stat 등을 모두 0으로 리셋한다.
+ */
 void reset_io_stats(struct thread_data *td)
 {
 	struct thread_stat *ts = &td->ts;
@@ -3346,6 +3460,7 @@ void add_agg_sample(union io_sample_data data, enum fio_ddir ddir,
 	__add_log_sample(iolog, mtime_since_genesis(), &sample);
 }
 
+/* [한국어] sync 완료 레이턴시 샘플 추가 (fsync/fdatasync 등) */
 void add_sync_clat_sample(struct thread_stat *ts, unsigned long long nsec)
 {
 	unsigned int idx = plat_val_to_idx(nsec);
@@ -3377,6 +3492,15 @@ add_lat_percentile_prio_sample(struct thread_stat *ts, unsigned long long nsec,
 		ts->clat_prio[ddir][clat_prio_index].io_u_plat[idx]++;
 }
 
+/*
+ * [한국어] 완료 레이턴시(clat) 샘플 추가 — I/O 완료 시 호출
+ *
+ * 1) io_stat에 min/max/mean/S 업데이트 (Welford 알고리즘)
+ * 2) 퍼센타일 버킷에 카운트 추가
+ * 3) ns/us/ms 분포 버킷에 카운트 추가
+ * 4) 우선순위별 통계가 활성화되었으면 별도 버킷에도 추가
+ * 5) 로그가 활성화되었으면 로그에 샘플 기록
+ */
 void add_clat_sample(struct thread_data *td, enum fio_ddir ddir,
 		     unsigned long long nsec, unsigned long long bs,
 		     struct io_u *io_u)
@@ -3481,6 +3605,7 @@ void add_clat_sample(struct thread_data *td, enum fio_ddir ddir,
 		__td_io_u_unlock(td);
 }
 
+/* [한국어] 제출 레이턴시(slat) 샘플 추가 — I/O 제출 시 호출 */
 void add_slat_sample(struct thread_data *td, struct io_u *io_u)
 {
 	const bool needs_lock = td_async_processing(td);
@@ -3514,6 +3639,7 @@ void add_slat_sample(struct thread_data *td, struct io_u *io_u)
 		__td_io_u_unlock(td);
 }
 
+/* [한국어] 전체 레이턴시(lat=slat+clat) 샘플 추가 */
 void add_lat_sample(struct thread_data *td, enum fio_ddir ddir,
 		    unsigned long long nsec, unsigned long long bs,
 		    struct io_u * io_u)
@@ -3557,6 +3683,7 @@ void add_lat_sample(struct thread_data *td, enum fio_ddir ddir,
 		__td_io_u_unlock(td);
 }
 
+/* [한국어] 대역폭 샘플 추가 — bw_avg_time 간격마다 평균 대역폭 계산 */
 void add_bw_sample(struct thread_data *td, struct io_u *io_u,
 		   unsigned int bytes, unsigned long long spent)
 {
@@ -3660,6 +3787,7 @@ static int add_bw_samples(struct thread_data *td, struct timespec *t)
 				td->ts.bw_stat, td->bw_log, true);
 }
 
+/* [한국어] IOPS 샘플 추가 — iops_avg_time 간격마다 평균 IOPS 계산 */
 void add_iops_sample(struct thread_data *td, struct io_u *io_u,
 		     unsigned int bytes)
 {
@@ -3709,6 +3837,10 @@ static bool td_in_logging_state(struct thread_data *td)
 
 /*
  * Returns msecs to next event
+ */
+/*
+ * [한국어] 주기적 로그 샘플 계산 — 헬퍼 스레드에서 호출
+ * 모든 활성 스레드의 대역폭 및 IOPS 로그 샘플을 시간 간격에 따라 계산한다.
  */
 int calc_log_samples(void)
 {
@@ -3760,11 +3892,13 @@ int calc_log_samples(void)
 	return next == ~0U ? 0 : next;
 }
 
+/* [한국어] 통계 시스템 초기화 — 세마포어 생성 */
 void stat_init(void)
 {
 	stat_sem = fio_shared_sem_init(FIO_SEM_UNLOCKED);
 }
 
+/* [한국어] 통계 시스템 정리 — 세마포어 해제 및 집계 로그 해제 */
 void stat_exit(void)
 {
 	/*
@@ -3778,6 +3912,7 @@ void stat_exit(void)
 /*
  * Called from signal handler. Wake up status thread.
  */
+/* [한국어] 실행 중 통계 출력 (외부 호출용 래퍼) */
 void show_running_run_stats(void)
 {
 	helper_do_stat();
