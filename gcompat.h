@@ -1,8 +1,18 @@
+/*
+ * [한국어 설명] GTK+ 버전 호환성 래퍼 헤더 (gcompat.h)
+ *
+ * === 파일의 역할 ===
+ * GTK+ 2.x의 다양한 마이너 버전 간 API 차이를 추상화하는 호환성 래퍼이다.
+ * GTK 2.24 미만에서 누락된 GtkComboBoxText API, GTK 2.14 미만의
+ * gtk_dialog_get_content_area() 등을 폴리필(polyfill)로 제공한다.
+ * GTK 2와 GTK 3 간의 그리기 이벤트 이름 차이("expose_event" vs "draw")도 처리한다.
+ */
 #ifndef GFIO_GTK_COMPAT
 #define GFIO_GTK_COMPAT
 
 #include <gtk/gtk.h>
 
+/* GTK 2.24 미만: GtkComboBoxText API가 없으므로 GtkComboBox로 폴리필 */
 #if GTK_MAJOR_VERSION <= 2 && GTK_MINOR_VERSION < 24
 struct GtkComboBoxText;
 typedef GtkComboBox GtkComboBoxText;

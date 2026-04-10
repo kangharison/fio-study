@@ -1,3 +1,11 @@
+/*
+ * [한국어 설명] gfio GTK 위젯 도우미 구현 (ghelpers.c)
+ *
+ * === 파일의 역할 ===
+ * gfio에서 자주 사용되는 GTK 위젯 생성 패턴을 유틸리티 함수로 구현한다.
+ * 프레임 안에 위젯을 배치하는 공통 패턴, 트리뷰 컬럼 구���,
+ * 멀티텍스트 위젯(하나의 엔트리에 여러 텍스트 전환 표시) 등을 제공한다.
+ */
 #include <stdlib.h>
 #include <string.h>
 #include <gtk/gtk.h>
@@ -5,6 +13,7 @@
 #include "gcompat.h"
 #include "ghelpers.h"
 
+/* 프레임(라벨 있는 테두리) 안에 콤보박스를 생성하여 box에 추가 */
 GtkWidget *new_combo_entry_in_frame(GtkWidget *box, const char *label)
 {
 	GtkWidget *entry, *frame;

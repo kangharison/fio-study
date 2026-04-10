@@ -1,19 +1,35 @@
+/*
+ * [한국어 설명] 그래프 눈금(tickmark) 계산 구현 (tickmarks.c)
+ *
+ * === 파일의 역할 ===
+ * 그래프의 축에 표시할 눈금 위치와 라벨을 계산한다.
+ * "Graphics Gems" (Andrew S. Glassner, ISBN 0-12-286166-3)의
+ * Paul Heckbert 알고리즘(p.657-659)을 기반으로 구현되었다.
+ *
+ * === 알고리즘 핵심 ===
+ * "nice number" 개념: 1, 2, 5 (또는 그 10의 거듭제곱 배)를 사용하여
+ * 사람이 읽기 편한 눈금 간격을 생성한다.
+ * 예: 데이터 범위가 0~87이면 눈금은 0, 10, 20, ..., 90으로 생성
+ *
+ * === shorten 함수 ===
+ * 큰 숫자(예: 1000000)를 축약(1000K 또는 1M)하여 축 라벨의 가독성을 높인다.
+ * use_KMG_symbols가 true이면 K/M/G/P/E 접미사를 사용한다.
+ */
 #include <stdio.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * adapted from Paul Heckbert's algorithm on p 657-659 of
- * Andrew S. Glassner's book, "Graphics Gems"
- * ISBN 0-12-286166-3
- *
- */
-
 #include "tickmarks.h"
 
 #define MAX(a, b) (((a) < (b)) ? (b) : (a))
 
+/*
+ * nicenum - "nice number"를 찾는 함수
+ * @x: 대상 숫자
+ * @round: true이면 반올림, false이면 올림
+ * @return: x에 가장 가까운 nice number (1, 2, 5의 10의 거듭제곱 배)
+ */
 static double nicenum(double x, int round)
 {
 	int exp;	/* exponent of x */

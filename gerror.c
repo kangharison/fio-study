@@ -1,3 +1,14 @@
+/*
+ * [한국어 설명] gfio 에러 보고 구현 (gerror.c)
+ *
+ * === 파일의 역할 ===
+ * GUI에서 에러와 정보 메시지를 사용자에게 표시하는 기능을 구현한다.
+ *
+ * === 주요 함수 ===
+ * - gfio_report_error(): 메인 윈도우 상단에 GTK InfoBar를 생성하여 에러 메시지 표시.
+ *   이미 InfoBar가 표시 중이면 메시지만 갱신한다.
+ * - gfio_report_info(): 모달 다이얼로그로 정보 메시지를 표시하고 사용자 확인을 대기.
+ */
 #include <locale.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +19,7 @@
 #include "gfio.h"
 #include "gerror.h"
 
+/* InfoBar에서 OK 버튼 클릭 시 InfoBar를 파괴하는 콜백 */
 static void on_info_bar_response(GtkWidget *widget, gint response,
 				 gpointer data)
 {

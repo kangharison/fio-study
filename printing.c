@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] gfio 인쇄 기능 구현 (printing.c)
+ *
+ * === 파일의 역할 ===
+ * GTK의 인쇄 프레임워크(GtkPrintOperation)를 사용하여 벤치마크 결과를
+ * 프린터로 출력하는 기능을 구현한다.
+ *
+ * === 동작 과정 ===
+ * 1. gfio_print_results()가 호출되면 GTK 인쇄 다이얼로그를 표시
+ * 2. begin_print() 콜백에서 페이지 크기, DPI 등을 확인하고 페이지 수 설정
+ * 3. results_draw_page() 콜백에서 Cairo 컨텍스트에 결과를 렌더링
+ * 4. results_print_done() 콜백에서 인쇄 오류를 처리
+ *
+ * 참고: 현재 구현은 테스트/디버그용으로 십자선과 좌표만 출력하며,
+ * 실제 벤치마크 데이터의 인쇄 기능은 아직 미완성 상태이다.
+ */
 #include <gtk/gtk.h>
 #include <cairo.h>
 
@@ -5,7 +21,7 @@
 #include "cairo_text_helpers.h"
 #include "printing.h"
 
-
+/* 인쇄 파라미터 - 페이지 크기, DPI, 설정 등을 보관 */
 static struct printing_parameters {
 	gdouble width, height, xdpi, ydpi;
 	GtkPrintSettings *settings;

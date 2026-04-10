@@ -20,6 +20,26 @@
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  *
  */
+/*
+ * [한국어 설명] 그래프 렌더링 라이브러리 구현 (graph.c)
+ *
+ * === 파일의 역할 ===
+ * Cairo 2D 그래픽을 사용하여 라인 그래프와 막대 그래프를 렌더링한다.
+ * gfio에서 실시간 IOPS/대역폭 모니터링 및 레이턴시 분포 표시에 사용된다.
+ *
+ * === 주요 기능 ===
+ * - 라인 그래프: 시간에 따른 IOPS/대역폭 변화 추이 (line_graph_draw)
+ * - 막대 그래프: 레이턴시 분포, 완료 깊이 분포 등 (bar_graph_draw)
+ * - 자동 축 스케일링: tickmarks.c를 이용한 적절한 눈금 간격 계산
+ * - 툴팁: 마우스 호버 시 데이터 포인트 값 표시 (prio_tree 기반 범위 검색)
+ * - 단위 축약: K(천), M(백만), G(십억) 단위로 자동 축약 및 콜백 알림
+ * - 데이터 제한: line_graph_set_data_count_limit()으로 표시할 최대 데이터 수 제한
+ *
+ * === 내부 데이터 구조 ===
+ * - graph: 그래프 전체를 나타내는 최상위 구조체 (제목, 크기, 라벨 리스트)
+ * - graph_label: 하나의 데이터 계열 (예: "Read IOPS" - 색상, 값 리스트 보유)
+ * - graph_value: 개별 데이터 포인트 (x/y 좌표 또는 단일 값 + 툴팁)
+ */
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -37,9 +57,11 @@
 
 /*
  * Allowable difference to show tooltip
+ * [한국어] 툴팁 표시를 위한 마우스-데이터 포인트 간 허용 거리 (비율)
  */
 #define TOOLTIP_DELTA	0.08
 
+/* x, y 좌표 쌍을 저장하는 구조체 - 라인 그래프의 데이터 포인트 */
 struct xyvalue {
 	double x, y;
 };
@@ -49,24 +71,26 @@ enum {
 	GV_F_PRIO_SKIP	= 2,
 };
 
+/* 그래프 데이터 포인트 - 개별 값 하나를 나타냄 */
 struct graph_value {
-	struct flist_head list;
-	struct prio_tree_node node;
-	struct flist_head alias;
-	unsigned int flags;
-	char *tooltip;
-	void *value;
+	struct flist_head list;          /* 라벨의 값 리스트에 연결 */
+	struct prio_tree_node node;      /* 툴팁 범위 검색용 우선순위 트리 노드 */
+	struct flist_head alias;         /* 동일 위치의 다른 값(별칭) 리스트 */
+	unsigned int flags;              /* GV_F_ON_PRIO, GV_F_PRIO_SKIP 등 */
+	char *tooltip;                   /* 마우스 호버 시 표시할 툴팁 문자열 */
+	void *value;                     /* 실제 값 (double 또는 xyvalue 포인터) */
 };
 
+/* 그래프 라벨(데이터 계열) - 하나의 선/막대 그룹을 나타냄 */
 struct graph_label {
-	struct flist_head list;
-	char *label;
-	struct flist_head value_list;
-	struct prio_tree_root prio_tree;
-	double r, g, b;
-	int hide;
-	int value_count;
-	struct graph *parent;
+	struct flist_head list;          /* 그래프의 라벨 리스트에 연결 */
+	char *label;                     /* 라벨 이름 (예: "Read IOPS") */
+	struct flist_head value_list;    /* 이 라벨에 속한 데이터 포인트 리스트 */
+	struct prio_tree_root prio_tree; /* 툴팁 검색용 우선순위 트리 루트 */
+	double r, g, b;                  /* 이 계열의 표시 색상 (RGB) */
+	int hide;                        /* 숨김 플래그 (INVISIBLE_COLOR 사용 시) */
+	int value_count;                 /* 데이터 포인트 개수 */
+	struct graph *parent;            /* 이 라벨이 속한 그래프 포인터 */
 };
 
 struct tick_value {
@@ -74,23 +98,24 @@ struct tick_value {
 	double value;
 };
 
+/* 그래프 최상위 구조체 - 하나의 그래프 전체를 관리 */
 struct graph {
-	char *title;
-	char *xtitle;
-	char *ytitle;
-	unsigned int xdim, ydim;
-	double xoffset, yoffset;
-	struct flist_head label_list;
-	int per_label_limit;
-	const char *font;
-	graph_axis_unit_change_callback x_axis_unit_change_callback;
-	graph_axis_unit_change_callback y_axis_unit_change_callback;
-	unsigned int base_offset;
-	unsigned int dont_graph_all_zeroes;
-	double left_extra;
-	double right_extra;
-	double top_extra;
-	double bottom_extra;
+	char *title;              /* 그래프 제목 */
+	char *xtitle;             /* X축 제목 */
+	char *ytitle;             /* Y축 제목 */
+	unsigned int xdim, ydim;  /* 그래프 크기 (픽셀) */
+	double xoffset, yoffset;  /* 그래프 위치 오프셋 (픽셀) */
+	struct flist_head label_list;  /* 데이터 계열(라벨) 리스트 */
+	int per_label_limit;      /* 라벨당 최대 데이터 포인트 수 (-1이면 무제한) */
+	const char *font;         /* 텍스트 렌더링 폰트 */
+	graph_axis_unit_change_callback x_axis_unit_change_callback;  /* X축 단위 변경 콜백 */
+	graph_axis_unit_change_callback y_axis_unit_change_callback;  /* Y축 단위 변경 콜백 */
+	unsigned int base_offset;          /* 단위 축약 기본 오프셋 (K/M/G) */
+	unsigned int dont_graph_all_zeroes; /* 모든 값이 0이면 그래프 생략 */
+	double left_extra;        /* 좌측 여백 비율 */
+	double right_extra;       /* 우측 여백 비율 */
+	double top_extra;         /* 상단 여백 비율 */
+	double bottom_extra;      /* 하단 여백 비율 */
 
 	double xtick_zero;
 	double xtick_delta;

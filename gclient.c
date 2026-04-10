@@ -1,3 +1,17 @@
+/*
+ * [한국어 설명] gfio 클라이언트 구현 파일 (gclient.c)
+ *
+ * === 파일의 역할 ===
+ * gfio에서 fio 서버와의 클라이언트 통신 및 결과 표시를 담당한다.
+ *
+ * === 주요 기능 ===
+ * - fio 서버로부터 수신한 이벤트(로그, 통계, ETA, 디스크 사용률 등) 처리
+ * - 결과 창(Results Window) 생성 및 통계 데이터를 테이블/그래프로 표시
+ * - thread_stat 구조체의 IOPS, 대역폭, 레이턴시 데이터를 GTK 위젯에 렌더링
+ * - 디스크 사용률(disk utilization) 통계 표시
+ * - 레이턴시 분포를 막대/라인 그래프로 시각화
+ * - Job 옵션 편집 및 전송 지원
+ */
 #include <stdlib.h>
 #include <string.h>
 
@@ -5,15 +19,15 @@
 #include <cairo.h>
 #include <gtk/gtk.h>
 
-#include "fio.h"
-#include "gfio.h"
-#include "ghelpers.h"
-#include "goptions.h"
-#include "gerror.h"
-#include "graph.h"
-#include "gclient.h"
-#include "printing.h"
-#include "lib/pow2.h"
+#include "fio.h"          /* fio 핵심 구조체 */
+#include "gfio.h"         /* gfio GUI 구조체 */
+#include "ghelpers.h"     /* GTK 위젯 도우미 */
+#include "goptions.h"     /* GTK 옵션 편집 창 */
+#include "gerror.h"       /* 에러 보고 다이얼로그 */
+#include "graph.h"        /* 그래프 렌더링 */
+#include "gclient.h"      /* 이 파일의 헤더 */
+#include "printing.h"     /* 인쇄 기능 */
+#include "lib/pow2.h"     /* 2의 거듭제곱 유틸리티 */
 
 static void gfio_display_ts(struct fio_client *client, struct thread_stat *ts,
 			    struct group_run_stats *rs);

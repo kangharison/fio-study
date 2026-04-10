@@ -1,9 +1,22 @@
+/*
+ * [한국어 설명] Cairo 텍스트 도우미 구현 (cairo_text_helpers.c)
+ *
+ * === 파일의 역할 ===
+ * Cairo 그래픽 라이브러리에서 텍스트를 다양한 정렬(좌측/중앙/우측/세로)로
+ * 렌더링하는 유틸리티 함수를 구현한다.
+ *
+ * === 정렬 방식 ===
+ * Cairo의 text_extents를 이용하여 텍스트의 실제 렌더링 크기를 측정한 후,
+ * 지정된 좌표를 기준으로 적절히 오프셋을 계산하여 정확한 위치에 배치한다.
+ * 세로 텍스트는 Cairo의 translate + rotate 변환을 사용하여 -90도 회전시킨다.
+ */
 #include "cairo_text_helpers.h"
 
 #include <cairo.h>
 #include <gtk/gtk.h>
 #include <math.h>
 
+/* 내부 구현: 지정된 정렬 방식으로 텍스트를 렌더링하는 공통 함수 */
 static void draw_aligned_text(cairo_t *cr, const char *font, double x, double y,
 			       double fontsize, const char *text, int alignment)
 {

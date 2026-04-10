@@ -1,3 +1,22 @@
+/*
+ * [한국어 설명] gfio 옵션 편집 창 구현 (goptions.c)
+ *
+ * === 파일의 역할 ===
+ * fio의 모든 job 옵션(--rw, --bs, --iodepth, --ioengine 등)을
+ * GTK 위젯(콤보박스, 스핀버튼, 체크박스, 텍스트 입력 등)으로 변환하여
+ * GUI에서 시각적으로 편집할 수 있게 한다.
+ *
+ * === 옵션 타입별 위젯 매핑 ===
+ * - FIO_OPT_STR_SET(bool) → GtkCheckButton (체크박스)
+ * - FIO_OPT_STR(enum) → GtkComboBox (드롭다운)
+ * - FIO_OPT_INT → GtkSpinButton (숫자 입력)
+ * - FIO_OPT_STR_STORE → GtkEntry (텍스트 입력)
+ * - FIO_OPT_STR_VAL → GtkSpinButton + GtkComboBox (값 + 단위)
+ * - FIO_OPT_RANGE → GtkSpinButton × 4 (범위 입력)
+ * - FIO_OPT_STR_MULTI → GtkCheckButton[] (다중 선택)
+ *
+ * 옵션 그룹(optgroup)별로 탭으로 분류되어 표시된다.
+ */
 #include <locale.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,13 +25,14 @@
 #include <cairo.h>
 #include <gtk/gtk.h>
 
-#include "fio.h"
-#include "gfio.h"
-#include "ghelpers.h"
-#include "gerror.h"
-#include "parse.h"
-#include "optgroup.h"
+#include "fio.h"          /* fio 핵심 구조체 */
+#include "gfio.h"         /* gfio GUI 구조체 */
+#include "ghelpers.h"     /* GTK 위젯 도우미 */
+#include "gerror.h"       /* 에러 보고 */
+#include "parse.h"        /* fio 옵션 파싱 프레임워크 */
+#include "optgroup.h"     /* 옵션 그룹 정의 */
 
+/* 개별 옵션 위젯의 기본 구조체 - 모든 옵션 타입의 공통 필드 */
 struct gopt {
 	GtkWidget *box;
 	unsigned int opt_index;
@@ -22,27 +42,32 @@ struct gopt {
 	struct flist_head changed_list;
 };
 
+/* 콤보박스(드롭다운) 옵션 위젯 - enum/문자열 선택형 옵션용 */
 struct gopt_combo {
 	struct gopt gopt;
 	GtkWidget *combo;
 };
 
+/* 정수 입력 옵션 위젯 - 스핀버튼으로 숫자 입력 */
 struct gopt_int {
 	struct gopt gopt;
 	unsigned long long lastval;
 	GtkWidget *spin;
 };
 
+/* 불리언 옵션 위젯 - 체크박스로 on/off 전환 */
 struct gopt_bool {
 	struct gopt gopt;
 	GtkWidget *check;
 };
 
+/* 문자열 입력 옵션 위젯 - 텍스트 엔트리로 자유 입력 */
 struct gopt_str {
 	struct gopt gopt;
 	GtkWidget *entry;
 };
 
+/* 값+단위 옵션 위젯 - 스핀버튼(숫자) + 콤보박스(단위: K/M/G 등) */
 struct gopt_str_val {
 	struct gopt gopt;
 	GtkWidget *spin;
@@ -52,25 +77,28 @@ struct gopt_str_val {
 
 #define GOPT_RANGE_SPIN	4
 
+/* 범위 입력 옵션 위젯 - 4개의 스핀버튼으로 범위 지정 (예: bsrange) */
 struct gopt_range {
 	struct gopt gopt;
 	GtkWidget *spins[GOPT_RANGE_SPIN];
 };
 
+/* 다중 선택 옵션 위젯 - 여러 체크박스로 복수 선택 (예: verify 방법) */
 struct gopt_str_multi {
 	struct gopt gopt;
 	GtkWidget *checks[PARSE_MAX_VP];
 };
 
+/* 옵션 위젯 타입 식별자 */
 enum {
-	GOPT_COMBO_INT = 1,
-	GOPT_COMBO_STR,
-	GOPT_INT,
-	GOPT_BOOL,
-	GOPT_STR,
-	GOPT_STR_VAL,
-	GOPT_RANGE,
-	GOPT_STR_MULTI,
+	GOPT_COMBO_INT = 1,   /* 정수 콤보박스 (enum → 정수) */
+	GOPT_COMBO_STR,       /* 문자열 콤보박스 (enum → 문자열) */
+	GOPT_INT,             /* 정수 스핀버튼 */
+	GOPT_BOOL,            /* 불리언 체크박스 */
+	GOPT_STR,             /* 문자열 텍스트 엔트리 */
+	GOPT_STR_VAL,         /* 값+단위 (스핀버튼 + 콤보박스) */
+	GOPT_RANGE,           /* 범위 (스핀버튼 × 4) */
+	GOPT_STR_MULTI,       /* 다중 선택 체크박스 */
 };
 
 struct gopt_frame_widget {

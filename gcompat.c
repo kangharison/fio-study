@@ -1,7 +1,16 @@
+/*
+ * [한국어 설명] GTK+ 버전 호환성 래퍼 구현 (gcompat.c)
+ *
+ * GTK+ 2.x의 구버전에서 누락된 API 함수들을 구현한다.
+ * - GTK 2.24 미만: GtkComboBoxText 관련 함수 (GtkComboBox로 위임)
+ * - GTK 3 미만: gtk_widget_get_allocated_width/height (allocation 필드 직접 접근)
+ * - GTK 2.18 미만: gtk_widget_set_can_focus (GTK_WIDGET_SET_FLAGS 매크로 사용)
+ */
 #include <gtk/gtk.h>
 
 #include "gcompat.h"
 
+/* GTK 2.24 미만: GtkComboBoxText API를 GtkComboBox API로 래핑 */
 #if GTK_MAJOR_VERSION <= 2 && GTK_MINOR_VERSION < 24
 
 GtkWidget *gtk_combo_box_text_new(void)

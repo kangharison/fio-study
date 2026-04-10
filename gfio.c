@@ -21,6 +21,26 @@
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  *
  */
+/*
+ * [한국어 설명] gfio 메인 GUI 구현 파일 (gfio.c)
+ *
+ * === 파일의 역할 ===
+ * gfio(GUI Front-end for fio)의 메인 윈도우를 생성하고 관리하는 파일이다.
+ * GTK+ 툴킷을 사용하여 fio 벤치마크의 시각적 인터페이스를 제공한다.
+ *
+ * === 주요 기능 ===
+ * - 메인 윈도우 레이아웃 구성 (메뉴, 탭, 그래프, 로그 뷰)
+ * - IOPS/대역폭 실시간 라인 그래프 표시 (Cairo 2D 그래픽 라이브러리 사용)
+ * - Connect/Send/Start 버튼을 통한 fio 서버 제어
+ * - 서버 프로브 정보 및 ETA(예상 완료 시간) 표시
+ * - Job 파일(.fio) 열기/저장 및 최근 파일 관리
+ * - 다중 서버를 노트북(탭) 형태로 동시 관리
+ *
+ * === gfio와 fio의 관계 ===
+ * gfio는 fio의 클라이언트-서버 모드를 활용한다.
+ * gfio → (네트워크) → fio --server → I/O 실행 → 결과 반환 → gfio에서 시각화
+ * 즉, gfio 자체는 I/O를 수행하지 않고 원격 fio 서버에 작업을 위임한다.
+ */
 #include <locale.h>
 #include <stdlib.h>
 #include <string.h>

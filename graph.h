@@ -1,15 +1,32 @@
+/*
+ * [한국어 설명] 그래프 렌더링 라이브러리 헤더 (graph.h)
+ *
+ * === 파일의 역할 ===
+ * Cairo 2D 그래픽 라이브러리를 사용하여 라인 그래프와 막대 그래프를
+ * 렌더링하는 기능을 제공한다. gfio에서 IOPS, 대역폭, 레이턴시 분포를
+ * 시각적으로 표시하는 데 사용된다.
+ *
+ * === 사용 흐름 ===
+ * 1. graph_new()로 그래프 객체 생성 (크기, 폰트 지정)
+ * 2. graph_title(), graph_x_title(), graph_y_title()로 제목 설정
+ * 3. graph_add_label()로 데이터 계열(라벨) 추가 (예: "Read IOPS", "Write IOPS")
+ * 4. graph_set_color()로 각 계열의 색상 설정
+ * 5. graph_add_data() 또는 graph_add_xy_data()로 데이터 포인트 추가
+ * 6. line_graph_draw() 또는 bar_graph_draw()로 Cairo 컨텍스트에 렌더링
+ * 7. graph_free()로 해제
+ */
 #ifndef GRAPH_H
 #define GRAPH_H
 
-struct graph;
-struct graph_label;
+struct graph;        /* 그래프 객체 (내부 구현은 graph.c에 정의) */
+struct graph_label;  /* 데이터 계열(라벨) 객체 */
 
-typedef struct graph_label * graph_label_t;
+typedef struct graph_label * graph_label_t;  /* 라벨 핸들 타입 */
 
-#define GRAPH_DEFAULT_FONT	"Sans 12"
+#define GRAPH_DEFAULT_FONT	"Sans 12"   /* 기본 그래프 폰트 */
 
 struct graph *graph_new(unsigned int xdim, unsigned int ydim, const char *font);
-/* graph_new() Returns a new graph structure of the given dimensions and font */
+/* graph_new() 지정된 크기와 폰트로 새 그래프 구조체를 생성하여 반환 */
 void graph_set_size(struct graph *g, unsigned int xdim, unsigned int ydim);
 /* graph_set_size() Changes the size of a graph to the given dimensions. */ 
 void graph_set_position(struct graph *g, double xoffset, double yoffset);
