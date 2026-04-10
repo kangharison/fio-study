@@ -3,11 +3,58 @@
  * nvme structure declarations and helper functions for the
  * io_uring_cmd engine.
  */
+/*
+ * [한국어 설명]
+ * nvme.c - io_uring_cmd 엔진을 위한 NVMe 헬퍼 함수 구현
+ *
+ * === 핵심 기능 영역 ===
+ *
+ * 1. 보호 정보(PI) 생성 및 검증:
+ *    - fio_nvme_generate_pi_16b_guard(): T10 DIF CRC16 가드 태그 생성
+ *    - fio_nvme_generate_pi_64b_guard(): NVMe CRC64 가드 태그 생성
+ *    - fio_nvme_verify_pi_16b_guard(): 16비트 가드 PI 검증
+ *    - fio_nvme_verify_pi_64b_guard(): 64비트 가드 PI 검증
+ *    - fio_nvme_pi_fill(): NVMe 명령의 CDW12~15에 PI 관련 플래그 설정
+ *
+ * 2. NVMe 명령 준비:
+ *    - fio_nvme_uring_cmd_prep(): read/write/trim/flush 명령의 CDW 필드 설정
+ *    - fio_nvme_uring_cmd_trim_prep(): DSM(Deallocate) 명령 준비
+ *
+ * 3. 디바이스 정보 조회:
+ *    - fio_nvme_get_info(): Identify 명령으로 LBA 크기, PI 설정 등 조회
+ *    - nvme_identify(): Admin Identify 명령 발행 (ioctl 래퍼)
+ *
+ * 4. ZNS (Zoned Namespaces) 지원:
+ *    - fio_nvme_get_zoned_model(): ZNS 지원 여부 확인
+ *    - fio_nvme_report_zones(): 존 리포트 조회 → fio zbd_zone 변환
+ *    - fio_nvme_reset_wp(): 존 쓰기 포인터 리셋
+ *    - fio_nvme_get_max_open_zones(): 최대 오픈 존 수 조회
+ *
+ * 5. FDP (Flexible Data Placement):
+ *    - fio_nvme_iomgmt_ruhs(): Reclaim Unit Handle 상태 조회
+ *
+ * === PI(Protection Information) 동작 원리 ===
+ * 쓰기 시: 각 LBA 블록마다 데이터로부터 CRC를 계산하여 가드 태그에 저장
+ * 읽기 시: 읽은 데이터로부터 CRC를 재계산하여 저장된 가드 태그와 비교
+ * PI 위치(pi_loc)에 따라 메타데이터의 시작 또는 끝에 PI 튜플이 위치함
+ * 확장 LBA(lba_ext > 0)이면 데이터+메타데이터가 연속, 아니면 별도 버퍼
+ */
 
 #include "nvme.h"
-#include "../crc/crc-t10dif.h"
-#include "../crc/crc64.h"
+#include "../crc/crc-t10dif.h"  /* T10 DIF CRC16 계산 함수 */
+#include "../crc/crc64.h"       /* NVMe CRC64 계산 함수 */
 
+/*
+ * [한국어] 16비트 가드(T10 DIF CRC16) 보호 정보 생성
+ *
+ * 쓰기 I/O의 각 LBA 블록에 대해:
+ * 1. pi_loc에 따라 PI 튜플의 위치(interval)를 계산
+ * 2. 데이터 영역에 대해 CRC16을 계산하여 guard에 저장
+ * 3. 앱 태그와 참조 태그(LBA 번호)를 설정
+ *
+ * 확장 LBA(lba_ext > 0): 데이터와 메타데이터가 연속 → buf에서 직접 접근
+ * 별도 메타데이터(lba_ext == 0): md_buf로 별도 접근, CRC는 데이터+메타데이터 누적
+ */
 static void fio_nvme_generate_pi_16b_guard(struct nvme_data *data,
 					   struct io_u *io_u,
 					   struct nvme_cmd_ext_io_opts *opts)
@@ -75,6 +122,16 @@ static void fio_nvme_generate_pi_16b_guard(struct nvme_data *data,
 	}
 }
 
+/*
+ * [한국어] 16비트 가드 PI 검증
+ *
+ * 읽기 I/O의 각 LBA 블록에 대해:
+ * 1. PI 비활성화 조건 확인 (apptag=0xFFFF이면 검사 건너뜀)
+ * 2. PRCHK_GUARD: CRC16 재계산 → 저장된 guard와 비교
+ * 3. PRCHK_APP: 앱 태그를 마스크 적용 후 비교
+ * 4. PRCHK_REF: 참조 태그(LBA 번호)를 비교 (Type1/2만)
+ * 불일치 시 -EIO 반환하고 에러 로그 출력
+ */
 static int fio_nvme_verify_pi_16b_guard(struct nvme_data *data,
 					struct io_u *io_u)
 {
@@ -160,6 +217,11 @@ next:
 	return 0;
 }
 
+/*
+ * [한국어] 64비트 가드(NVMe CRC64) 보호 정보 생성
+ * 16비트 버전과 동일한 로직이지만 CRC64를 사용하여 더 강력한 무결성 보호 제공.
+ * 참조 태그는 48비트(6바이트)로 확장되어 더 넓은 LBA 범위를 커버.
+ */
 static void fio_nvme_generate_pi_64b_guard(struct nvme_data *data,
 					   struct io_u *io_u,
 					   struct nvme_cmd_ext_io_opts *opts)
@@ -227,6 +289,11 @@ static void fio_nvme_generate_pi_64b_guard(struct nvme_data *data,
 	}
 }
 
+/*
+ * [한국어] 64비트 가드 PI 검증
+ * CRC64 재계산 후 저장된 가드 태그와 비교.
+ * 참조 태그는 48비트 비정렬 big-endian으로 저장/비교.
+ */
 static int fio_nvme_verify_pi_64b_guard(struct nvme_data *data,
 					struct io_u *io_u)
 {
@@ -312,6 +379,13 @@ next:
 
 	return 0;
 }
+/*
+ * [한국어] NVMe Trim(Deallocate) 명령 준비
+ * DSM(Dataset Management) 명령으로 NVMe 디바이스에 deallocate 요청.
+ * 단일 범위이면 io_u의 offset/length에서 직접 변환,
+ * 다중 범위이면 io_u->xfer_buf에 저장된 trim_range 배열을 변환.
+ * CDW10: Number of Ranges - 1 (0-based)
+ */
 static void fio_nvme_uring_cmd_trim_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 					 struct nvme_dsm *dsm)
 {
@@ -345,6 +419,21 @@ static void fio_nvme_uring_cmd_trim_prep(struct nvme_uring_cmd *cmd, struct io_u
 	}
 }
 
+/*
+ * [한국어] NVMe passthrough 명령 준비 (메인 진입점)
+ *
+ * io_u의 ddir에 따라:
+ * - READ: read_opcode (보통 0x02 또는 io_uring_cmd용 커스텀 opcode)
+ * - WRITE: write_opcode
+ * - TRIM: fio_nvme_uring_cmd_trim_prep()으로 위임
+ * - SYNC/DATASYNC: flush 명령 (opcode=0x00)
+ *
+ * CDW10~11: 시작 LBA (64비트를 상/하위 32비트로 분할)
+ * CDW12: NLB(0-based) | dtype(비트 20~23) | cdw12_flags(PI 플래그 등)
+ * CDW13: DSPEC(비트 16~31) - FDP 데이터 배치 지정
+ * iov가 NULL이 아니면 vectored I/O, 아니면 단일 버퍼
+ * write_zeroes 명령은 데이터 버퍼 불필요
+ */
 int fio_nvme_uring_cmd_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 			    struct iovec *iov, struct nvme_dsm *dsm,
 			    uint8_t read_opcode, uint8_t write_opcode,
@@ -405,6 +494,11 @@ int fio_nvme_uring_cmd_prep(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 	return 0;
 }
 
+/*
+ * [한국어] 가드 태그 생성 디스패처
+ * PI가 활성화되고 PRACT=0(호스트가 PI 처리)일 때만 동작.
+ * 가드 유형(16비트/64비트)에 따라 적절한 생성 함수를 호출.
+ */
 void fio_nvme_generate_guard(struct io_u *io_u, struct nvme_cmd_ext_io_opts *opts)
 {
 	struct nvme_data *data = FILE_ENG_DATA(io_u->file);
@@ -417,6 +511,16 @@ void fio_nvme_generate_guard(struct io_u *io_u, struct nvme_cmd_ext_io_opts *opt
 	}
 }
 
+/*
+ * [한국어] NVMe 명령에 PI 관련 필드 설정
+ *
+ * 1. CDW12에 io_flags(PRCHK_GUARD/APP/REF, PRACT)를 OR로 추가
+ * 2. 가드 태그를 생성 (fio_nvme_generate_guard)
+ * 3. PI 유형과 가드 유형에 따라:
+ *    - CDW14: 초기 참조 태그 (시작 LBA)
+ *    - CDW3: 64비트 가드의 경우 참조 태그 상위 16비트
+ *    - CDW15: 앱 태그 마스크(상위 16비트) | 앱 태그(하위 16비트)
+ */
 void fio_nvme_pi_fill(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 		      struct nvme_cmd_ext_io_opts *opts)
 {
@@ -457,6 +561,11 @@ void fio_nvme_pi_fill(struct nvme_uring_cmd *cmd, struct io_u *io_u,
 	}
 }
 
+/*
+ * [한국어] PI 검증 디스패처
+ * 가드 유형(16비트/64비트)에 따라 적절한 검증 함수를 호출.
+ * 반환값: 0=성공, -EIO=무결성 검사 실패
+ */
 int fio_nvme_pi_verify(struct nvme_data *data, struct io_u *io_u)
 {
 	int ret = 0;
@@ -475,6 +584,12 @@ int fio_nvme_pi_verify(struct nvme_data *data, struct io_u *io_u)
 	return ret;
 }
 
+/*
+ * [한국어] NVMe Admin Identify 명령 발행
+ * NVME_IOCTL_ADMIN_CMD ioctl을 통해 컨트롤러에 Identify 명령을 보냄.
+ * CNS(Controller or Namespace Structure)와 CSI(Command Set Identifier)에 따라
+ * 컨트롤러/네임스페이스/커맨드세트별 정보를 조회.
+ */
 static int nvme_identify(int fd, __u32 nsid, enum nvme_identify_cns cns,
 			 enum nvme_csi csi, void *data)
 {
@@ -491,6 +606,20 @@ static int nvme_identify(int fd, __u32 nsid, enum nvme_identify_cns cns,
 	return ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd);
 }
 
+/*
+ * [한국어] NVMe 디바이스 정보 조회 (엔진 초기화 시 호출)
+ *
+ * 동작 과정:
+ * 1. /dev/ngXnY 캐릭터 디바이스만 지원 (FIO_TYPE_CHAR 검사)
+ * 2. NVME_IOCTL_ID로 네임스페이스 ID 획득
+ * 3. Identify Controller로 ctratt(ELBAS 지원 여부) 확인
+ * 4. Identify Namespace로 LBA 크기, 메타데이터 크기, PI 설정 조회
+ * 5. ELBAS 지원 시 NVM Identify NS로 가드 유형(16b/64b) 결정
+ * 6. PRACT=1이고 ms==pi_size이면 메타데이터 크기를 0으로 설정
+ *    (컨트롤러가 PI를 자동 삽입/제거하므로 호스트에서 처리 불필요)
+ * 7. flbas 비트4로 확장 LBA 여부 결정
+ * 8. nsze를 nlba에 반환 (파일 크기 계산용)
+ */
 int fio_nvme_get_info(struct fio_file *f, __u64 *nlba, __u32 pi_act,
 		      struct nvme_data *data)
 {
@@ -623,6 +752,12 @@ out:
 	return err;
 }
 
+/*
+ * [한국어] NVMe ZNS 디바이스 모델 확인
+ * ZNS CSI로 Identify Controller/Namespace를 시도하여
+ * 성공하면 ZBD_HOST_MANAGED, 실패하면 ZBD_NONE 반환.
+ * fio의 ZBD(Zoned Block Device) 프레임워크에서 호출됨.
+ */
 int fio_nvme_get_zoned_model(struct thread_data *td, struct fio_file *f,
 			     enum zbd_zoned_model *model)
 {
@@ -663,6 +798,11 @@ out:
 	return 0;
 }
 
+/*
+ * [한국어] NVMe ZNS Zone Management Receive (존 리포트) 명령 발행
+ * slba부터 시작하는 존들의 상태를 data_len 크기만큼 조회.
+ * zras_feat에 NVME_ZNS_ZRAS_FEAT_ERZ를 설정하면 빈 존도 포함.
+ */
 static int nvme_report_zones(int fd, __u32 nsid, __u64 slba, __u32 zras_feat,
 			     __u32 data_len, void *data)
 {
@@ -681,6 +821,18 @@ static int nvme_report_zones(int fd, __u32 nsid, __u64 slba, __u32 zras_feat,
 	return ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
 }
 
+/*
+ * [한국어] NVMe ZNS 존 리포트 조회 및 fio 형식 변환
+ *
+ * 동작 과정:
+ * 1. ZNS Identify NS로 존 크기(zlen) 계산
+ * 2. zones_chunks(기본 1024)씩 나누어 반복 조회 (대규모 존 수 처리)
+ * 3. 각 nvme_zns_desc를 fio의 zbd_zone 구조체로 변환:
+ *    - start, len, wp, capacity: LBA → 바이트 변환
+ *    - zt(존 타입): SEQWRITE_REQ → ZBD_ZONE_TYPE_SWR
+ *    - zs(존 상태): Empty/Open/Closed/Full → fio 존 상태로 매핑
+ * 반환값: 조회된 존 수
+ */
 int fio_nvme_report_zones(struct thread_data *td, struct fio_file *f,
 			  uint64_t offset, struct zbd_zone *zbdz,
 			  unsigned int nr_zones)
@@ -803,6 +955,12 @@ out:
 	return ret;
 }
 
+/*
+ * [한국어] ZNS 존 쓰기 포인터(Write Pointer) 리셋
+ * offset~offset+length 범위의 모든 존에 대해 Zone Management Send(Reset) 명령 발행.
+ * 리셋된 존은 Empty 상태로 돌아가 처음부터 다시 쓸 수 있게 됨.
+ * 파일이 아직 열리지 않은 경우 임시로 open하고 완료 후 close.
+ */
 int fio_nvme_reset_wp(struct thread_data *td, struct fio_file *f,
 		      uint64_t offset, uint64_t length)
 {
@@ -842,6 +1000,12 @@ int fio_nvme_reset_wp(struct thread_data *td, struct fio_file *f,
 	return -ret;
 }
 
+/*
+ * [한국어] ZNS 최대 오픈 존 수 조회
+ * ZNS Identify NS의 mor(Max Open Resources) + 1을 반환.
+ * mor는 0-based이므로 +1하여 실제 최대 오픈 존 수를 계산.
+ * fio의 ZBD 프레임워크에서 동시 오픈 존 수를 제한하는 데 사용.
+ */
 int fio_nvme_get_max_open_zones(struct thread_data *td, struct fio_file *f,
 				unsigned int *max_open_zones)
 {
@@ -867,6 +1031,13 @@ out:
 	return ret;
 }
 
+/*
+ * [한국어] FDP Reclaim Unit Handle 상태 조회
+ * I/O Management Receive(opcode=0x12) 명령으로 RUH 상태를 조회.
+ * CDW10=1은 Reclaim Unit Handle Status를 의미.
+ * FDP는 호스트가 데이터 배치를 제어하여 GC(Garbage Collection)로 인한
+ * Write Amplification을 줄이는 NVMe 기능.
+ */
 static inline int nvme_fdp_reclaim_unit_handle_status(int fd, __u32 nsid,
 						      __u32 data_len, void *data)
 {
@@ -882,6 +1053,12 @@ static inline int nvme_fdp_reclaim_unit_handle_status(int fd, __u32 nsid,
 	return ioctl(fd, NVME_IOCTL_IO_CMD, &cmd);
 }
 
+/*
+ * [한국어] FDP RUH 상태 조회 래퍼 함수
+ * NVMe 캐릭터 디바이스를 열고 RUH 상태를 조회.
+ * 실패 시 ENOTSUP으로 설정하여 FDP 미지원 디바이스를 처리.
+ * dataplacement.c에서 호출되어 RUH ID 목록을 획득함.
+ */
 int fio_nvme_iomgmt_ruhs(struct thread_data *td, struct fio_file *f,
 			 struct nvme_fdp_ruh_status *ruhs, __u32 bytes)
 {
