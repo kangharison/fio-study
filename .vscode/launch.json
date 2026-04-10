@@ -1,0 +1,130 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "fio: sequential read (libaio)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/fio",
+            "args": [
+                "--name=debug-test",
+                "--filename=/dev/nvme0n1",
+                "--rw=read",
+                "--bs=4k",
+                "--iodepth=16",
+                "--numjobs=1",
+                "--direct=1",
+                "--ioengine=libaio",
+                "--runtime=10",
+                "--time_based"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Follow child processes (fork mode)",
+                    "text": "-gdb-set follow-fork-mode child",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Detach on fork off to debug child only",
+                    "text": "-gdb-set detach-on-fork on",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build fio (debug)",
+            "miDebuggerPath": "/usr/bin/gdb"
+        },
+        {
+            "name": "fio: sequential read (numjobs=4, attach parent)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/fio",
+            "args": [
+                "--name=debug-test",
+                "--filename=/dev/nvme0n1",
+                "--rw=read",
+                "--bs=4k",
+                "--iodepth=16",
+                "--numjobs=4",
+                "--direct=1",
+                "--ioengine=libaio",
+                "--runtime=10",
+                "--time_based"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Follow parent on fork",
+                    "text": "-gdb-set follow-fork-mode parent",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Detach on fork to avoid hang",
+                    "text": "-gdb-set detach-on-fork on",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build fio (debug)",
+            "miDebuggerPath": "/usr/bin/gdb"
+        },
+        {
+            "name": "fio: custom args",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/fio",
+            "args": [
+                "${input:fioArgs}"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Follow child processes",
+                    "text": "-gdb-set follow-fork-mode child",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Detach on fork",
+                    "text": "-gdb-set detach-on-fork on",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "build fio (debug)",
+            "miDebuggerPath": "/usr/bin/gdb"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "fioArgs",
+            "type": "promptString",
+            "description": "fio arguments (e.g. --name=test --filename=/dev/nvme0n1 ...)",
+            "default": "--name=test --filename=/dev/nvme0n1 --rw=read --bs=4k --iodepth=16 --numjobs=1 --direct=1 --ioengine=libaio --runtime=10"
+        }
+    ]
+}

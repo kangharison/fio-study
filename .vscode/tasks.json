@@ -1,0 +1,41 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "configure fio",
+            "type": "shell",
+            "command": "./configure",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "build fio (debug)",
+            "type": "shell",
+            "command": "make",
+            "args": [
+                "-j$(nproc)",
+                "EXTFLAGS=-O0 -g3 -fno-omit-frame-pointer"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "dependsOn": "configure fio",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "clean fio",
+            "type": "shell",
+            "command": "make clean",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}
