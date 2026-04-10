@@ -1,3 +1,15 @@
+/*
+ * [한국어 설명] 블룸 필터 구현 (bloom.c)
+ *
+ * === 파일의 역할 ===
+ * 블룸 필터는 확률적 자료구조로, 특정 원소가 집합에 포함되어 있는지를 빠르게 판별한다.
+ * 5개의 해시 함수(jhash, xxhash, murmurhash3, crc32c, fnv)를 사용하여 비트맵에 매핑하며,
+ * false positive는 가능하지만 false negative는 발생하지 않는다.
+ *
+ * === fio에서의 사용 ===
+ * fio의 중복 제거(deduplication) 감지에 사용된다. I/O 데이터 블록이 이미 기록된
+ * 데이터와 중복되는지를 빠르게 확인하여 중복 쓰기 패턴을 시뮬레이션한다.
+ */
 #include <stdlib.h>
 
 #include "bloom.h"

@@ -1,3 +1,15 @@
+/*
+ * [한국어 설명] fio 연결 리스트 병합 정렬 (flist_sort.c)
+ *
+ * === 파일의 역할 ===
+ * fio의 이중 연결 리스트(flist)를 위한 병합 정렬(merge sort) 구현이다.
+ * Linux 커널의 list_sort에서 가져온 코드로, O(n log n) 시간 복잡도를 가지며
+ * 안정 정렬(stable sort)을 보장한다.
+ *
+ * === fio에서의 사용 ===
+ * fio 내부에서 연결 리스트로 관리되는 데이터(예: I/O 큐, 통계 항목 등)를
+ * 비교 함수 기반으로 정렬해야 할 때 flist_sort()를 호출한다.
+ */
 #include <stdio.h>
 #include <string.h>
 #include "../flist.h"

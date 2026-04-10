@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] 계층적 비트맵(Axmap) 구현 (axmap.c)
+ *
+ * === 파일의 역할 ===
+ * 다단계 계층적 비트맵(axiom map)을 구현하여 사용된 블록을 효율적으로 추적한다.
+ * 각 상위 레벨의 비트가 하위 레벨의 한 워드 전체가 가득 찼는지를 나타내므로,
+ * 비트맵이 채워질수록 검색 속도가 빨라지는 캐시 친화적 구조이다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - struct axmap: nr_levels 단계의 axmap_level 배열, 총 nr_bits 비트 관리
+ * - struct axmap_level: 한 레벨의 비트맵 (unsigned long 배열)
+ * - log64(blocks) 레벨 구조: 20000 블록 시 약 1.9% 오버헤드 (블록당 약 1.019비트)
+ * - axmap_handler: 레벨 0부터 상위로 콜백 함수를 전파하여 비트 설정/조회
+ * - axmap_find_first_free: 최상위 레벨부터 하향 탐색하여 빈 비트를 O(log n) 시간에 탐색
+ * - ffz(find first zero): 아키텍처 비트 연산으로 빈 비트 위치를 빠르게 찾음
+ *
+ * === fio에서의 사용 ===
+ * 기본 랜덤맵(--norandommap=0) 구현에 사용된다. 랜덤 I/O 시 이미 접근한 블록을
+ * 추적하여 중복 접근을 방지하고, axmap_next_free()로 다음 미사용 블록을 빠르게 찾는다.
+ */
+
+/*
  * Bitmap of bitmaps, where each layer is number-of-bits-per-word smaller than
  * the previous. Hence an 'axmap', since we axe each previous layer into a
  * much smaller piece. I swear, that is why it's named like that. It has

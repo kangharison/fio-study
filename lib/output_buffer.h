@@ -1,3 +1,14 @@
+/*
+ * [한국어 설명] 동적 확장 출력 버퍼 헤더 (output_buffer.h)
+ *
+ * === 파일의 역할 ===
+ * buf_output 구조체(버퍼 포인터, 현재 길이, 최대 길이)와 buf_output_init,
+ * buf_output_free, buf_output_add 함수의 선언을 정의한다.
+ *
+ * === fio에서의 사용 ===
+ * fio의 출력 관련 모듈에서 동적 버퍼를 사용하여 텍스트를 누적 생성할 때
+ * 이 헤더를 포함한다.
+ */
 #ifndef FIO_OUTPUT_BUFFER_H
 #define FIO_OUTPUT_BUFFER_H
 

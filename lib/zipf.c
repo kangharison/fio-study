@@ -1,3 +1,24 @@
+/*
+ * [한국어 설명] Zipf 및 Pareto 분포 생성기 (zipf.c)
+ *
+ * === 파일의 역할 ===
+ * Zipf 분포와 Pareto 분포를 따르는 난수를 생성한다.
+ * 이 두 분포는 비균등(non-uniform) 랜덤 I/O 패턴을 시뮬레이션하는 데 사용되며,
+ * 소수의 핫 영역에 접근이 집중되는 실제 워크로드를 모델링할 수 있다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - struct zipf_state: nranges, theta, zetan, pareto_pow 등을 포함하는 분포 상태
+ * - Zipf: zeta 함수를 사전 계산(최대 10M 반복)하고, 역변환 샘플링으로 값 생성
+ * - Pareto: pow(rand, pareto_pow) 공식으로 멱법칙(power-law) 분포 생성
+ * - __hash_u64: 생성된 값을 해시하여 공간적 편향을 분산시킴 (disable_hash로 비활성화 가능)
+ * - rand_off: center 파라미터로 분포의 중심 오프셋을 지정
+ *
+ * === fio에서의 사용 ===
+ * --random_distribution=zipf:theta 또는 pareto:h 옵션으로 활성화된다.
+ * theta가 클수록 소수 블록에 접근이 집중되고, Pareto의 h 값이 작을수록
+ * 더 균등한 분포를 생성한다. 데이터베이스나 캐시 워크로드 벤치마크에 유용하다.
+ */
+
 #include <math.h>
 #include <string.h>
 #include "zipf.h"

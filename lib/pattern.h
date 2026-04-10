@@ -1,3 +1,23 @@
+/*
+ * [한국어 설명] 버퍼 패턴 헤더 (pattern.h)
+ *
+ * === 파일의 역할 ===
+ * I/O 버퍼 패턴 파싱 및 채우기의 공개 API와 관련 구조체를 정의한다.
+ * 패턴 포맷 설명자와 파싱 결과 구조체, 그리고 패턴 조작 함수 선언을 포함한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - MAX_PATTERN_SIZE (128MiB): 동적 할당 패턴의 최대 크기 제한
+ * - struct pattern_fmt_desc: 포맷 문자열(fmt), 길이(len), paste 콜백을 정의
+ * - struct pattern_fmt: 파싱된 포맷의 버퍼 내 위치(off)와 설명자 포인터
+ * - parse_and_fill_pattern_alloc: 입력을 파싱하고 결과 버퍼를 자동 할당
+ * - cpy_pattern/cmp_pattern: 패턴 복사 및 비교
+ * - paste_format/paste_format_inplace: 런타임 포맷 값 삽입
+ *
+ * === fio에서의 사용 ===
+ * verify.c에서 검증 패턴 처리에 사용되고, io_u.c에서 쓰기 버퍼 초기화에 사용된다.
+ * --buffer_pattern, --verify_pattern 옵션의 파싱 결과가 이 구조체들에 저장된다.
+ */
+
 #ifndef FIO_PARSE_PATTERN_H
 #define FIO_PARSE_PATTERN_H
 

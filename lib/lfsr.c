@@ -1,3 +1,24 @@
+/*
+ * [한국어 설명] 선형 피드백 시프트 레지스터(LFSR) 구현 (lfsr.c)
+ *
+ * === 파일의 역할 ===
+ * LFSR(Linear Feedback Shift Register)을 이용하여 중복 없이 전체 범위를 순회하는
+ * 의사 난수 시퀀스를 생성한다. 최대 63비트까지 지원하며, 각 비트 폭에 대한
+ * 최적 탭(tap) 위치 테이블을 내장하고 있다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - XNOR LFSR: 시프트와 XOR 마스크로 O(1) 시간에 다음 값을 생성 (주기: 2^n - 1)
+ * - lfsr_taps[64]: 3비트~63비트 LFSR의 최적 탭 위치 테이블
+ * - spin 메커니즘: 한 번에 여러 LFSR 스텝을 실행하여 연속 값 간의 상관성을 줄임
+ * - prepare_spin: spin으로 인한 부분 순환(sub-sequence cycle) 검출 및 보정
+ * - struct fio_lfsr: xormask, last_val, cached_bit, max_val, spin, cycle_length 포함
+ *
+ * === fio에서의 사용 ===
+ * --norandommap 옵션과 함께 사용되어 랜덤맵 없이도 모든 블록을 정확히 한 번씩
+ * 방문하는 것을 보장한다. 메모리 오버헤드가 매우 적어(상태 변수 몇 개만 필요)
+ * 대용량 장치에서도 효율적으로 동작한다.
+ */
+
 #include <stdio.h>
 
 #include "lfsr.h"

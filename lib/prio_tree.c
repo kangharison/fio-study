@@ -1,4 +1,26 @@
 /*
+ * [한국어 설명] 우선순위 검색 트리(Priority Search Tree) 구현 (prio_tree.c)
+ *
+ * === 파일의 역할 ===
+ * Linux 커널에서 가져온 기수 우선순위 검색 트리(Radix PST)를 구현한다.
+ * 구간(interval) [start, last]을 저장하고, 주어진 구간과 겹치는 모든 노드를
+ * O(log n + m) 시간에 효율적으로 열거(stabbing query)할 수 있다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - McCreight의 Radix PST: 힙과 기수 트리의 결합으로 구간 쿼리를 효율적으로 처리
+ * - prio_tree_insert: O(log n) 삽입 (최악 O((log n)^2)은 트리 확장 시)
+ * - prio_tree_remove: O(log n) 삭제, 하위 노드 중 heap_index가 큰 것으로 교체
+ * - prio_tree_next/prio_tree_first: 전위 순회(pre-order)로 겹치는 구간 열거
+ * - prio_tree_expand: index_bits 확장 시 루트 체인을 재구성
+ * - size_level: radix_index 이후 heap_index-radix_index를 인덱스로 전환
+ *
+ * === fio에서의 사용 ===
+ * gfio(그래픽 프론트엔드)의 그래프 툴팁에서 범위 쿼리에 사용된다.
+ * 마우스 위치에 해당하는 데이터 포인트를 빠르게 찾기 위해
+ * 구간을 PST에 저장하고 stabbing query로 관련 항목을 조회한다.
+ */
+
+/*
  * lib/prio_tree.c - priority search tree
  *
  * Copyright (C) 2004, Rajesh Venkatasubramanian <vrajesh@umich.edu>

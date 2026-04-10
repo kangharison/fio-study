@@ -1,4 +1,16 @@
 /*
+ * [한국어 설명] IEEE 754 부동소수점 pack/unpack (ieee754.c)
+ *
+ * === 파일의 역할 ===
+ * IEEE 754 형식의 부동소수점 값을 정수로 직렬화(pack)하거나 정수에서 부동소수점으로
+ * 역직렬화(unpack)하는 함수를 제공한다. 플랫폼 독립적인 방식으로 부동소수점 데이터를
+ * 바이트 스트림으로 변환할 수 있게 해준다.
+ *
+ * === fio에서의 사용 ===
+ * fio의 클라이언트-서버 프로토콜에서 네트워크를 통해 부동소수점 값을 전송할 때
+ * 이식 가능한 직렬화를 위해 사용된다.
+ */
+/*
  * Shamelessly lifted from Beej's Guide to Network Programming, found here:
  *
  * http://beej.us/guide/bgnet/output/html/singlepage/bgnet.html#serialization

@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] 레드-블랙 트리 헤더 (rbtree.h)
+ *
+ * === 파일의 역할 ===
+ * Linux 커널 유래의 레드-블랙 트리 자료구조의 노드/루트 구조체, 매크로, API를 정의한다.
+ * 사용자는 자체 삽입/검색 로직을 구현하고, rb_insert_color()로 균형을 유지한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - struct fio_rb_node: rb_parent_color(부모 포인터 + 색상 비트), rb_left, rb_right
+ * - struct rb_root: 트리의 루트 노드 포인터
+ * - rb_parent/rb_color 매크로: 포인터 하위 2비트를 이용한 색상 인코딩/디코딩
+ * - rb_link_node: 새 노드를 트리에 연결 (색상 조정 전)
+ * - rb_entry/container_of: 노드 포인터로부터 포함 구조체를 역참조
+ * - RB_EMPTY_NODE/RB_CLEAR_NODE: 센티널 처리 매크로
+ *
+ * === fio에서의 사용 ===
+ * fio의 다양한 정렬 자료구조에 사용된다. stat.c의 I/O 로그 관리,
+ * smalloc의 메모리 풀 관리, 각종 타이머/이벤트 큐 등에서 rb_root를 선언하고
+ * rb_insert_color/rb_erase로 노드를 관리한다.
+ */
+
+/*
   Red Black Trees
   (C) 1999  Andrea Arcangeli <andrea@suse.de>
   

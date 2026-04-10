@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] 레드-블랙 트리 구현 (rbtree.c)
+ *
+ * === 파일의 역할 ===
+ * Linux 커널에서 가져온 레드-블랙 트리(자가 균형 이진 탐색 트리) 구현이다.
+ * 삽입, 삭제, 순회 연산을 O(log n) 시간에 수행하며,
+ * 색상 재조정과 회전 연산으로 트리의 균형을 유지한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - __rb_rotate_left/__rb_rotate_right: 좌/우 회전으로 트리 균형 조정
+ * - rb_insert_color: 삽입 후 레드-블랙 속성 복원 (삼촌 노드 색상에 따른 케이스 처리)
+ * - __rb_erase_color: 삭제 후 레드-블랙 속성 복원 (형제 노드 색상에 따른 케이스 처리)
+ * - rb_erase: 노드 삭제 시 후계자(successor) 노드로 교체 후 색상 보정
+ * - rb_first/rb_next: 정렬 순서의 최소값 조회 및 중위 순회(in-order traversal)
+ * - rb_parent_color 필드: 포인터 하위 비트에 색상 정보를 인코딩하여 메모리 절약
+ *
+ * === fio에서의 사용 ===
+ * fio 전체에서 정렬된 데이터 관리에 사용된다. I/O 로그의 시간순 정렬,
+ * 대기 중인 I/O 요청의 우선순위 관리, iolog의 오프셋별 정렬 등에 활용된다.
+ */
+
+/*
   Red Black Trees
   (C) 1999  Andrea Arcangeli <andrea@suse.de>
   (C) 2002  David Woodhouse <dwmw2@infradead.org>

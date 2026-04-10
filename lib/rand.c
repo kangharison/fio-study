@@ -1,4 +1,24 @@
 /*
+ * [한국어 설명] 난수 생성기 구현 (rand.c)
+ *
+ * === 파일의 역할 ===
+ * Tausworthe 알고리즘 기반의 의사 난수 생성기(PRNG)를 구현한다.
+ * 32비트(Taus88, 주기 약 2^88)와 64비트(Taus258, 주기 약 2^258) 두 가지 버전을 제공하며,
+ * 난수 시드 초기화 및 버퍼를 난수 데이터로 채우는 기능을 포함한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - Taus88: 3개의 상태 변수(s1, s2, s3)를 XOR 조합하는 결합 Tausworthe 생성기
+ * - Taus258: 5개의 상태 변수를 사용하는 64비트 확장 버전
+ * - LCG(Linear Congruential Generator): 시드 초기화에 사용
+ * - CONFIG_SEED_BUCKETS: 여러 소수 기반 시드로 병렬 해시하여 버퍼를 빠르게 채움
+ * - __fill_random_buf_percentage: 난수와 패턴을 비율에 따라 혼합하여 버퍼 채움
+ *
+ * === fio에서의 사용 ===
+ * fio의 모든 난수 기반 기능의 핵심 엔진이다. 랜덤 I/O 오프셋 생성, 블록 크기 랜덤화,
+ * 검증용 버퍼 데이터 생성, buffer_compress_percentage 옵션 처리 등에 사용된다.
+ */
+
+/*
   This is a maximally equidistributed combined Tausworthe generator
   based on code from GNU Scientific Library 1.5 (30 Jun 2004)
 

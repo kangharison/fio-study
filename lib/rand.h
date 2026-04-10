@@ -1,3 +1,25 @@
+/*
+ * [한국어 설명] 난수 생성기 헤더 (rand.h)
+ *
+ * === 파일의 역할 ===
+ * fio의 의사 난수 생성기(PRNG) 인터페이스를 정의한다.
+ * 32비트 Taus88과 64비트 Taus258 상태 구조체, 인라인 난수 생성 함수,
+ * 그리고 범위 지정 난수 생성 유틸리티를 제공한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - struct taus88_state: 3개 상태 변수(s1,s2,s3)를 갖는 32비트 Tausworthe 상태
+ * - struct taus258_state: 5개 상태 변수를 갖는 64비트 Tausworthe 상태
+ * - struct frand_state: use64 플래그로 32/64비트를 선택하는 통합 난수 상태
+ * - TAUSWORTHE 매크로: 시프트-XOR 연산으로 다음 난수를 O(1)에 생성
+ * - __rand_0_1: [0,1) 범위의 균등 분포 실수를 반환
+ * - rand_between: 지정된 범위 [start, end] 내의 균등 분포 정수를 반환
+ *
+ * === fio에서의 사용 ===
+ * fio 전체에서 사용하는 난수 생성의 핵심 헤더이다. zipf, gauss, lfsr 등
+ * 다른 분포 생성기들도 이 헤더의 frand_state를 내부적으로 사용하며,
+ * I/O 오프셋, 블록 크기, 지연 시간 등의 랜덤화에 활용된다.
+ */
+
 #ifndef FIO_RAND_H
 #define FIO_RAND_H
 

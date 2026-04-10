@@ -1,3 +1,23 @@
+/*
+ * [한국어 설명] 가우시안(정규) 분포 생성기 (gauss.c)
+ *
+ * === 파일의 역할 ===
+ * 가우시안(정규) 분포를 따르는 난수를 생성한다.
+ * 중심 부근에 접근이 집중되고 양쪽 끝으로 갈수록 확률이 감소하는
+ * 종형(bell curve) 분포의 I/O 패턴을 시뮬레이션한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - 중심극한정리(CLT) 기반: GAUSS_ITERS(12)개의 균등 난수를 합산하여 정규 분포 근사
+ * - gauss_dev: 표준편차(stddev) 범위 내에서 추가 편차를 생성하여 분포 폭을 조정
+ * - struct gauss_state: frand_state(난수 상태), nranges(범위), stddev(표준편차),
+ *   rand_off(중심 오프셋), disable_hash(해시 비활성화 플래그) 포함
+ * - __hash_u64: 생성된 값을 해시하여 공간적 편향을 분산
+ *
+ * === fio에서의 사용 ===
+ * --random_distribution=normal:dev 옵션으로 활성화된다. dev 값은 백분율로 표현되며,
+ * 작을수록 중심에 더 집중된 접근 패턴을 생성한다. SSD 웨어 레벨링 테스트 등에 유용하다.
+ */
+
 #include <math.h>
 #include <string.h>
 #include "../hash.h"

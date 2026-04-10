@@ -1,3 +1,25 @@
+/*
+ * [한국어 설명] 우선순위 검색 트리 헤더 (prio_tree.h)
+ *
+ * === 파일의 역할 ===
+ * 우선순위 검색 트리(PST)의 노드/루트/이터레이터 구조체, 초기화 매크로,
+ * 그리고 삽입/삭제/순회 API를 정의한다.
+ *
+ * === 주요 알고리즘/자료구조 ===
+ * - struct prio_tree_node: left, right, parent 포인터와 start/last(구간 범위)
+ * - struct prio_tree_root: 루트 노드 포인터와 index_bits(트리 높이 결정)
+ * - struct prio_tree_iter: 순회 상태 (cur, mask, value, size_level, 쿼리 범위)
+ * - INIT_PRIO_TREE_NODE: 노드의 left/right/parent를 자기 자신으로 초기화 (센티널)
+ * - prio_tree_empty/prio_tree_root/prio_tree_left_empty/prio_tree_right_empty:
+ *   센티널 기반 상태 확인 인라인 함수들
+ * - prio_tree_entry: 노드 포인터로부터 포함 구조체를 역참조하는 매크로
+ *
+ * === fio에서의 사용 ===
+ * gfio의 graph.c에서 그래프 데이터 포인트의 범위 쿼리에 사용된다.
+ * prio_tree_iter_init으로 쿼리 범위를 설정하고, prio_tree_next로
+ * 겹치는 구간을 순회하여 해당 데이터 포인트의 툴팁 정보를 표시한다.
+ */
+
 #ifndef _LINUX_PRIO_TREE_H
 #define _LINUX_PRIO_TREE_H
 

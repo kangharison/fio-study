@@ -1,3 +1,14 @@
+/*
+ * [한국어 설명] IEEE 754 부동소수점 변환 헤더 (ieee754.h)
+ *
+ * === 파일의 역할 ===
+ * pack754/unpack754 함수의 선언과 fio_double_to_uint64/fio_uint64_to_double 매크로를
+ * 정의한다. fio_fp64_t 공용체 타입도 여기서 선언된다.
+ *
+ * === fio에서의 사용 ===
+ * fio의 클라이언트-서버 통신에서 double 값을 uint64로 변환하여 네트워크로 전송할 때
+ * 이 헤더의 매크로와 타입을 사용한다.
+ */
 #ifndef FIO_IEEE754_H
 #define FIO_IEEE754_H
 
