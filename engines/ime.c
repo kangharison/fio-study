@@ -15,6 +15,34 @@
  */
 
 /*
+ * [한국어 설명] DDN IME (Infinite Memory Engine) I/O 엔진 구현 (ime.c)
+ *
+ * === 엔진 개요 ===
+ * DDN(DataDirect Networks)의 IME(Infinite Memory Engine) 버스트 버퍼 시스템에 접근하기
+ * 위한 I/O 엔진이다. 이 파일은 세 가지 엔진을 정의한다:
+ * - ime_psync: 가장 기본적인 동기 엔진으로, 큐에 I/O가 들어올 때마다 ime_native를 호출
+ * - ime_psyncv: iovec을 모아서 일괄 커밋하는 동기 벡터 엔진 (한 번에 하나의 요청만)
+ * - ime_aio: iovec 기반 비동기 엔진으로 여러 요청을 동시에 생성/제출 가능
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * ime_native_init(), ime_native_finalize() (IME 초기화/종료)
+ * ime_native_pread(), ime_native_pwrite() (동기 I/O)
+ * ime_native_preadv(), ime_native_pwritev() (벡터 I/O)
+ * ime_native_aio_read(), ime_native_aio_write(), ime_native_aio_wait() (비동기 I/O)
+ * ime_native_open(), ime_native_close(), ime_native_lstat() (파일 관리)
+ * pthread_mutex, pthread_cond (비동기 완료 동기화)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=ime_psync / --ioengine=ime_psyncv / --ioengine=ime_aio 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * [공통] .setup, .open_file, .close_file, .get_file_size, .unlink_file
+ * [ime_psync] .queue (ime_native_pread/pwrite 직접 호출)
+ * [ime_psyncv] .queue, .commit, .getevents, .event (iovec 모아서 preadv/pwritev)
+ * [ime_aio] .queue, .commit, .getevents, .event (비동기 aio_read/aio_write/aio_wait)
+ */
+
+/*
  * Some details about the new engines are given below:
  *
  *

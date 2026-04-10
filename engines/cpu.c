@@ -1,4 +1,26 @@
 /*
+ * [한국어 설명] cpuio I/O 엔진 구현 (cpu.c)
+ *
+ * === 엔진 개요 ===
+ * 실제 I/O를 수행하지 않고 CPU 사이클만 소모하는 엔진이다.
+ * CPU 바운드 워크로드를 시뮬레이션하거나, I/O 워크로드와 혼합하여
+ * CPU 부하 상황을 재현하는 데 사용된다. noop(빈 루프)과 qsort(정렬) 두 가지
+ * 스트레스 모드를 지원하며, cpuload 옵션으로 CPU 사용률을 조절할 수 있다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * usleep(3), qsort(3) (CPU 연소용, 실제 I/O 시스템 호출 없음)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=cpuio 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .queue: fio_cpuio_queue (CPU 사이클 소모 루프 실행)
+ * - .init: fio_cpuio_init (cpuload 옵션 검증)
+ * - .cleanup: fio_cpuio_cleanup
+ * - .open_file: fio_cpuio_open (파일을 실제로 열지 않음)
+ */
+
+/*
  * CPU engine
  *
  * Doesn't transfer any data, merely burns CPU cycles according to

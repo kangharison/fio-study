@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] Ceph RBD I/O 엔진 구현 (rbd.c)
+ *
+ * === 엔진 개요 ===
+ * Ceph의 librbd 라이브러리를 사용하여 RADOS Block Device(RBD)에 블록 수준의
+ * I/O를 수행하는 엔진이다. Ceph 클러스터에 연결하여 RBD 이미지에 대한
+ * 비동기 읽기/쓰기/trim 작업을 지원하며, 선택적으로 poll 기반 완료 통지도 가능하다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * librbd - RBD 이미지 접근 (rbd_open, rbd_aio_read, rbd_aio_write, rbd_aio_discard 등)
+ * librados - Ceph 클러스터 연결 (rados_create, rados_connect, rados_ioctx_create 등)
+ * eventfd/poll - 비동기 완료 이벤트 통지 (CONFIG_RBD_POLL 설정 시)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=rbd 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .queue, .getevents, .event, .cleanup,
+ * .open_file, .invalidate, .io_u_init, .io_u_free
+ */
+
+/*
  * rbd engine
  *
  * IO engine using Ceph's librbd to test RADOS Block Devices.

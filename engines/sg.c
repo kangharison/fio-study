@@ -1,4 +1,27 @@
 /*
+ * [한국어 설명] SCSI Generic (SG) I/O 엔진 구현 (sg.c)
+ *
+ * === 엔진 개요 ===
+ * Linux SG v3 인터페이스를 사용하여 SCSI 장치에 직접 SCSI 명령을 전송하는 I/O 엔진이다.
+ * /dev/sgY 캐릭터 디바이스를 통한 비동기 모드와 /dev/sdX 블록 디바이스 또는
+ * direct=1/sync=1 설정의 /dev/sgY를 통한 동기 모드를 지원한다.
+ * SG_IO ioctl을 사용하여 SCSI read/write/verify/trim 명령을 직접 발행한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * ioctl(SG_IO) - SCSI 명령 전송 (동기 모드)
+ * write()/read() - /dev/sgY를 통한 비동기 SCSI 명령 전송/수신
+ * ioctl(SG_GET_VERSION_NUM, SG_SET_COMMAND_Q, SG_SET_RESERVED_SIZE)
+ * poll() - 비동기 완료 대기
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=sg 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init, .prep, .queue, .commit, .getevents, .event,
+ * .errdetails, .cleanup, .open_file, .close_file, .get_file_size
+ */
+
+/*
  * sg engine
  *
  * IO engine that uses the Linux SG v3 interface to talk to SCSI devices

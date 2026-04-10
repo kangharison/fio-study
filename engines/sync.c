@@ -1,4 +1,29 @@
 /*
+ * [한국어 설명] sync I/O 엔진 구현 (sync.c)
+ *
+ * === 엔진 개요 ===
+ * 가장 기본적인 동기식 I/O 엔진으로, 표준 POSIX 시스템 호출을 사용하여 데이터를 전송한다.
+ * 하나의 파일에서 sync(read/write+lseek), psync(pread/pwrite), vsync(readv/writev),
+ * pvsync(preadv/pwritev), pvsync2(preadv2/pwritev2) 등 5가지 변형 엔진을 제공한다.
+ * 모든 I/O가 동기적으로 완료되며, fio의 기본 I/O 엔진이다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * read(2), write(2), lseek(2), pread(2), pwrite(2),
+ * readv(2), writev(2), preadv(2), pwritev(2), preadv2(2), pwritev2(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=sync / psync / vsync / pvsync / pvsync2 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .prep: fio_syncio_prep (sync 엔진에서 lseek 수행)
+ * - .queue: fio_syncio_queue, fio_psyncio_queue, fio_vsyncio_queue 등
+ * - .commit: fio_vsyncio_commit (vsync 계열에서 벡터 I/O 일괄 제출)
+ * - .event / .getevents: fio_vsyncio_event / fio_vsyncio_getevents
+ * - .init / .cleanup: fio_vsyncio_init / fio_vsyncio_cleanup
+ * - .open_file / .close_file / .get_file_size: generic 콜백 사용
+ */
+
+/*
  * sync/psync engine
  *
  * IO engine that does regular read(2)/write(2) with lseek(2) to transfer

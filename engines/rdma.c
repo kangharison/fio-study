@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] RDMA I/O 엔진 구현 (rdma.c)
+ *
+ * === 엔진 개요 ===
+ * InfiniBand verbs(libibverbs)와 RDMA/CM 라이브러리를 기반으로 한 RDMA I/O 엔진이다.
+ * RDMA 메모리 시맨틱(RDMA_WRITE/RDMA_READ)과 채널 시맨틱(SEND/RECV)을 모두 지원하며,
+ * InfiniBand, RoCE, iWARP 프로토콜을 통해 원격 메모리에 직접 접근하여 I/O를 수행한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libibverbs - InfiniBand verbs API (ibv_post_send, ibv_post_recv, ibv_poll_cq 등)
+ * librdmacm - RDMA 연결 관리 (rdma_create_id, rdma_connect, rdma_accept 등)
+ * poll() - 이벤트 채널 대기
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=rdma 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .post_init, .prep, .queue, .commit,
+ * .getevents, .event, .cleanup, .open_file, .close_file
+ */
+
+/*
  * RDMA I/O engine
  *
  * RDMA I/O engine based on the IB verbs and RDMA/CM user space libraries.

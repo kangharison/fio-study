@@ -4,6 +4,33 @@
  * IO engine that reads/writes from MTD character devices.
  *
  */
+
+/*
+ * [한국어 설명] mtd I/O 엔진 구현 (mtd.c)
+ *
+ * === 엔진 개요 ===
+ * MTD(Memory Technology Device) 캐릭터 디바이스(/dev/mtdN)를 통해 플래시 메모리
+ * (NOR, NAND 등)에 직접 읽기/쓰기/삭제(TRIM)를 수행하는 I/O 엔진이다.
+ * libmtd 라이브러리를 사용하여 erase block 단위로 I/O를 분할 처리하며,
+ * 불량 블록(bad block) 감지 및 마킹 기능을 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * mtd_read(), mtd_write(), mtd_erase() (libmtd 라이브러리)
+ * mtd_is_bad(), mtd_mark_bad() (불량 블록 관리)
+ * mtd_get_dev_info(), libmtd_open(), libmtd_close()
+ * ioctl() (mtd-user.h 통해 MTD 제어)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=mtd 옵션으로 선택
+ * filename=/dev/mtdN, skip_bad=1 옵션으로 불량 블록 건너뛰기 가능
+ *
+ * === 구현하는 주요 콜백 ===
+ * .queue (fio_mtd_queue) - erase block 단위로 분할하여 mtd_read/mtd_write/mtd_erase 수행
+ * .open_file (fio_mtd_open_file) - generic_open_file + MTD 장치 정보 조회
+ * .close_file (fio_mtd_close_file) - 리소스 해제 + generic_close_file
+ * .get_file_size (fio_mtd_get_file_size) - MTD 장치 크기 조회
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>

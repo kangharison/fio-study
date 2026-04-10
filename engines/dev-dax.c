@@ -18,6 +18,32 @@
  */
 
 /*
+ * [한국어 설명] dev-dax I/O 엔진 구현 (dev-dax.c)
+ *
+ * === 엔진 개요 ===
+ * Device DAX(/dev/daxN.N) 장치에 직접 접근하여 영속 메모리(PMEM)를 대상으로
+ * 읽기/쓰기를 수행하는 I/O 엔진이다. mmap()으로 DAX 장치를 메모리에 매핑한 후,
+ * 읽기는 memcpy(), 쓰기는 pmem_memcpy_persist()를 사용하여 데이터를 전송한다.
+ * O_DIRECT 플래그 없이 동작하며(DAX 자체가 직접 접근), 동기식으로 즉시 완료된다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * mmap(), munmap() (DAX 장치 메모리 매핑)
+ * memcpy() (읽기), pmem_memcpy_persist() (쓰기, libpmem 라이브러리)
+ * stat(), realpath(), fopen(), fscanf() (장치 크기 조회용)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=dev-dax 옵션으로 선택
+ * filename=/dev/daxN.N, direct=0 (필수), bs=2m (최소 정렬 권장)
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init (fio_devdax_init) - 블록 크기/페이지 정렬 검증
+ * .prep (fio_devdax_prep) - mmap 영역 관리 및 io_u->mmap_data 설정
+ * .queue (fio_devdax_queue) - memcpy/pmem_memcpy_persist로 동기 I/O 수행
+ * .open_file / .close_file - generic + fio_devdax_data 할당/해제
+ * .get_file_size (fio_devdax_get_file_size) - sysfs에서 DAX 장치 크기 조회
+ */
+
+/*
  * device dax engine
  * IO engine that access a DAX device directly for read and write data
  *

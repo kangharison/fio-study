@@ -1,4 +1,27 @@
 /*
+ * [한국어 설명] xNVMe I/O 엔진 구현 (xnvme.c)
+ *
+ * === 엔진 개요 ===
+ * xNVMe 라이브러리를 사용하여 NVMe 장치에 접근하는 I/O 엔진이다.
+ * io_uring, SPDK, Linux NVMe 드라이버 등 다양한 백엔드를 지원하며,
+ * NVMe 존 네임스페이스(ZNS)와 Flexible Data Placement(FDP) 기능도 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libxnvme - NVMe 장치 접근 (xnvme_dev_open, xnvme_queue_init, xnvme_nvm_read/write 등)
+ * libxnvme - 존 관리 (xnvme_znd_report_zones, xnvme_znd_mgmt_send 등)
+ * pthread_mutex - 초기화 직렬화
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=xnvme 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init, .cleanup, .queue, .getevents, .event, .open_file, .close_file,
+ * .get_file_size, .iomem_alloc, .iomem_free, .io_u_init, .io_u_free,
+ * .invalidate, .get_zoned_model, .report_zones, .reset_wp, .get_max_open_zones,
+ * .fdp_fetch_ruhs
+ */
+
+/*
  * fio xNVMe IO Engine
  *
  * IO engine using the xNVMe C API.

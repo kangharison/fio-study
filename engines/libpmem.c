@@ -16,6 +16,32 @@
  */
 
 /*
+ * [한국어 설명] libpmem I/O 엔진 구현 (libpmem.c)
+ *
+ * === 엔진 개요 ===
+ * PMDK(Persistent Memory Development Kit)의 libpmem 라이브러리를 사용하여
+ * DAX 파일시스템 위의 영속 메모리(NVDIMM)에 읽기/쓰기를 수행하는 I/O 엔진이다.
+ * pmem_map_file()로 파일을 매핑하고, 쓰기는 pmem_memcpy()로, 읽기는 memcpy()로 처리한다.
+ * sync=1 설정 시 매 쓰기마다 pmem_drain()으로 영속성을 보장하며,
+ * direct=1은 PMEM_F_MEM_NONTEMPORAL 플래그를 활성화한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * pmem_map_file(), pmem_unmap(), pmem_memcpy(), pmem_drain() (libpmem / PMDK >= 1.5)
+ * memcpy() (읽기용)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=libpmem 옵션으로 선택
+ * directory=/mnt/pmem0/ (DAX 마운트된 파일시스템), direct=1, sync=1, iodepth=1 권장
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init (fio_libpmem_init) - 블록 크기/페이지 정렬 검증
+ * .prep (fio_libpmem_prep) - io_u->mmap_data 오프셋 계산
+ * .queue (fio_libpmem_queue) - pmem_memcpy/memcpy로 동기 I/O 수행
+ * .open_file (fio_libpmem_open_file) - pmem_map_file()로 파일 매핑
+ * .close_file (fio_libpmem_close_file) - pmem_unmap()으로 매핑 해제
+ */
+
+/*
  * libpmem engine
  *
  * IO engine that uses libpmem (part of PMDK collection) to write data

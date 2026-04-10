@@ -2,6 +2,33 @@
  * Native Solaris async IO engine
  *
  */
+
+/*
+ * [한국어 설명] solarisaio I/O 엔진 구현 (solarisaio.c)
+ *
+ * === 엔진 개요 ===
+ * Solaris 운영체제의 네이티브 비동기 I/O 인터페이스(aioread/aiowrite/aiowait)를 사용하는
+ * I/O 엔진이다. POSIX AIO가 아닌 Solaris 고유의 <sys/asynch.h> API를 직접 사용하며,
+ * MAXASYNCHIO 상수로 최대 동시 I/O 깊이가 제한된다. 선택적으로 SIGIO 시그널 기반 완료
+ * 통지도 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * aioread(), aiowrite(), aiowait() (Solaris <sys/asynch.h>)
+ * fsync(), fdatasync()
+ * sigaction() (SIGIO 완료 모드 사용 시)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=solarisaio 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init (fio_solarisaio_init) - aio 이벤트 배열 할당 및 최대 깊이 설정
+ * .prep (fio_solarisaio_prep) - io_u에 aio 상태 초기화
+ * .queue (fio_solarisaio_queue) - aioread/aiowrite로 비동기 I/O 제출
+ * .getevents (fio_solarisaio_getevents) - aiowait()으로 완료 이벤트 수집
+ * .event (fio_solarisaio_event) - 완료된 io_u 반환
+ * .cleanup (fio_solarisaio_cleanup) - 리소스 해제
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

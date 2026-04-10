@@ -1,7 +1,28 @@
 /*
+ * [한국어 설명] falloc I/O 엔진 구현 (falloc.c)
+ *
+ * === 엔진 개요 ===
+ * fallocate() 시스템 호출을 사용하여 파일 공간을 사전 할당하는 엔진이다.
+ * 실제 데이터를 쓰지 않고 파일 시스템에 블록을 할당하므로 공간 할당 성능을 측정할 수 있다.
+ * READ는 FALLOC_FL_KEEP_SIZE, WRITE는 크기 확장 fallocate,
+ * TRIM은 FALLOC_FL_PUNCH_HOLE로 동작한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * fallocate(2), open(2), close(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=falloc 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .queue: fio_fallocate_queue (fallocate 호출 수행)
+ * - .open_file: open_file (O_CREAT|O_RDWR로 파일 열기, TRIM 지원)
+ * - .close_file / .get_file_size: generic 콜백 사용
+ */
+
+/*
  * falloc: ioengine for https://git.kernel.org/pub/scm/linux/kernel/git/axboe/fio
  *
- * IO engine that does regular fallocate to simulate data transfer 
+ * IO engine that does regular fallocate to simulate data transfer
  * as fio ioengine.
  * DDIR_READ  does fallocate(,mode = FALLOC_FL_KEEP_SIZE,)
  * DDIR_WRITE does fallocate(,mode = 0) : fallocate with size extension

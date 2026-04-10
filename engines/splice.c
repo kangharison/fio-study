@@ -1,4 +1,26 @@
 /*
+ * [한국어 설명] splice I/O 엔진 구현 (splice.c)
+ *
+ * === 엔진 개요 ===
+ * splice()와 vmsplice() 시스템 호출을 사용하여 파일과 파이프 사이에서
+ * 제로 카피(zero-copy) 데이터 전송을 수행하는 엔진이다.
+ * 커널 버퍼를 중간 매개체로 활용하여 사용자 공간 복사를 최소화한다.
+ * vmsplice를 통한 사용자 공간 직접 전송도 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * splice(2), vmsplice(2), pipe(2), munmap(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=splice 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .init: fio_spliceio_init (파이프 생성, vmsplice 지원 여부 확인)
+ * - .queue: fio_spliceio_queue (splice/vmsplice로 데이터 전송)
+ * - .cleanup: fio_spliceio_cleanup (파이프 닫기)
+ * - .open_file / .close_file / .get_file_size: generic 콜백 사용
+ */
+
+/*
  * splice engine
  *
  * IO engine that transfers data by doing splices to/from pipes and

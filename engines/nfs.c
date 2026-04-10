@@ -1,3 +1,24 @@
+/*
+ * [한국어 설명] NFS I/O 엔진 구현 (nfs.c)
+ *
+ * === 엔진 개요 ===
+ * libnfs 라이브러리를 사용하여 커널 NFS 마운트를 거치지 않고 NFS 프로토콜에
+ * 직접 접근하는 I/O 엔진이다. 비동기 NFS 읽기/쓰기 작업을 지원하며,
+ * stat/mkdir/rmdir, stat/touch/rm 등의 메타데이터 작업 벤치마크도 가능하다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libnfs - NFS 클라이언트 (nfs_init_context, nfs_mount, nfs_open, nfs_pread_async,
+ *          nfs_pwrite_async, nfs_stat64_async 등)
+ * poll() - NFS 소켓 이벤트 대기
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=nfs 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .queue, .getevents, .event, .cleanup,
+ * .open_file, .close_file
+ */
+
 #include <stdlib.h>
 #include <poll.h>
 #include <nfsc/libnfs.h>

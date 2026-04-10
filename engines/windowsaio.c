@@ -4,6 +4,34 @@
  * IO engine using Windows IO Completion Ports.
  */
 
+/*
+ * [한국어 설명] windowsaio I/O 엔진 구현 (windowsaio.c)
+ *
+ * === 엔진 개요 ===
+ * Windows 운영체제의 I/O Completion Ports(IOCP)를 사용하는 비동기 I/O 엔진이다.
+ * OVERLAPPED 구조체를 통해 비동기 ReadFile/WriteFile을 수행하고, IOCP로 완료를 통지받는다.
+ * 별도의 완료 스레드(IoCompletionRoutine)를 사용하거나, 직접 GetQueuedCompletionStatusEx로
+ * 완료 이벤트를 수집하는 두 가지 모드를 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * CreateIoCompletionPort(), GetQueuedCompletionStatus(), GetQueuedCompletionStatusEx(),
+ * ReadFile(), WriteFile(), FlushFileBuffers(), CreateFile(), CreateThread(),
+ * WaitForSingleObject(), SetEvent(), CreateEvent()
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=windowsaio 옵션으로 선택
+ * no_completion_thread 옵션으로 별도 완료 스레드 비활성화 가능
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init (fio_windowsaio_init) - IOCP 생성 및 완료 스레드 시작
+ * .queue (fio_windowsaio_queue) - ReadFile/WriteFile로 비동기 I/O 제출
+ * .getevents (fio_windowsaio_getevents) - IOCP에서 완료 이벤트 수집
+ * .event (fio_windowsaio_event) - 완료된 io_u 반환
+ * .cleanup (fio_windowsaio_cleanup) - 리소스 정리
+ * .open_file / .close_file - CreateFile/CloseHandle 기반 파일 열기/닫기
+ * .io_u_init / .io_u_free - OVERLAPPED 구조체 할당/해제
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

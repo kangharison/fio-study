@@ -1,4 +1,31 @@
 /*
+ * [한국어 설명] fileoperations I/O 엔진 구현 (fileoperations.c)
+ *
+ * === 엔진 개요 ===
+ * 실제 데이터 I/O 없이 파일/디렉터리 메타데이터 작업의 지연 시간을 측정하는 엔진이다.
+ * 파일 생성(filecreate), 상태 조회(filestat), 삭제(filedelete)와
+ * 디렉터리 생성(dircreate), 상태 조회(dirstat), 삭제(dirdelete) 6가지 엔진을 제공한다.
+ * stat, lstat, statx 등 다양한 상태 조회 시스템 호출을 선택할 수 있다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * open(2), close(2), unlink(2), stat(2), lstat(2), statx(2),
+ * mkdir(2), rmdir(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=filecreate / filestat / filedelete /
+ *   dircreate / dirstat / dirdelete 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .init / .cleanup: init / cleanup (fc_data 구조체 관리)
+ * - .queue: queue_io (작업 유형에 따라 적절한 동작 수행)
+ * - .open_file: open_file / stat_file / delete_file (엔진별 다른 동작)
+ * - .close_file: generic_close_file
+ * - .get_file_size: get_file_size / generic_get_file_size
+ * - .setup: setup_dirs (디렉터리 엔진용 설정)
+ * - .unlink_file: remove_dir (디렉터리 엔진용 정리)
+ */
+
+/*
  * file/directory operations engine
  *
  * IO engine that doesn't do any IO, just operates files/directories

@@ -1,4 +1,23 @@
 /*
+ * [한국어 설명] ftruncate I/O 엔진 구현 (ftruncate.c)
+ *
+ * === 엔진 개요 ===
+ * ftruncate() 시스템 호출을 사용하여 파일 크기 변경(truncation) 성능을 측정하는 엔진이다.
+ * WRITE 방향에서만 ftruncate를 수행하며, 실제 데이터 전송 없이 파일 크기를 변경한다.
+ * 가장 간단한 엔진 중 하나로, queue 콜백만 구현한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * ftruncate(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=ftruncate 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .queue: fio_ftruncate_queue (ftruncate 호출)
+ * - .open_file / .close_file / .get_file_size: generic 콜백 사용
+ */
+
+/*
  * ftruncate: ioengine for https://git.kernel.org/pub/scm/linux/kernel/git/axboe/fio
  *
  * IO engine that does regular truncates to simulate data transfer

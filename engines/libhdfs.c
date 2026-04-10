@@ -1,4 +1,24 @@
 /*
+ * [한국어 설명] HDFS I/O 엔진 구현 (libhdfs.c)
+ *
+ * === 엔진 개요 ===
+ * libhdfs 라이브러리를 사용하여 Hadoop Distributed File System(HDFS)에 I/O를 수행하는
+ * 엔진이다. HDFS는 파일 생성 후 수정을 지원하지 않으므로, 작은 크기의 파일을 여러 개
+ * 생성하고 fio 오프셋에 따라 파일을 선택하는 방식으로 랜덤 읽기/쓰기를 구현한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libhdfs - HDFS 접근 (hdfsConnect, hdfsOpenFile, hdfsRead, hdfsWrite, hdfsCloseFile 등)
+ * libhdfs - 파일 관리 (hdfsCreateDirectory, hdfsListDirectory, hdfsDelete 등)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=libhdfs 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .prep, .queue, .open_file, .close_file,
+ * .io_u_init, .io_u_free
+ */
+
+/*
  * libhdfs engine
  *
  * this engine helps perform read/write operations on hdfs cluster using

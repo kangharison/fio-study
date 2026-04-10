@@ -4,6 +4,35 @@
  * IO engine using Glusterfs's gfapi async interface
  *
  */
+
+/*
+ * [한국어 설명] GlusterFS 비동기 I/O 엔진 구현 (glusterfs_async.c)
+ *
+ * === 엔진 개요 ===
+ * GlusterFS의 gfapi 비동기 인터페이스를 사용하는 I/O 엔진이다.
+ * glfs_pread_async()/glfs_pwrite_async()로 비동기 I/O를 제출하고,
+ * 콜백 함수(gf_async_cb)를 통해 완료를 통지받는다. 아직 실험적(experimental) 상태로
+ * 표시되어 있으며, 스레드 모드(use_thread=1)로 강제 설정된다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * glfs_pread_async(), glfs_pwrite_async() (비동기 읽기/쓰기)
+ * glfs_fsync_async(), glfs_fdatasync_async() (비동기 동기화)
+ * glfs_discard_async() (비동기 TRIM, CONFIG_GF_TRIM 정의 시)
+ * (공통 함수는 glusterfs.c의 gfapi 호출 사용)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=gfapi_async 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init (fio_gf_async_setup) - GlusterFS 연결 + aio 이벤트 배열 할당
+ * .cleanup (fio_gf_cleanup) - 리소스 정리 (glusterfs.c 공통)
+ * .queue (fio_gf_async_queue) - glfs_pread_async/pwrite_async로 비동기 I/O 제출
+ * .getevents (fio_gf_getevents) - 콜백으로 완료된 이벤트 수집
+ * .event (fio_gf_event) - 완료된 io_u 반환
+ * .io_u_init / .io_u_free - fio_gf_iou 구조체 할당/해제
+ * .open_file / .close_file / .unlink_file / .get_file_size (glusterfs.c 공통)
+ */
+
 #include "gfapi.h"
 #define NOT_YET 1
 struct fio_gf_iou {

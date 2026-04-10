@@ -5,6 +5,31 @@
  *
  */
 
+/*
+ * [한국어 설명] GlusterFS 동기 I/O 엔진 구현 (glusterfs_sync.c)
+ *
+ * === 엔진 개요 ===
+ * GlusterFS의 gfapi 동기 인터페이스를 사용하는 I/O 엔진이다.
+ * glfs_read()/glfs_write()로 동기 I/O를 수행하며, glfs_fsync()/glfs_fdatasync()로
+ * 동기화를 처리한다. 공통 초기화/파일 관리 코드는 glusterfs.c에서 가져온다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * glfs_read(), glfs_write() (동기 읽기/쓰기)
+ * glfs_fsync(), glfs_fdatasync() (동기화)
+ * glfs_lseek() (파일 오프셋 이동)
+ * (공통 함수는 glusterfs.c의 gfapi 호출 사용)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=gfapi 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init (fio_gf_setup) - GlusterFS 연결 초기화 (glusterfs.c 공통)
+ * .cleanup (fio_gf_cleanup) - 리소스 정리 (glusterfs.c 공통)
+ * .prep (fio_gf_prep) - glfs_lseek으로 오프셋 설정
+ * .queue (fio_gf_queue) - glfs_read/glfs_write로 동기 I/O 수행
+ * .open_file / .close_file / .unlink_file / .get_file_size (glusterfs.c 공통)
+ */
+
 #include "gfapi.h"
 
 #define LAST_POS(f)	((f)->engine_pos)

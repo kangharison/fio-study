@@ -1,4 +1,24 @@
 /*
+ * [한국어 설명] HTTP/HTTPS I/O 엔진 구현 (http.c)
+ *
+ * === 엔진 개요 ===
+ * libcurl을 사용하여 HTTP(S) GET/PUT 요청으로 I/O를 수행하는 엔진이다.
+ * S3 호환 오브젝트 스토리지, WebDAV, OpenStack Swift 프로토콜을 지원하며,
+ * AWS Signature V4 인증, HTTPS, MD5 체크섬 등의 기능을 포함한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libcurl - HTTP 요청 수행 (curl_easy_init, curl_easy_perform, curl_easy_setopt 등)
+ * OpenSSL - HMAC-SHA256 서명, SHA256 해시, MD5 체크섬 (S3 인증용)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=http 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .queue, .getevents, .event, .cleanup,
+ * .open_file, .invalidate
+ */
+
+/*
  * HTTP GET/PUT IO engine
  *
  * IO engine to perform HTTP(S) GET/PUT requests via libcurl-easy.

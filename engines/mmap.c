@@ -1,4 +1,26 @@
 /*
+ * [한국어 설명] mmap I/O 엔진 구현 (mmap.c)
+ *
+ * === 엔진 개요 ===
+ * 메모리 맵 I/O 엔진으로, 파일을 mmap()으로 메모리에 매핑한 후 memcpy()를 통해
+ * 읽기/쓰기를 수행한다. 32비트 아키텍처에서는 총 1GiB의 매핑 크기 제한이 있으며,
+ * Transparent Huge Pages(THP) 옵션도 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * mmap(2), munmap(2), msync(2), madvise(2), memcpy(3)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=mmap 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .init: fio_mmapio_init (매핑 크기 초기화)
+ * - .prep: fio_mmapio_prep (필요 시 mmap 영역 재매핑)
+ * - .queue: fio_mmapio_queue (memcpy로 데이터 전송, msync로 동기화)
+ * - .open_file / .close_file: fio_mmapio_open_file / fio_mmapio_close_file
+ * - .get_file_size: generic_get_file_size
+ */
+
+/*
  * mmap engine
  *
  * IO engine that reads/writes from files by doing memcpy to/from

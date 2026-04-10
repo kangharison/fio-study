@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] e4defrag I/O 엔진 구현 (e4defrag.c)
+ *
+ * === 엔진 개요 ===
+ * ext4 파일 시스템의 조각 모음(defragmentation)을 시뮬레이션하는 엔진이다.
+ * EXT4_IOC_MOVE_EXT ioctl을 사용하여 파일의 블록을 도너(donor) 파일로부터
+ * 이동시킨다. ext4 조각 모음 도구의 성능을 벤치마크하는 데 사용된다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * ioctl(2) - EXT4_IOC_MOVE_EXT, open(2), close(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=e4defrag 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .init: fio_e4defrag_init (도너 파일 열기, 블록 크기 확인)
+ * - .queue: fio_e4defrag_queue (EXT4_IOC_MOVE_EXT ioctl 수행)
+ * - .cleanup: fio_e4defrag_cleanup (도너 파일 닫기)
+ * - .open_file / .close_file / .get_file_size: generic 콜백 사용
+ */
+
+/*
  * ioe_e4defrag:  ioengine for https://git.kernel.org/pub/scm/linux/kernel/git/axboe/fio
  *
  * IO engine that does regular EXT4_IOC_MOVE_EXT ioctls to simulate

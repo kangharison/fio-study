@@ -1,4 +1,26 @@
 /*
+ * [한국어 설명] null I/O 엔진 구현 (null.c)
+ *
+ * === 엔진 개요 ===
+ * 실제 I/O를 수행하지 않는 가상 엔진으로, I/O를 수행하는 척만 한다.
+ * fio 자체의 오버헤드를 측정하거나 fio 프레임워크를 테스트하는 데 사용된다.
+ * 외부 C++ 엔진(FIO_EXTERNAL_ENGINE)으로도 컴파일하여 사용할 수 있다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * 실제 시스템 호출 없음 (큐잉만 시뮬레이션)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=null 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .queue: fio_null_queue (io_u를 큐에 추가만 함)
+ * - .commit: fio_null_commit (큐잉된 I/O를 완료 처리)
+ * - .getevents / .event: fio_null_getevents / fio_null_event
+ * - .init / .cleanup: fio_null_init / fio_null_cleanup
+ * - .open_file: fio_null_open (실제 파일 열기 없음)
+ */
+
+/*
  * null engine
  *
  * IO engine that doesn't do any real IO transfers, it just pretends to.

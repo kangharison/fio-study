@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] libblkio I/O 엔진 구현 (libblkio.c)
+ *
+ * === 엔진 개요 ===
+ * libblkio 라이브러리를 사용하여 다양한 고성능 블록 I/O 인터페이스에 접근하는 엔진이다.
+ * io_uring, vfio-user, virtio-blk-vhost-user, virtio-blk-vhost-vdpa 등
+ * 여러 백엔드를 통합적으로 지원하며, 메모리 영역 관리와 이벤트 기반 완료 통지를 제공한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libblkio - 블록 I/O 추상화 (blkio_create, blkioq_do_io, blkioq_get_completions 등)
+ * eventfd - 완료 이벤트 통지 (FIO_BLKIO_WAIT_MODE_EVENTFD 모드)
+ * pthread_mutex - 프로세스 수준 상태 동기화
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=libblkio 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .post_init, .cleanup, .iomem_alloc, .iomem_free,
+ * .open_file, .queue, .getevents, .event
+ */
+
+/*
  * libblkio engine
  *
  * IO engine using libblkio to access various block I/O interfaces:

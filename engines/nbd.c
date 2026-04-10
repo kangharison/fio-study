@@ -1,4 +1,24 @@
 /*
+ * [한국어 설명] NBD (Network Block Device) I/O 엔진 구현 (nbd.c)
+ *
+ * === 엔진 개요 ===
+ * libnbd 라이브러리를 사용하여 NBD 서버와 통신하는 I/O 엔진이다.
+ * NBD URI를 통해 원격 블록 디바이스에 연결하며, 비동기 읽기/쓰기/trim/flush
+ * 작업을 지원한다. 완료 콜백 방식으로 I/O 완료를 처리한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libnbd - NBD 클라이언트 (nbd_create, nbd_connect_uri, nbd_aio_pread,
+ *          nbd_aio_pwrite, nbd_aio_trim, nbd_aio_flush, nbd_poll 등)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=nbd 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .cleanup, .queue, .getevents, .event,
+ * .io_u_init, .io_u_free, .open_file, .invalidate
+ */
+
+/*
  * NBD engine
  *
  * IO engine that talks to an NBD server.

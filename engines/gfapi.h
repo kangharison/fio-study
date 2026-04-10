@@ -1,3 +1,15 @@
+/*
+ * [한국어 설명] GlusterFS API (gfapi) 공통 헤더 (gfapi.h)
+ *
+ * === 개요 ===
+ * GlusterFS 분산 파일 시스템의 gfapi 기반 I/O 엔진들이 공유하는 헤더 파일이다.
+ * GlusterFS 볼륨/브릭 설정 옵션(gf_options)과 연결 상태 데이터(gf_data)를 정의하며,
+ * setup, cleanup, open, close 등 공통 콜백 함수를 선언한다.
+ *
+ * === 사용하는 라이브러리 ===
+ * libgfapi (glusterfs/api/glfs.h)
+ */
+
 #include <glusterfs/api/glfs.h>
 #include "../fio.h"
 

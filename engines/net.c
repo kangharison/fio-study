@@ -1,4 +1,31 @@
 /*
+ * [한국어 설명] net I/O 엔진 구현 (net.c)
+ *
+ * === 엔진 개요 ===
+ * 네트워크 소켓을 통해 I/O를 수행하는 엔진으로, TCP, UDP, Unix 도메인 소켓,
+ * VSOCK 프로토콜을 지원한다. 클라이언트(송신)와 서버(수신) 모드를 모두 지원하며,
+ * splice를 활용한 제로 카피 전송(netsplice)도 가능하다.
+ * IPv4/IPv6 모두 지원하며, UDP 시퀀스 번호를 통한 패킷 순서 검증도 수행한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * socket(2), connect(2), bind(2), listen(2), accept(2),
+ * send(2)/recv(2), sendto(2)/recvfrom(2), sendmsg(2)/recvmsg(2),
+ * splice(2), poll(2), setsockopt(2)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=net 또는 --ioengine=netsplice 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .prep: fio_netio_prep (전송 크기 설정)
+ * - .queue: fio_netio_queue (소켓 읽기/쓰기)
+ * - .setup: fio_netio_setup / fio_netio_setup_splice
+ * - .init: fio_netio_init (소켓 생성 및 연결)
+ * - .cleanup: fio_netio_cleanup
+ * - .open_file / .close_file: fio_netio_open_file / fio_netio_close_file
+ * - .terminate: fio_netio_terminate (연결 종료)
+ */
+
+/*
  * net engine
  *
  * IO engine that reads/writes to/from sockets.

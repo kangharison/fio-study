@@ -6,6 +6,36 @@
  * libzbc engine
  * IO engine using libzbc library to talk to SMR disks.
  */
+
+/*
+ * [한국어 설명] libzbc I/O 엔진 구현 (libzbc.c)
+ *
+ * === 엔진 개요 ===
+ * libzbc 라이브러리를 사용하여 SMR(Shingled Magnetic Recording) 및 ZNS(Zoned Namespace)
+ * 드라이브와 같은 Zoned Block Device에 직접 접근하는 I/O 엔진이다.
+ * SCSI/ATA 패스스루 방식으로 zbc_pread/zbc_pwrite를 수행하며, 존(zone) 관리 기능
+ * (리포트, 리셋, 피니시 등)을 fio의 ZBD 프레임워크에 통합한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * zbc_open(), zbc_close(), zbc_pread(), zbc_pwrite(), zbc_flush() (libzbc)
+ * zbc_report_zones(), zbc_reset_zone(), zbc_finish_zone() (존 관리)
+ * zbc_get_device_info() (장치 정보 조회)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=libzbc 옵션으로 선택
+ * 블록 또는 캐릭터 디바이스 파일을 대상으로 사용
+ *
+ * === 구현하는 주요 콜백 ===
+ * .queue (libzbc_queue) - zbc_pread/zbc_pwrite/zbc_flush로 동기 I/O 수행
+ * .open_file / .close_file - zbc_open/zbc_close로 장치 열기/닫기
+ * .cleanup (libzbc_cleanup) - 장치 리소스 정리
+ * .get_file_size (libzbc_get_file_size) - 장치 섹터 수로 크기 계산
+ * .get_zoned_model - Host Aware/Managed 모델 보고
+ * .report_zones - 존 정보 조회
+ * .reset_wp / .finish_zone - 존 쓰기 포인터 리셋/피니시
+ * .get_max_open_zones - 최대 동시 오픈 존 수 조회
+ */
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>

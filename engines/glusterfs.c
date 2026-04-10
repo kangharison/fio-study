@@ -5,6 +5,36 @@
  *
  */
 
+/*
+ * [한국어 설명] GlusterFS 공통 코드 (glusterfs.c)
+ *
+ * === 엔진 개요 ===
+ * GlusterFS 분산 파일시스템에 접근하기 위한 gfapi(GlusterFS API) 공통 코드를 구현한다.
+ * 이 파일 자체는 독립적인 I/O 엔진이 아니라, glusterfs_sync.c(gfapi)와
+ * glusterfs_async.c(gfapi_async) 엔진이 공유하는 초기화, 파일 열기/닫기, 정리 함수를
+ * 제공한다. single-instance 모드에서는 동일 볼륨/브릭에 대한 glfs 인스턴스를 재사용한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * glfs_new(), glfs_init(), glfs_fini() (GlusterFS 초기화/종료)
+ * glfs_set_volfile_server(), glfs_set_logging() (연결 설정)
+ * glfs_creat(), glfs_close(), glfs_lstat() (파일 관리)
+ * glfs_write(), glfs_read(), glfs_lseek() (I/O 연산)
+ * glfs_ftruncate(), glfs_fsync(), glfs_unlink() (파일 조작)
+ * glfs_fadvise() (I/O 힌트, GFAPI_USE_FADVISE 정의 시)
+ * pthread_mutex (single-instance 모드의 동시성 제어)
+ *
+ * === fio에서의 사용법 ===
+ * 이 파일은 직접 사용되지 않으며, gfapi 또는 gfapi_async 엔진에서 내부적으로 사용
+ * 옵션: volume=<볼륨명>, brick=<브릭주소>, single-instance=<0|1>
+ *
+ * === 제공하는 주요 함수 ===
+ * fio_gf_setup() - GlusterFS 연결 초기화
+ * fio_gf_cleanup() - 리소스 정리 및 연결 해제
+ * fio_gf_open_file() / fio_gf_close_file() - glfs_creat/glfs_close 기반 파일 열기/닫기
+ * fio_gf_get_file_size() - glfs_lstat으로 파일 크기 조회
+ * fio_gf_unlink_file() - 파일 삭제
+ */
+
 #include "gfapi.h"
 #include "../optgroup.h"
 

@@ -1,4 +1,27 @@
 /*
+ * [한국어 설명] exec I/O 엔진 구현 (exec.c)
+ *
+ * === 엔진 개요 ===
+ * 직접 I/O를 수행하지 않고 외부 프로그램을 실행하는 엔진이다.
+ * program 옵션으로 실행할 프로그램을, arguments 옵션으로 인수를 지정하며,
+ * grace_time 이후 SIGKILL로 프로세스를 종료한다.
+ * 표준 출력/에러를 파일로 리다이렉트하는 옵션도 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * fork(2)/exec(3) (popen(3) 사용), kill(2), waitpid(2),
+ * signal(2) - SIGTERM/SIGKILL
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=exec 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .queue: fio_exec_queue (외부 프로그램 실행 및 완료 대기)
+ * - .init: fio_exec_init (program 옵션 검증)
+ * - .cleanup: fio_exec_cleanup (실행 중인 프로세스 종료)
+ * - .open_file: fio_exec_open (파일을 실제로 열지 않음)
+ */
+
+/*
  * Exec engine
  *
  * Doesn't transfer any data, merely run 3rd party tools

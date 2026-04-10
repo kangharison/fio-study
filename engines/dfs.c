@@ -1,3 +1,25 @@
+/*
+ * [한국어 설명] DAOS File System (DFS) I/O 엔진 구현 (dfs.c)
+ *
+ * === 엔진 개요 ===
+ * DAOS 분산 스토리지 시스템의 DFS(DAOS File System) 인터페이스를 사용하는 I/O 엔진이다.
+ * DAOS 풀과 컨테이너에 연결하여 파일 수준의 비동기 읽기/쓰기 작업을 수행하며,
+ * 오브젝트 클래스와 청크 크기 등 DAOS 특유의 설정 옵션을 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libdaos - DAOS 클러스터 연결 (daos_init, daos_pool_connect, daos_cont_open)
+ * libdfs - 파일 시스템 작업 (dfs_mount, dfs_open, dfs_read, dfs_write 등)
+ * DAOS 이벤트 큐 - 비동기 I/O (daos_eq_create, daos_eq_poll)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=dfs 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .prep, .cleanup, .open_file, .close_file,
+ * .unlink_file, .invalidate, .get_file_size,
+ * .queue, .getevents, .event, .io_u_init, .io_u_free
+ */
+
 /**
  * FIO engine for DAOS File System (dfs).
  *

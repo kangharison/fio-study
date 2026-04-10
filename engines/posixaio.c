@@ -1,4 +1,29 @@
 /*
+ * [한국어 설명] posixaio I/O 엔진 구현 (posixaio.c)
+ *
+ * === 엔진 개요 ===
+ * POSIX 표준 비동기 I/O(AIO) 인터페이스를 사용하는 엔진이다.
+ * aio_read()/aio_write()로 비동기 I/O를 제출하고, aio_error()/aio_return()으로
+ * 완료 상태를 확인한다. 리눅스 네이티브 AIO(libaio)와 달리 이식성이 높다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * aio_read(3), aio_write(3), aio_error(3), aio_return(3),
+ * aio_suspend(3) (POSIX AIO 라이브러리 - librt)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=posixaio 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * - .init: fio_posixaio_init (이벤트 배열 할당)
+ * - .prep: fio_posixaio_prep (aiocb 구조체 설정)
+ * - .queue: fio_posixaio_queue (aio_read/aio_write 호출)
+ * - .getevents: fio_posixaio_getevents (aio_suspend로 완료 대기)
+ * - .event: fio_posixaio_event (완료된 io_u 반환)
+ * - .cleanup: fio_posixaio_cleanup
+ * - .open_file / .close_file / .get_file_size: generic 콜백 사용
+ */
+
+/*
  * posixaio engine
  *
  * IO engine that uses the posix defined aio interface.

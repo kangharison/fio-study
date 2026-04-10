@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] NVIDIA GPUDirect Storage (cuFile) I/O 엔진 구현 (libcufile.c)
+ *
+ * === 엔진 개요 ===
+ * NVIDIA cuFile API를 사용하여 GPU 메모리와 스토리지 간 직접 데이터 전송을 수행하는
+ * I/O 엔진이다. GPUDirect Storage 기술을 통해 CPU를 거치지 않고 GPU 메모리에
+ * 직접 I/O하며, cuFile I/O와 POSIX I/O 모드를 모두 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * cuFile API - GPU 직접 I/O (cuFileDriverOpen, cuFileHandleRegister, cuFileRead, cuFileWrite)
+ * CUDA Runtime - GPU 메모리 관리 (cudaMalloc, cudaMemcpy, cudaSetDevice)
+ * POSIX I/O - 대체 I/O 경로 (pread, pwrite)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=libcufile 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .init, .queue, .get_file_size, .open_file, .close_file,
+ * .iomem_alloc, .iomem_free, .cleanup
+ */
+
+/*
  * Copyright (c)2020 System Fabric Works, Inc. All Rights Reserved.
  * mailto:info@systemfabricworks.com
  *

@@ -7,6 +7,35 @@
  * (also requires -D_GNU_SOURCE -DCONFIG_STRSEP on Linux)
  *
  */
+
+/*
+ * [한국어 설명] 외부 I/O 엔진 스켈레톤/템플릿 (skeleton_external.c)
+ *
+ * === 엔진 개요 ===
+ * 실제 I/O를 수행하지 않는 템플릿 파일로, 외부(external) fio I/O 엔진을 작성할 때
+ * 참고하는 골격 코드이다. 공유 라이브러리(.so)로 컴파일되어 dlsym()을 통해 fio에
+ * 로드되며, register_ioengine()/unregister_ioengine() 대신 dlsym으로 ioengine 심볼을
+ * 직접 가져오는 방식으로 동작한다. 각 콜백 함수에 상세한 영문 주석이 포함되어 있다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * 없음 (템플릿이므로 실제 I/O 수행 없음)
+ * generic_open_file(), generic_close_file() (기본 파일 열기/닫기)
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=external:/path/to/skeleton_external.o 형태로 외부 엔진 로드
+ * 실제 엔진 개발 시 이 파일을 복사하여 콜백 함수를 구현
+ *
+ * === 구현하는 주요 콜백 (템플릿) ===
+ * .init (fio_skeleton_init) - 엔진 초기화 (비어 있음)
+ * .prep (fio_skeleton_prep) - I/O 준비 (비어 있음)
+ * .queue (fio_skeleton_queue) - I/O 제출 (FIO_Q_COMPLETED만 반환)
+ * .getevents (fio_skeleton_getevents) - 이벤트 수집 (비어 있음)
+ * .event (fio_skeleton_event) - 이벤트 반환 (NULL 반환)
+ * .cleanup (fio_skeleton_cleanup) - 정리 (비어 있음)
+ * .open_file / .close_file - generic 함수 사용
+ * .get_zoned_model / .report_zones / .reset_wp / .get_max_open_zones - ZBD 콜백 템플릿
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>

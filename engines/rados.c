@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] Ceph RADOS 오브젝트 스토어 I/O 엔진 구현 (rados.c)
+ *
+ * === 엔진 개요 ===
+ * Ceph의 librados 라이브러리를 사용하여 RADOS 오브젝트 저장소에 직접 오브젝트 수준의
+ * I/O를 수행하는 엔진이다. RBD와 달리 블록 디바이스가 아닌 오브젝트 단위로 접근하며,
+ * Ceph OSD의 저수준 성능을 측정하는 데 적합하다. 비동기 I/O 작업을 지원한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * librados - RADOS 오브젝트 접근 (rados_aio_write, rados_aio_read, rados_aio_remove 등)
+ * librados - 클러스터 연결 (rados_create, rados_connect, rados_ioctx_create)
+ * pthread mutex/cond - 완료된 I/O 동기화
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=rados 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .queue, .getevents, .event, .cleanup,
+ * .open_file, .invalidate, .io_u_init, .io_u_free
+ */
+
+/*
  *  Ceph Rados engine
  *
  * IO engine using Ceph's RADOS interface to test low-level performance of

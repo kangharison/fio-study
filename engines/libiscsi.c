@@ -1,4 +1,25 @@
 /*
+ * [한국어 설명] iSCSI I/O 엔진 구현 (libiscsi.c)
+ *
+ * === 엔진 개요 ===
+ * libiscsi 라이브러리를 사용하여 iSCSI 타겟에 직접 접근하는 I/O 엔진이다.
+ * 커널 iSCSI initiator 없이 사용자 공간에서 iSCSI 프로토콜을 구현하며,
+ * SCSI READ/WRITE 명령을 통해 원격 iSCSI LUN에 I/O를 수행한다.
+ *
+ * === 사용하는 시스템 호출/라이브러리 ===
+ * libiscsi - iSCSI 접근 (iscsi_create_context, iscsi_full_connect_sync,
+ *            iscsi_pread16_iov_task, iscsi_pwrite16_iov_task 등)
+ * poll() - iSCSI 소켓 이벤트 대기
+ *
+ * === fio에서의 사용법 ===
+ * --ioengine=libiscsi 옵션으로 선택
+ *
+ * === 구현하는 주요 콜백 ===
+ * .setup, .init, .prep, .queue, .getevents, .event,
+ * .cleanup, .open_file, .close_file
+ */
+
+/*
  * libiscsi engine
  *
  * this engine read/write iscsi lun with libiscsi.
