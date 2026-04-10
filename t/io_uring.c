@@ -1,3 +1,15 @@
+/*
+ * [한국어 설명] 독립형 io_uring 테스트/벤치마크 도구 (io_uring.c)
+ *
+ * === 파일의 역할 ===
+ * fio와 독립적으로 io_uring의 성능을 테스트하는 벤치마크 프로그램이다.
+ * 폴링(polled) 및 비폴링(non-polled) 모드, 고정 버퍼(fixed buffers),
+ * 등록된 파일(registered files) 등 다양한 io_uring 옵션을 지원한다.
+ *
+ * === 사용법 ===
+ * 컴파일 후 직접 실행하며, 커맨드라인 옵션으로 블록 크기, 큐 깊이,
+ * 폴링 모드 등을 지정하여 io_uring I/O 성능을 측정한다.
+ */
 #include <stdio.h>
 #include <errno.h>
 #include <assert.h>

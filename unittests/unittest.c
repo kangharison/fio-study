@@ -1,4 +1,12 @@
 /*
+ * [한국어 설명] 단위 테스트 프레임워크 실행기 (unittest.c)
+ *
+ * === 파일의 역할 ===
+ * CU(Check Unit) 테스트 스위트를 탐색하고 실행하는 단위 테스트 프레임워크의 메인 러너이다.
+ * 등록된 모든 테스트 스위트를 수집하여 순차적으로 실행하고, 테스트 결과를 보고한다.
+ * fio 프로젝트의 라이브러리 함수들에 대한 자동화된 테스트 실행을 담당한다.
+ */
+/*
  * fio unittest
  * Copyright (C) 2018 Tomohiro Kusumi <kusumi.tomohiro@osnexus.com>
  */

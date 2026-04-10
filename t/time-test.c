@@ -1,4 +1,16 @@
 /*
+ * [한국어 설명] 클럭/타이머 테스트 유틸리티 (time-test.c)
+ *
+ * === 파일의 역할 ===
+ * 다양한 클럭 소스(gettimeofday, clock_gettime, CPU RDTSC)의 정확도와
+ * 오버헤드를 테스트하는 유틸리티이다. CPU 클럭 틱을 나노초로 변환하는
+ * 과정의 산술 연산과 보정(calibration)을 검증한다.
+ *
+ * === 사용법 ===
+ * 컴파일 후 직접 실행하면 각 클럭 소스의 변환 정확도와
+ * 타이밍 오버헤드 결과를 출력한다.
+ */
+/*
  * Carry out arithmetic to explore conversion of CPU clock ticks to nsec
  *
  * When we use the CPU clock for timing, we do the following:

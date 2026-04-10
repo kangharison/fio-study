@@ -1,4 +1,16 @@
 /*
+ * [한국어 설명] Zipf/Pareto/Gauss 분포 생성 및 시각화 도구 (genzipf.c)
+ *
+ * === 파일의 역할 ===
+ * Zipf, Pareto, 정규(Gauss) 분포 데이터를 생성하고 분석하는 도구이다.
+ * 지정된 분포 유형과 매개변수로 랜덤 값을 생성한 뒤 버킷별 히트 수를
+ * 출력하여 I/O 접근 패턴의 분포 특성을 시각적으로 확인할 수 있다.
+ *
+ * === 사용법 ===
+ * -t 옵션으로 분포 유형(zipf/pareto/gauss), -i로 분포 매개변수를 지정한다.
+ * 예: ./fio-genzipf -t zipf -i 1.2 -g 1 -b 4096 -o 20
+ */
+/*
  * Generate/analyze pareto/zipf distributions to better understand
  * what an access pattern would look like.
  *

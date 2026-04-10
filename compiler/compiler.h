@@ -1,3 +1,11 @@
+/*
+ * [한국어 설명] 컴파일러 추상화 매크로 헤더 (compiler.h)
+ *
+ * === 파일의 역할 ===
+ * GCC/Clang 컴파일러의 내장 함수와 속성을 추상화하는 매크로를 정의한다.
+ * __builtin_expect를 감싼 fio_likely/fio_unlikely, __attribute__ 기반의 unused, packed, weak, format 헬퍼, 그리고 static_assert를 제공한다.
+ * 다양한 컴파일러 환경에서 fio가 이식 가능하도록 컴파일러별 차이를 숨기는 역할을 한다.
+ */
 #ifndef FIO_COMPILER_H
 #define FIO_COMPILER_H
 

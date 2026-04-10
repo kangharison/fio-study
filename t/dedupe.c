@@ -1,4 +1,16 @@
 /*
+ * [한국어 설명] 중복 제거(deduplication) 분석 도구 (dedupe.c)
+ *
+ * === 파일의 역할 ===
+ * 파일이나 블록 디바이스를 읽어 중복 제거 비율(dedup ratio)을 계산하는 도구이다.
+ * 지정된 블록 크기로 데이터를 스캔하고 다양한 해시 알고리즘(MD5, CRC32 등)을
+ * 사용하여 체크섬을 계산한 뒤 중복 블록의 비율을 분석한다.
+ *
+ * === 사용법 ===
+ * 분석할 파일 또는 디바이스 경로를 인자로 지정하고,
+ * 블록 크기와 스레드 수 등의 옵션을 설정하여 실행한다.
+ */
+/*
  * Small tool to check for dedupable blocks in a file or device. Basically
  * just scans the filename for extents of the given size, checksums them,
  * and orders them up.

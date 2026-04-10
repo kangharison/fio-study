@@ -1,4 +1,12 @@
 /*
+ * [한국어 설명] 대소문자 무시 문자열 검색 단위 테스트 (strcasestr.c)
+ *
+ * === 파일의 역할 ===
+ * oslib/strcasestr 모듈의 대소문자를 무시하는 부분 문자열 검색 기능을 검증하는 단위 테스트이다.
+ * 대문자와 소문자가 혼합된 다양한 문자열에서 올바르게 부분 문자열을 찾는지 테스트한다.
+ * 시스템에 strcasestr이 없는 환경에서 fio의 자체 구현이 정상 동작하는지 확인한다.
+ */
+/*
  * Copyright (C) 2019 Tomohiro Kusumi <tkusumi@netbsd.org>
  */
 #include "../unittest.h"

@@ -1,4 +1,12 @@
 /*
+ * [한국어 설명] 모의 테스트용 TAP 프로토콜 헤더 (tap.h)
+ *
+ * === 파일의 역할 ===
+ * TAP(Test Anything Protocol) 형식의 테스트 출력을 지원하는 모의 테스트용 헤더 파일이다.
+ * 테스트 결과를 표준화된 TAP 형식으로 출력하여 자동화된 테스트 도구와 연동할 수 있게 한다.
+ * 테스트 계획 선언, 성공/실패 보고, 진단 메시지 출력 등의 매크로와 함수를 제공한다.
+ */
+/*
  * TAP (Test Anything Protocol) output support for FIO mock tests
  *
  * This provides a simple TAP output format for automated testing.

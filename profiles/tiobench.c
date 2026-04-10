@@ -1,3 +1,11 @@
+/*
+ * [한국어 설명] tiobench 호환 워크로드 프로파일 (tiobench.c)
+ *
+ * === 파일의 역할 ===
+ * 고전적인 tiobench 벤치마크를 에뮬레이션하는 워크로드 프로파일이다.
+ * --profile=tiobench 옵션으로 사용하며, 기존 tiobench 결과와 비교할 수 있도록 동일한 I/O 패턴을 재현한다.
+ * 순차 읽기/쓰기 및 랜덤 읽기/쓰기 테스트를 포함하여 디스크 성능을 측정한다.
+ */
 #include "../fio.h"
 #include "../profile.h"
 #include "../parse.h"

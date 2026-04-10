@@ -1,4 +1,16 @@
 /*
+ * [한국어 설명] 비동기 파일 읽기-파이프 쓰기 테스트 도구 (read-to-pipe-async.c)
+ *
+ * === 파일의 역할 ===
+ * 파일을 비동기적으로 읽어 파이프(stdout)로 출력하는 테스트 프로그램이다.
+ * 읽기 지연이 설정된 임계값을 초과하면 새 스레드를 생성하여 다음 읽기를 처리함으로써
+ * coordinated omission 문제를 방지하고 정확한 지연 시간을 측정한다.
+ *
+ * === 사용법 ===
+ * -f 옵션으로 읽을 파일을 지정하고 실행하면, 파일 내용을 stdout으로 출력하며
+ * 읽기 지연 시간 통계를 stderr로 보고한다. 예: ./read-to-pipe-async -f file.gz | gzip -dc > out
+ */
+/*
  * Read a file and write the contents to stdout. If a given read takes
  * longer than 'max_us' time, then we schedule a new thread to handle
  * the next read. This avoids the coordinated omission problem, where

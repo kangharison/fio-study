@@ -1,3 +1,11 @@
+/*
+ * [한국어 설명] Aerospike ACT 워크로드 프로파일 (act.c)
+ *
+ * === 파일의 역할 ===
+ * Aerospike 데이터베이스의 I/O 패턴을 시뮬레이션하여 SSD 적합성을 검증하는 ACT(Aerospike Certification Tool) 워크로드 프로파일이다.
+ * --profile=act 옵션으로 사용하며, Aerospike가 요구하는 읽기/쓰기 비율과 블록 크기를 재현하여 스토리지 장치의 성능을 평가한다.
+ * 실제 Aerospike 환경에서의 디스크 성능을 사전에 검증할 수 있게 해준다.
+ */
 #include "../fio.h"
 #include "../profile.h"
 #include "../parse.h"

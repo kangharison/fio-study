@@ -1,3 +1,11 @@
+/*
+ * [한국어 설명] 단일 파일 퍼즈 테스트 하네스 (onefile.c)
+ *
+ * === 파일의 역할 ===
+ * 퍼즈 테스트를 libFuzzer 없이 독립적으로 실행할 수 있게 해주는 하네스 프로그램이다.
+ * 명령줄로 지정된 파일을 읽어 메모리에 로드한 뒤 LLVMFuzzerTestOneInput 함수에
+ * 전달하여 단일 입력에 대한 퍼즈 대상 함수의 동작을 검증한다.
+ */
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>

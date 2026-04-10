@@ -1,3 +1,15 @@
+/*
+ * [한국어 설명] blktrace 데이터를 fio 작업 파일로 변환하는 도구 (btrace2fio.c)
+ *
+ * === 파일의 역할 ===
+ * blktrace 바이너리 트레이스 데이터를 읽어서 해당 I/O 패턴을 재현할 수 있는
+ * fio 작업 설정 파일을 생성한다. 트레이스된 I/O 워크로드를 fio로 리플레이할 때
+ * 사용되며, 읽기/쓰기 비율, 큐 깊이, I/O 크기 등을 자동으로 분석한다.
+ *
+ * === 사용법 ===
+ * blktrace로 수집한 바이너리 파일을 입력으로 지정하면
+ * fio에서 사용할 수 있는 job 파일(.fio)을 출력한다.
+ */
 #include <stdio.h>
 #include <unistd.h>
 #include <inttypes.h>

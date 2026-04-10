@@ -1,3 +1,11 @@
+/*
+ * [한국어 설명] INI/작업 파일 파서 퍼즈 테스트 (fuzz_parseini.c)
+ *
+ * === 파일의 역할 ===
+ * AFL이나 libFuzzer 같은 퍼징 도구와 함께 사용되는 퍼즈 테스트 대상 함수를
+ * 구현한다. LLVMFuzzerTestOneInput 인터페이스를 통해 무작위 데이터를 fio의
+ * parse_jobs_ini 함수에 전달하여 파서의 견고성과 크래시 여부를 검증한다.
+ */
 #include "fio.h"
 
 static int initialized = 0;

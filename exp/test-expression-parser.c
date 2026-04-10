@@ -1,4 +1,12 @@
 /*
+ * [한국어 설명] 실험적 수식 파서 테스트 (test-expression-parser.c)
+ *
+ * === 파일의 역할 ===
+ * fio 옵션에서 사용되는 산술 수식 파싱 기능을 테스트하는 실험적 프로그램이다.
+ * 덧셈, 뺄셈, 곱셈 등의 산술 표현식이 올바르게 파싱되고 계산되는지 검증한다.
+ * 새로운 수식 파서 기능의 개발 및 디버깅을 위한 테스트 용도로 사용된다.
+ */
+/*
  * (C) Copyright 2014, Stephen M. Cameron.
  *
  * The license below covers all files distributed with fio unless otherwise

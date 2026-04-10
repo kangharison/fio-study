@@ -1,4 +1,12 @@
 /*
+ * [한국어 설명] 지연 시간 정밀도 모의 테스트 (test_latency_precision.c)
+ *
+ * === 파일의 역할 ===
+ * fio의 지연 시간(latency) 계산에서 수치 정밀도를 검증하는 모의 테스트이다.
+ * 지연 시간 통계 계산 과정에서 부동소수점 정밀도 문제가 발생하지 않는지 테스트한다.
+ * 평균, 백분위수 등의 지연 시간 통계가 정확하게 계산되는지 다양한 시나리오로 확인한다.
+ */
+/*
  * Mock test for latency calculation numerical precision
  *
  * Purpose:
