@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] 메인 아키텍처 추상화 헤더 (arch.h)
+ *
+ * === 파일의 역할 ===
+ * 컴파일러 매크로(__i386__, __x86_64__, __aarch64__ 등)를 통해 현재 CPU 아키텍처를
+ * 감지하고, 해당 아키텍처 전용 헤더 파일을 자동으로 포함시킨다. arch_t 열거형으로
+ * 지원되는 모든 아키텍처를 정의하며, 원자적 연산 매크로와 io_uring 시스템 콜 번호 등
+ * 공통 인프라를 제공한다.
+ *
+ * === 제공하는 기능 ===
+ * - arch_x86_64, arch_arm, arch_ppc 등 아키텍처 열거형 (arch_t enum)
+ * - atomic_add, atomic_sub, atomic_load_relaxed 등 원자적 연산 매크로
+ * - 아키텍처별 헤더 자동 포함 (#if defined 분기)
+ * - arch_init() 기본 구현 및 io_uring 시스템 콜 번호 정의
+ */
 #ifndef ARCH_H
 #define ARCH_H
 

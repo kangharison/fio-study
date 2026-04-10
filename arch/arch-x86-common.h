@@ -1,3 +1,17 @@
+/*
+ * [한국어 설명] x86 공통 코드 헤더 (arch-x86-common.h)
+ *
+ * === 파일의 역할 ===
+ * 32비트 x86과 64비트 x86_64가 공유하는 공통 기능을 구현한다. CPUID 명령어를
+ * 통한 CPU 기능 감지(TSC 신뢰성, RDRAND 지원 여부 등), Intel과 AMD 프로세서
+ * 각각에 대한 초기화 로직을 제공한다.
+ *
+ * === 제공하는 기능 ===
+ * - cpuid(): CPUID 명령어 고수준 래퍼 함수
+ * - arch_init_intel(): Intel CPU TSC 신뢰성 및 RDRAND 기능 감지
+ * - arch_init_amd(): AMD CPU 기능 감지 및 초기화
+ * - tsc_reliable, arch_random: CPU 기능 플래그 외부 변수
+ */
 #ifndef FIO_ARCH_X86_COMMON
 #define FIO_ARCH_X86_COMMON
 

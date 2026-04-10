@@ -1,3 +1,16 @@
+/*
+ * [한국어 설명] SPARC 64비트 아키텍처 지원 헤더 (arch-sparc64.h)
+ *
+ * === 파일의 역할 ===
+ * SPARC 64비트 프로세서를 위한 아키텍처별 지원을 제공한다.
+ * membar 명령어를 사용하여 하드웨어 수준의 메모리 배리어를 구현하며,
+ * branch-always 명령어와 조합하여 안전한 배리어 실행을 보장한다.
+ *
+ * === 제공하는 기능 ===
+ * - membar_safe(): membar 명령어를 안전하게 실행하는 매크로
+ * - read_barrier(): #LoadLoad membar 기반 읽기 배리어
+ * - write_barrier(): #StoreStore membar 기반 쓰기 배리어
+ */
 #ifndef ARCH_SPARC64_H
 #define ARCH_SPARC64_H
 

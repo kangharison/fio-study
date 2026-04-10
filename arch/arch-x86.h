@@ -1,3 +1,17 @@
+/*
+ * [한국어 설명] x86 (32비트) 아키텍처 지원 헤더 (arch-x86.h)
+ *
+ * === 파일의 역할 ===
+ * 32비트 x86 프로세서를 위한 저수준 기능을 제공한다. x86_64 버전과 유사하지만
+ * 32비트 환경에 맞게 CPUID에서 ebx 레지스터를 xchg로 보존하고, RDTSC 결과를
+ * 64비트로 합치는 방식이 다르다.
+ *
+ * === 제공하는 기능 ===
+ * - do_cpuid(): 32비트 환경용 CPUID 명령어 래퍼 (ebx 보존 처리)
+ * - get_cpu_clock(): RDTSC 명령어로 CPU 타임스탬프 카운터 읽기
+ * - arch_ffz(): BSFL 명령어를 이용한 Find First Zero 비트 연산
+ * - read_barrier(), write_barrier(): 컴파일러 메모리 배리어
+ */
 #ifndef ARCH_X86_H
 #define ARCH_X86_H
 

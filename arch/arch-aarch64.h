@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] ARM 64비트 (AArch64/ARM64) 아키텍처 지원 헤더 (arch-aarch64.h)
+ *
+ * === 파일의 역할 ===
+ * AArch64 (ARM64) 프로세서를 위한 저수준 기능을 제공한다. CNTVCT_EL0 가상
+ * 타이머 카운터를 통한 사이클 측정, RBIT+CLZ 명령어 조합의 FFZ 비트 연산,
+ * __sync_synchronize 기반 메모리 배리어를 구현한다.
+ *
+ * === 제공하는 기능 ===
+ * - get_cpu_clock(): CNTVCT_EL0 레지스터로 가상 타이머 카운터 읽기
+ * - arch_ffz(): RBIT/CLZ 명령어를 이용한 Find First Zero 비트 연산
+ * - read_barrier(), write_barrier(): __sync_synchronize 메모리 배리어
+ * - isb(): ISB (Instruction Synchronization Barrier) 명령어
+ * - arch_init(): tsc_reliable을 true로 설정하는 초기화 함수
+ */
 #ifndef ARCH_AARCH64_H
 #define ARCH_AARCH64_H
 

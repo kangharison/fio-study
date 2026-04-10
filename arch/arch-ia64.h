@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] Intel Itanium (IA-64) 아키텍처 지원 헤더 (arch-ia64.h)
+ *
+ * === 파일의 역할 ===
+ * Intel Itanium (IA-64) 프로세서를 위한 아키텍처별 지원을 제공한다.
+ * ar.itc(Interval Time Counter) 레지스터를 통해 CPU 사이클 카운터를 읽고,
+ * mf(memory fence) 명령어로 메모리 배리어를 구현한다.
+ *
+ * === 제공하는 기능 ===
+ * - get_cpu_clock(): ar.itc 레지스터를 이용한 사이클 카운터 읽기
+ * - read_barrier() / write_barrier(): mf 명령어 기반 메모리 배리어
+ * - ia64_popcnt(): 인라인 어셈블리 기반 population count
+ * - arch_ffz(): 첫 번째 0 비트 탐색 함수
+ * - arch_init(): TSC reliable 플래그 설정 초기화
+ */
 #ifndef ARCH_IA64_H
 #define ARCH_IA64_H
 

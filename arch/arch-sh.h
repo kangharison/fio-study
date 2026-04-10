@@ -1,3 +1,17 @@
+/*
+ * [한국어 설명] SuperH (SH) 아키텍처 지원 헤더 (arch-sh.h)
+ *
+ * === 파일의 역할 ===
+ * Renesas SuperH 32비트 프로세서를 위한 아키텍처별 지원을 제공한다.
+ * ELF auxiliary vector에서 CPU 기능을 감지하여 synco 명령어 사용 가능 여부를
+ * 판별하고, 이에 따라 적절한 메모리 배리어를 선택적으로 적용한다.
+ *
+ * === 제공하는 기능 ===
+ * - mb(): CPU 기능에 따라 synco 또는 컴파일러 배리어를 선택하는 매크로
+ * - read_barrier() / write_barrier(): mb() 기반 메모리 배리어
+ * - arch_init(): ELF auxv에서 LLSC 기능 감지 및 arch_flags 설정
+ * - CPU_HAS_LLSC: Load-Linked/Store-Conditional 기능 플래그
+ */
 /* Renesas SH (32bit) only */
 
 #ifndef ARCH_SH_H

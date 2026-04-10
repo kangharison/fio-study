@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] x86-64 (AMD64) 아키텍처 지원 헤더 (arch-x86_64.h)
+ *
+ * === 파일의 역할 ===
+ * 64비트 x86 (AMD64/Intel 64) 프로세서를 위한 저수준 기능을 제공한다. RDTSC
+ * 명령어를 통한 CPU 사이클 카운터 읽기, mfence 기반 메모리 배리어, BSF 명령어를
+ * 이용한 FFZ(Find First Zero) 비트 연산을 인라인 어셈블리로 구현한다.
+ *
+ * === 제공하는 기능 ===
+ * - do_cpuid(): CPUID 명령어 래퍼 (CPU 기능 조회)
+ * - get_cpu_clock(): RDTSC 명령어로 CPU 타임스탬프 카운터 읽기
+ * - arch_ffz(): BSF 명령어를 이용한 Find First Zero 비트 연산
+ * - tsc_barrier(): mfence 메모리 배리어
+ * - ARCH_HAVE_SSE4_2: SSE4.2 CRC32C 하드웨어 가속 지원 플래그
+ * - RDRAND/RDSEED: 하드웨어 난수 생성 지원
+ */
 #ifndef ARCH_X86_64_H
 #define ARCH_X86_64_H
 

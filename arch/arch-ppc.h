@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] PowerPC 아키텍처 지원 헤더 (arch-ppc.h)
+ *
+ * === 파일의 역할 ===
+ * 32비트 및 64비트 PowerPC 프로세서를 위한 저수준 기능을 제공한다. MFSPR
+ * 명령어를 통한 타임베이스 카운터 읽기, sync/lwsync 기반 메모리 배리어,
+ * CNTLZW/CNTLZD 명령어를 이용한 비트 연산을 구현한다.
+ *
+ * === 제공하는 기능 ===
+ * - mfspr(): MFSPR 명령어로 특수 목적 레지스터 읽기
+ * - get_cpu_clock(): 타임베이스(TB) 레지스터로 CPU 클록 읽기
+ * - arch_ffz(): CNTLZW/CNTLZD를 이용한 Find First Zero 비트 연산
+ * - __ilog2(): 선행 제로 카운트 기반 정수 로그2 계산
+ * - read_barrier(): lwsync(64비트) 또는 sync(32비트) 메모리 배리어
+ * - write_barrier(): sync 메모리 배리어
+ */
 #ifndef ARCH_PPC_H
 #define ARCH_PPC_H
 

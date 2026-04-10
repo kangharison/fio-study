@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] RISC-V 64비트 아키텍처 지원 헤더 (arch-riscv64.h)
+ *
+ * === 파일의 역할 ===
+ * 64비트 RISC-V 프로세서를 위한 저수준 기능을 제공한다. RDTIME 명령어를 통한
+ * 타이머 카운터 읽기, fence 명령어 기반의 읽기/쓰기 메모리 배리어, ecall을
+ * 이용한 직접 시스템 콜 인터페이스를 구현한다.
+ *
+ * === 제공하는 기능 ===
+ * - get_cpu_clock(): RDTIME 명령어로 타이머 값 읽기
+ * - read_barrier(): fence r,r 읽기 메모리 배리어
+ * - write_barrier(): fence w,w 쓰기 메모리 배리어
+ * - arch_init(): tsc_reliable을 true로 설정하는 초기화 함수
+ * - __do_syscall0~6: ecall 기반 직접 시스템 콜 매크로
+ */
 #ifndef ARCH_RISCV64_H
 #define ARCH_RISCV64_H
 

@@ -1,3 +1,16 @@
+/*
+ * [한국어 설명] ARM 32비트 아키텍처 지원 헤더 (arch-arm.h)
+ *
+ * === 파일의 역할 ===
+ * 32비트 ARM 프로세서를 위한 기본 기능을 제공한다. ARMv4~v6 구형 코어에서는
+ * 컴파일러 배리어만 사용하고, ARMv7A/v8A 이상에서는 __sync_synchronize를
+ * 통한 하드웨어 메모리 배리어를 사용하는 조건부 컴파일을 수행한다.
+ *
+ * === 제공하는 기능 ===
+ * - nop: ARM 버전별 NOP 명령어 (mov r0,r0 또는 nop)
+ * - read_barrier(): 읽기 메모리 배리어 (ARMv7+ 하드웨어 / ARMv6- 컴파일러)
+ * - write_barrier(): 쓰기 메모리 배리어 (ARMv7+ 하드웨어 / ARMv6- 컴파일러)
+ */
 #ifndef ARCH_ARM_H
 #define ARCH_ARM_H
 
