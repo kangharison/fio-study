@@ -1,9 +1,24 @@
 /*
- * [한국어] workqueue.h - 오프로드 모드 워크큐 헤더
+ * [한국어 설명] 오프로드 모드 워크큐 헤더 (workqueue.h)
  *
- * I/O 작업을 별도 워커 스레드 풀로 오프로드하기 위한 구조체 및 함수 선언.
- * rate-submit 모드에서 사용되며, 메인 스레드가 I/O를 직접 처리하지 않고
- * 워커 스레드에 위임하여 일정한 제출 속도를 유지한다.
+ * === 파일의 역할 ===
+ * I/O 작업을 별도 워커 스레드 풀로 오프로드하기 위한 구조체 및 함수를 선언한다.
+ * rate-submit 모드에서 메인 스레드가 I/O를 워커에 위임하여 일정 제출 속도를 유지.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * workqueue.c와 짝을 이루는 헤더. rate-submit.c와 iolog.c에서 참조.
+ * workqueue.h → workqueue.c(구현) / rate-submit.c(I/O 오프로드) / iolog.c(압축)
+ *
+ * === 타 모듈과의 연결 ===
+ * - workqueue.c: 이 헤더의 구조체와 함수의 구현
+ * - rate-submit.c: rate 제한 I/O 제출 시 워크큐 사용
+ * - iolog.c: 로그 압축 작업을 워크큐에 제출
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct workqueue_work: 워크큐에 추가되는 개별 작업 단위
+ * - struct submit_worker: 워커 스레드 구조체 (스레드, 뮤텍스, 작업 리스트)
+ * - struct workqueue: 워크큐 전체 관리 구조체 (워커 배열, 콜백)
+ * - workqueue_init/enqueue/flush/exit: 워크큐 라이프사이클 API
  */
 #ifndef FIO_RATE_H
 #define FIO_RATE_H

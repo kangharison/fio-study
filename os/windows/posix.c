@@ -1,3 +1,28 @@
+/*
+ * [한국어 설명] Windows POSIX 호환 함수 구현 (windows/posix.c)
+ *
+ * === 파일의 역할 ===
+ * MinGW/MSVC에서 제공하지 않는 POSIX/Linux 함수들을 Windows API로 에뮬레이션.
+ * 에러 코드 변환, 동적 라이브러리(dlopen/dlsym), 시간(gettimeofday, ctime_r),
+ * 메모리 매핑(mmap/munmap), 공유 메모리(shmget/shmat), 소켓(poll, inet_aton),
+ * 프로세스(fork, waitpid, kill) 등을 포함. fio 동작에 필요한 최소한만 구현.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os-windows.h → windows/posix.h → windows/posix.c
+ * fio의 모든 모듈에서 호출하는 POSIX 함수가 이 파일의 구현으로 연결됨.
+ *
+ * === 타 모듈과의 연결 ===
+ * - os-windows.h: 함수 선언
+ * - lib/hweight.h: GetNumLogicalProcessors에서 hweight64 사용
+ * - log.h: 에러 로깅
+ *
+ * === 주요 함수 요약 ===
+ * - win_to_posix_error(): Windows 에러 → POSIX errno 매핑 테이블
+ * - sysconf(): _SC_NPROCESSORS_CONF, _SC_PAGESIZE, _SC_PHYS_PAGES 에뮬레이션
+ * - mmap()/munmap(): VirtualAlloc/MapViewOfFile 기반 구현
+ * - shmget()/shmat(): CreateFileMapping/MapViewOfFile 기반 구현
+ * - gettimeofday(): GetSystemTimeAsFileTime 기반 구현
+ */
 /* This file contains functions which implement those POSIX and Linux functions
  * that MinGW and Microsoft don't provide. The implementations contain just enough
  * functionality to support fio.
@@ -28,6 +53,15 @@
 extern unsigned long mtime_since_now(struct timespec *);
 extern void fio_gettime(struct timespec *, void *);
 
+/*
+ * [한국어]
+ * win_to_posix_error - Windows 에러 코드를 POSIX errno로 변환
+ * @winerr: GetLastError()로 얻은 Windows 에러 코드
+ * @return: 대응하는 POSIX errno 값
+ *
+ * fio 전체에서 Windows API 호출 실패 시 errno 설정에 사용.
+ * 매핑되지 않는 에러는 EIO로 반환하고 로그에 경고 출력.
+ */
 int win_to_posix_error(DWORD winerr)
 {
 	switch (winerr) {
@@ -175,6 +209,12 @@ int win_to_posix_error(DWORD winerr)
 	return winerr;
 }
 
+/*
+ * [한국어]
+ * GetNumLogicalProcessors - 논리 프로세서 수 조회
+ * GetLogicalProcessorInformation API로 프로세서 코어 정보를 얻고
+ * hweight64로 각 코어의 프로세서 마스크에서 비트 수를 합산.
+ */
 int GetNumLogicalProcessors(void)
 {
 	SYSTEM_LOGICAL_PROCESSOR_INFORMATION *processor_info = NULL;
@@ -208,6 +248,12 @@ int GetNumLogicalProcessors(void)
 	return num_processors;
 }
 
+/*
+ * [한국어]
+ * sysconf - POSIX sysconf 에뮬레이션
+ * _SC_NPROCESSORS_CONF, _SC_PAGESIZE, _SC_PHYS_PAGES를 Windows API로 구현.
+ * GetActiveProcessorCount, GetSystemInfo, GlobalMemoryStatusEx 사용.
+ */
 long sysconf(int name)
 {
 	long val = -1;
@@ -254,11 +300,13 @@ long sysconf(int name)
 
 char *dl_error = NULL;
 
+/* [한국어] POSIX dlclose 에뮬레이션 - FreeLibrary 래퍼 */
 int dlclose(void *handle)
 {
 	return !FreeLibrary((HMODULE)handle);
 }
 
+/* [한국어] POSIX dlopen 에뮬레이션 - LoadLibrary 래퍼 */
 void *dlopen(const char *file, int mode)
 {
 	HMODULE hMod;
@@ -272,6 +320,7 @@ void *dlopen(const char *file, int mode)
 	return hMod;
 }
 
+/* [한국어] POSIX dlsym 에뮬레이션 - GetProcAddress 래퍼 */
 void *dlsym(void *handle, const char *name)
 {
 	FARPROC fnPtr;
@@ -325,6 +374,12 @@ char *ctime_r(const time_t *t, char *buf)
 	return buf;
 }
 
+/*
+ * [한국어]
+ * gettimeofday - Windows 에뮬레이션
+ * GetSystemTimeAsFileTime()으로 Windows 시간(1601년 기준 100ns 단위)을 얻어
+ * Unix epoch(1970년) 기준 마이크로초로 변환. 정밀도 ~15ms.
+ */
 int gettimeofday(struct timeval *restrict tp, void *restrict tzp)
 {
 	FILETIME fileTime;
@@ -369,6 +424,12 @@ int lstat(const char *path, struct stat *buf)
 	return stat(path, buf);
 }
 
+/*
+ * [한국어]
+ * mmap - Windows 메모리 매핑 에뮬레이션
+ * MAP_ANON 시 VirtualAlloc, 파일 매핑 시 CreateFileMapping+MapViewOfFile 사용.
+ * PROT_NONE/READ/WRITE를 Windows 보호 플래그로 변환.
+ */
 void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 {
 	DWORD vaProt = 0;
@@ -417,6 +478,7 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off)
 	return allocAddr;
 }
 
+/* [한국어] munmap 에뮬레이션 - UnmapViewOfFile 또는 VirtualFree 시도 */
 int munmap(void *addr, size_t len)
 {
 	BOOL success;
@@ -549,6 +611,12 @@ return 0;
 #define CLOCK_MONOTONIC_RAW 4
 #endif
 
+/*
+ * [한국어]
+ * mlock - 메모리 잠금 에뮬레이션
+ * 프로세스 작업 세트 크기를 늘린 후 VirtualLock으로 페이지 고정.
+ * 메모리가 스왑아웃되지 않도록 보장.
+ */
 int mlock(const void * addr, size_t len)
 {
 	SIZE_T min, max;
@@ -636,6 +704,12 @@ int fsync(int fildes)
 int nFileMappings = 0;
 HANDLE fileMappings[1024];
 
+/*
+ * [한국어]
+ * shmget - SysV 공유 메모리 에뮬레이션
+ * CreateFileMapping(INVALID_HANDLE_VALUE)으로 페이지 파일 기반 매핑 생성.
+ * fileMappings[] 배열에 핸들 저장하고 인덱스를 shmid로 반환.
+ */
 int shmget(key_t key, size_t size, int shmflg)
 {
 	int mapid = -1;
@@ -656,6 +730,7 @@ int shmget(key_t key, size_t size, int shmflg)
 	return mapid;
 }
 
+/* [한국어] shmat 에뮬레이션 - MapViewOfFile + VirtualAlloc(MEM_COMMIT) */
 void *shmat(int shmid, const void *shmaddr, int shmflg)
 {
 	void *mapAddr;
@@ -717,6 +792,12 @@ int setgid(gid_t gid)
 	return -1;
 }
 
+/*
+ * [한국어]
+ * nice - 프로세스 우선순위 에뮬레이션
+ * nice 값을 Windows 프로세스 우선순위 클래스로 매핑.
+ * incr < -15: HIGH, incr < 0: ABOVE_NORMAL, incr > 15: IDLE 등.
+ */
 int nice(int incr)
 {
 	DWORD prioclass = NORMAL_PRIORITY_CLASS;
@@ -736,6 +817,12 @@ int nice(int incr)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * getrusage - 리소스 사용량 에뮬레이션
+ * GetProcessTimes/GetThreadTimes로 사용자/커널 시간을 조회.
+ * RUSAGE_SELF(프로세스), RUSAGE_THREAD(현재 스레드) 지원.
+ */
 int getrusage(int who, struct rusage *r_usage)
 {
 	const uint64_t SECONDS_BETWEEN_1601_AND_1970 = 11644473600;
@@ -782,6 +869,7 @@ int fdatasync(int fildes)
 	return fsync(fildes);
 }
 
+/* [한국어] pwrite 에뮬레이션 - _lseeki64로 오프셋 이동 후 _write, 원위치 복귀 */
 ssize_t pwrite(int fildes, const void *buf, size_t nbyte,
 		off_t offset)
 {
@@ -795,6 +883,7 @@ ssize_t pwrite(int fildes, const void *buf, size_t nbyte,
 	return len;
 }
 
+/* [한국어] pread 에뮬레이션 - _lseeki64로 오프셋 이동 후 read, 원위치 복귀 */
 ssize_t pread(int fildes, void *buf, size_t nbyte, off_t offset)
 {
 	int64_t pos = _telli64(fildes);
@@ -842,6 +931,7 @@ long long strtoll(const char *restrict str, char **restrict endptr, int base)
 }
 #endif
 
+/* [한국어] poll 에뮬레이션 - select() 기반. POLLIN/POLLOUT/POLLHUP 처리. */
 int poll(struct pollfd fds[], nfds_t nfds, int timeout)
 {
 	struct timeval tv;
@@ -893,6 +983,7 @@ int poll(struct pollfd fds[], nfds_t nfds, int timeout)
 	return rc;
 }
 
+/* [한국어] opendir 에뮬레이션 - CreateFileA로 디렉토리 존재 확인 후 컨텍스트 생성 */
 DIR *opendir(const char *dirname)
 {
 	struct dirent_ctx *dc = NULL;
@@ -933,6 +1024,7 @@ int closedir(DIR *dirp)
 	return 0;
 }
 
+/* [한국어] readdir 에뮬레이션 - FindFirstFileA/FindNextFile 기반 */
 struct dirent *readdir(DIR *dirp)
 {
 	static struct dirent de;

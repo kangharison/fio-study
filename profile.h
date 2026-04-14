@@ -6,6 +6,20 @@
  * 사전 정의된 워크로드 프로파일을 위한 구조체 및 함수를 선언한다.
  * 프로파일은 특정 벤치마크 시나리오(예: tiobench, act)를
  * 재현하기 위한 옵션/후크 집합이다.
+ 
+ * === 파일의 역할 ===
+ * 워크로드 프로파일을 위한 구조체 및 함수를 선언한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * profile.c와 짝을 이루는 헤더. profiles/*.c에서 프로파일 정의 시 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - profile.c: 이 헤더의 함수 구현
+ * - profiles/*.c: 프로파일 정의
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct profile_ops: 프로파일 콜백 (prep/init/io_ops)
+ * - register_profile()/load_profile(): 등록/로드 API
  */
 
 #include "flist.h"

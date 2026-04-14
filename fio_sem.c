@@ -11,6 +11,21 @@
  *   fio_sem_up()            - V 연산 (잠금 해제, 대기자 깨움)
  *   fio_sem_down_trylock()  - 비차단 잠금 시도
  *   fio_sem_down_timeout()  - 타임아웃 있는 잠금 획득
+ 
+ * === 파일의 역할 ===
+ * pthread mutex와 condition variable을 이용한 세마포어를 구현한다.
+ * mmap(MAP_SHARED)으로 공유 메모리를 할당하여 프로세스 간 동기화가 가능.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 전체에서 동기화 프리미티브로 사용. smalloc.c, backend.c, server.c 등에서 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio_sem.h: API 선언
+ * - pshared.c: PTHREAD_PROCESS_SHARED 속성 초기화
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_sem_init(): 공유 메모리에 세마포어 생성
+ * - fio_sem_down()/fio_sem_up(): P/V 연산
  */
 #include <stdio.h>
 #include <string.h>

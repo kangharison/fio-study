@@ -1,9 +1,21 @@
 /*
- * [한국어] blktrace.h - blktrace 구조체 및 API 선언
+ * [한국어 설명] blktrace 구조체 및 API 선언 (blktrace.h)
  *
- * blktrace는 Linux 블록 레이어의 I/O 트레이스 데이터를 캡처하는 도구이다.
- * 이 헤더는 blktrace 바이너리 파일을 읽고 재생하기 위한 구조체와 함수를 선언한다.
- * FIO_HAVE_BLKTRACE가 정의되지 않은 경우, 모든 함수는 false를 반환하는 스텁으로 대체된다.
+ * === 파일의 역할 ===
+ * blktrace 바이너리 파일을 읽고 재생하기 위한 구조체와 함수를 선언한다.
+ * FIO_HAVE_BLKTRACE가 미정의 시 모든 함수는 스텁으로 대체된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * blktrace.c와 짝을 이루는 헤더. iolog.c에서 blktrace 형식 판별 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - blktrace.c: 이 헤더의 함수 구현
+ * - iolog.c: read_iolog()에서 is_blktrace() 호출
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - is_blktrace(): blktrace 바이너리 형식 판별
+ * - init_blktrace_read(): blktrace 파일 로드
+ * - merge_blktrace_iologs(): 여러 blktrace 파일 병합
  */
 #ifndef FIO_BLKTRACE_H
 #define FIO_BLKTRACE_H

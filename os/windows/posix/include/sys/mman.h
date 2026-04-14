@@ -1,3 +1,9 @@
+/*
+ * [한국어 설명] Windows용 sys/mman.h 호환 헤더
+ * POSIX 메모리 매핑 API(mmap/munmap/msync/mlock/munlock)와
+ * 관련 상수(PROT_*, MAP_*, MS_*)를 정의.
+ * 실제 구현은 windows/posix.c에서 VirtualAlloc/MapViewOfFile 기반.
+ */
 #ifndef SYS_MMAN_H
 #define SYS_MMAN_H
 

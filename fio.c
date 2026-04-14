@@ -29,26 +29,31 @@
  * 이 파일은 fio(Flexible I/O Tester)의 최상위 진입점(main 함수)을 포함한다.
  * fio는 리눅스/유닉스 시스템에서 디스크 I/O 성능을 벤치마킹하기 위한 도구로,
  * 다양한 I/O 패턴(순차, 랜덤, 혼합 등)과 I/O 엔진(libaio, io_uring, sync 등)을
- * 지원한다.
+ * 지원한다. main() 함수에서 초기화, 옵션 파싱, 실행 모드 분기를 수행한다.
  *
- * === 전체 I/O 흐름에서의 위치 ===
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 실행의 최상위 진입점이다. main()에서 모든 것이 시작된다.
  * 1. [fio.c - main()] ← 현재 파일. 프로그램 시작점.
  *    - 환경 초기화 (initialize_fio)
  *    - 서버 소켓 키 생성 (fio_server_create_sk_key)
- *    - 명령줄 옵션 파싱 (parse_options)
+ *    - 명령줄 옵션 파싱 (parse_options → init.c)
  *    - 시간 서브시스템 초기화 (fio_time_init)
  * 2. 클라이언트-서버 모드 분기:
- *    a. 클라이언트 모드 (nr_clients > 0):
- *       - 원격 fio 서버에 접속하여 작업을 전송하고 결과를 수집한다.
- *       - fio_start_all_clients() → fio_handle_clients()
- *    b. 로컬(백엔드) 모드 (nr_clients == 0):
- *       - 로컬에서 직접 I/O 워크로드를 실행한다.
- *       - fio_backend() → 스레드/프로세스 생성 → I/O 엔진 호출 → 결과 집계
- * 3. 종료 정리 (deinitialize_fio)
+ *    a. 클라이언트 모드: fio_start_all_clients() → fio_handle_clients() (client.c)
+ *    b. 로컬 모드: fio_backend() (backend.c) → 스레드 생성 → I/O 실행 → 결과 집계
+ * 호출 체인: main() → parse_options() [init.c] → fio_backend() [backend.c]
  *
- * === 주요 의존 헤더 ===
- * - fio.h: fio의 핵심 자료구조(thread_data, io_u 등)와 함수 선언을 포함하는
- *          통합 헤더 파일. 이 헤더를 통해 거의 모든 fio 서브시스템에 접근한다.
+ * === 타 모듈과의 연결 ===
+ * - init.c: parse_options()로 명령줄/잡 파일을 파싱하여 thread_data를 구성
+ * - backend.c: fio_backend()로 로컬 I/O 워크로드를 실행
+ * - client.c: fio_start_all_clients()/fio_handle_clients()로 원격 서버에 작업 전송
+ * - server.c: fio_start_server()로 서버 모드 진입
+ * - fio.h: 핵심 자료구조(thread_data, io_u 등)와 함수 선언을 포함하는 통합 헤더
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - main(): 프로그램 진입점. 초기화 → 파싱 → 클라이언트/백엔드 모드 분기 → 종료 정리
+ * - initialize_fio(): 전역 환경 초기화 (디버그, 로그, 메모리, 뮤텍스)
+ * - deinitialize_fio(): 종료 시 자원 정리
  */
 
 /* fio의 통합 헤더 파일 포함 - 모든 핵심 자료구조와 함수 선언이 여기에 있다 */

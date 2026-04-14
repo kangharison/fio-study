@@ -3,6 +3,19 @@
  *
  * 동일한 파일을 여러 fio job이 공유할 때 사용되는 해시 테이블 API를 선언한다.
  * 파일명을 키로 사용하여 fio_file 구조체를 빠르게 검색할 수 있다.
+ 
+ * === 파일의 역할 ===
+ * 파일 해시 테이블 API를 선언한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * filehash.c와 짝을 이루는 헤더.
+ *
+ * === 타 모듈과의 연결 ===
+ * - filehash.c: 이 헤더의 함수 구현
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - file_hash_init/exit(): 초기화/정리
+ * - add_file_hash()/lookup_file_hash(): 추가/검색
  */
 #ifndef FIO_FILE_HASH_H
 #define FIO_FILE_HASH_H

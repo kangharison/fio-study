@@ -13,6 +13,7 @@
 #ifndef FIO_TYPES_H
 #define FIO_TYPES_H
 
+/* [한국어] C 컴파일러에 bool 타입이 없는 환경을 위한 폴백 정의 */
 #if !defined(CONFIG_HAVE_BOOL) && !defined(__cplusplus)
 typedef int bool;
 #ifndef false
@@ -25,6 +26,7 @@ typedef int bool;
 #include <stdbool.h> /* IWYU pragma: export */
 #endif
 
+/* [한국어] __kernel_rwf_t: Linux RWF 플래그 타입. 커널 헤더에 없는 환경을 위한 폴백 */
 #if !defined(CONFIG_HAVE_KERNEL_RWF_T)
 typedef int __kernel_rwf_t;
 #endif

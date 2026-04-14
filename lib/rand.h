@@ -27,27 +27,38 @@
 #include <assert.h>
 #include "types.h"
 
+/* [한국어] 32비트 난수의 최대값 (0xFFFFFFFF) */
 #define FRAND32_MAX	(-1U)
+/* [한국어] 32비트 난수 범위 + 1 (double, [0,1) 변환용) */
 #define FRAND32_MAX_PLUS_ONE	(1.0 * (1ULL << 32))
+/* [한국어] 64비트 난수의 최대값 (0xFFFFFFFFFFFFFFFF) */
 #define FRAND64_MAX	(-1ULL)
+/* [한국어] 64비트 난수 범위 + 1 (double, [0,1) 변환용. 오버플로 방지를 위해 분리 곱셈) */
 #define FRAND64_MAX_PLUS_ONE	(1.0 * (1ULL << 32) * (1ULL << 32))
 
 struct taus88_state {
 	unsigned int s1, s2, s3;
+	/* [한국어] 3개의 Tausworthe 상태 변수. XOR 조합으로 32비트 난수 생성.
+	 * 제약: s1>1, s2>7, s3>15 (상위 비트가 0이면 안 됨) */
 };
 
 struct taus258_state {
 	uint64_t s1, s2, s3, s4, s5;
+	/* [한국어] 5개의 64비트 Tausworthe 상태 변수. XOR 조합으로 64비트 난수 생성.
+	 * 주기 약 2^258으로 대규모 I/O 테스트에서도 주기 반복이 발생하지 않음 */
 };
 
 struct frand_state {
 	unsigned int use64;
+	/* [한국어] 0이면 32비트 Taus88, 1이면 64비트 Taus258 사용.
+	 * --allrandrepeat, --randseed 설정과 플랫폼에 따라 결정됨 */
 	union {
 		struct taus88_state state32;
 		struct taus258_state state64;
 	};
 };
 
+/* [한국어] rand_max - 현재 모드(32/64비트)의 난수 최대값을 반환 */
 static inline uint64_t rand_max(struct frand_state *state)
 {
 	if (state->use64)
@@ -84,6 +95,13 @@ static inline void frand_copy(struct frand_state *dst, struct frand_state *src)
 	dst->use64 = src->use64;
 }
 
+/*
+ * [한국어] __rand32 - Taus88 알고리즘으로 32비트 난수 한 개 생성
+ *
+ * TAUSWORTHE 매크로: (상태 & 마스크) << 시프트 ^ ((상태 << a) ^ 상태) >> b
+ * 각 상태 변수를 독립적으로 갱신한 뒤 XOR 조합하여 최종 값을 생성한다.
+ * 마스크(c)는 상위 비트 제약을 유지하기 위해 하위 비트를 클리어한다.
+ */
 static inline unsigned int __rand32(struct taus88_state *state)
 {
 #define TAUSWORTHE(s,a,b,c,d) ((s&c)<<d) ^ (((s <<a) ^ s)>>b)
@@ -92,9 +110,16 @@ static inline unsigned int __rand32(struct taus88_state *state)
 	state->s2 = TAUSWORTHE(state->s2, 2, 25, 4294967288UL, 4);
 	state->s3 = TAUSWORTHE(state->s3, 3, 11, 4294967280UL, 17);
 
+	/* [한국어] 3개 상태의 XOR 조합이 최종 난수 */
 	return (state->s1 ^ state->s2 ^ state->s3);
 }
 
+/*
+ * [한국어] __rand64 - Taus258 알고리즘으로 64비트 난수 한 개 생성
+ *
+ * 5개의 64비트 상태 변수를 각각 시프트-XOR 연산으로 갱신한 뒤
+ * 전체를 XOR 조합하여 64비트 난수를 생성한다. 주기 약 2^258.
+ */
 static inline uint64_t __rand64(struct taus258_state *state)
 {
 	uint64_t xval;
@@ -125,6 +150,12 @@ static inline uint64_t __rand(struct frand_state *state)
 		return __rand32(&state->state32);
 }
 
+/*
+ * [한�����] __rand_0_1 - [0, 1) 범위의 균등 분포 실수를 반환
+ *
+ * (난수 + 1.0) / (최대값 + 1.0)으로 변환하여 0.0 이상 1.0 미만의 값을 생성.
+ * zipf, gauss 등 분포 생성기에서 균등 난수를 기반으로 역변환 샘플링할 때 사용.
+ */
 static inline double __rand_0_1(struct frand_state *state)
 {
 	if (state->use64) {
@@ -138,6 +169,10 @@ static inline double __rand_0_1(struct frand_state *state)
 	}
 }
 
+/*
+ * [한국어] rand32_upto - [0, end] 범위의 32비트 난수를 반환
+ * 스케일링 방식으로 범위를 제한. rand_between()에서 내부적으로 호출됨.
+ */
 static inline uint32_t rand32_upto(struct frand_state *state, uint32_t end)
 {
 	uint32_t r;
@@ -149,6 +184,7 @@ static inline uint32_t rand32_upto(struct frand_state *state, uint32_t end)
 	return (int) ((double)end * (r / FRAND32_MAX_PLUS_ONE));
 }
 
+/* [한국어] rand64_upto - [0, end] 범위의 64비트 난수를 반환 */
 static inline uint64_t rand64_upto(struct frand_state *state, uint64_t end)
 {
 	uint64_t r;
@@ -172,10 +208,18 @@ static inline uint64_t rand_between(struct frand_state *state, uint64_t start,
 		return start + rand32_upto(state, end - start);
 }
 
+/*
+ * [한국어] __get_next_seed - 다음 시드 값을 생성
+ *
+ * 64비트 플랫폼(sizeof(int) != sizeof(long*))에서는 두 번의 난수를 곱하여
+ * 전체 64비트 범위를 커버하는 시드를 생성한다.
+ * fill_random_buf()에서 버퍼 채우기용 시드를 뽑을 때 호출됨.
+ */
 static inline uint64_t __get_next_seed(struct frand_state *fs)
 {
 	uint64_t r = __rand(fs);
 
+	/* [한국어] 64비트 플랫폼에서 두 난수를 곱해 전체 비트 범위를 활용 */
 	if (sizeof(int) != sizeof(long *))
 		r *= (unsigned long) __rand(fs);
 

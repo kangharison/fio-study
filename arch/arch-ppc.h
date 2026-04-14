@@ -44,6 +44,7 @@
 #define PPC_CNTLZL "cntlzw"
 #endif
 
+/* [한국어] __ilog2 - CNTLZ(선행 제로 카운트) 명령어를 이용한 정수 log2 계산 */
 static inline int __ilog2(unsigned long bitmask)
 {
 	int lz;
@@ -52,6 +53,7 @@ static inline int __ilog2(unsigned long bitmask)
 	return BITS_PER_LONG - 1 - lz;
 }
 
+/* [한국어] arch_ffz - 비트마스크를 반전 후 최하위 설정 비트의 log2를 구하여 FFZ를 계산한다 */
 static inline int arch_ffz(unsigned long bitmask)
 {
 	if ((bitmask = ~bitmask) == 0)
@@ -59,6 +61,7 @@ static inline int arch_ffz(unsigned long bitmask)
 	return  __ilog2(bitmask & -bitmask);
 }
 
+/* [한국어] mfspr - MFSPR 명령어로 특수 목적 레지스터(SPR) 값을 읽는다 */
 static inline unsigned int mfspr(unsigned int reg)
 {
 	unsigned int val;
@@ -72,6 +75,7 @@ static inline unsigned int mfspr(unsigned int reg)
 #define SPRN_ATBL  0x20E /* Alternate Time Base Lower */
 #define SPRN_ATBU  0x20F /* Alternate Time Base Upper */
 
+/* [한국어] get_cpu_clock (64비트) - 타임베이스 하위 레지스터를 직접 읽는다. 0이면 재시도. */
 #ifdef __powerpc64__
 static inline unsigned long long get_cpu_clock(void)
 {
@@ -88,6 +92,7 @@ static inline unsigned long long get_cpu_clock(void)
 	return rval;
 }
 #else
+/* [한국어] get_cpu_clock (32비트) - TBU/TBL을 읽되, 상위 레지스터가 변하지 않을 때까지 반복 */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned int tbl, tbu0, tbu1;

@@ -39,6 +39,11 @@ extern unsigned long arch_flags;
 
 #define CPU_HAS_LLSC	0x0040
 
+/*
+ * [한국어] arch_init - ELF auxiliary vector를 탐색하여 CPU_HAS_LLSC 기능을 감지한다.
+ * LLSC(Load-Linked/Store-Conditional)가 지원되면 synco 메모리 배리어를 활성화한다.
+ * envp 뒤의 ELF auxv 배열을 직접 순회하는 저수준 기법을 사용한다.
+ */
 static inline int arch_init(char *envp[])
 {
 	Elf32_auxv_t *auxv;

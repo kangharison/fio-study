@@ -3,24 +3,30 @@
  * later read that back and replay
  */
 /*
- * [한국어] iolog.c - I/O 로깅 및 재생
+ * [한국어 설명] I/O 로깅 및 재생 (iolog.c)
  *
- * 이 파일은 fio의 I/O 패턴을 파일에 기록하고, 나중에 재생하는 기능을 구현한다.
- * 주요 기능:
- *   1) log_io_u() / log_file()        - I/O 동작과 파일 이벤트를 iolog 파일에 기록
- *   2) read_iolog() / read_iolog_get() - iolog 파일을 읽어 I/O 패턴을 재생
- *   3) init_iolog()                    - iolog 읽기/쓰기 모드 초기화
- *   4) setup_log() / flush_log()       - 성능 로그 설정 및 파일 출력
- *   5) gz_work() / iolog_flush()       - zlib 기반 로그 압축/해제
- *   6) td_writeout_logs()              - 모든 로그(BW/LAT/IOPS 등)를 파일에 기록
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 I/O 패턴을 파일에 기록하고 나중에 재생하는 기능을 구현한다.
+ * I/O 동작 로깅, iolog 파일 읽기/재생, 성능 로그(BW/LAT/IOPS) 설정 및 출력,
+ * zlib 기반 로그 압축/해제를 담당한다.
  *
- * iolog 파일 형식:
- *   - 버전 2: "<파일명> <동작> <오프셋> <크기>" 형식
- *   - 버전 3: "<타임스탬프> <파일명> <동작> <오프셋> <크기>" 형식 (시간 기반 재생 지원)
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 thread_main()에서 init_iolog()으로 로그를 초기화하고,
+ * do_io() 중 log_io_u()로 I/O 동작을 기록하며, 종료 시 td_writeout_logs()로 출력.
+ * 호출 체인: thread_main() → init_iolog() [이 파일] / do_io() → log_io_u() [이 파일]
  *
- * 로그 압축 흐름 (CONFIG_ZLIB):
- *   로그 청크 초과 → iolog_cur_flush() → workqueue에 gz_work 제출
- *   → deflate 압축 → chunk_list에 추가 → flush_log()에서 inflate 후 출력
+ * === 타 모듈과의 연결 ===
+ * - backend.c: init_iolog(), log_io_u(), td_writeout_logs() 호출
+ * - stat.c: 성능 로그 샘플 기록 (setup_log, flush_log)
+ * - workqueue.c: gz_work() 로그 압축을 워크큐에 제출
+ * - iolog.h: io_log, io_piece, io_sample 등 구조체 정의
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - init_iolog(): iolog 읽기/쓰기 모드 초기화
+ * - log_io_u(): I/O 동작을 iolog 파일에 기록
+ * - read_iolog(): iolog 파일을 읽어 I/O 패턴 재생
+ * - setup_log()/flush_log(): 성능 로그 설정 및 파일 출력
+ * - td_writeout_logs(): 모든 로그(BW/LAT/IOPS)를 파일에 기록
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

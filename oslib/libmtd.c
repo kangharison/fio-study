@@ -23,6 +23,35 @@
 
 /* Imported from mtd-utils by dehrenberg */
 
+/*
+ * [한국어 설명] MTD 라이브러리 주요 구현 (libmtd.c)
+ *
+ * === 파일의 역할 ===
+ * MTD(Memory Technology Device) 라이브러리의 핵심 구현 파일이다.
+ * sysfs(/sys/class/mtd)를 통해 MTD 장치 정보를 조회하고, ioctl을 통해
+ * 소거(erase), 읽기(read), 쓰기(write), 잠금(lock/unlock), 배드블록 관리 등
+ * MTD 장치의 모��� 주요 작업을 수행한다.
+ * sysfs가 지원되지 않는 구형 커널에서는 libmtd_legacy.c로 폴백한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 MTD I/O 엔진에서 사용된다:
+ *   engines/mtd.c → libmtd.h API → [libmtd.c] → sysfs 읽기 / ioctl 호출
+ *
+ * === 타 모듈과의 연결 ===
+ * - libmtd.h: 공개 API 선언
+ * - libmtd_int.h: struct libmtd 내부 구조체
+ * - libmtd_legacy.c: sysfs 미지원 시 레거시 구현
+ * - libmtd_common.h: 에러 매크로, xmalloc() 등
+ * - <mtd/mtd-user.h>: MTD ioctl 정의 (MEMERASE, MEMWRITE 등)
+ *
+ * === 주요 함수 요약 ===
+ * - libmtd_open()/close(): 라이브러리 초기화/해제 (sysfs 경로 구성)
+ * - mtd_get_info(): 시스템의 MTD 장치 목록 조회
+ * - mtd_get_dev_info(): 개별 MTD 장치 상세 정보 조회
+ * - mtd_erase(): 소거블록 소거 (MEMERASE/MEMERASE64 ioctl)
+ * - mtd_read()/write(): MTD 장치 데이터 읽기/쓰기
+ * - mtd_torture(): 소거블록 고문 테스트 (패턴 쓰기/읽기 반복)
+ */
 #include <limits.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -43,6 +72,13 @@
 #include "libmtd_int.h"
 #include "libmtd_common.h"
 
+/*
+ * [한국어]
+ * mkpath - 두 경로 구성요소를 합쳐 전체 경로 생성
+ *
+ * sysfs 경로를 동적으로 구성하는 데 사용된다.
+ * 예: mkpath("/sys/class/mtd", "mtd0") → "/sys/class/mtd/mtd0"
+ */
 /**
  * mkpath - compose full path from 2 given components.
  * @path: the first component
@@ -67,6 +103,13 @@ static char *mkpath(const char *path, const char *name)
 	return n;
 }
 
+/*
+ * [한국어]
+ * read_data - sysfs 파일에서 데이터를 읽는 범용 헬퍼
+ *
+ * sysfs 속성 파일은 작은 텍스트이므로 한 번에 읽어 NUL 종료 처리한다.
+ * 파일 내용이 buf_len보다 크면 EINVAL 에러를 반환한다.
+ */
 /**
  * read_data - read data from a file.
  * @file: the file to read from
@@ -396,6 +439,13 @@ static int dev_read_pos_ll(const char *patt, int mtd_num, long long *value)
 	return read_pos_ll(file, value);
 }
 
+/*
+ * [한국어]
+ * type_str2int - MTD 장치 타입 문자열을 정수 상수로 변환
+ *
+ * sysfs의 type 파일에서 읽은 문자열("nand", "nor" 등)을
+ * <mtd/mtd-user.h>의 MTD_NANDFLASH, MTD_NORFLASH 등 상수로 변환한다.
+ */
 /**
  * type_str2int - convert MTD device type to integer.
  * @str: MTD device type string to convert
@@ -556,6 +606,22 @@ static int sysfs_is_supported(struct libmtd *lib)
 	return 1;
 }
 
+/*
+ * [한국어]
+ * libmtd_open - MTD 라이브러리를 초기화하고 디스크립터를 반환
+ *
+ * @return: 성공 시 라이브러리 디스크립터(libmtd_t), 실패 시 NULL
+ *
+ * 동작 과정:
+ * 1) struct libmtd를 할당하고 초기화
+ * 2) sysfs 경로 패턴들을 구성 (/sys/class/mtd/mtdN/name 등)
+ * 3) sysfs_is_supported()로 sysfs MTD 지원 여부 확인
+ * 4) sysfs 미지원 시 경로를 NULL로 설정 (이후 legacy_* 함수 사용)
+ * 5) sysfs 지원 시 모든 속성 파일 경로 패턴을 구성
+ *
+ * 호출 체인:
+ *   engines/mtd.c → [libmtd_open()] → mkpath(), sysfs_is_supported()
+ */
 libmtd_t libmtd_open(void)
 {
 	struct libmtd *lib;
@@ -628,6 +694,14 @@ out_error:
 	return NULL;
 }
 
+/*
+ * [한국어]
+ * libmtd_close - MTD 라이브러리 자원 해제
+ *
+ * @desc: libmtd_open()에서 반환된 라이브러리 디스크립터
+ *
+ * 모든 동적 할당된 sysfs 경로 문자열과 struct libmtd를 free()한다.
+ */
 void libmtd_close(libmtd_t desc)
 {
 	struct libmtd *lib = (struct libmtd *)desc;
@@ -647,6 +721,7 @@ void libmtd_close(libmtd_t desc)
 	free(lib);
 }
 
+/* [한국어] mtd_dev_present: MTD 장치 존재 여부 확인 (sysfs stat 또는 legacy /proc/mtd) */
 int mtd_dev_present(libmtd_t desc, int mtd_num) {
 	struct stat st;
 	struct libmtd *lib = (struct libmtd *)desc;
@@ -661,6 +736,17 @@ int mtd_dev_present(libmtd_t desc, int mtd_num) {
 	}
 }
 
+/*
+ * [한국어]
+ * mtd_get_info - 시스템의 MTD 장치 전체 정보를 수집
+ *
+ * @desc: 라이브러리 디스크립터
+ * @info: 결과가 저장될 mtd_info 구조체
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * sysfs 지원 시 /sys/class/mtd 디렉토리를 스캔하여 mtdN 패턴의 디렉토리를 세고,
+ * 장치 수, 최소/최대 번호를 파악한다. sysfs 미지원 시 legacy_mtd_get_info() 호출.
+ */
 int mtd_get_info(libmtd_t desc, struct mtd_info *info)
 {
 	DIR *sysfs_mtd;
@@ -733,6 +819,18 @@ out_close:
 	return -1;
 }
 
+/*
+ * [한국어]
+ * mtd_get_dev_info1 - MTD 장치 번호로 개별 장치 상세 정보 조회
+ *
+ * @desc: 라이브러리 디스크립터
+ * @mtd_num: MTD 장치 번호
+ * @mtd: 결과가 저장될 mtd_dev_info 구조체
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * sysfs의 각 속성 파일(name, type, erasesize, size 등)을 읽어
+ * mtd_dev_info 구조체를 채운다. sysfs 미지원 시 legacy 함수 사용.
+ */
 int mtd_get_dev_info1(libmtd_t desc, int mtd_num, struct mtd_dev_info *mtd)
 {
 	int ret;
@@ -786,6 +884,17 @@ int mtd_get_dev_info1(libmtd_t desc, int mtd_num, struct mtd_dev_info *mtd)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * mtd_get_dev_info - 장치 노드 경로로 MTD 장치 정보 조회
+ *
+ * @desc: 라이브러리 디스크립터
+ * @node: 장치 노드 경로 (예: "/dev/mtd0")
+ * @mtd: 결과가 저장될 mtd_dev_info 구조체
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * 장치 노드에서 major:minor를 얻어 MTD 번호를 찾고, mtd_get_dev_info1()에 위임.
+ */
 int mtd_get_dev_info(libmtd_t desc, const char *node, struct mtd_dev_info *mtd)
 {
 	int mtd_num;
@@ -800,6 +909,7 @@ int mtd_get_dev_info(libmtd_t desc, const char *node, struct mtd_dev_info *mtd)
 	return mtd_get_dev_info1(desc, mtd_num, mtd);
 }
 
+/* [한국어] ioctl 에러 발생 시 장치 번호와 소거블록 번호를 포함한 에러 메시지 출력 */
 static inline int mtd_ioctl_error(const struct mtd_dev_info *mtd, int eb,
 				  const char *sreq)
 {
@@ -807,6 +917,7 @@ static inline int mtd_ioctl_error(const struct mtd_dev_info *mtd, int eb,
 			  sreq, eb, mtd->mtd_num);
 }
 
+/* [한국어] 소거블록 번호의 유효 범위(0 ~ eb_cnt-1) 검증 */
 static int mtd_valid_erase_block(const struct mtd_dev_info *mtd, int eb)
 {
 	if (eb < 0 || eb >= mtd->eb_cnt) {
@@ -818,6 +929,13 @@ static int mtd_valid_erase_block(const struct mtd_dev_info *mtd, int eb)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * mtd_xlock - 소거블록 잠금/해제의 공통 구현
+ *
+ * MEMLOCK/MEMUNLOCK ioctl을 호출하여 소거블록을 잠그거나 해제한다.
+ * 잠긴 소거블록은 소거/쓰기가 불가능하다 (NOR 플래시에서 주로 사용).
+ */
 static int mtd_xlock(const struct mtd_dev_info *mtd, int fd, int eb, int req,
 		     const char *sreq)
 {
@@ -849,6 +967,22 @@ int mtd_unlock(const struct mtd_dev_info *mtd, int fd, int eb)
 	return mtd_xlock(mtd, fd, eb, MEMUNLOCK);
 }
 
+/*
+ * [한국어]
+ * mtd_erase - 소거블록을 소거하여 모든 비트를 0xFF로 초기화
+ *
+ * @desc: 라이브러리 디스크립터
+ * @mtd: MTD 장치 정보
+ * @fd: 장치 파일 디스크립터
+ * @eb: 소거할 소거블록 번호
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * NAND/NOR 플래시는 쓰기 전에 반드시 소거해야 한다 (0→1 전환은 소거로만 가능).
+ * 먼저 MEMERASE64(64비트)를 시도하고, 지원하지 않으면 MEMERASE(32비트)로 폴백한다.
+ *
+ * 호출 체인:
+ *   engines/mtd.c → [mtd_erase()] → ioctl(MEMERASE64/MEMERASE)
+ */
 int mtd_erase(libmtd_t desc, const struct mtd_dev_info *mtd, int fd, int eb)
 {
 	int ret;
@@ -934,6 +1068,7 @@ int mtd_is_locked(const struct mtd_dev_info *mtd, int fd, int eb)
 	return ret;
 }
 
+/* [한국어] 고문 테스트에 사용할 바이트 패턴: 체커보드(0xa5, 0x5a)와 0x00 */
 /* Patterns to write to a physical eraseblock when torturing it */
 static uint8_t patterns[] = {0xa5, 0x5a, 0x0};
 
@@ -956,6 +1091,20 @@ static int check_pattern(const void *buf, uint8_t patt, int size)
 	return 1;
 }
 
+/*
+ * [한국어]
+ * mtd_torture - 소거블록의 건전성을 테스트하는 고문(torture) 함수
+ *
+ * @desc: 라이브러리 디스크립터
+ * @mtd: MTD 장치 정보
+ * @fd: 장치 파일 디스크립터
+ * @eb: 테스트할 소거블록 번호
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * 여러 패턴(0xa5, 0x5a, 0x00)으로 소거→쓰기→읽기→검증 사이클을 반복하여
+ * 소거블록이 정상 동작하는지 확인한다. 소거 후 0xFF인지, 패턴 쓰기 후
+ * 올바르게 읽히는지를 ��증한다. 불량 블록 후보를 확인하는 데 사용된다.
+ */
 int mtd_torture(libmtd_t desc, const struct mtd_dev_info *mtd, int fd, int eb)
 {
 	int err, i, patt_count;
@@ -1011,6 +1160,16 @@ out:
 	return -1;
 }
 
+/*
+ * [한국어]
+ * mtd_is_bad - 소거블록이 배드 블록인지 확인
+ *
+ * @return: 정상이면 0, 배드이면 1, 에러 시 -1
+ *
+ * NAND 플래시는 제조 시 또는 사용 중 배드 블록이 발생할 수 있다.
+ * MEMGETBADBLOCK ioctl로 커널에 배드 블록 여부를 질의한다.
+ * bb_allowed가 false인 장치(NOR 등)는 항상 0을 반환한다.
+ */
 int mtd_is_bad(const struct mtd_dev_info *mtd, int fd, int eb)
 {
 	int ret;
@@ -1030,6 +1189,13 @@ int mtd_is_bad(const struct mtd_dev_info *mtd, int fd, int eb)
 	return ret;
 }
 
+/*
+ * [한국어]
+ * mtd_mark_bad - 소거블록을 배드 블록으로 표시
+ *
+ * MEMSETBADBLOCK ioctl로 커널에 해당 소거블록을 영구적으로 배드 표시한다.
+ * 한 번 표시되면 이후 이 블록은 사용되지 않는다.
+ */
 int mtd_mark_bad(const struct mtd_dev_info *mtd, int fd, int eb)
 {
 	int ret;
@@ -1051,6 +1217,24 @@ int mtd_mark_bad(const struct mtd_dev_info *mtd, int fd, int eb)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * mtd_read - MTD 장치에서 데이터 읽기
+ *
+ * @mtd: MTD 장치 정보
+ * @fd: 장치 파일 디스크립터
+ * @eb: 읽을 소거블록 번호
+ * @offs: 소거블록 내 오프셋
+ * @buf: 데이터를 저장할 버퍼
+ * @len: 읽을 바이트 수
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * lseek로 소거블록 시작 + offs 위치로 이동한 후 read()로 데이터를 읽는다.
+ * 짧은 읽기(short read)가 발생할 수 있으므로 루프로 전체 길이를 읽는다.
+ *
+ * 호출 체인:
+ *   engines/mtd.c → [mtd_read()] → lseek(), read()
+ */
 int mtd_read(const struct mtd_dev_info *mtd, int fd, int eb, int offs,
 	     void *buf, int len)
 {
@@ -1122,6 +1306,28 @@ static int legacy_auto_oob_layout(const struct mtd_dev_info *mtd, int fd,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * mtd_write - MTD 장치에 데이터(+OOB) 쓰기
+ *
+ * @desc: 라이브러리 디스크립터
+ * @mtd: MTD 장치 정보
+ * @fd: 장치 파일 디스크립터
+ * @eb: 쓸 소거블록 번호
+ * @offs: 소거블록 내 오프셋 (서브페이지 정렬 필요)
+ * @data: 데이터 버퍼
+ * @len: 데이터 길이 (서브페이지 정렬 필요)
+ * @oob: OOB 데이터 버퍼 (NULL이면 OOB 쓰지 않음)
+ * @ooblen: OOB 데이터 길이
+ * @mode: OOB 쓰기 모드 (MTD_OPS_AUTO_OOB 등)
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * OOB가 있으면 MEMWRITE ioctl을 먼저 시도하고, 지원하지 않으면
+ * 구형 OOB ioctl로 폴백한다. 데이터는 lseek + write()로 기록한다.
+ *
+ * 호출 체인:
+ *   engines/mtd.c → [mtd_write()] → ioctl(MEMWRITE), write()
+ */
 int mtd_write(libmtd_t desc, const struct mtd_dev_info *mtd, int fd, int eb,
 	      int offs, void *data, int len, void *oob, int ooblen,
 	      uint8_t mode)
@@ -1192,6 +1398,14 @@ int mtd_write(libmtd_t desc, const struct mtd_dev_info *mtd, int fd, int eb,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * do_oob_op - OOB(Out-Of-Band) 읽기/쓰기의 공통 구현
+ *
+ * OOB는 NAND 플래시 페이지의 추가 영역으로, ECC(Error Correction Code)와
+ * 메타데이터를 저장한다. 먼저 64비트 ioctl(MEMREADOOB64/MEMWRITEOOB64)을
+ * 시도하고, 지원하지 않으면 32비트 ioctl로 폴백한다.
+ */
 static int do_oob_op(libmtd_t desc, const struct mtd_dev_info *mtd, int fd,
 	      uint64_t start, uint64_t length, void *data, unsigned int cmd64,
 	      unsigned int cmd)
@@ -1283,6 +1497,20 @@ int mtd_write_oob(libmtd_t desc, const struct mtd_dev_info *mtd, int fd,
 			 MEMWRITEOOB64, MEMWRITEOOB);
 }
 
+/*
+ * [한국어]
+ * mtd_write_img - 이미지 파일을 MTD 장치에 기록
+ *
+ * @mtd: MTD 장치 정보
+ * @fd: 장치 파일 디스크립터
+ * @eb: 시작 소거블록 번호
+ * @offs: 시작 오프셋
+ * @img_name: 기록할 이미지 파일 경로
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * 이미지 파일을 열어 MTD 장치에 소거블록 단위로 기록한다.
+ * 이미지 크기가 서브페이지에 정렬되어야 하고, 장치 범위를 넘지 않아야 한다.
+ */
 int mtd_write_img(const struct mtd_dev_info *mtd, int fd, int eb, int offs,
 		  const char *img_name)
 {
@@ -1380,6 +1608,16 @@ out_close:
 	return -1;
 }
 
+/*
+ * [한국어]
+ * mtd_probe_node - 노드가 MTD 장치인지 확인
+ *
+ * @desc: 라이브러리 디스크립터
+ * @node: 확인할 장치 노드 경로
+ * @return: MTD 장치이면 1, 아니면 -1 (errno=ENODEV)
+ *
+ * 노드의 major:minor를 시스템의 모든 MTD 장치와 비교하여 확인한다.
+ */
 int mtd_probe_node(libmtd_t desc, const char *node)
 {
 	struct stat st;

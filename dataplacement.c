@@ -19,6 +19,20 @@
  *   - FIO_DP_RR     : 라운드 로빈 (순차 순환)
  *   - FIO_DP_RANDOM : 균등 랜덤
  *   - FIO_DP_SCHEME : 오프셋 범위 기반 매핑 (스킴 파일에서 로드)
+ 
+ * === 파일의 역할 ===
+ * NVMe FDP/스트림을 사용하여 쓰기 I/O에 데이터 배치 힌트를 부여한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 do_io()에서 dp_fill_dspec_data()로 힌트를 설정.
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c/io_u.c: I/O 제출 시 dspec 설정
+ * - dataplacement.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - dp_init(): RUH 정보 조회 및 스킴 로드
+ * - dp_fill_dspec_data(): 쓰기 I/O의 dtype/dspec 결정
  */
 
 #include <errno.h>      /* 에러 코드 */

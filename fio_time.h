@@ -8,6 +8,20 @@
  *   - ramp_period_*()            : 워밍업(ramp) 기간 관리
  *   - cycles_spin/usec_spin()    : CPU 스핀 대기
  *   - usec_sleep()               : 마이크로초 단위 슬립
+ 
+ * === 파일의 역할 ===
+ * fio 시간 측정 및 관리 함수를 선언한다. 경과 시간, ramp period, 대기 함수 포함.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * time.c와 짝을 이루는 헤더. fio 전체에서 시간 관련 함수 사용 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - time.c: 이 헤더의 함수 구현
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - ntime/utime/mtime_since*(): 경과 시간 계산
+ * - ramp_period_check/over(): 워밍업 기간 관리
+ * - usec_spin()/usec_sleep(): 대기 함수
  */
 #ifndef FIO_TIME_H
 #define FIO_TIME_H

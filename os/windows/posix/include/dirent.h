@@ -1,3 +1,9 @@
+/*
+ * [한국어 설명] Windows용 dirent.h 호환 헤더
+ * POSIX 디렉토리 읽기 API(opendir/readdir/closedir)를 선언.
+ * dirent_ctx 구조체는 FindFirstFile/FindNextFile 핸들을 래핑.
+ * 실제 구현은 windows/posix.c.
+ */
 #ifndef DIRENT_H
 #define DIRENT_H
 

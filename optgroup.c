@@ -9,6 +9,20 @@
  *   2) fio_opt_cat_groups[] - 세부 카테고리 (Rate, Zone, Verify, 각 I/O 엔진별 등)
  *
  * 각 옵션은 비트마스크로 하나 이상의 그룹에 속할 수 있다.
+ 
+ * === 파일의 역할 ===
+ * fio 옵션들을 논리적 그룹과 카테고리로 분류하는 테이블을 정의.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * optgroup.h와 짝. parse.c/options.c에서 옵션 그룹 표시 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - optgroup.h: 그룹 열거형, 구조체 정의
+ * - parse.c/options.c: 옵션 그룹 참조
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_opt_groups[]: 상위 카테고리 테이블
+ * - fio_opt_cat_groups[]: 세부 카테고리 테이블
  */
 #include <stdio.h>
 #include <inttypes.h>

@@ -1,11 +1,25 @@
 /*
- * [한국어] gettime.h - 시간 측정 API 선언
+ * [한국어 설명] 시간 측정 API 선언 (gettime.h)
  *
- * fio에서 사용하는 시간 측정 관련 함수와 구조체를 선언한다.
- * 지원하는 클록 소스:
- *   - CS_GTOD     : gettimeofday() 기반 (벽시계 시간)
- *   - CS_CGETTIME : clock_gettime(CLOCK_MONOTONIC) 기반 (단조 증가 시계)
- *   - CS_CPUCLOCK : CPU TSC(타임스탬프 카운터) 기반 (가장 낮은 오버헤드)
+ * === 파일의 역할 ===
+ * fio에서 사용하는 시간 측정 관련 함수, 구조체, 클록 소스 열거형을 선언한다.
+ * CS_GTOD(gettimeofday), CS_CGETTIME(clock_gettime), CS_CPUCLOCK(CPU TSC) 지원.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * gettime.c와 짝을 이루는 헤더. fio.h에서 포함되어 전체 코드에서 사용 가능.
+ * gettime.h → gettime.c(구현) / fio.h(전역 포함) / backend.c, io_u.c(시간 측정)
+ *
+ * === 타 모듈과의 연결 ===
+ * - gettime.c: 이 헤더의 함수 구현
+ * - fio.h: 이 헤더를 포함하여 전역 접근 제공
+ * - arch/arch.h: CPU 클록 읽기 (get_cpu_clock)
+ * - lib/seqlock.h: gtod 스레드와의 동기화
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - enum fio_cs: 클록 소스 (CS_GTOD, CS_CGETTIME, CS_CPUCLOCK)
+ * - fio_gettime(): 현재 시간 조회 핵심 함수
+ * - fio_clock_init(): 클록 초기화 및 TSC 캘리브레이션
+ * - ntime_since/utime_since/mtime_since: 시간 차이 계산
  */
 #ifndef FIO_GETTIME_H
 #define FIO_GETTIME_H

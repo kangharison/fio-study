@@ -24,6 +24,30 @@
  *
  */
 
+/*
+ * [한국어 설명] T10-DIF CRC-16 구현 (crct10dif_common.c)
+ *
+ * === 파일의 역할 ===
+ * T10 DIF(Data Integrity Field) CRC-16을 구현한다.
+ * CONFIG_LIBISAL 정의 시 Intel ISA-L 라이브러리의 crc16_t10dif()로 가속하고,
+ * 미정의 시 소프트웨어 테이블 룩업 방식으로 계산한다.
+ * 다항식: x^16 + x^15 + x^11 + x^9 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1 (0x8BB7)
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * SCSI T10 표준의 DIF/DIX 프로토콜에서 512바이트 섹터마다 CRC를 부착한다.
+ * fio에서는 이 CRC를 데이터 검증 옵션으로 사용할 수 있다.
+ * 호출 체인: verify.c → fio_crc_t10dif() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - crc-t10dif.h: 인터페이스 정의
+ * - verify.c: verify=crc-t10dif 옵션 시 호출
+ * - ISA-L 라이브러리: CONFIG_LIBISAL 정의 시 하드웨어 가속 사용
+ *
+ * === 주요 함수 요약 ===
+ * - fio_crc_t10dif(): T10-DIF CRC-16 계산 (시드값을 받아 증분 계산 가능)
+ */
+
+/* [한국어] CONFIG_LIBISAL 정의 시: Intel ISA-L 라이브러리의 하드웨어 가속 CRC 사용 */
 #ifdef CONFIG_LIBISAL
 #include <isa-l/crc.h>
 
@@ -34,6 +58,7 @@ extern unsigned short fio_crc_t10dif(unsigned short crc,
 	return crc16_t10dif(crc, buffer, len);
 }
 
+/* [한국어] CONFIG_LIBISAL 미정의 시: 소프트웨어 테이블 룩업 방식 사용 */
 #else
 #include "crc-t10dif.h"
 
@@ -41,6 +66,7 @@ extern unsigned short fio_crc_t10dif(unsigned short crc,
  * x^16 + x^15 + x^11 + x^9 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
  * gt: 0x8bb7
  */
+/* [한국어] T10-DIF CRC-16 룩업 테이블: 다항식 0x8BB7로부터 생성된 256개 항목 */
 static const unsigned short t10_dif_crc_table[256] = {
 	0x0000, 0x8BB7, 0x9CD9, 0x176E, 0xB205, 0x39B2, 0x2EDC, 0xA56B,
 	0xEFBD, 0x640A, 0x7364, 0xF8D3, 0x5DB8, 0xD60F, 0xC161, 0x4AD6,

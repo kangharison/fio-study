@@ -1,20 +1,28 @@
 /*
- * [한국어] parse.h - fio 옵션 파싱 시스템의 핵심 헤더
+ * [한국어 설명] fio 옵션 파싱 시스템 핵심 헤더 (parse.h)
  *
- * 이 파일은 fio의 설정(옵션) 파싱 프레임워크를 정의한다.
- * 주요 내용:
- *   1) fio_opt_type     - 옵션의 타입 열거형 (문자열, 정수, 불린, 범위 등)
- *   2) value_pair       - 문자열 옵션 값과 정수 값의 매핑 쌍
- *   3) fio_option       - 개별 옵션 정의 구조체 (이름, 타입, 오프셋, 범위, 콜백 등)
- *   4) 파싱 API         - parse_option(), fill_default_options(), options_init() 등
- *   5) 유틸리티 함수     - str_to_decimal(), check_str_bytes(), string_distance() 등
- *   6) td_var() 인라인  - 옵션 오프셋으로부터 thread_data 내 실제 변수 포인터를 계산
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 설정(옵션) 파싱 프레임워크를 정의한다. fio_opt_type(옵션 타입),
+ * fio_option(옵션 정의 구조체), 파싱 API, td_var() 인라인 함수를 제공한다.
+ * 각 옵션의 off1~off6 필드가 thread_options 내 변수의 offsetof를 저장하며,
+ * td_var()로 오프셋 → 실제 메모리 주소로 변환하여 값을 저장한다.
  *
- * fio 옵션 시스템의 작동 원리:
- *   - 각 옵션은 fio_option 구조체로 정의되며, off1~off6 필드는 thread_options 구조체 내
- *     해당 변수의 오프셋(offsetof)을 저장한다.
- *   - 파싱 시 td_var()를 통해 오프셋 → 실제 메모리 주소로 변환하여 값을 저장한다.
- *   - posval[] 배열은 문자열 ↔ 정수 매핑을 정의한다 (예: "read" → DDIR_READ).
+ * === 전체 아키텍처에서의 위치 ===
+ * parse.c와 짝을 이루는 헤더로, options.c에서 fio_option 구조체로 옵션을 정의하고,
+ * init.c에서 파싱 API를 호출한다.
+ * parse.h → parse.c(구현) / options.c(옵션 정의) / init.c(파싱 호출)
+ *
+ * === 타 모듈과의 연결 ===
+ * - parse.c: 이 헤더의 구조체와 함수의 구현
+ * - options.c: fio_option 구조체로 각 옵션을 정의
+ * - init.c: parse_option()/fill_default_options() 호출
+ * - thread_options.h: 옵션 값이 저장되는 대상 (offsetof로 참조)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - enum fio_opt_type: 옵션 타입 (STR, INT, BOOL, RANGE, STR_VAL 등)
+ * - struct fio_option: 옵션 정의 (이름, 타입, 오프셋, 범위, 콜백, posval 등)
+ * - parse_option(): "opt=val" 문자열 파싱 API
+ * - td_var(): 옵션 오프셋 → thread_data 내 변수 포인터 변환 인라인
  */
 #ifndef FIO_PARSE_H
 #define FIO_PARSE_H

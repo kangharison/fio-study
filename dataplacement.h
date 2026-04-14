@@ -4,6 +4,20 @@
  * NVMe FDP 및 스트림(Streams) 기반 데이터 배치를 위한 상수, 구조체, 함수 선언.
  * FDP는 호스트가 데이터의 물리적 배치를 힌트로 제공하여
  * SSD 내부의 가비지 컬렉션(GC) 효율을 높이는 기술이다.
+ 
+ * === 파일의 역할 ===
+ * NVMe FDP/스트림 기반 데이터 배치를 위한 상수, 구조체, 함수를 선언.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * dataplacement.c와 짝을 이루는 헤더. ioengines.h에서 포함.
+ *
+ * === 타 모듈과의 연결 ===
+ * - dataplacement.c: 이 헤더의 함수 구현
+ * - ioengines.h: 이 헤더를 포함
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct dp_scheme: 데이터 배치 스킴
+ * - FDP_DIR_DTYPE/STREAMS_DIR_DTYPE: 배치 방식 상수
  */
 #ifndef FIO_DATAPLACEMENT_H
 #define FIO_DATAPLACEMENT_H

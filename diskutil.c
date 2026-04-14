@@ -15,6 +15,20 @@
  * 디바이스 탐색 흐름:
  *   파일 경로 -> stat()으로 major/minor 번호 획득 -> /sys/block/ 탐색 ->
  *   sysfs에서 파티션/디스크 구분 -> disk_util 구조체 생성 및 등록
+ 
+ * === 파일의 역할 ===
+ * /sys/block/<dev>/stat에서 디스크 I/O 활용도를 주기적으로 수집. iostat 유사 통계.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * helper_thread.c에서 update_io_ticks()를 주기적으로 호출.
+ *
+ * === 타 모듈과의 연결 ===
+ * - helper_thread.c: 주기적 통계 업데이트
+ * - diskutil.h: 구조체 및 API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - init_disk_util(): 디바이스 찾아 항목 생성
+ * - update_io_ticks(): 모든 디바이스 통계 폴링
  */
 
 #include <inttypes.h>       /* PRIu64 등 고정 크기 정수 포맷 매크로 */

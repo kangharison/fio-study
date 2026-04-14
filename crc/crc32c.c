@@ -30,6 +30,26 @@
  * any later version.
  *
  */
+/*
+ * [한국어 설명] CRC-32C 소프트웨어 구현 (crc32c.c)
+ *
+ * === 파일의 역할 ===
+ * CRC-32C(Castagnoli) 체크섬의 소프트웨어 구현을 제공한다.
+ * Castagnoli 다항식 0x1EDC6F41을 사용하며, iSCSI 드라이버에서 유래했다.
+ * 이 구현은 하드웨어 가속(SSE4.2/ARM CRC)을 사용할 수 없을 때의 폴백이다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio_crc32c() 인라인 함수에서 하드웨어 가속이 불가능할 때 호출된다.
+ * 호출 체인: verify.c → fio_crc32c() [crc32c.h] → crc32c_sw() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - crc32c.h: 인터페이스 정의와 자동 디스패치 함수 fio_crc32c()
+ * - crc32c-intel.c: Intel SSE4.2 하드웨어 가속 대안
+ * - crc32c-arm64.c: ARM64 CRC 하드웨어 가속 대안
+ *
+ * === 주요 함수 요약 ===
+ * - crc32c_sw(): 테이블 기반 소프트웨어 CRC-32C 계산
+ */
 #include "crc32c.h"
 
 /*
@@ -41,6 +61,11 @@
  * reflect output bytes = true
  */
 
+/*
+ * [한국어] CRC-32C 룩업 테이블 (256개 항목)
+ * Castagnoli 다항식 0x1EDC6F41로부터 생성된 reflected(입출력 비트 반전) 테이블이다.
+ * 표준 CRC-32와 다른 다항식을 사용하므로 테이블 값이 다르다.
+ */
 static const uint32_t crc32c_table[256] = {
 	0x00000000L, 0xF26B8303L, 0xE13B70F7L, 0x1350F3F4L,
 	0xC79A971FL, 0x35F1141CL, 0x26A1E7E8L, 0xD4CA64EBL,
@@ -113,6 +138,22 @@ static const uint32_t crc32c_table[256] = {
  * crc using table.
  */
 
+/*
+ * [한국어]
+ * crc32c_sw - 소프트웨어 방식 CRC-32C 체크섬 계산
+ *
+ * @data: CRC를 계산할 데이터 버퍼 포인터
+ * @length: 데이터 길이(바이트)
+ * @return: 계산된 32비트 CRC-32C 값 (비트 반전 없음 - 초기값 ~0에서 시작)
+ *
+ * reflected 방식으로 바이트 단위 테이블 룩업을 수행한다.
+ * 초기값을 ~0(0xFFFFFFFF)으로 설정하고, 각 바이트마다:
+ *   crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+ * 최종 반전(~)은 수행하지 않는다 (호출자가 필요시 처리).
+ *
+ * 호출 체인:
+ *   fio_crc32c() [crc32c.h] → [crc32c_sw] → crc32c_table[] 참조
+ */
 uint32_t crc32c_sw(unsigned char const *data, unsigned long length)
 {
 	uint32_t crc = ~0;

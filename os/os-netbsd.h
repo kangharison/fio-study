@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] NetBSD 플랫폼 OS 추상화 헤더 (os-netbsd.h)
+ *
+ * === 파일의 역할 ===
+ * NetBSD에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * DIOCGDINFO ioctl로 디스크 라벨 기반 크기 조회, _lwp_self()로 스레드 ID,
+ * sysctl(HW_PHYSMEM64)로 물리 메모리 조회, statvfs로 여유 공간 조회.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __NetBSD__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): DIOCGDINFO ioctl (disklabel 사용)
+ * - gettid(): _lwp_self() 래퍼
+ * - get_fs_free_size(): statvfs로 여유 공간 조회
+ */
 #ifndef FIO_OS_NETBSD_H
 #define FIO_OS_NETBSD_H
 

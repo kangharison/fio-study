@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] HP-UX 플랫폼 OS 추상화 헤더 (os-hpux.h)
+ *
+ * === 파일의 역할 ===
+ * HP-UX에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * DIOC_DESCRIBE_EXT ioctl로 디스크 크기 조회, pstat으로 물리 메모리,
+ * mpctl(MPC_GETNUMSPUS)로 CPU 수 조회. aiocb64 타입을 사용하는 특이사항.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __hpux 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): DIOC_DESCRIBE_EXT ioctl (disk_describe_type_ext_t)
+ * - os_phys_mem(): pstat(PSTAT_STATIC)으로 물리 메모리 x 페이지 크기
+ * - cpus_configured(): mpctl(MPC_GETNUMSPUS)
+ */
 #ifndef FIO_OS_HPUX_H
 #define FIO_OS_HPUX_H
 
@@ -37,6 +53,7 @@
 
 #define FIO_USE_GENERIC_SWAP
 
+/* [한국어] HP-UX는 64비트 AIO 구조체(aiocb64)를 사용하므로 별도 typedef 필요 */
 #define FIO_OS_HAVE_AIOCB_TYPEDEF
 
 #ifdef CONFIG_PTHREAD_GETAFFINITY

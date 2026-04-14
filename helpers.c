@@ -10,6 +10,20 @@
  *   - sync_file_range()  : 파일 범위 동기화 (ENOSYS 반환)
  *   - syncfs()           : 파일시스템 전체 동기화 (ENOSYS 반환)
  *   - posix_fadvise()    : 파일 접근 힌트 (무시, 성공 반환)
+ 
+ * === 파일의 역할 ===
+ * 플랫폼 미지원 시스템 콜에 대한 폴백 구현을 제공. CONFIG_* 비활성 시에만 컴파일.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * filesetup.c 등에서 fallocate, sync_file_range 등 호출 시 폴백으로 링크.
+ *
+ * === 타 모듈과의 연결 ===
+ * - helpers.h: API 선언
+ * - filesetup.c: 파일 공간 할당/동기화 시 사용
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fallocate()/posix_fallocate(): 파일 공간 할당 폴백
+ * - sync_file_range()/syncfs(): 동기화 폴백
  */
 #include <errno.h>
 

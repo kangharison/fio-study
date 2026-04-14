@@ -22,9 +22,9 @@ extern long double unpack754(uint64_t i, unsigned bits, unsigned expbits);
 
 typedef struct fio_fp64 {
 	union {
-		uint64_t i;
-		double f;
-		uint8_t filler[16];
+		uint64_t i;		/* [한국어] 정수 표현 (네트워크 전송/직렬화용) */
+		double f;		/* [한국어] 부동소수점 표현 (연산용) */
+		uint8_t filler[16];	/* [한국어] 16바이트 정렬 패딩 */
 	} u;
 } fio_fp64_t;
 

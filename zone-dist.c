@@ -7,6 +7,21 @@
  *
  * zone_split은 디바이스를 여러 영역으로 나누고, 각 영역에
  * 서로 다른 접근 비율(access_perc)과 크기 비율(size_perc)을 부여한다.
+ 
+ * === 파일의 역할 ===
+ * zone_split 옵션에 따라 I/O 접근을 존별로 분배하는 인덱스 테이블을 생성.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * init.c에서 td_zone_gen_index()로 인덱스 생성. io_u.c에서 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - init.c: 인덱스 생성 호출
+ * - io_u.c: 오프셋 결정 시 인덱스 참조
+ * - zone-dist.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - td_zone_gen_index(): 존 분배 인덱스 생성
+ * - td_zone_free_index(): 인덱스 해제
  */
 #include <stdlib.h>
 #include "fio.h"

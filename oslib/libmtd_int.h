@@ -23,6 +23,28 @@
 
 /* Imported from mtd-utils by dehrenberg */
 
+/*
+ * [한국어 설명] MTD 라이브러리 내부 데이터 구조체 헤더 (libmtd_int.h)
+ *
+ * === 파일의 역할 ===
+ * MTD 라이브러리의 내부 구현에서만 사용되는 데이터 구조체와 상수를 정의한다.
+ * struct libmtd가 핵심으로, sysfs 파일 경로 패턴들과 64비트 ioctl 지원 여부를
+ * 추적한다. 공개 API에서는 libmtd_t(void*)로 은닉된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * libmtd.c와 libmtd_legacy.c에서 내부적으로 사용되며,
+ * 공개 API 사용자(engines/mtd.c)에게는 노출되지 않는다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - libmtd.c: 이 구조체를 사용하는 주요 구현 파일
+ * - libmtd_legacy.c: sysfs 미지원 시 /proc/mtd 기반 레거시 함수 선언
+ * - libmtd.h: 공개 API (libmtd_t를 통해 간접 참조)
+ *
+ * === 주요 구조체 요약 ===
+ * - struct libmtd: MTD 라이브러리 내부 상태 (sysfs 경로 패턴, ioctl 지원 여부)
+ * - SYSFS_MTD 등 상수: /sys/class/mtd 하위 파일명 정의
+ * - legacy_* 함수: sysfs 미지원 커널용 레거시 API 선언
+ */
 #ifndef __LIBMTD_INT_H__
 #define __LIBMTD_INT_H__
 
@@ -32,6 +54,8 @@ extern "C" {
 
 #define PROGRAM_NAME "libmtd"
 
+/* [한국어] sysfs의 MTD 관련 파일 경로 및 속성명 상수 */
+/* [한국어] /sys/class/mtd 디렉토리 하위의 각 속성 파일 이름 */
 #define SYSFS_MTD        "class/mtd"
 #define MTD_NAME_PATT    "mtd%d"
 #define MTD_DEV          "dev"
@@ -45,9 +69,10 @@ extern "C" {
 #define MTD_REGION_CNT   "numeraseregions"
 #define MTD_FLAGS        "flags"
 
-#define OFFS64_IOCTLS_UNKNOWN       0
-#define OFFS64_IOCTLS_NOT_SUPPORTED 1
-#define OFFS64_IOCTLS_SUPPORTED     2
+/* [한국어] 64비트 오프셋 ioctl 지원 상태 - 커널 2.6.31+에서 추가됨 */
+#define OFFS64_IOCTLS_UNKNOWN       0  /* [한국어] 아직 확인되지 않음 */
+#define OFFS64_IOCTLS_NOT_SUPPORTED 1  /* [한국어] 지원하지 않음 (구형 커널) */
+#define OFFS64_IOCTLS_SUPPORTED     2  /* [한국어] 지원함 */
 
 /**
  * libmtd - MTD library description data structure.
@@ -96,6 +121,8 @@ struct libmtd
 	unsigned int offs64_ioctls:2;
 };
 
+/* [한국어] sysfs 미지원 구형 커널(2.6.30 미만)용 레거시 함수 선언 */
+/* [한국어] /proc/mtd 파일을 파싱하여 MTD 정보를 얻는 대체 구현 */
 int legacy_libmtd_open(void);
 int legacy_dev_present(int mtd_num);
 int legacy_mtd_get_info(struct mtd_info *info);

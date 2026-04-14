@@ -26,27 +26,27 @@
 #include <inttypes.h>
 
 struct prio_tree_node {
-	struct prio_tree_node	*left;
-	struct prio_tree_node	*right;
-	struct prio_tree_node	*parent;
-	uint64_t		start;
-	uint64_t		last;	/* last location _in_ interval */
+	struct prio_tree_node	*left;		/* [한국어] 왼쪽 자식 (자기 자신이면 비어 있음) */
+	struct prio_tree_node	*right;		/* [한국어] 오른쪽 자식 */
+	struct prio_tree_node	*parent;	/* [한국어] 부모 (자기 자신이면 루트) */
+	uint64_t		start;		/* [한국어] 구간의 시작 (radix_index) */
+	uint64_t		last;		/* [한국어] 구간의 끝 (heap_index, start <= last) */
 };
 
 struct prio_tree_root {
-	struct prio_tree_node	*prio_tree_node;
-	unsigned short 		index_bits;
+	struct prio_tree_node	*prio_tree_node;	/* [한국어] 트리의 루트 노드 (NULL이면 빈 트리) */
+	unsigned short 		index_bits;	/* [한국어] 트리 높이 결정. max_heap_index < 2^index_bits */
 };
 
 struct prio_tree_iter {
-	struct prio_tree_node	*cur;
-	unsigned long		mask;
-	unsigned long		value;
-	int			size_level;
+	struct prio_tree_node	*cur;		/* [한국어] 현재 순회 위치 */
+	unsigned long		mask;		/* [한국어] 현재 레벨의 비트 마스크 */
+	unsigned long		value;		/* [한국어] 지금까지 누적된 인덱스 값 */
+	int			size_level;	/* [한국어] 0=radix 인덱스 단계, >0=size 인덱스 단계 */
 
-	struct prio_tree_root	*root;
-	uint64_t		r_index;
-	uint64_t		h_index;
+	struct prio_tree_root	*root;		/* [한국어] 검색 대상 트리 루트 */
+	uint64_t		r_index;	/* [한국어] 쿼리 구간의 시작 (radix_index) */
+	uint64_t		h_index;	/* [한국어] 쿼리 구간의 끝 (heap_index) */
 };
 
 static inline void prio_tree_iter_init(struct prio_tree_iter *iter,

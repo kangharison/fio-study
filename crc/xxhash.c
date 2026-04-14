@@ -62,6 +62,27 @@ You can contact the author at :
 //**************************************
 // Includes & Memory related functions
 //**************************************
+/*
+ * [한국어 설명] xxHash 고속 해시 알고리즘 구현 (xxhash.c)
+ *
+ * === 파일의 역할 ===
+ * xxHash 32비트 해시 함수를 구현한다. 4개의 병렬 누적자(v1~v4)를 사용하여
+ * 16바이트 스트라이프를 한 번에 처리하며, PRIME 상수들로 곱셈과 회전을 수행한다.
+ * 엔디안 독립적으로 동작하며, 비정렬 메모리 접근도 처리한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: verify.c / crc/test.c → XXH32() 또는 XXH32_init/update/digest
+ *
+ * === 타 모듈과의 연결 ===
+ * - xxhash.h: 인터페이스와 XXH_state32_t 구조체 정의
+ * - verify.c: verify=xxhash 옵션 시 호출
+ *
+ * === 주요 함수 요약 ===
+ * - XXH32(): 단일 블록 해시 (내부적으로 XXH32_endian_align 호출)
+ * - XXH32_endian_align(): 핵심 해시 계산 (엔디안/정렬 파라미터화)
+ * - XXH32_init/update/digest(): 스트리밍 API
+ * - XXH32_intermediateDigest(): 상태 유지하면서 중간 해시 추출
+ */
 #include "xxhash.h"
 #include <stdlib.h>
 #include <string.h>

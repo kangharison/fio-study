@@ -18,6 +18,8 @@
 
 #define nop	do { } while (0)
 
+/* [한국어] membar_safe - 분기 명령과 조합하여 membar를 안전하게 실행하는 매크로
+ * SPARC에서는 membar가 branch delay slot에서 오동작할 수 있어 ba,pt로 감싸 보호한다 */
 #define membar_safe(type) \
 	do {    __asm__ __volatile__("ba,pt     %%xcc, 1f\n\t" \
 					" membar   " type "\n" \

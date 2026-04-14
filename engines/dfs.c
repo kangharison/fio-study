@@ -1,23 +1,37 @@
 /*
  * [한국어 설명] DAOS File System (DFS) I/O 엔진 구현 (dfs.c)
  *
- * === 엔진 개요 ===
- * DAOS 분산 스토리지 시스템의 DFS(DAOS File System) 인터페이스를 사용하는 I/O 엔진이다.
- * DAOS 풀과 컨테이너에 연결하여 파일 수준의 비동기 읽기/쓰기 작업을 수행하며,
- * 오브젝트 클래스와 청크 크기 등 DAOS 특유의 설정 옵션을 지원한다.
+ * === 파일의 역할 ===
+ * 이 파일은 Intel DAOS 분산 스토리지의 POSIX-유사 파일 시스템 레이어인 libdfs
+ * 위에서 동작하는 fio I/O 엔진을 구현한다. DAOS 풀(pool)과 컨테이너(container)에
+ * 연결해 DFS 네임스페이스 내에서 파일을 생성/열기/읽기/쓰기/삭제하며, DAOS
+ * 이벤트 큐(EQ) 기반 비동기 제출/완료 수집을 지원한다. 오브젝트 클래스(cid)와
+ * 청크 크기(chunk size) 같은 DAOS 고유 옵션을 통해 데이터 분산/복제 정책을 지정.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * libdaos - DAOS 클러스터 연결 (daos_init, daos_pool_connect, daos_cont_open)
- * libdfs - 파일 시스템 작업 (dfs_mount, dfs_open, dfs_read, dfs_write 등)
- * DAOS 이벤트 큐 - 비동기 I/O (daos_eq_create, daos_eq_poll)
+ * === 전체 아키텍처에서의 위치 ===
+ * 엔진 플러그인 계약에서 setup→init(풀/컨테이너/DFS 마운트)→open_file→queue→
+ * getevents→event→close_file→cleanup 순서로 호출된다. queue는 dfs_read/write를
+ * 즉시 호출하되 DAOS 이벤트를 통해 비동기 완료를 보고하는 전형적 aio 패턴이다.
+ * 실행 컨텍스트는 잡 스레드(유저스페이스), 클라이언트 측 libdaos가 RPC로 DAOS
+ * 서버(storage engine)와 통신한다.
  *
- * === fio에서의 사용법 ===
- * --ioengine=dfs 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * - 상위: ioengines.c의 전체 콜백 세트(setup/init/prep/queue/commit/getevents/
+ *   event/cleanup/open_file/close_file/unlink_file/invalidate/get_file_size,
+ *   io_u_init/io_u_free).
+ * - 하위: libdaos(daos_init/daos_pool_connect/daos_cont_open/daos_eq_create/
+ *   daos_eq_poll), libdfs(dfs_mount/dfs_open/dfs_read/dfs_write/dfs_remove 등).
+ * - 프로세스 전역 상태: daos_initialized, num_threads, daos_mutex, poh/coh/cid를
+ *   공유해 여러 잡이 같은 DAOS 연결을 재사용한다.
+ * - 공유: thread_data::io_ops_data에 DFS 마운트 핸들/EQ, io_u::engine_data에 개별
+ *   요청 컨텍스트(fio_dfs_iou) 저장.
  *
- * === 구현하는 주요 콜백 ===
- * .setup, .init, .prep, .cleanup, .open_file, .close_file,
- * .unlink_file, .invalidate, .get_file_size,
- * .queue, .getevents, .event, .io_u_init, .io_u_free
+ * === 주요 함수/구조체 요약 ===
+ * - daos_fio_setup/init: 최초 호출 시 DAOS 초기화 + 풀/컨테이너 연결(뮤텍스 보호).
+ * - dfs_fio_queue: dfs_read/write에 이벤트를 붙여 비동기 제출.
+ * - dfs_fio_getevents/event: daos_eq_poll로 완료 이벤트 수집 → io_u 매핑.
+ * - fio_dfs_open_file/close_file/unlink_file: dfs_open/dfs_release/dfs_remove 래핑.
+ * - 전역 poh/coh/cid/daos_mutex: 잡 간 DAOS 핸들 공유 및 초기화 레이스 방지.
  */
 
 /**
@@ -40,21 +54,23 @@ daos_handle_t		coh;  /* container handle */
 daos_oclass_id_t	cid = OC_UNKNOWN;  /* object class */
 dfs_t			*daosfs; /* dfs mount reference */
 
+/* [한국어] DAOS I/O 유닛 확장 데이터 - io_u->engine_data에 저장 */
 struct daos_iou {
-	struct io_u	*io_u;
-	daos_event_t	ev;
-	d_sg_list_t	sgl;
-	d_iov_t		iov;
-	daos_size_t	size;
-	bool		complete;
+	struct io_u	*io_u;		/* [한국어] 대응하는 fio io_u */
+	daos_event_t	ev;		/* [한국어] DAOS 비동기 이벤트 핸들 */
+	d_sg_list_t	sgl;		/* [한국어] scatter/gather 리스트 (DAOS I/O 버퍼 기술자) */
+	d_iov_t		iov;		/* [한국어] I/O 벡터 (단일 버퍼 포인터+길이) */
+	daos_size_t	size;		/* [한국어] 읽기 완료 시 실제 전송된 크기 */
+	bool		complete;	/* [한국어] I/O 완료 여부 */
 };
 
+/* [한국어] DAOS/DFS 엔진의 내부 상태 구조체 */
 struct daos_data {
-	daos_handle_t	eqh;
-	dfs_obj_t	*obj;
-	struct io_u	**io_us;
-	int		queued;
-	int		num_ios;
+	daos_handle_t	eqh;		/* [한국어] DAOS 이벤트 큐 핸들 (비동기 I/O 완료 추적) */
+	dfs_obj_t	*obj;		/* [한국어] DFS 파일 오브젝트 핸들 */
+	struct io_u	**io_us;	/* [한국어] 완료된 io_u 배열 */
+	int		queued;		/* [한국어] 큐에 대기 중인 I/O 수 */
+	int		num_ios;	/* [한국어] 수집된 완료 이벤트 수 */
 };
 
 struct daos_fio_options {

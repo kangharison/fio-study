@@ -9,11 +9,41 @@
  *
  */
 
+/*
+ * [한국어 설명] CRC-64 체크섬 구현 (crc64.c)
+ *
+ * === 파일의 역할 ===
+ * 두 가지 CRC-64 변형을 구현한다:
+ *   1) fio_crc64(): 범용 CRC-64 (다항식 0x95AC9329AC4BC9B5, 초기값 ~0)
+ *   2) fio_crc64_nvme(): NVMe 규격 64비트 CRC (위 주석의 다항식)
+ * NVMe CRC-64는 CONFIG_LIBISAL64 정의 시 Intel ISA-L 라이브러리로 가속된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 verify 기능에서 CRC-64 체크섬 옵션이 선택되었을 때 호출된다.
+ * 64비트 CRC는 32비트 대비 충돌 확률이 극히 낮아 대용량 데이터 검증에 적합하다.
+ * 호출 체인: verify.c → fio_crc64() / fio_crc64_nvme()
+ *
+ * === 타 모듈과의 연결 ===
+ * - verify.c: verify=crc64 옵션 시 호출
+ * - crc64.h: 인터페이스 정의
+ * - crc64table.h: NVMe CRC-64 룩업 테이블
+ * - crc/test.c: 벤치마크 테스트
+ *
+ * === 주요 함수 요약 ===
+ * - fio_crc64(): 범용 CRC-64 계산 (crctab64 테이블 사용)
+ * - fio_crc64_nvme(): NVMe CRC-64 계산 (crc64nvmetable 또는 ISA-L 사용)
+ */
 #include "crc64.h"
 #include "crc64table.h"
 
 /*
  * poly 0x95AC9329AC4BC9B5ULL and init 0xFFFFFFFFFFFFFFFFULL
+ */
+
+/*
+ * [한국어] 범용 CRC-64 룩업 테이블 (256개 항목)
+ * 다항식 0x95AC9329AC4BC9B5에서 생성된 테이블이다.
+ * 초기값 0xFFFFFFFFFFFFFFFF(~0)에서 시작하여 바이트 단위로 계산한다.
  */
 static const unsigned long long crctab64[256] = {
   0x0000000000000000ULL, 0x7ad870c830358979ULL, 0xf5b0e190606b12f2ULL,
@@ -104,6 +134,19 @@ static const unsigned long long crctab64[256] = {
   0x29b7d047efec8728ULL
 };
 
+/*
+ * [한국어]
+ * fio_crc64 - 범용 CRC-64 체크섬 계산
+ *
+ * @buffer: CRC를 계산할 데이터 버퍼
+ * @length: 데이터 길이(바이트)
+ * @return: 계산된 64비트 CRC 값
+ *
+ * 초기값 0에서 시작, reflected 방식으로 바이트 단위 테이블 룩업을 수행한다.
+ *
+ * 호출 체인:
+ *   verify.c / crc/test.c → [fio_crc64] → crctab64[] 참조
+ */
 unsigned long long fio_crc64(const unsigned char *buffer, unsigned long length)
 {
 	unsigned long long crc = 0;

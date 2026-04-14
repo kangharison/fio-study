@@ -2,32 +2,36 @@
 #define FIO_H
 
 /*
- * fio.h - fio (Flexible I/O Tester)의 메인 헤더 파일
+ * [한국어 설명] fio 메인 헤더 파일 (fio.h)
  *
- * [한국어 개요]
- * 이 파일은 fio의 핵심 데이터 구조와 함수 선언을 포함합니다.
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 핵심 데이터 구조와 함수 선언을 포함하는 통합 헤더이다.
  * 가장 중요한 구조체는 struct thread_data로, 하나의 I/O 작업(job)을 실행하는
- * 스레드/프로세스의 전체 상태를 담고 있습니다.
+ * 스레드/프로세스의 전체 상태를 담고 있다. 거의 모든 fio 소스 파일이 이 헤더를 포함한다.
  *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 중앙 헤더로서, 모든 핵심 모듈(backend.c, io_u.c, ioengines.c, stat.c 등)이
+ * 이 파일을 포함한다. thread_data 구조체를 통해 모든 서브시스템이 연결된다.
  * 핵심 구조체 관계:
- *   thread_data (이 파일) - 스레드의 런타임 상태 전체
- *     ├── thread_options (thread_options.h) - 사용자가 설정한 옵션 값들 (.o 필드)
- *     ├── io_u (io_u.h) - 개별 I/O 요청 단위 (io_u_freelist, io_u_all 등으로 관리)
- *     ├── fio_file (file.h) - I/O 대상 파일 정보 (files[] 배열)
- *     ├── thread_stat (stat.h) - 통계 수집 결과 (.ts 필드)
- *     └── ioengine_ops (ioengines.h) - I/O 엔진 인터페이스 (.io_ops 필드)
+ *   thread_data (이 파일)
+ *     ├── thread_options (thread_options.h) - 사용자 설정 옵션 (.o 필드)
+ *     ├── io_u (io_u.h) - I/O 요청 단위 (io_u_freelist, io_u_all)
+ *     ├── fio_file (file.h) - 파일 정보 (files[] 배열)
+ *     ├── thread_stat (stat.h) - 통계 (.ts 필드)
+ *     └── ioengine_ops (ioengines.h) - I/O 엔진 인터페이스 (.io_ops)
  *
- * thread_data vs thread_options:
- *   - thread_options: 사용자가 job 파일이나 커맨드라인으로 지정한 "설정값"
- *     (블록 크기, 큐 깊이, 파일 경로, 읽기/쓰기 비율 등)
- *   - thread_data: thread_options를 포함하며, 런타임에 변하는 "상태값"도 관리
- *     (현재 완료된 I/O 수, 에러 상태, 난수 생성기 상태, 통계 등)
+ * === 타 모듈과의 연결 ===
+ * - backend.c, io_u.c, ioengines.c, stat.c 등 거의 모든 모듈이 이 헤더를 포함
+ * - thread_options.h: 사용자 설정 옵션 구조체 (td->o로 접근)
+ * - io_u.h: io_u 구조체 정의 (td가 io_u 풀을 관리)
+ * - file.h: fio_file 구조체 정의 (td가 파일 배열을 관리)
+ * - stat.h: thread_stat 구조체 정의 (td->ts로 통계 접근)
  *
- * thread_data와 io_u의 관계:
- *   - thread_data는 io_u 풀(pool)을 관리합니다 (io_u_freelist, io_u_all)
- *   - I/O를 발행할 때 io_u_freelist에서 io_u를 꺼내 사용하고,
- *     완료되면 다시 freelist로 반환합니다.
- *   - io_u는 하나의 I/O 연산(read/write/trim)의 오프셋, 크기, 버퍼, 방향 등을 담습니다.
+ * === 주요 함수/구조체 요약 ===
+ * - struct thread_data: 스레드 런타임 상태 전체 (옵션, I/O 풀, 통계, 파일, 엔진)
+ * - td_io_*() 인라인: I/O 엔진 호출 래퍼
+ * - for_each_td(): 모든 thread_data를 순회하는 매크로
+ * - thread_data vs thread_options: 런타임 상태 vs 사용자 설정값
  */
 
 /* 표준 라이브러리 헤더 */

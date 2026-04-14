@@ -16,6 +16,21 @@
  *   remove_file_hash()   - 해시 테이블에서 파일 제거
  *   file_bloom_exists()  - bloom 필터로 존재 여부 확인
  *   file_hash_exit()     - 자원 해제
+ 
+ * === 파일의 역할 ===
+ * 여러 fio job이 동일 파일에 접근할 때 파일명 기반 해시 테이블로 fio_file을 공유 관리.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * libfio.c에서 file_hash_init()으로 초기화. filesetup.c에서 파일 열기/닫기 시 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - filesetup.c: add_file_hash()/lookup_file_hash() 호출
+ * - libfio.c: file_hash_init/exit
+ * - filehash.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - add_file_hash(): 파일을 해시 테이블에 추가
+ * - lookup_file_hash(): 파일명으로 검색
  */
 #include <stdlib.h>
 #include <assert.h>

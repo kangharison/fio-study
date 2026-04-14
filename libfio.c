@@ -22,17 +22,30 @@
  *
  */
 /*
- * [한국어] libfio.c - fio 라이브러리 핵심 초기화/정리 및 유틸리티 함수 모음
+ * [한국어 설명] fio 라이브러리 핵심 초기화/정리 및 유틸리티 (libfio.c)
  *
- * 이 파일은 fio의 전역 상태 관리 및 초기화/종료를 담당한다.
- * 주요 기능:
- *   1) reset_io_counters()  - I/O 카운터 초기화
- *   2) clear_io_state()     - 스레드의 I/O 상태를 완전히 초기화 (파일 닫기, 시드 재설정 등)
- *   3) reset_all_stats()    - 모든 통계 카운터 리셋 (ramp time 이후 호출됨)
- *   4) td_set_runstate()    - 스레드 실행 상태 전이 (CREATED -> RUNNING -> EXITED 등)
- *   5) fio_terminate_threads() - 지정된 그룹/전체 스레드에 종료 신호 전달
- *   6) initialize_fio()     - fio 전체 초기화 (엔디안 검사, 메모리, 파일잠금, 로케일 등)
- *   7) deinitialize_fio()   - fio 종료 정리
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 전역 상태 관리 및 초기화/종료를 담당한다. I/O 카운터 리셋,
+ * 스레드 상태 전이, 전역 종료 시그널 전달, fio 전체 초기화/정리를 포함한다.
+ * initialize_fio()/deinitialize_fio()가 프로그램 시작/종료 시 호출된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * main() [fio.c]에서 initialize_fio()를 호출하고, 종료 시 deinitialize_fio()를 호출.
+ * backend.c의 thread_main()에서 td_set_runstate(), reset_all_stats() 등을 호출.
+ * 호출 체인: main() → initialize_fio() [이 파일] / thread_main() → td_set_runstate()
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.c: main()에서 initialize_fio()/deinitialize_fio() 호출
+ * - backend.c: thread_main()에서 td_set_runstate(), reset_all_stats() 호출
+ * - smalloc.c: sinit()/scleanup()으로 공유 메모리 초기화/정리
+ * - filelock.c: fio_filelock_init()/fio_filelock_exit()
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - initialize_fio(): fio 전체 초기화 (엔디안 검사, 메모리, 파일잠금, 로케일)
+ * - deinitialize_fio(): fio 종료 정리
+ * - td_set_runstate(): 스레드 실행 상태 전이 (CREATED→RUNNING→EXITED 등)
+ * - fio_terminate_threads(): 지정된 그룹/전체 스레드에 종료 신호 전달
+ * - reset_all_stats(): 모든 통계 카운터 리셋 (ramp time 이후)
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

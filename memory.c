@@ -2,22 +2,28 @@
  * Memory helpers
  */
 /*
- * [한국어] memory.c - I/O 버퍼 메모리 할당/해제
+ * [한국어 설명] I/O 버퍼 메모리 할당/해제 (memory.c)
  *
- * 이 파일은 fio의 I/O 작업에 사용되는 버퍼 메모리를 다양한 방식으로
- * 할당하고 해제하는 기능을 구현한다.
+ * === 파일의 역할 ===
+ * fio의 I/O 작업에 사용되는 버퍼 메모리를 다양한 방식으로 할당/해제한다.
+ * malloc, mmap, hugepage, 공유 메모리, GPU 메모리 등 7가지 할당 방식을 지원.
+ * fio_pin_memory()로 메모리를 물리 RAM에 고정하여 스왑 영향을 배제할 수 있다.
  *
- * 지원하는 메모리 할당 방식:
- *   - MEM_MALLOC:     일반 malloc()
- *   - MEM_MMAP:       익명 mmap (MAP_PRIVATE)
- *   - MEM_MMAPHUGE:   hugepage 파일 또는 MAP_HUGETLB 사용 mmap
- *   - MEM_MMAPSHARED: MAP_SHARED mmap (파일 백업)
- *   - MEM_SHM:        System V 공유 메모리 (shmget/shmat)
- *   - MEM_SHMHUGE:    hugepage 기반 System V 공유 메모리
- *   - MEM_CUDA_MALLOC: GPU 메모리 할당 (GPUDirect RDMA용)
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 thread_main()에서 allocate_io_mem()으로 I/O 버퍼를 할당하고,
+ * 종료 시 free_io_mem()으로 해제한다.
+ * 호출 체인: thread_main() [backend.c] → allocate_io_mem() [이 파일]
  *
- * 또한 fio_pin_memory()/fio_unpin_memory()로 메모리를 물리 RAM에
- * 고정(mlock)하여 I/O 성능 측정 시 스왑 영향을 배제할 수 있다.
+ * === 타 모듈과의 연결 ===
+ * - backend.c: thread_main()에서 I/O 버퍼 할당/해제
+ * - fio.h: MEM_MALLOC/MEM_MMAP 등 메모리 타입 정의
+ * - thread_options.h: mem_type 옵션으로 할당 방식 선택
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - allocate_io_mem(): I/O 버퍼 메모리 할당 (mem_type에 따라 분기)
+ * - free_io_mem(): I/O 버퍼 메모리 해제
+ * - fio_pin_memory(): 메모리를 물리 RAM에 고정 (mlock)
+ * - fio_unpin_memory(): 고정된 메모리 해제 (munlock)
  */
 
 /* 시스템 헤더 */

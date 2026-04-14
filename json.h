@@ -8,6 +8,20 @@
  *   - json_array   : JSON 배열 (값의 순서열)
  *   - json_pair    : JSON 키-값 쌍
  *   - 인라인 헬퍼 함수들: 타입별 값 추가를 편리하게 수행
+ 
+ * === 파일의 역할 ===
+ * fio JSON 출력을 위한 자료구조(json_value, json_object, json_array)와 API를 정의.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * json.c와 짝을 이루는 헤더. stat.c에서 JSON 출력 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - json.c: 이 헤더의 함수 구현
+ * - stat.c: JSON 형식 통계 출력
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct json_value/object/array/pair: JSON 자료구조
+ * - json_create_*/json_print_*: 생성/출력 API
  */
 #ifndef __JSON__H
 #define __JSON__H

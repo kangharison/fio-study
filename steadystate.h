@@ -13,6 +13,21 @@
  *
  * 옵션 수식어:
  *   - PCT (FIO_SS_PCT): 판정값을 평균의 백분율로 환산
+ 
+ * === 파일의 역할 ===
+ * IOPS/BW/레이턴시의 변동 안정화 판단을 위한 구조체, 상태 플래그, API를 선언.
+ * slope(기울기)/deviation(편차) 판정 모드, IOPS/BW/LAT 메트릭을 지원.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * steadystate.c와 짝을 이루는 헤더. helper_thread.c에서 SS 체크 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - steadystate.c: 이 헤더의 함수 구현
+ * - helper_thread.c: 주기적으로 steadystate_check() 호출
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct steadystate_data: SS 판정 데이터 (윈도우, 기울기, 편차)
+ * - FIO_SS_SLOPE/FIO_SS_IOPS/FIO_SS_BW/FIO_SS_PCT: SS 모드 플래그
  */
 #ifndef FIO_STEADYSTATE_H
 #define FIO_STEADYSTATE_H

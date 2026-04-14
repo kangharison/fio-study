@@ -26,10 +26,10 @@
 #define NR_ITERS	64
 
 struct memcpy_test {
-	const char *name;
-	void *src;
-	void *dst;
-	size_t size;
+	const char *name;	/* [한국어] 테스트 이름 (예: "8 bytes", "131072 bytes") */
+	void *src;		/* [한국어] 소스 버퍼 (난수 데이터로 채워짐) */
+	void *dst;		/* [한국어] 대상 버퍼 */
+	size_t size;		/* [한국어] 한 번의 복사 크기 (바이트) */
 };
 
 static struct memcpy_test tests[] = {
@@ -83,16 +83,16 @@ static struct memcpy_test tests[] = {
 };
 
 struct memcpy_type {
-	const char *name;
-	unsigned int mask;
-	void (*fn)(struct memcpy_test *);
+	const char *name;	/* [한국어] 복사 방법 이름 (memcpy/memmove/simple/hybrid) */
+	unsigned int mask;	/* [한국어] 비트 마스크 (여러 테스트 유형을 OR로 조합 가능) */
+	void (*fn)(struct memcpy_test *);	/* [한국어] 실제 복사 수행 함수 */
 };
 
 enum {
-	T_MEMCPY	= 1U << 0,
-	T_MEMMOVE	= 1U << 1,
-	T_SIMPLE	= 1U << 2,
-	T_HYBRID	= 1U << 3,
+	T_MEMCPY	= 1U << 0,	/* [한국어] 표준 memcpy */
+	T_MEMMOVE	= 1U << 1,	/* [한국어] 표준 memmove (겹침 허용) */
+	T_SIMPLE	= 1U << 2,	/* [한국어] 단순 바이트 단위 복사 */
+	T_HYBRID	= 1U << 3,	/* [한국어] 64바이트 이상은 simple, 미만은 memcpy */
 };
 
 #define do_test(test, fn)	do {					\
@@ -242,6 +242,16 @@ static void free_tests(void)
 	free(tests[0].dst);
 }
 
+/*
+ * [한국어] fio_memcpy_test - 메모리 복사 성능 벤치마크 실행
+ *
+ * @type: 테스트 유형 문자열 ("memcpy", "memmove", "simple", "hybrid" 또는 쉼표 구분,
+ *        NULL이면 전체, "help"/"list"이면 목록 출력)
+ * @return: 0=성공, 1=오류 또는 목록 출력
+ *
+ * 32MB 버퍼를 64회 반복 복사하여 각 블록 크기별 MiB/sec를 측정한다.
+ * 호출 체인: fio main → [fio_memcpy_test] → setup_tests → t_memcpy 등
+ */
 int fio_memcpy_test(const char *type)
 {
 	unsigned int test_mask = 0;

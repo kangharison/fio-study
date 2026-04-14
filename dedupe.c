@@ -1,13 +1,22 @@
 /*
- * [한국어] dedupe.c - 중복 제거(deduplication) 버퍼 관리
+ * [한국어 설명] 중복 제거(deduplication) 버퍼 관리 (dedupe.c)
  *
- * 이 파일은 fio의 중복 제거 워킹셋(working set) 시드를 초기화하는 기능을 담당한다.
- * 중복 제거 모드에서는 특정 비율의 I/O가 동일한 데이터 패턴을 사용하여
- * 스토리지의 중복 제거 성능을 테스트할 수 있다.
+ * === 파일의 역할 ===
+ * fio의 중복 제거 워킹셋 시드를 초기화하는 기능을 담당한다. 중복 제거 모드에서는
+ * 특정 비율의 I/O가 동일 데이터 패턴을 사용하여 스토리지 중복 제거 성능을 테스트.
  *
- * 주요 기능:
- *   1) init_global_dedupe_working_set_seeds() - 전역 중복 제거 시드 초기화
- *   2) init_dedupe_working_set_seeds()        - 작업별 중복 제거 워킹셋 시드 초기화
+ * === 전체 아키텍처에서의 위치 ===
+ * init.c의 add_job()에서 init_dedupe_working_set_seeds()를 호출.
+ * 호출 체인: add_job() [init.c] → init_dedupe_working_set_seeds() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - init.c: add_job()에서 중복 제거 시드 초기화
+ * - dedupe.h: API 선언
+ * - io_u.c: I/O 버퍼 채울 때 중복 제거 시드 참조
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - init_global_dedupe_working_set_seeds(): 전역 중복 제거 시드 초기화
+ * - init_dedupe_working_set_seeds(): 작업별 워킹셋 시드 초기화
  */
 
 #include "fio.h"  /* fio 핵심 구조체 및 매크로 */

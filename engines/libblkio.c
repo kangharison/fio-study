@@ -1,22 +1,37 @@
 /*
- * [한국어 설명] libblkio I/O 엔진 구현 (libblkio.c)
+ * [한국어 설명] libblkio 기반 블록 I/O 엔진 (libblkio.c)
  *
- * === 엔진 개요 ===
- * libblkio 라이브러리를 사용하여 다양한 고성능 블록 I/O 인터페이스에 접근하는 엔진이다.
- * io_uring, vfio-user, virtio-blk-vhost-user, virtio-blk-vhost-vdpa 등
- * 여러 백엔드를 통합적으로 지원하며, 메모리 영역 관리와 이벤트 기반 완료 통지를 제공한다.
+ * === 파일의 역할 ===
+ * libblkio(블록 I/O 추상화 라이브러리)를 사용하는 fio I/O 엔진 "libblkio"를 구현한다.
+ * libblkio는 io_uring, virtio-blk-vhost-user/vdpa, vfio-user, nvme-io_uring 등 다양한
+ * 고성능 블록 백엔드를 단일 API(blkio/blkioq)로 감싸는 라이브러리이며, 이 파일은 fio의
+ * queue/commit/getevents 계약을 blkioq_do_io/blkioq_get_completions 호출로 매핑한다.
+ * 완료 대기 방식은 block/eventfd/loop 세 가지 모드를 지원한다.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * libblkio - 블록 I/O 추상화 (blkio_create, blkioq_do_io, blkioq_get_completions 등)
- * eventfd - 완료 이벤트 통지 (FIO_BLKIO_WAIT_MODE_EVENTFD 모드)
- * pthread_mutex - 프로세스 수준 상태 동기화
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=libblkio로 선택되는 플러그인. 프로세스 전역 blkio 인스턴스 하나를
+ * proc_state에 두고 여러 잡 스레드가 공유하며, 각 스레드는 blkioq(큐) 하나를 소유한다.
+ * 실행 흐름: backend.c → td_io_init → fio_blkio_setup/init → post_init(공용 blkio 시작)
+ * → I/O 루프(queue에서 blkioq에 enqueue, commit에서 blkioq_do_io 플러시, getevents에서
+ * blkioq_get_completions/eventfd_read) → cleanup. 프로세스 공용 상태는 pthread_mutex로
+ * 보호되고 각 큐는 잡 스레드 단독 소유이다.
  *
- * === fio에서의 사용법 ===
- * --ioengine=libblkio 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c, options.c).
+ * 하단: libblkio(blkio_create, blkio_set_*, blkio_start, blkio_add_queue,
+ *       blkio_alloc_mem_region, blkioq_read/write, blkioq_do_io,
+ *       blkioq_get_completions, blkio_get_completion_fd), eventfd read.
+ * 데이터 흐름: io_u->xfer_buf ↔ 등록된 blkio_mem_region ↔ blkioq 요청 ↔ 백엔드 드라이버.
+ * 공유 상태: proc_state(mutex/initted_threads/initted_hipri_threads/b) — 프로세스 단위.
  *
- * === 구현하는 주요 콜백 ===
- * .setup, .init, .post_init, .cleanup, .iomem_alloc, .iomem_free,
- * .open_file, .queue, .getevents, .event
+ * === 주요 함수/구조체 요약 ===
+ * - fio_blkio_setup(): 잡 단위 옵션 검증.
+ * - fio_blkio_init()/post_init(): 공용 blkio 생성/시작과 큐 추가.
+ * - fio_blkio_iomem_alloc()/_free(): blkio_alloc_mem_region로 정렬 버퍼 할당.
+ * - fio_blkio_queue()/_commit(): 큐에 요청 등록 후 blkioq_do_io로 플러시.
+ * - fio_blkio_getevents()/_event(): 완료 수확(블록/eventfd/loop 모드).
+ * - struct fio_blkio_data: 스레드 단위 큐/메모리 영역/iovec/completions.
+ * - proc_state: 프로세스 단위 동기화 필드.
  */
 
 /*
@@ -62,15 +77,16 @@ static void fio_blkio_proc_unlock(void) {
 }
 
 /* per-thread state */
+/* [한국어] libblkio 엔진의 스레드별 내부 상태 구조체 */
 struct fio_blkio_data {
-	struct blkioq *q;
-	int completion_fd; /* may be -1 if not FIO_BLKIO_WAIT_MODE_EVENTFD */
+	struct blkioq *q;			/* [한국어] libblkio I/O 큐 핸들 */
+	int completion_fd;			/* [한국어] eventfd 완료 통지용 (-1이면 미사용) */
 
-	bool has_mem_region; /* whether mem_region is valid */
-	struct blkio_mem_region mem_region; /* only if allocated by libblkio */
+	bool has_mem_region;			/* [한국어] mem_region이 유효한지 여부 */
+	struct blkio_mem_region mem_region;	/* [한국어] libblkio가 할당한 메모리 영역 */
 
-	struct iovec *iovecs; /* for vectored requests */
-	struct blkio_completion *completions;
+	struct iovec *iovecs;			/* [한국어] 벡터 I/O 요청용 iovec 배열 */
+	struct blkio_completion *completions;	/* [한국어] 완료 이벤트 수집 배열 */
 };
 
 enum fio_blkio_wait_mode {
@@ -79,23 +95,24 @@ enum fio_blkio_wait_mode {
 	FIO_BLKIO_WAIT_MODE_LOOP,
 };
 
+/* [한국어] libblkio 엔진 전용 옵션 구조체 */
 struct fio_blkio_options {
-	void *pad; /* option fields must not have offset 0 */
+	void *pad;					/* [한국어] fio 옵션 구조체 정렬 패딩 */
 
-	char *driver;
+	char *driver;					/* [한국어] libblkio 드라이버 이름 (io_uring, vfio-user 등) */
 
-	char *path;
-	char *pre_connect_props;
+	char *path;					/* [한국어] 장치/소켓 경로 */
+	char *pre_connect_props;			/* [한국어] connect 전에 설정할 속성 (key=value 형식) */
 
-	int num_entries;
-	int queue_size;
-	char *pre_start_props;
+	int num_entries;				/* [한국어] I/O 큐 엔트리 수 */
+	int queue_size;					/* [한국어] 큐 크기 */
+	char *pre_start_props;				/* [한국어] start 전에 설정할 속성 */
 
-	unsigned int hipri;
-	unsigned int vectored;
-	unsigned int write_zeroes_on_trim;
-	enum fio_blkio_wait_mode wait_mode;
-	unsigned int force_enable_completion_eventfd;
+	unsigned int hipri;				/* [한국어] 고우선순위(폴링) I/O 사용 여부 */
+	unsigned int vectored;				/* [한국어] 벡터 I/O(readv/writev) 사용 여부 */
+	unsigned int write_zeroes_on_trim;		/* [한국어] TRIM을 write-zeroes로 대체할지 여부 */
+	enum fio_blkio_wait_mode wait_mode;		/* [한국어] 완료 대기 모드 (block/eventfd/loop) */
+	unsigned int force_enable_completion_eventfd;	/* [한국어] 완료 eventfd 강제 활성화 */
 };
 
 static struct fio_option options[] = {

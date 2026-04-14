@@ -7,6 +7,20 @@
  *      - shared=true이면 smalloc(공유 메모리), false이면 calloc으로 할당
  *   2) io_u_ring  - 원형 버퍼(FIFO) 방식의 링
  *      - 크기를 2의 거듭제곱으로 올림하여 비트 AND 래핑 사용
+ 
+ * === 파일의 역할 ===
+ * io_u freelist를 관리하는 스택(io_u_queue)과 링 버퍼(io_u_ring)를 구현.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * io_u.c에서 io_u 할당/반환 시 io_u_queue 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - io_u.c: get_io_u/put_io_u에서 큐 사용
+ * - io_u_queue.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - io_u_qpush/qpop(): 스택 방식 push/pop
+ * - io_u_rpush/rpop(): 링 버퍼 방식 push/pop
  */
 #include <stdlib.h>
 #include <string.h>

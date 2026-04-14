@@ -5,19 +5,29 @@
  *
  */
 /*
- * [한국어] workqueue.c - 오프로드 모드 워크큐 구현
+ * [한국어 설명] 오프로드 모드 워크큐 구현 (workqueue.c)
  *
- * I/O 작업을 별도의 워커 스레드로 오프로드하는 범용 워크큐 메커니즘.
- * 주요 기능:
- *   1) workqueue_init()    - 워크큐 초기화: 워커 스레드 풀 생성
- *   2) workqueue_enqueue() - 작업을 유휴 워커에게 배분
- *   3) workqueue_flush()   - 모든 워커가 유휴 상태가 될 때까지 대기
- *   4) workqueue_exit()    - 모든 워커 종료 및 자원 해제
- *   5) worker_thread()     - 각 워커 스레드의 메인 루프 (작업 대기 -> 처리 반복)
+ * === 파일의 역할 ===
+ * I/O 작업을 별도의 워커 스레드 풀로 오프로드하는 범용 워크큐 메커니즘을 구현한다.
+ * 워커 스레드 풀 생성, 작업 배분, 플러시, 종료/자원 해제를 담당한다.
+ * rate-submit 모드에서 메인 스레드가 I/O를 워커에 위임하여 일정 제출 속도를 유지한다.
  *
- * 동작 흐름:
- *   enqueue 호출 -> 가장 적합한 워커 선택 -> 워커의 work_list에 작업 추가
- *   -> 워커가 깨어나 handle_list()로 작업 처리 -> 완료 시 유휴 상태로 전환
+ * === 전체 아키텍처에서의 위치 ===
+ * rate-submit.c에서 workqueue_init/enqueue를 호출하여 I/O를 오프로드.
+ * iolog.c에서 gz_work 로그 압축을 워크큐에 제출.
+ * 호출 체인: rate-submit.c / iolog.c → workqueue_enqueue() [이 파일] → worker_thread()
+ *
+ * === 타 모듈과의 연결 ===
+ * - rate-submit.c: rate 제한 I/O 제출 시 워크큐 사용
+ * - iolog.c: gz_work 로그 압축 작업을 워크큐에 제출
+ * - workqueue.h: 워크큐/워커 구조체 및 API 선언
+ * - pshared.c: 프로세스 간 공유 뮤텍스/조건변수
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - workqueue_init(): 워커 스레드 풀 생성 및 초기화
+ * - workqueue_enqueue(): 작업을 유휴 워커에게 배분
+ * - workqueue_flush(): 모든 워커가 유휴 상태가 될 때까지 대기
+ * - worker_thread(): 각 워커 스레드의 메인 루프
  */
 
 #include <unistd.h>

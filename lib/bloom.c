@@ -21,8 +21,9 @@
 
 struct bloom {
 	uint64_t nentries;
-
+	/* [한국어] 비트맵에 매핑 가능한 총 엔트리(비트) 수 */
 	uint32_t *map;
+	/* [한국어] 비트맵 배열. nentries 비트를 uint32_t 배열로 저장 */
 };
 
 #define BITS_PER_INDEX	(sizeof(uint32_t) * 8)
@@ -30,7 +31,9 @@ struct bloom {
 
 struct bloom_hash {
 	unsigned int seed;
+	/* [한국어] 해시 함수의 초기 시드 (BLOOM_SEED=0x8989) */
 	uint32_t (*fn)(const void *, uint32_t, uint32_t);
+	/* [한국어] 해시 함수 포인터 (data, len, seed) → 32비트 해시값 */
 };
 
 static uint32_t bloom_crc32c(const void *buf, uint32_t len, uint32_t seed)
@@ -70,6 +73,18 @@ static struct bloom_hash hashes[] = {
 
 #define N_HASHES	5
 
+/*
+ * [한국어] bloom_new - 블룸 필터를 생성
+ *
+ * @entries: 비트맵의 총 비트 수 (원소 수가 아닌 비트 수로 지정)
+ * @return: 생성된 블룸 필터 (실패 시 NULL)
+ *
+ * CRC32C 하드웨어 가속을 프로브하고 비트맵 메모리를 calloc으로 할당한다.
+ * 5개의 해시 함수를 사용하므로, false positive 확률은
+ * (1 - e^(-5*n/m))^5 (n=원소 수, m=entries)로 추정된다.
+ *
+ * 호출 체인: fio 초기화 → [bloom_new]
+ */
 struct bloom *bloom_new(uint64_t entries)
 {
 	struct bloom *b;
@@ -96,12 +111,25 @@ void bloom_free(struct bloom *b)
 	free(b);
 }
 
+/*
+ * [한국어] __bloom_check - 블룸 필터에 원소를 검사하고 선택적으로 추가
+ *
+ * @b: 블룸 필터
+ * @data: 검사할 데이터
+ * @len: 데이터 길이
+ * @set: true이면 존재하지 않는 비트를 설정 (추가), false이면 조회만
+ * @return: 모든 해시 비트가 이미 설정되어 있었으면 true (이미 존재)
+ *
+ * 5개의 해시 함수로 데이터를 해시하고, 각 결과를 비트맵의 인덱스로 변환한다.
+ * set=true일 때는 비트를 설정하면서 검사, set=false일 때는 하나라도 0이면 즉시 false 반환.
+ */
 static bool __bloom_check(struct bloom *b, const void *data, unsigned int len,
 			  bool set)
 {
 	uint32_t hash[N_HASHES];
 	int i, was_set;
 
+	/* [한국어] 5개의 독립적 해시 함수로 데이터를 해시하고 비트 위치로 변환 */
 	for (i = 0; i < N_HASHES; i++) {
 		hash[i] = hashes[i].fn(data, len, hashes[i].seed);
 		hash[i] = hash[i] % b->nentries;
@@ -113,21 +141,31 @@ static bool __bloom_check(struct bloom *b, const void *data, unsigned int len,
 		const unsigned int bit = hash[i] & BITS_INDEX_MASK;
 
 		if (b->map[index] & (1U << bit))
-			was_set++;
+			was_set++;	/* [한국어] 이미 설정된 비트 - 기존 원소와 충돌 가능 */
 		else if (set)
-			b->map[index] |= 1U << bit;
+			b->map[index] |= 1U << bit;	/* [한국어] 새 비트 설정 (추가 모드) */
 		else
-			break;
+			break;	/* [한국어] 조회 모드에서 미설정 비트 발견 → 확실히 없음 */
 	}
 
+	/* [한국어] 5개 모두 설정되어 있었으면 true (이미 존재하거나 false positive) */
 	return was_set == N_HASHES;
 }
 
+/*
+ * [한국어] bloom_set - uint32_t 배열 데이터를 블룸 필터에 추가하고 이미 존재했는지 반환
+ * @return: true이면 이미 존재 (또는 false positive)
+ */
 bool bloom_set(struct bloom *b, uint32_t *data, unsigned int nwords)
 {
 	return __bloom_check(b, data, nwords * sizeof(uint32_t), true);
 }
 
+/*
+ * [한국어] bloom_string - 문자열 데이터의 블룸 필터 멤버십 검사/추가
+ * @set: true이면 추가 + 검사, false이면 검사만
+ * @return: true이면 이미 존재 (또는 false positive)
+ */
 bool bloom_string(struct bloom *b, const char *data, unsigned int len,
 		  bool set)
 {

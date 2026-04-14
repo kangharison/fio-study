@@ -22,6 +22,7 @@
 #define read_barrier()	asm volatile ("mf" ::: "memory")
 #define write_barrier()	asm volatile ("mf" ::: "memory")
 
+/* [한국어] ia64_popcnt - Itanium의 popcnt 명령어로 설정된 비트 수를 센다 */
 #define ia64_popcnt(x)							\
 ({									\
 	unsigned long ia64_intri_res;					\
@@ -29,11 +30,13 @@
 	ia64_intri_res;							\
 })
 
+/* [한국어] arch_ffz - popcnt를 활용하여 최하위 0 비트의 위치를 구한다 */
 static inline unsigned long arch_ffz(unsigned long bitmask)
 {
 	return ia64_popcnt(bitmask & (~bitmask - 1));
 }
 
+/* [한국어] get_cpu_clock - ar.itc(Interval Time Counter) 레지스터에서 사이클 카운터를 읽는다 */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned long long ret;

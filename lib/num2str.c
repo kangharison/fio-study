@@ -20,6 +20,7 @@
 #include "num2str.h"
 
 
+/* [한국어] IEC 이진 접두사: Ki=2^10, Mi=2^20, Gi=2^30, Ti=2^40, Pi=2^50, Ei=2^60 */
 static const char *iecstr[] = { "", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei" };
 
 /**

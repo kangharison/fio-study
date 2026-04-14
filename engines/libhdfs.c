@@ -1,21 +1,33 @@
 /*
- * [한국어 설명] HDFS I/O 엔진 구현 (libhdfs.c)
+ * [한국어 설명] Hadoop HDFS(libhdfs) I/O 엔진 (libhdfs.c)
  *
- * === 엔진 개요 ===
- * libhdfs 라이브러리를 사용하여 Hadoop Distributed File System(HDFS)에 I/O를 수행하는
- * 엔진이다. HDFS는 파일 생성 후 수정을 지원하지 않으므로, 작은 크기의 파일을 여러 개
- * 생성하고 fio 오프셋에 따라 파일을 선택하는 방식으로 랜덤 읽기/쓰기를 구현한다.
+ * === 파일의 역할 ===
+ * Hadoop HDFS의 JNI 래퍼 libhdfs를 사용하는 fio I/O 엔진 "libhdfs"를 구현한다. HDFS는
+ * 기존 파일 수정이 불가능(append only)하므로, 지정된 청크 크기(chunck_size)만큼 여러
+ * 작은 파일을 생성하고 fio가 요청한 오프셋을 (파일 id, 파일내 오프셋) 쌍으로 변환해
+ * 랜덤 read/write를 시뮬레이션한다. 동기 엔진으로 동작한다.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * libhdfs - HDFS 접근 (hdfsConnect, hdfsOpenFile, hdfsRead, hdfsWrite, hdfsCloseFile 등)
- * libhdfs - 파일 관리 (hdfsCreateDirectory, hdfsListDirectory, hdfsDelete 등)
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=libhdfs로 선택되어 fio 플러그인 레지스트리에 등록된다. 실행 흐름:
+ * backend.c → td_io_init → fio_hdfsio_setup/_init(hdfsConnect) → open_file(필요 파일
+ * 생성) → I/O 루프(prep에서 오프셋 → 청크 id 매핑, queue에서 hdfsRead/Write) → cleanup
+ * (hdfsDisconnect). 각 잡 스레드가 독립된 HDFS 연결을 갖거나 single_instance 옵션으로
+ * 하나의 연결을 공유한다. 실행 컨텍스트는 fio 잡 스레드 + JVM 쓰레드.
  *
- * === fio에서의 사용법 ===
- * --ioengine=libhdfs 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c, options.c).
+ * 하단: libhdfs(hdfsConnect/Disconnect/OpenFile/CloseFile/Read/Write/Seek/
+ *       CreateDirectory/ListDirectory/Delete/GetPathInfo).
+ * 데이터 흐름: io_u->xfer_buf ↔ hdfsRead/hdfsWrite ↔ HDFS NameNode/DataNode.
+ * 공유 상태: hdfsio_data(스레드별 fs/fp/curr_file_id), hdfsio_options(잡별 설정).
  *
- * === 구현하는 주요 콜백 ===
- * .setup, .init, .prep, .queue, .open_file, .close_file,
- * .io_u_init, .io_u_free
+ * === 주요 함수/구조체 요약 ===
+ * - fio_hdfsio_setup()/_init(): HDFS 연결 및 디렉터리 준비.
+ * - fio_hdfsio_prep(): fio 오프셋 → (청크 id, 내부 오프셋) 변환 후 필요 시 파일 전환.
+ * - fio_hdfsio_queue(): hdfsRead/hdfsWrite 동기 호출.
+ * - fio_hdfsio_open_file()/_close_file(): 청크 파일 생성/해제.
+ * - struct hdfsio_data: 연결 핸들, 현재 열린 청크 id.
+ * - struct hdfsio_options: 서버 주소, 청크 크기, 단일 인스턴스 모드 등.
  */
 
 /*
@@ -40,20 +52,22 @@
 #define CHUNCK_NAME_LENGTH_MAX 80
 #define CHUNCK_CREATION_BUFFER_SIZE 65536
 
+/* [한국어] HDFS 엔진의 내부 상태 구조체 */
 struct hdfsio_data {
-	hdfsFS fs;
-	hdfsFile fp;
-	uint64_t curr_file_id;
+	hdfsFS fs;		/* [한국어] HDFS 파일 시스템 핸들 - hdfsConnect()로 생성 */
+	hdfsFile fp;		/* [한국어] 현재 열린 HDFS 파일 핸들 */
+	uint64_t curr_file_id;	/* [한국어] 현재 열린 청크 파일 ID (오프셋 기반 계산) */
 };
 
+/* [한국어] HDFS 엔진 전용 옵션 구조체 */
 struct hdfsio_options {
-	void *pad;			/* needed because offset can't be 0 for an option defined used offsetof */
-	char *host;
-	char *directory;
-	unsigned int port;
-	unsigned int chunck_size;
-	unsigned int single_instance;
-	unsigned int use_direct;
+	void *pad;			/* [한국어] fio 옵션 구조체 정렬 패딩 */
+	char *host;			/* [한국어] HDFS NameNode 호스트명 */
+	char *directory;		/* [한국어] HDFS 작업 디렉터리 경로 */
+	unsigned int port;		/* [한국어] HDFS NameNode 포트 번호 */
+	unsigned int chunck_size;	/* [한국어] 개별 청크 파일 크기 (HDFS는 파일 수정 불가하므로 작은 파일 다수 생성) */
+	unsigned int single_instance;	/* [한국어] 단일 HDFS 연결 인스턴스 사용 여부 */
+	unsigned int use_direct;	/* [한국어] 직접 읽기 모드 사용 여부 */
 };
 
 static struct fio_option options[] = {

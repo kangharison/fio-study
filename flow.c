@@ -1,15 +1,25 @@
 /*
- * [한국어] flow.c - I/O 흐름(flow) 제어 모듈
+ * [한국어 설명] I/O 흐름(flow) 제어 모듈 (flow.c)
  *
- * 이 파일은 여러 fio 작업(job) 간의 I/O 속도 비율을 제어하는 흐름 제어 기능을 구현한다.
+ * === 파일의 역할 ===
+ * 여러 fio 작업(job) 간의 I/O 속도 비율을 제어하는 흐름 제어 기능을 구현한다.
  * 같은 flow_id를 공유하는 작업들은 각자의 flow weight에 비례하여 I/O를 수행한다.
- * 예: job A(flow=3)와 job B(flow=1)이면 A가 B의 3배 속도로 I/O를 수행하도록 조절된다.
+ * 예: job A(flow=3)와 job B(flow=1)이면 A가 B의 3배 속도로 I/O 수행.
  *
- * 주요 기능:
- *   1) flow_threshold_exceeded() - 현재 스레드가 할당된 비율을 초과했는지 검사
- *   2) flow_get() / flow_put()   - 흐름 객체 참조 획득/해제 (공유 메모리 기반)
- *   3) flow_init_job() / flow_exit_job() - 작업별 흐름 초기화/정리
- *   4) flow_init() / flow_exit() - 전역 흐름 서브시스템 초기화/정리
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 do_io()에서 flow_threshold_exceeded()를 호출하여 비율을 체크.
+ * thread_main()에서 flow_init_job()/flow_exit_job()으로 흐름 참조 관리.
+ * 호출 체인: do_io() [backend.c] → flow_threshold_exceeded() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: do_io()에서 흐름 임계치 체크, thread_main()에서 초기화/정리
+ * - flow.h: 흐름 제어 API 선언
+ * - smalloc.c: 공유 메모리로 fio_flow 구조체 할당 (프로세스 간 공유)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - flow_threshold_exceeded(): 현재 스레드가 할당 비율을 초과했는지 검사
+ * - flow_init_job()/flow_exit_job(): 작업별 흐름 초기화/정리
+ * - struct fio_flow: 흐름 공유 상태 (id, refs, flow_counter)
  */
 
 #include "fio.h"       /* fio 핵심 구조체 및 매크로 */

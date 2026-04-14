@@ -23,6 +23,23 @@
  *   - update_acct_fn        : 워커의 I/O 통계를 부모 스레드에 합산
  *   - alloc/free_worker_fn  : 워커별 thread_data 할당/해제
  *   - init/exit_worker_fn   : 워커의 I/O 엔진 초기화/종료
+ 
+ * === 파일의 역할 ===
+ * io_submit_mode=offload일 때 워크큐 기반 I/O 제출 메커니즘을 구현한다.
+ * 메인 스레드가 I/O를 워커에 위임하여 정밀한 속도 제어를 달성.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 thread_main()에서 rate_submit_init()으로 초기화.
+ * 호출 체인: thread_main() [backend.c] → rate_submit_init() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: thread_main()에서 초기화/종료
+ * - workqueue.c: 워크큐 메커니즘 제공
+ * - rate-submit.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - rate_submit_init(): 워크큐 초기화, 워커 스레드 생성
+ * - rate_submit_exit(): 워크큐 종료
  */
 
 #include <assert.h>     /* assert() 매크로 */

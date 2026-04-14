@@ -6,6 +6,37 @@
  * [한국어 설명]
  * cmdprio.c - libaio/io_uring 엔진 공통 I/O 우선순위 처리 구현
  *
+ * === 파일의 역할 ===
+ * 이 파일은 libaio와 io_uring 같은 비동기 I/O 엔진이 공통으로 사용하는
+ * "커맨드별 우선순위 설정(cmdprio)" 로직을 제공한다. 사용자가 잡 파일/CLI에
+ * cmdprio_percentage, cmdprio_bssplit, cmdprio_class, cmdprio_hint 같은 옵션을
+ * 주면, 매 I/O마다 확률 기반 또는 블록 크기별 분포에 따라 io_u->ioprio/
+ * ioprio_hint 값을 조정해 커널 I/O 스케줄러(blk-mq scheduler)에 전달될
+ * 우선순위를 제어한다. 또한 우선순위별 분리된 clat(완료 지연) 통계 슬롯을
+ * td->ts.clat_prio에 할당해 통계 수집 경로와 연동한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * libaio.c / io_uring.c 같은 엔진이 init에서 fio_cmdprio_init을 호출해 옵션을
+ * 파싱·검증·통계 슬롯을 준비하고, queue 경로에서 io_u마다 fio_cmdprio_set_ioprio을
+ * 호출해 ioprio 필드를 변경한 뒤 커널에 I/O를 제출한다. 실행 컨텍스트는
+ * 잡 스레드(유저스페이스)이며, 커널 측에서는 ioprio_set 또는 SQE의 ioprio
+ * 필드를 통해 block layer 우선순위 큐로 라우팅된다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 상위: libaio.c, io_uring.c, 기타 비동기 엔진의 init/queue.
+ * - 하위: lib/rand.c(rand_between), stat.c(clat_prio 관리), options.c(옵션 파싱).
+ * - 공유: thread_data(td->o.ioprio_class, td->ioprio, td->ts.clat_prio[ddir]),
+ *   io_u(ioprio, ioprio_hint, clat_prio_index).
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_cmdprio_init(): 옵션 해석·모드 결정(PERC/BSSPLIT)·내부 배열 구축·clat 슬롯 할당.
+ * - fio_cmdprio_set_ioprio(): 핫 패스. io_u의 ddir/블록 크기에 따라 확률적으로
+ *   ioprio 덮어쓰기 및 clat_prio_index 설정.
+ * - fio_cmdprio_percentage(): 현재 io_u에 적용할 비율 계산(PERC vs BSSPLIT 분기).
+ * - fio_cmdprio_gen_perc / fio_cmdprio_parse_and_gen_bssplit(): 모드별 설정 생성.
+ * - fio_cmdprio_cleanup(): prios/bsprio 배열 해제.
+ * - struct cmdprio / cmdprio_prio / cmdprio_bsprio_desc: 모드·항목 기술 구조체.
+ *
  * === 핵심 동작 흐름 ===
  * 1. fio_cmdprio_init()
  *    - 사용자 옵션 분석 → 모드 결정 (PERC 또는 BSSPLIT)

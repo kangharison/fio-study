@@ -3,6 +3,20 @@
  *
  * /proc/diskstats 및 /sys/block/에서 디스크 I/O 활용도를 수집하기 위한
  * 구조체 및 함수를 정의한다. iostat과 유사한 디스크 통계를 fio 내부에서 제공한다.
+ 
+ * === 파일의 역할 ===
+ * /proc/diskstats, /sys/block/ 기반 디스크 I/O 활용도 수집 구조체/함수 정의.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * diskutil.c와 짝을 이루는 헤더. helper_thread.c에서 주기적 업데이트 호출.
+ *
+ * === 타 모듈과의 연결 ===
+ * - diskutil.c: 이 헤더의 함수 구현
+ * - helper_thread.c: update_io_ticks() 주기적 호출
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct disk_util: 디스크 유틸리티 통계
+ * - init_disk_util()/update_io_ticks(): 초기화/업데이트
  */
 #ifndef FIO_DISKUTIL_H
 #define FIO_DISKUTIL_H

@@ -19,6 +19,24 @@
  * 데이터 구조:
  *   순환 버퍼(ring buffer)로 윈도우 크기만큼의 샘플을 유지.
  *   head: 가장 오래된 데이터, tail: 가장 최근 데이터 위치.
+ 
+ * === 파일의 역할 ===
+ * IOPS/BW/레이턴시 변동이 안정화되었는지 판단하여 테스트를 조기 종료할 수 있게 한다.
+ * slope(기울기) 모드와 deviation(편차) 모드 두 가지 판정 알고리즘을 지원.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * helper_thread.c에서 주기적으로 steadystate_check()를 호출한다.
+ * 호출 체인: helper_thread [helper_thread.c] → steadystate_check() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - helper_thread.c: 주기적으로 steadystate_check() 호출
+ * - steadystate.h: SS 구조체, 상태 플래그, API 선언
+ * - backend.c: SS 도달 시 스레드 종료 트리거
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - steadystate_check(): IOPS/BW/lat 수집 후 SS 도달 판정
+ * - steadystate_slope(): 최소자승법 기울기 기반 판정
+ * - steadystate_deviation(): 평균 대비 최대 편차 기반 판정
  */
 
 #include <stdlib.h>

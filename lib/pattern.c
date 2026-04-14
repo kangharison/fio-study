@@ -353,6 +353,26 @@ static const char *parse_format(const char *in, char *out, unsigned int parsed,
  *
  * Returns number of bytes filled or err < 0 in case of failure.
  */
+/*
+ * [한국어] parse_and_fill_pattern - 복합 패턴 문자열을 파싱하여 버퍼에 채움
+ *
+ * @in: 입력 패턴 문자열 (예: "0xff""hello"%o-100)
+ * @in_len: 입력 길이
+ * @out: 출력 버퍼 (NULL이면 필요한 길이만 계산)
+ * @out_len: 출력 버퍼 길이
+ * @fmt_desc: 포맷 설명자 배열 (%o 등의 정의)
+ * @fmt: 파싱된 포맷 정보 배열 [출력]
+ * @fmt_sz_out: 포맷 배열 크기 [입출력]
+ * @return: 채워진 바이트 수 (에러 시 -EINVAL)
+ *
+ * 입력 문자열을 순회하며 첫 문자로 타입을 판별한다:
+ * - ': 파일 경로 (parse_file)
+ * - ": 문자열 (parse_string)
+ * - %: 포맷 지시자 (parse_format)
+ * - 기타: 숫자 (parse_number, 0x 접두사로 16진수 판별)
+ *
+ * 호출 체인: parse_and_fill_pattern_alloc() → [parse_and_fill_pattern]
+ */
 static int parse_and_fill_pattern(const char *in, unsigned int in_len,
 				  char *out, unsigned int out_len,
 				  const struct pattern_fmt_desc *fmt_desc,
@@ -439,17 +459,27 @@ static int parse_and_fill_pattern(const char *in, unsigned int in_len,
  *
  * Returns number of bytes filled or err < 0 in case of failure.
  */
+/*
+ * [한국어] parse_and_fill_pattern_alloc - 패턴을 파싱하고 결과 버퍼를 자동 할당
+ *
+ * 먼저 out=NULL로 호출하여 필요한 크기를 계산하고, malloc한 뒤 다시 파싱한다.
+ * 호출자가 반환된 *out을 free()해야 한다.
+ *
+ * 호출 체인: options.c (set_verify_pattern 등) → [parse_and_fill_pattern_alloc]
+ */
 int parse_and_fill_pattern_alloc(const char *in, unsigned int in_len,
 		char **out, const struct pattern_fmt_desc *fmt_desc,
 		struct pattern_fmt *fmt, unsigned int *fmt_sz_out)
 {
 	int count;
 
+	/* [한국어] 1차 호출: out=NULL로 필요한 크기만 계산 */
 	count = parse_and_fill_pattern(in, in_len, NULL, MAX_PATTERN_SIZE,
 				       fmt_desc, fmt, fmt_sz_out);
 	if (count < 0)
 		return count;
 
+	/* [한국어] 2차 호출: 계산된 크기로 할당 후 실제 파싱 */
 	*out = malloc(count);
 	count = parse_and_fill_pattern(in, in_len, *out, count, fmt_desc,
 				       fmt, fmt_sz_out);
@@ -478,7 +508,9 @@ static int dup_pattern(char *out, unsigned int out_len, unsigned int pattern_len
 	left = (out_len - off);
 	len  = min(left, off);
 
-	/* Duplicate leftover */
+	/* Duplicate leftover
+	 * [한국어] 더블링 기법: 채워진 영역을 2배씩 복사하여 O(log n) 시간에 전체 버퍼를 채움.
+	 * 첫 복사는 pattern_len바이트, 다음은 2*pattern_len, 그 다음은 4*pattern_len... */
 	while (left) {
 		memcpy(out + off, out, len);
 		left -= len;
@@ -524,13 +556,29 @@ int cpy_pattern(const char *pattern, unsigned int pattern_len,
  *
  * Returns 0 in case of success or errno < 0 in case of failure.
  */
+/*
+ * [한국어] cmp_pattern - 버퍼가 패턴의 반복으로 구성되어 있는지 비교
+ *
+ * @pattern: 원본 패턴
+ * @pattern_size: 패턴 크기
+ * @off: 패턴 내 시작 오프셋 (버퍼가 패턴의 중간부터 시작할 때)
+ * @buf: 비교할 버퍼
+ * @len: 버퍼 길이
+ * @return: 0=일치, -EILSEQ=불일치
+ *
+ * 루프를 최소화하기 위해 먼저 버퍼 내부의 반복 패턴을 비교하고(자기 자신과 비교),
+ * 그 다음 패턴과 직접 비교하여 2번의 memcmp로 검증을 완료한다.
+ *
+ * 호출 체인: verify.c → [cmp_pattern]
+ */
 int cmp_pattern(const char *pattern, unsigned int pattern_size,
 		unsigned int off, const char *buf, unsigned int len)
 {
 	int rc;
 	unsigned int size;
 
-	/* Find the difference in buffer */
+	/* Find the difference in buffer
+	 * [한국어] 버퍼 내부의 반복 일관성을 확인 (buf[0..] vs buf[pattern_size..]) */
 	if (len > pattern_size) {
 		rc = memcmp(buf, buf + pattern_size, len - pattern_size);
 		if (rc)

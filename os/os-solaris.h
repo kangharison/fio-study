@@ -1,3 +1,20 @@
+/*
+ * [한국어 설명] Solaris 플랫폼 OS 추상화 헤더 (os-solaris.h)
+ *
+ * === 파일의 역할 ===
+ * Solaris에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * pset(프로세서 세트) 기반 CPU 친화성, DKIOCGMEDIAINFO ioctl로 디스크 크기 조회,
+ * directio() 함수로 O_DIRECT 에뮬레이션, 자체 ctime_r 3인자 호출 등을 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __sun__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - chardev_size(): DKIOCGMEDIAINFO ioctl (dk_minfo 구조체)
+ * - fio_set_odirect(): directio(DIRECTIO_ON)
+ * - fio_cpuset_init(): pset_create() - CPU 프로세서 세트 생성
+ * - fio_cpu_isset(): pset_info()로 CPU 목록 조회 후 확인
+ */
 #ifndef FIO_OS_SOLARIS_H
 #define FIO_OS_SOLARIS_H
 
@@ -32,6 +49,7 @@
 #define fio_swap32(x)	BSWAP_32(x)
 #define fio_swap64(x)	BSWAP_64(x)
 
+/* [한국어] Solaris 난수 시드 구조체 (erand48용) */
 struct solaris_rand_seed {
 	unsigned short r[3];
 };
@@ -52,6 +70,7 @@ struct solaris_rand_seed {
 	pthread_getaffinity_np(pthread_self(), sizeof(mask), &(mask))
 #endif
 
+/* [한국어] Solaris CPU 마스크 = pset ID (프로세서 세트 기반 친화성) */
 typedef psetid_t os_cpu_mask_t;
 
 static inline int chardev_size(struct fio_file *f, unsigned long long *bytes)

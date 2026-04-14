@@ -7,6 +7,20 @@
  *   - container_of 매크로로 리스트 노드에서 부모 구조체 포인터를 역추적
  *   - 삽입, 삭제, 결합(splice), 순회 등 기본 연산 제공
  *   - flist_sort()로 병합 정렬 지원
+ 
+ * === 파일의 역할 ===
+ * Linux 커널 list.h 기반 이중 연결 리스트 구현. 침투적(intrusive) 리스트.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 전체에서 가장 기본적인 자료구조. 거의 모든 모듈에서 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio 전체: io_u, fio_file, 워크큐 등 모든 리스트 관리
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct flist_head: 리스트 노드 (prev, next)
+ * - flist_add/del/for_each: 삽입/삭제/순회
+ * - container_of: 노드 → 부모 구조체 역추적
  */
 #ifndef _LINUX_FLIST_H
 #define _LINUX_FLIST_H

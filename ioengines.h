@@ -1,9 +1,27 @@
 /*
- * fio I/O 엔진 인터페이스 헤더 파일
- * 이 파일은 fio의 I/O 엔진이 구현해야 하는 모든 함수 포인터(콜백)와
- * 플래그, 상태 값을 정의한다.
- * 새로운 I/O 엔진을 작성하려면 ioengine_ops 구조체의 필수 콜백을 구현하고,
- * register_ioengine()으로 등록하면 된다.
+ * [한국어 설명] fio I/O 엔진 인터페이스 헤더 (ioengines.h)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 I/O 엔진이 구현해야 하는 모든 함수 포인터(콜백)와 플래그,
+ * 상태 값을 정의한다. 새로운 I/O 엔진을 작성하려면 ioengine_ops 구조체의
+ * 필수 콜백을 구현하고, register_ioengine()으로 등록하면 된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * ioengines.c와 함께 I/O 엔진 추상화 계층을 구성한다.
+ * backend.c → ioengines.c(td_io_*) → engines/*.c 호출 체인에서
+ * 이 헤더가 ioengine_ops 인터페이스를 정의하여 엔진 플러그인 구조를 가능하게 한다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - ioengines.c: td_io_*() 함수가 이 헤더의 ioengine_ops 콜백을 호출
+ * - engines/*.c: 각 엔진이 ioengine_ops를 구현하여 등록
+ * - fio.h: thread_data에 io_ops 필드로 엔진 인터페이스 포인터 저장
+ * - io_u.h: io_u 구조체를 콜백 함수의 파라미터로 전달
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct ioengine_ops: I/O 엔진 콜백 테이블 (init, prep, queue, commit, getevents 등)
+ * - enum fio_q_status: queue() 반환값 (COMPLETED, QUEUED, BUSY)
+ * - enum fio_ioengine_flags: 엔진 특성 플래그 (동기/비동기, pthreads 필요 등)
+ * - FIO_IOOPS_VERSION: 엔진 ABI 버전 번호 (동적 로딩 호환성 보장)
  */
 
 #ifndef FIO_IOENGINE_H

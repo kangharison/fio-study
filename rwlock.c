@@ -11,6 +11,20 @@
  *   fio_rwlock_read()   - 읽기 잠금 획득
  *   fio_rwlock_write()  - 쓰기 잠금 획득
  *   fio_rwlock_unlock() - 잠금 해제
+ 
+ * === 파일의 역할 ===
+ * pthread_rwlock 기반 읽기-쓰기 잠금을 구현. mmap(MAP_SHARED)으로 프로세스 간 공유.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * filehash.c에서 파일 해시 테이블 동기화에 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - rwlock.h: API 선언
+ * - filehash.c: 해시 테이블 동기화
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_rwlock_init/remove(): 생성/해제
+ * - fio_rwlock_read/write/unlock(): 읽기/쓰기 잠금
  */
 #include <stdio.h>
 #include <string.h>

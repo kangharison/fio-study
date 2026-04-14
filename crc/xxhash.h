@@ -57,6 +57,31 @@ It depends on successfully passing SMHasher test set.
 10 is a perfect score.
 */
 
+/*
+ * [한국어 설명] xxHash 고속 해시 알고리즘 헤더 (xxhash.h)
+ *
+ * === 파일의 역할 ===
+ * xxHash 32비트 해시 함수의 인터페이스를 정의한다.
+ * Yann Collet이 설계한 비암호학적 해시로, RAM 속도에 가까운 처리량(5.4 GB/s)을
+ * 달성하면서 SMHasher 테스트를 완벽히 통과하는 고품질 해시이다.
+ * 단일 블록 처리(XXH32)와 스트리밍 처리(init/update/digest) 두 가지 API를 제공한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: verify.c → XXH32() 또는 XXH32_init/update/digest
+ *
+ * === 타 모듈과의 연결 ===
+ * - verify.c: verify=xxhash 옵션 시 호출
+ * - xxhash.c: 구현
+ * - crc/test.c: 벤치마크 테스트
+ *
+ * === 주요 구조체 ===
+ * - XXH_state32_t: 스트리밍 해시 상태 (4개의 누적자 v1~v4, 임시 버퍼)
+ *
+ * === 주요 함수 요약 ===
+ * - XXH32(): 단일 블록 해시 계산 (가장 빠름)
+ * - XXH32_init/update/digest(): 스트리밍 해시 (대용량 데이터)
+ * - XXH32_intermediateDigest(): 상태를 유지하면서 중간 해시 획득
+ */
 #pragma once
 
 #if defined (__cplusplus)
@@ -65,16 +90,28 @@ extern "C" {
 
 #include <inttypes.h>
 
+/*
+ * [한국어] xxHash 스트리밍 상태 구조체
+ * init()으로 초기화하고, update()로 데이터를 반복 투입한 뒤,
+ * digest()로 최종 해시를 추출한다.
+ */
 struct XXH_state32_t
 {
     uint64_t total_len;
+    /* 지금까지 처리한 총 바이트 수 - 16바이트 이상이면 누적자 사용 */
     uint32_t seed;
+    /* 해시 시드값 - 같은 데이터라도 시드가 다르면 다른 해시 생성 */
     uint32_t v1;
     uint32_t v2;
     uint32_t v3;
     uint32_t v4;
+    /* 4개의 병렬 누적자(accumulator)
+     * 각각 PRIME 상수로 곱셈/회전을 수행하여 입력을 혼합
+     * 최종적으로 rotl+합산으로 병합하여 32비트 해시 생성 */
     int memsize;
+    /* 임시 버퍼에 저장된 바이트 수 (0~15) */
     char memory[16];
+    /* 16바이트 미만 잔여 데이터 임시 저장 버퍼 */
 };
 
 //****************************

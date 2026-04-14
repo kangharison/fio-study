@@ -4,6 +4,21 @@
  * fio 내부에서 사용하는 세마포어 구조체와 API를 선언한다.
  * 공유 메모리(mmap) 기반으로 프로세스 간 동기화를 지원하며,
  * pthread mutex + condition variable로 구현되어 있다.
+ 
+ * === 파일의 역할 ===
+ * fio 내부에서 사용하는 세마포어 구조체와 API를 선언한다.
+ * 공유 메모리(mmap) 기반으로 프로세스 간 동기화를 지원.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio_sem.c와 짝을 이루는 헤더. fio 전체에서 동기화에 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio_sem.c: 이 헤더의 함수 구현
+ * - smalloc.c, backend.c, server.c: 세마포어 사용
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct fio_sem: 세마포어 구조체 (mutex + cond + value + magic)
+ * - fio_sem_init/remove/down/up: 세마포어 라이프사이클 API
  */
 #ifndef FIO_SEM_H
 #define FIO_SEM_H

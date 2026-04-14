@@ -15,8 +15,34 @@
    along with this program; if not, write to the Free Software Foundation,
    Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.  */
 
+/*
+ * [한국어 설명] CRC-32 체크섬 구현 (crc32.c)
+ *
+ * === 파일의 역할 ===
+ * POSIX.2 표준 CRC-32 체크섬을 계산하는 함수를 구현한다.
+ * 256개 항목의 룩업 테이블을 사용하여 바이트 단위로 빠르게 CRC를 계산한다.
+ * 다항식: 0x04C11DB7 (이더넷, PKZIP, gzip 등에서 사용하는 표준 CRC-32)
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 verify 기능에서 CRC-32 체크섬 옵션이 선택되었을 때 호출된다.
+ * CRC-32C(Castagnoli)와 달리 하드웨어 가속이 없는 순수 소프트웨어 구현이다.
+ * 호출 체인: verify.c → fio_crc32() → crctab[] 룩업 테이블 참조
+ *
+ * === 타 모듈과의 연결 ===
+ * - verify.c: verify=crc32 옵션 시 이 함수를 호출하여 데이터 무결성 검증
+ * - crc/test.c: 벤치마크 테스트에서 성능 측정
+ * - crc32c.c: 다른 다항식(Castagnoli)을 사용하는 별도 CRC-32 구현
+ *
+ * === 주요 함수 요약 ===
+ * - fio_crc32(): 버퍼 데이터의 CRC-32 체크섬을 계산하여 반환
+ */
 #include "crc32.h"
 
+/*
+ * [한국어] CRC-32 룩업 테이블 (256개 항목)
+ * 다항식 0x04C11DB7로부터 미리 계산된 테이블이다.
+ * 바이트 단위 처리 시 비트별 연산 대신 테이블 참조로 고속 계산이 가능하다.
+ */
 static const uint32_t crctab[256] = {
   0x0,
   0x04C11DB7, 0x09823B6E, 0x0D4326D9, 0x130476DC, 0x17C56B6B,
@@ -72,6 +98,22 @@ static const uint32_t crctab[256] = {
   0xA2F33668, 0xBCB4666D, 0xB8757BDA, 0xB5365D03, 0xB1F740B4
 };
 
+/*
+ * [한국어]
+ * fio_crc32 - 버퍼 데이터의 CRC-32 체크섬 계산
+ *
+ * @buffer: CRC를 계산할 데이터 버퍼 포인터
+ * @length: 데이터 길이(바이트)
+ * @return: 계산된 32비트 CRC 체크섬 값
+ *
+ * 바이트 단위로 룩업 테이블을 참조하여 CRC-32를 계산한다.
+ * 알고리즘: CRC를 8비트 좌측 시프트하고, (CRC 상위 8비트 ^ 현재 바이트)를
+ * 테이블 인덱스로 사용하여 XOR 연산한다.
+ * 초기값 0에서 시작하며, 최종 XOR 반전(~)은 수행하지 않는다.
+ *
+ * 호출 체인:
+ *   verify.c / crc/test.c → [fio_crc32] → crctab[] 참조
+ */
 uint32_t fio_crc32(const void *buffer, unsigned long length)
 {
 	const unsigned char *cp = (const unsigned char *) buffer;

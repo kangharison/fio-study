@@ -20,6 +20,15 @@
 
 #define MTAB	"/etc/mtab"
 
+/*
+ * [한국어] device_is_mounted - 장치가 마운트되어 있는지 확인 (Linux 구현)
+ *
+ * @dev: 장치 경로 (예: "/dev/sda1")
+ * @return: 1=마운트됨, 0=마운트되지 않음
+ *
+ * /etc/mtab을 순회하며 장치 이름이 일치하는 엔트리를 찾는다.
+ * 호출 체인: init.c (setup_files) → [device_is_mounted] → getmntent(3)
+ */
 int device_is_mounted(const char *dev)
 {
 	FILE *mtab;

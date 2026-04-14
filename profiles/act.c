@@ -5,6 +5,22 @@
  * Aerospike 데이터베이스의 I/O 패턴을 시뮬레이션하여 SSD 적합성을 검증하는 ACT(Aerospike Certification Tool) 워크로드 프로파일이다.
  * --profile=act 옵션으로 사용하며, Aerospike가 요구하는 읽기/쓰기 비율과 블록 크기를 재현하여 스토리지 장치의 성능을 평가한다.
  * 실제 Aerospike 환경에서의 디스크 성능을 사전에 검증할 수 있게 해준다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * profile.c의 register_profile()로 등록되어 init.c에서 --profile=act 옵션 파싱 시 활성화된다.
+ * 호출 체인: main() -> parse_options() -> profile->prep_cmd() -> act_prep_cmdline()
+ * 런타임: backend.c -> td_io_queue() -> io_u 완료 -> act_io_u_lat() 콜백
+ *
+ * === 타 모듈과의 연결 ===
+ * - profile.h: profile_ops 구조체를 통해 프로파일 시스템에 등록
+ * - fio_sem: 멀티스레드 결과 집계를 위한 세마포어 동기화
+ * - thread_data: td->prof_data에 act_prof_data를 저장하여 스레드별 통계 관리
+ *
+ * === 주요 콜백 함수 ===
+ * - act_prep_cmdline(): 디바이스 이름 파싱 및 fio 옵션 생성
+ * - act_td_init(): 스레드별 레이턴시 슬라이스 초기화
+ * - act_io_u_lat(): 매 I/O 완료 시 레이턴시 버킷 분류 및 합격 판정
+ * - act_td_exit(): 스레드 종료 시 전역 통계에 병합
  */
 #include "../fio.h"
 #include "../profile.h"
@@ -19,11 +35,12 @@
 
 #define SAMPLE_SEC	3600		/* 1h checks */
 
+/* [한국어] ACT 합격 기준 - 각 레이턴시 임계값별 허용 초과 비율(퍼밀, 1/1000) */
 struct act_pass_criteria {
-	unsigned int max_usec;
-	unsigned int max_perm;
+	unsigned int max_usec;	/* 레이턴시 임계값 (마이크로초) */
+	unsigned int max_perm;	/* 허용되는 최대 초과 비율 (퍼밀 단위) */
 };
-#define ACT_MAX_CRIT	3
+#define ACT_MAX_CRIT	3	/* 1ms, 8ms, 64ms 세 가지 기준 */
 
 static struct act_pass_criteria act_pass[ACT_MAX_CRIT] = {
 	{
@@ -270,6 +287,11 @@ static int act_add_dev(const char *dev)
 /*
  * Fill our private options into the command line
  */
+/*
+ * [한국어] act_prep_cmdline - profile_ops.prep_cmd 콜백
+ * device-names 옵션에서 쉼표로 구분된 디바이스 이름을 파싱하여
+ * 각 디바이스에 대한 읽기/쓰기 작업 옵션을 act_opts 배열에 추가한다.
+ */
 static int act_prep_cmdline(void)
 {
 	if (!act_options.device_names) {
@@ -296,6 +318,12 @@ static int act_prep_cmdline(void)
 	return 0;
 }
 
+/*
+ * [한국어] act_io_u_lat - I/O 완료 시 레이턴시를 기록하는 콜백 함수
+ * prof_io_ops.io_u_lat에 등록되어 매 I/O 완료 후 호출된다.
+ * 레이턴시를 ACT 기준(1ms/8ms/64ms)의 버킷에 분류하고,
+ * SAMPLE_SEC(1시간) 경과 시 합격 기준 초과 여부를 판정한다.
+ */
 static int act_io_u_lat(struct thread_data *td, uint64_t nsec)
 {
 	struct act_prof_data *apd = td->prof_data;
@@ -427,6 +455,11 @@ static void put_act_ref(struct thread_data *td)
 	fio_sem_up(act_run_data->sem);
 }
 
+/*
+ * [한국어] act_td_init - 스레드별 ACT 프로파일 데이터를 초기화하는 콜백
+ * prof_io_ops.td_init에 등록되어 스레드 시작 시 호출된다.
+ * 테스트 기간을 SAMPLE_SEC 단위로 나누어 슬라이스 배열을 할당한다.
+ */
 static int act_td_init(struct thread_data *td)
 {
 	struct act_prof_data *apd;
@@ -443,6 +476,11 @@ static int act_td_init(struct thread_data *td)
 	return 0;
 }
 
+/*
+ * [한국어] act_td_exit - 스레드 종료 시 결과를 집계하고 정리하는 콜백
+ * prof_io_ops.td_exit에 등록되어 스레드 종료 시 호출된다.
+ * 개별 스레드의 슬라이스 데이터를 전역 act_run_data에 병합한다.
+ */
 static void act_td_exit(struct thread_data *td)
 {
 	struct act_prof_data *apd = td->prof_data;
@@ -453,12 +491,14 @@ static void act_td_exit(struct thread_data *td)
 	td->prof_data = NULL;
 }
 
+/* [한국어] ACT 프로파일 I/O 콜백 구조체 - 스레드 초기화/종료 및 레이턴시 기록 */
 static struct prof_io_ops act_io_ops = {
 	.td_init	= act_td_init,
 	.td_exit	= act_td_exit,
 	.io_u_lat	= act_io_u_lat,
 };
 
+/* [한국어] ACT 프로파일 등록 구조체 - --profile=act로 선택 시 사용되는 설정과 콜백 */
 static struct profile_ops act_profile = {
 	.name		= "act",
 	.desc		= "ACT Aerospike like benchmark",
@@ -469,6 +509,7 @@ static struct profile_ops act_profile = {
 	.io_ops		= &act_io_ops,
 };
 
+/* [한국어] act_register - fio 시작 시 자동 호출되는 생성자(constructor), ACT 프로파일을 등록 */
 static void fio_init act_register(void)
 {
 	act_run_data = calloc(1, sizeof(*act_run_data));
@@ -478,6 +519,7 @@ static void fio_init act_register(void)
 		log_err("fio: failed to register profile 'act'\n");
 }
 
+/* [한국어] act_unregister - fio 종료 시 자동 호출되는 소멸자(destructor), 리소스 정리 */
 static void fio_exit act_unregister(void)
 {
 	while (org_idx && org_idx < opt_idx)

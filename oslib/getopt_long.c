@@ -1,4 +1,27 @@
 /*
+ * [한국어 설명] 긴 옵션 파싱 함수 폴리필 구현 (getopt_long.c)
+ *
+ * === 파일의 역할 ===
+ * getopt_long_only() 함수의 폴리필 구현을 제공한다. 이 함수는 커맨드라인에서
+ * --name=value 형태의 긴 옵션과 -x 형태의 짧은 옵션을 모두 파싱한다.
+ * klibc 라이브러리에서 가져온 코드로, GNU getopt_long_only()의 주요 부분집합을
+ * 구현한다. 옵션 재정렬, -W foo, 첫 번째 optstring 문자 "-"는 지원하지 않는다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 커맨드라인 파싱의 핵심이다.
+ * main() [fio.c] → parse_options() [init.c] → getopt_long_only()
+ * fio의 모든 --옵션은 이 함수를 통해 파싱된다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 호출자: init.c의 parse_options()
+ * - 의존: oslib/getopt.h (struct option, enum 정의)
+ * - 전역 변수: optarg(옵션 인자), optind(다음 인덱스), opterr, optopt
+ *
+ * === 주요 함수 요약 ===
+ * - getopt_long_only(): 긴 옵션과 짧은 옵션을 모두 파싱하는 메인 함수
+ * - option_matches(): 인자 문자열과 옵션 이름의 일치 여부를 확인하는 헬퍼
+ */
+/*
  * getopt.c
  *
  * getopt_long(), or at least a common subset thereof:
@@ -16,15 +39,29 @@
 
 #include "getopt.h"
 
-char *optarg;
-int optind, opterr, optopt;
+/* [한국어] getopt 전역 변수들 - POSIX 표준에서 정의된 인터페이스 */
+char *optarg;    /* [한국어] 현재 옵션의 인자 문자열 포인터 */
+int optind, opterr, optopt;  /* [한국어] optind: 다음 argv 인덱스, optopt: 알 수 없는 옵션 문자 */
 
+/* [한국어] 파싱 상태를 추적하는 내부 구조체 - 여러 호출 간 상태 유지 */
 static struct getopt_private_state {
-	const char *optptr;
-	const char *last_optstring;
-	char *const *last_argv;
+	const char *optptr;        /* [한국어] 현재 옵션 문자열 내 위치 (결합 옵션 -abc 처리용) */
+	const char *last_optstring; /* [한국어] 마지막 호출 시 optstring - 변경 감지용 */
+	char *const *last_argv;    /* [한국어] 마지막 호출 시 argv - 변경 감지용 */
 } pvt;
 
+/*
+ * [한국어]
+ * option_matches - 인자 문자열과 옵션 이름의 일치 여부 확인
+ *
+ * @arg_str: 사용자가 입력한 옵션 문자열 (--이후 부분, '='까지)
+ * @opt_name: 비교할 옵션 이름
+ * @smatch: 1이면 부분 매칭 허용, 0이면 전체 매칭만 허용
+ * @return: 일치 시 arg_str에서 옵션 이름 이후 위치 ('=' 또는 '\0'), 불일치 시 NULL
+ *
+ * 호출 체인:
+ *   getopt_long_only() → [option_matches()]
+ */
 static inline const char *option_matches(const char *arg_str,
 					 const char *opt_name, int smatch)
 {
@@ -39,6 +76,26 @@ static inline const char *option_matches(const char *arg_str,
 	return arg_str;
 }
 
+/*
+ * [한국어]
+ * getopt_long_only - 긴 옵션과 짧은 옵션을 모두 파싱하는 메인 함수
+ *
+ * @argc: 인자 개수
+ * @argv: 인자 배열
+ * @optstring: 짧은 옵션 문자열 (예: "o:v" → -o는 인자 필요, -v는 인자 없음)
+ * @longopts: struct option 배열 (이름이 NULL인 원소로 종료)
+ * @longindex: 매칭된 긴 옵션의 인덱스가 저장될 포인터 (NULL 가능)
+ * @return: 옵션 문자/값, '?'는 에러, -1은 옵션 끝
+ *
+ * 동작 과정:
+ * 1) "--"로 시작하면 긴 옵션으로 처리 (longopts 배열에서 검색)
+ * 2) "-"로 시작하면 짧은 옵션으로 처리 (optstring에서 검색)
+ * 3) 옵션이 아닌 인자를 만나면 -1 반환
+ * 4) GNU 확장: 긴 옵션의 부분 매칭(unique prefix)을 지원
+ *
+ * 호출 체인:
+ *   parse_options() [init.c] → [getopt_long_only()] → option_matches()
+ */
 int getopt_long_only(int argc, char *const *argv, const char *optstring,
 		const struct option *longopts, int *longindex)
 {

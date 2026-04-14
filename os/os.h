@@ -1,3 +1,30 @@
+/*
+ * [한국어 설명] OS 추상화 메인 헤더 (os.h)
+ *
+ * === 파일의 역할 ===
+ * fio가 다양한 운영체제(Linux, macOS, FreeBSD, Windows 등)에서 동작할 수 있도록
+ * 플랫폼별 차이를 추상화하는 최상위 헤더. 컴파일 타임에 OS를 감지하여
+ * 적절한 os-<platform>.h 헤더를 포함하고, 해당 플랫폼에서 미제공하는
+ * 기능에 대해 폴백(fallback) 구현을 제공한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 거의 모든 모듈이 이 헤더를 포함하며, 플랫폼 독립적인 코드 작성을 가능하게 함.
+ * 호출 체인: fio 전체 → os/os.h → os/os-<platform>.h → 플랫폼 시스템 콜
+ *
+ * === 타 모듈과의 연결 ===
+ * - arch/arch.h: CPU 아키텍처별 정의 (바이트 오더, 배리어 등)
+ * - lib/types.h: 기본 타입 정의
+ * - file.h: fio_file 구조체 (blockdev_size, fio_fallocate 등에서 사용)
+ * - backend.c, io_u.c 등 핵심 모듈이 CPU 친화성, 메모리 매핑, 블록 디바이스 크기 등에 접근
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - blockdev_size(): 블록 디바이스 크기 조회 (플랫폼별 구현)
+ * - fio_setaffinity()/fio_getaffinity(): CPU 친화성 설정/조회
+ * - init_random_seeds(): /dev/urandom에서 난수 시드 초기화
+ * - os_phys_mem(): 시스템 물리 메모리 크기 조회
+ * - fio_swap16/32/64(): 바이트 오더 변환 함수
+ * - os_cpu_mask_t: 플랫폼별 CPU 마스크 타입
+ */
 #ifndef FIO_OS_H
 #define FIO_OS_H
 
@@ -12,6 +39,7 @@
 #include "../arch/arch.h" /* IWYU pragma: export */
 #include "../lib/types.h"
 
+/* [한국어] 지원 OS 식별자 열거형 - FIO_OS 매크로에 설정됨 */
 enum {
 	os_linux = 1,
 	os_aix,
@@ -26,13 +54,19 @@ enum {
 	os_dragonfly,
 	os_qnx,
 
-	os_nr,
+	os_nr,	/* [한국어] OS 총 개수 (배열 크기 결정용) */
 };
 
+/* [한국어] CPU 하드웨어 기능 플래그 - os_cpu_has()에서 런타임 감지에 사용 */
 typedef enum {
-        CPU_ARM64_CRC32C,
+        CPU_ARM64_CRC32C,	/* [한국어] ARM64 CRC32C 하드웨어 가속 지원 여부 */
 } cpu_features;
 
+/*
+ * [한국어] 컴파일 타임 OS 감지 및 플랫폼별 헤더 포함
+ * 각 플랫폼 헤더에서 blockdev_size(), os_phys_mem(), CPU 친화성 등을 정의.
+ * 플랫폼 헤더가 정의하지 않는 기능은 아래의 폴백 구현이 사용됨.
+ */
 /* IWYU pragma: begin_exports */
 #if defined(__linux__)
 #include "os-linux.h"
@@ -60,6 +94,7 @@ typedef enum {
 #error "unsupported os"
 #endif
 
+/* [한국어] EDQUOT(디스크 쿼터 초과) 에러가 없는 플랫폼에서 EIO로 대체 */
 #ifndef EDQUOT
 #define EDQUOT	EIO
 #endif
@@ -91,6 +126,11 @@ typedef struct aiocb os_aiocb_t;
 #define POSIX_FADV_NORMAL	(0)
 #endif
 
+/*
+ * [한국어] CPU 친화성 폴백 구현
+ * 플랫폼이 FIO_HAVE_CPU_AFFINITY를 정의하지 않으면 아무것도 하지 않는
+ * 스텁 함수들을 제공. cpus_allowed 옵션은 이 경우 무시됨.
+ */
 #ifndef FIO_HAVE_CPU_AFFINITY
 #define fio_cpu_clear(mask, cpu)	do { } while (0)
 typedef unsigned long os_cpu_mask_t;
@@ -118,6 +158,7 @@ static inline int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu_index)
 extern int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu);
 #endif
 
+/* [한국어] I/O 우선순위 폴백 - Linux 외 플랫폼에서 ioprio 기능 무효화 */
 #ifndef FIO_HAVE_IOPRIO_CLASS
 #define ioprio_class(prio)		0
 #define ioprio_value_is_class_rt(prio)	(false)
@@ -135,12 +176,16 @@ extern int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu);
 #define IOPRIO_MAX_PRIO			0
 #endif
 
+/* [한국어] O_DIRECT 지원 여부 - 미지원 플랫폼에서는 0으로 설정하여 direct=1 옵션 무효화 */
 #ifndef FIO_HAVE_ODIRECT
 #define OS_O_DIRECT			0
 #else
 #define OS_O_DIRECT			O_DIRECT
 #endif
 
+/* [한국어] 거대 페이지(Huge Page) 지원 폴백
+ * FIO_HUGE_PAGE 기본값 4MB (4194304). 미지원 시 0으로 설정.
+ * hugepage-size 옵션과 연동되어 대규모 I/O 버퍼 할당에 사용됨. */
 #ifndef FIO_HAVE_HUGETLB
 #define SHM_HUGETLB			0
 #define MAP_HUGETLB			0
@@ -165,6 +210,7 @@ extern int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu);
 #define OS_RAND_MAX			RAND_MAX
 #endif
 
+/* [한국어] 기본 I/O 엔진 - Linux: psync, Windows: windowsaio */
 #ifndef FIO_PREFERRED_ENGINE
 #define FIO_PREFERRED_ENGINE	"psync"
 #endif
@@ -185,6 +231,11 @@ typedef unsigned int socklen_t;
 #define os_ctime_r(x, y, z)     (void) ctime_r((x), (y))
 #endif
 
+/*
+ * [한국어] 범용 바이트 스왑 함수
+ * 플랫폼이 자체 바이트 스왑을 제공하지 않을 때 사용하는 제네릭 구현.
+ * 네트워크 프로토콜, 디스크 데이터 등 엔디안 변환에 사용됨.
+ */
 #ifdef FIO_USE_GENERIC_SWAP
 static inline uint16_t fio_swap16(uint16_t val)
 {
@@ -209,6 +260,12 @@ static inline uint64_t fio_swap64(uint64_t val)
 }
 #endif
 
+/*
+ * [한국어] 바이트 오더 변환 매크로
+ * 리틀 엔디안: be→cpu는 스왑 필요, le→cpu는 그대로
+ * 빅 엔디안: be→cpu는 그대로, le→cpu는 스왑 필요
+ * stat.c, client/server 등에서 네트워크/디스크 데이터 변환에 사용.
+ */
 #ifndef FIO_HAVE_BYTEORDER_FUNCS
 #ifdef CONFIG_LITTLE_ENDIAN
 #define __be16_to_cpu(x)		fio_swap16(x)
@@ -291,8 +348,17 @@ static inline uint64_t fio_swap64(uint64_t val)
 	__cpu_to_le64(val);			\
 })
 
+/* [한국어] 캐시 라인 크기 기본값 128바이트 - 실제 값은 arch_cache_line_size()로 조회 */
 #define FIO_DEF_CL_SIZE		128
 
+/*
+ * [한국어]
+ * os_cache_line_size - CPU 캐시 라인 크기 조회
+ *
+ * @return: 캐시 라인 크기 (바이트), 감지 실패 시 기본값 128
+ *
+ * false sharing 방지를 위한 구조체 정렬에 사용됨.
+ */
 static inline int os_cache_line_size(void)
 {
 #ifdef FIO_HAVE_CL_SIZE
@@ -307,6 +373,17 @@ static inline int os_cache_line_size(void)
 #endif
 }
 
+/*
+ * [한국어]
+ * blockdev_size - 블록 디바이스 크기 조회 (제네릭 구현)
+ *
+ * @f: 대상 fio_file (fd가 열려 있어야 함)
+ * @bytes: 크기를 저장할 포인터
+ * @return: 0=성공, errno=실패
+ *
+ * lseek(SEEK_END)로 파일 끝 위치를 구하는 범용 방식.
+ * Linux는 BLKGETSIZE64 ioctl, macOS는 DKIOC* 등 플랫폼별 구현이 우선함.
+ */
 #ifdef FIO_USE_GENERIC_BDEV_SIZE
 static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 {
@@ -323,6 +400,17 @@ static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 }
 #endif
 
+/*
+ * [한국어]
+ * init_random_seeds - 난수 시드 초기화 (/dev/urandom 사용)
+ *
+ * @rand_seeds: 시드 값을 저장할 버퍼
+ * @size: 버퍼 크기 (바이트)
+ * @return: 0=성공, 1=실패
+ *
+ * fio 시작 시 각 스레드의 난수 생성기를 초기화하는 데 사용.
+ * Windows는 CryptGenRandom()으로 별도 구현.
+ */
 #ifdef FIO_USE_GENERIC_INIT_RANDOM_STATE
 static inline int init_random_seeds(uint64_t *rand_seeds, int size)
 {
@@ -343,6 +431,7 @@ static inline int init_random_seeds(uint64_t *rand_seeds, int size)
 }
 #endif
 
+/* [한국어] 파일시스템 여유 공간 조회 폴백 - 미지원 시 0 반환 */
 #ifndef FIO_HAVE_FS_STAT
 static inline unsigned long long get_fs_free_size(const char *path)
 {
@@ -350,6 +439,7 @@ static inline unsigned long long get_fs_free_size(const char *path)
 }
 #endif
 
+/* [한국어] 시스템에 구성된 CPU 수 조회 - sysconf(_SC_NPROCESSORS_CONF) 사용 */
 #ifndef FIO_HAVE_CPU_CONF_SYSCONF
 static inline unsigned int cpus_configured(void)
 {
@@ -391,6 +481,7 @@ static inline int shm_attach_to_open_removed(void)
 }
 #endif
 
+/* [한국어] fallocate 폴백 - 미지원 플랫폼에서 ENOSYS 반환 */
 #ifndef FIO_HAVE_NATIVE_FALLOCATE
 static inline bool fio_fallocate(struct fio_file *f, uint64_t offset, uint64_t len)
 {

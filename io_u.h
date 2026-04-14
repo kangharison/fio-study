@@ -1,42 +1,31 @@
-/**
- * io_u.h - fio I/O 유닛(io_u) 헤더 파일
+/*
+ * [한국어 설명] fio I/O 유닛(io_u) 헤더 파일 (io_u.h)
  *
- * [io_u의 생명주기 (Lifecycle of io_u)]
+ * === 파일의 역할 ===
+ * 이 파일은 fio에서 하나의 I/O 요청을 표현하는 핵심 구조체 io_u와 관련 플래그,
+ * 상태 정의, 인라인 함수를 선언한다. io_u는 freelist → active → in-flight
+ * → completed → freelist의 생명주기를 거치며, 각 단계의 플래그와 상태 전이를
+ * 이 헤더에서 정의한다.
  *
- *   io_u는 fio에서 하나의 I/O 요청을 표현하는 핵심 구조체이다.
- *   각 io_u 인스턴스는 다음과 같은 생명주기를 거친다:
+ * === 전체 아키텍처에서의 위치 ===
+ * io_u는 fio의 I/O 파이프라인 전체에서 사용되는 핵심 데이터 단위이다.
+ * backend.c → io_u.c → ioengines.c → I/O 엔진 전체 흐름에서 io_u가 전달된다.
+ * io_u.h는 io_u 구조체를 정의하며, io_u.c, backend.c, ioengines.c, verify.c 등이
+ * 이 헤더를 포함한다.
  *
- *   1. freelist (유휴 상태)
- *      - 초기 생성 후 또는 I/O 완료 후 freelist에 대기
- *      - IO_U_F_FREE 플래그가 설정되어 있음
- *      - get_io_u() 호출 시 freelist에서 꺼내어 사용
+ * === 타 모듈과의 연결 ===
+ * - io_u.c: io_u의 할당/반환/완료 처리 구현
+ * - backend.c: do_io()에서 io_u를 가져와 I/O 루프 수행
+ * - ioengines.c: td_io_queue()에서 io_u를 엔진에 제출
+ * - verify.c: 검증 시 io_u 버퍼의 데이터 무결성 확인
+ * - 핵심 자료구조: io_u(I/O 요청), thread_data(io_u 풀 관리)
  *
- *   2. active (활성 상태)
- *      - get_io_u()를 통해 freelist에서 꺼내진 상태
- *      - offset, buflen, ddir 등 I/O 파라미터가 설정됨
- *      - 버퍼(buf)에 데이터가 채워짐 (쓰기의 경우)
- *      - IO_U_F_FREE 플래그가 해제됨
- *
- *   3. in-flight (전송 중 상태)
- *      - I/O 엔진(ioengine)에 제출(submit)된 상태
- *      - IO_U_F_FLIGHT 플래그가 설정됨
- *      - issue_time이 기록됨
- *      - 비동기 엔진의 경우 여러 io_u가 동시에 in-flight 가능
- *
- *   4. completed (완료 상태)
- *      - I/O 엔진이 완료를 보고한 상태
- *      - io_u_sync_complete() 또는 io_u_queued_complete()로 처리
- *      - 레이턴시 통계가 계산됨 (start_time, issue_time 기반)
- *      - 검증(verify)이 필요한 경우 verify_list에 추가
- *
- *   5. freelist로 복귀
- *      - put_io_u()를 통해 freelist로 반환
- *      - IO_U_F_FREE 플래그가 다시 설정됨
- *      - 다음 I/O 요청에 재사용됨
- *
- *   [재큐잉 경로]
- *      - I/O 엔진이 FIO_Q_BUSY를 반환하면 requeue_io_u()로 재큐잉
- *      - 재큐잉된 io_u는 다음 제출 시도에서 우선 처리됨
+ * === 주요 함수/구조체 요약 ===
+ * - struct io_u: I/O 요청 단위. offset, buflen, ddir, buf, flags 등 포함
+ * - IO_U_F_FREE/FLIGHT/IN_CUR_DEPTH 등: io_u 상태 플래그 (비트마스크)
+ * - io_u 생명주기: freelist → active(get_io_u) → in-flight(queue)
+ *   → completed(getevents) → freelist(put_io_u)
+ * - 재큐잉: FIO_Q_BUSY 시 requeue_io_u()로 재큐잉, 다음 시도에서 우선 처리
  */
 #ifndef FIO_IO_U
 #define FIO_IO_U

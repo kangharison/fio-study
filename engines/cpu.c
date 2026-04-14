@@ -1,23 +1,33 @@
 /*
  * [한국어 설명] cpuio I/O 엔진 구현 (cpu.c)
  *
- * === 엔진 개요 ===
- * 실제 I/O를 수행하지 않고 CPU 사이클만 소모하는 엔진이다.
- * CPU 바운드 워크로드를 시뮬레이션하거나, I/O 워크로드와 혼합하여
- * CPU 부하 상황을 재현하는 데 사용된다. noop(빈 루프)과 qsort(정렬) 두 가지
- * 스트레스 모드를 지원하며, cpuload 옵션으로 CPU 사용률을 조절할 수 있다.
+ * === 파일의 역할 ===
+ * 이 파일은 실제 I/O를 수행하지 않고 CPU 사이클만 소모하는 "cpuio" 엔진을
+ * 구현한다. CPU 바운드 워크로드를 단독으로 재현하거나, 다른 I/O 엔진과
+ * 혼합(잡 병렬 실행)하여 CPU 부하 상황에서의 I/O 성능 저하를 관찰하는 것이
+ * 주 목적이다. 두 가지 스트레스 모드(noop — 빈 루프, qsort — 대용량 배열 정렬)가
+ * 있으며, cpuload(0~100%)와 cpuchunk(ms) 옵션으로 연소/수면 비율을 제어한다.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * usleep(3), qsort(3) (CPU 연소용, 실제 I/O 시스템 호출 없음)
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 엔진 플러그인 계약 위에 존재하되 I/O 관련 콜백은 대부분 no-op이다.
+ * td_io_open_file은 fio_cpuio_open으로 가짜 성공을 돌려주고, td_io_queue에서
+ * fio_cpuio_queue가 CPU 연소 + usleep 조합으로 목표 cpuload를 시뮬레이트한다.
+ * 실행 컨텍스트는 잡 스레드(유저스페이스). 커널 측 의존은 usleep(3) 경로뿐.
  *
- * === fio에서의 사용법 ===
- * --ioengine=cpuio 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * - 상위: ioengines.c의 td_io_init/td_io_queue/td_io_cleanup/td_io_open_file.
+ * - 하위: usleep(3), qsort(3), 사용자 지정 RNG(MWC)만 사용. 외부 I/O 없음.
+ * - 옵션: optgroup.h의 FIO_OPT_C_ENGINE/FIO_OPT_G_CPUIO 카테고리/그룹.
+ * - 공유: thread_data::io_ops_data에 엔진별 상태(qsort 워크 버퍼 등)를 저장.
  *
- * === 구현하는 주요 콜백 ===
- * - .queue: fio_cpuio_queue (CPU 사이클 소모 루프 실행)
- * - .init: fio_cpuio_init (cpuload 옵션 검증)
- * - .cleanup: fio_cpuio_cleanup
- * - .open_file: fio_cpuio_open (파일을 실제로 열지 않음)
+ * === 주요 함수/구조체 요약 ===
+ * - fio_cpuio_queue(): 메인 루프 — 지정 모드로 CPU 연소 + 남은 시간 usleep.
+ * - fio_cpuio_init(): cpuload 범위 검증, qsort 워크버퍼 준비.
+ * - fio_cpuio_cleanup(): 워크버퍼 해제.
+ * - fio_cpuio_open(): 파일을 실제로 열지 않음 — 가짜 성공 반환.
+ * - struct cpu_options: cpuload/cpuchunk/mode/qsort_size 등 잡 옵션.
+ * - struct mwc: qsort 입력 랜덤화용 Multiply-With-Carry 난수 생성기 상태.
+ * - enum stress_mode: FIO_CPU_NOOP, FIO_CPU_QSORT.
  */
 
 /*
@@ -33,9 +43,10 @@
 // number of 32 bit integers to sort
 static size_t qsort_size = (256 * (1ULL << 10)); // 256KB
 
+/* [한국어] Multiply-With-Carry 난수 생성기 상태 (qsort 데이터 초기화용) */
 struct mwc {
-	uint32_t w;
-	uint32_t z;
+	uint32_t w;	/* [한국어] MWC 난수 상태 변수 w */
+	uint32_t z;	/* [한국어] MWC 난수 상태 변수 z */
 };
 
 enum stress_mode {
@@ -43,13 +54,14 @@ enum stress_mode {
 	FIO_CPU_QSORT = 1,
 };
 
+/* [한국어] cpuio 엔진 전용 옵션 구조체 */
 struct cpu_options {
-	void *pad;
-	unsigned int cpuload;
-	unsigned int cpucycle;
-	enum stress_mode cpumode;
-	unsigned int exit_io_done;
-	int32_t *qsort_data;
+	void *pad;			/* [한국어] fio 옵션 구조체 정렬 패딩 */
+	unsigned int cpuload;		/* [한국어] 목표 CPU 사용률 (0-100%) */
+	unsigned int cpucycle;		/* [한국어] CPU 연소 주기 (마이크로초 단위) - thinktime 계산에 사용 */
+	enum stress_mode cpumode;	/* [한국어] 스트레스 모드: noop(빈 루프) 또는 qsort(정렬 연산) */
+	unsigned int exit_io_done;	/* [한국어] 다른 I/O 스레드 완료 시 이 스레드도 종료할지 여부 */
+	int32_t *qsort_data;		/* [한국어] qsort 모드에서 정렬할 데이터 배열 (256KB) */
 };
 
 static struct fio_option options[] = {
@@ -161,6 +173,14 @@ static int stress_qsort_cmp_3(const void *p1, const void *p2)
 	return *i1 - *i2;
 }
 
+/*
+ * [한국어]
+ * do_qsort - qsort 모드에서 CPU를 소모하는 실제 작업 수행
+ *
+ * 4가지 방식(정순, 역순, 바이트 정렬, 역순)으로 반복 정렬하여 CPU를 연소한다.
+ * 실행 시간을 측정하여 cpucycle을 동적으로 조정하고, thinktime을 재계산한다.
+ * 이를 통해 cpuload 옵션에 맞는 CPU 사용률을 유지한다.
+ */
 static int do_qsort(struct thread_data *td)
 {
 	struct thread_options *o = &td->o;
@@ -195,6 +215,17 @@ static int do_qsort(struct thread_data *td)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * fio_cpuio_queue - cpuio 엔진의 I/O 제출 콜백
+ *
+ * 실제 I/O를 수행하지 않고 CPU 사이클만 소모한다.
+ * noop 모드: usec_spin()으로 지정 시간만큼 빈 루프를 돈다.
+ * qsort 모드: do_qsort()로 데이터 정렬 연산을 수행한다.
+ * exit_io_done 옵션이 설정되고 다른 I/O 스레드가 모두 완료되면 종료한다.
+ *
+ * 호출 체인: td_io_queue() → [이 함수] → usec_spin()/do_qsort()
+ */
 static enum fio_q_status fio_cpuio_queue(struct thread_data *td,
 					 struct io_u fio_unused *io_u)
 {
@@ -262,6 +293,16 @@ static int qsort_init(struct thread_data *td)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * fio_cpuio_init - cpuio 엔진 초기화 콜백
+ *
+ * cpuload 옵션을 검증하고, thinktime을 cpuload 비율에 따라 계산한다.
+ * cpuload=80이면 80% CPU 사용, 20% 대기 시간으로 설정한다.
+ * qsort 모드에서는 정렬 데이터를 미리 할당하고 난수로 초기화한다.
+ *
+ * 호출 체인: td_io_init() → [이 함수] → noop_init()/qsort_init()
+ */
 static int fio_cpuio_init(struct thread_data *td)
 {
 	struct thread_options *o = &td->o;
@@ -317,6 +358,11 @@ static int fio_cpuio_init(struct thread_data *td)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * fio_cpuio_cleanup - cpuio 엔진 정리 콜백
+ * qsort 모드에서 할당한 정렬 데이터 배열을 해제한다.
+ */
 static void fio_cpuio_cleanup(struct thread_data *td)
 {
 	struct cpu_options *co = td->eo;

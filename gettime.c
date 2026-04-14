@@ -2,20 +2,29 @@
  * Clock functions
  */
 /*
- * [한국어] gettime.c - 시간 측정 함수 구현
+ * [한국어 설명] 시간 측정 함수 구현 (gettime.c)
  *
- * fio에서 사용하는 모든 시간 측정 기능을 구현한다.
- * 주요 기능:
- *   1) fio_gettime()     - 현재 설정된 클록 소스에서 시간을 가져오는 핵심 함수
- *   2) fio_clock_init()  - CPU 클록 캘리브레이션 및 클록 소스 초기화
- *   3) calibrate_cpu_clock() - CPU TSC 주파수를 측정하여 나노초 변환 파라미터 계산
- *   4) fio_monotonic_clocktest() - 멀티코어 환경에서 TSC 동기화 검증
- *   5) ntime_since/utime_since/mtime_since - 시간 차이 계산 유틸리티
+ * === 파일의 역할 ===
+ * fio에서 사용하는 모든 시간 측정 기능을 구현한다. 클록 소스 초기화,
+ * CPU TSC 캘리브레이션, 현재 시간 조회, 시간 차이 계산 유틸리티를 제공한다.
+ * CS_GTOD(gettimeofday), CS_CGETTIME(clock_gettime), CS_CPUCLOCK(CPU TSC) 지원.
  *
- * 지원하는 클록 소스:
- *   - CS_GTOD     : gettimeofday() - 가장 호환성 높지만 오버헤드 있음
- *   - CS_CGETTIME : clock_gettime(CLOCK_MONOTONIC) - 기본값, 단조 증가 보장
- *   - CS_CPUCLOCK : CPU TSC 직접 읽기 - 가장 빠르지만 플랫폼 의존적
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 모든 레이턴시 측정이 fio_gettime()을 통해 이루어진다.
+ * main() → fio_time_init() → fio_clock_init() [이 파일]
+ * do_io() [backend.c] → fio_gettime() [이 파일] (I/O 시작/완료 시각 기록)
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.c: fio_time_init()에서 클록 초기화
+ * - backend.c/io_u.c: fio_gettime()으로 I/O 레이턴시 측정
+ * - gettime.h: 클록 소스 열거형(fio_cs), API 선언
+ * - gettime-thread.c: gtod 전용 스레드 (저오버헤드 시간 갱신)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_gettime(): 현재 클록 소스에서 시간을 가져오는 핵심 함수
+ * - fio_clock_init(): CPU 클록 캘리브레이션 및 클록 소스 초기화
+ * - calibrate_cpu_clock(): CPU TSC 주파수 측정 → 나노초 변환 파라미터 계산
+ * - ntime_since/utime_since/mtime_since: 시간 차이 계산 유틸리티
  */
 
 #include <math.h>

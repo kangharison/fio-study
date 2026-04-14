@@ -6,6 +6,20 @@
  * fio 옵션들을 논리적 그룹으로 분류하기 위한 구조체와 열거형을 정의한다.
  * 각 옵션은 비트마스크를 통해 상위 카테고리(opt_category)와
  * 세부 카테고리(opt_category_group)에 매핑된다.
+ 
+ * === 파일의 역할 ===
+ * fio 옵션 그룹 분류를 위한 구조체와 열거형을 정의한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * optgroup.c와 짝을 이루는 헤더. parse.c/options.c에서 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - optgroup.c: 그룹 테이블 구현
+ * - parse.c/options.c: 그룹 표시
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct opt_group: 그룹 이름 + 비트마스크
+ * - enum opt_category/opt_category_group: 카테고리 열거형
  */
 
 /* [한국어] 옵션 그룹 구조체 - 이름과 비트마스크 쌍 */

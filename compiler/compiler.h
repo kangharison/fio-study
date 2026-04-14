@@ -18,9 +18,10 @@
  * Mark unused variables passed to ops functions as unused, to silence gcc
  */
 #define fio_unused	__attribute__((__unused__))
-#define fio_init	__attribute__((constructor))
-#define fio_exit	__attribute__((destructor))
+#define fio_init	__attribute__((constructor))	/* [한국어] main() 이전에 자동 호출되는 초기화 함수 지정 */
+#define fio_exit	__attribute__((destructor))	/* [한국어] main() 이후에 자동 호출되는 정리 함수 지정 */
 
+/* [한국어] 분기 예측 힌트 - 조건이 거짓일 가능성이 높음을 컴파일러에 알려 최적화 */
 #define fio_unlikely(x)	__builtin_expect(!!(x), 0)
 
 /*
@@ -70,8 +71,8 @@
 #endif
 
 #ifdef FIO_INTERNAL
-#define FIO_ARRAY_SIZE(x)    (sizeof((x)) / (sizeof((x)[0])))
-#define FIO_FIELD_SIZE(s, f) (sizeof(((__typeof__(s))0)->f))
+#define FIO_ARRAY_SIZE(x)    (sizeof((x)) / (sizeof((x)[0])))  /* [한국어] 배열 원소 개수 계산 */
+#define FIO_FIELD_SIZE(s, f) (sizeof(((__typeof__(s))0)->f))    /* [한국어] 구조체 필드 크기 계산 */
 #endif
 
 #ifndef __has_attribute
@@ -79,6 +80,7 @@
 #define __GCC4_has_attribute___fallthrough__	0
 #endif
 
+/* [한국어] switch-case에서 의도적 fall-through를 명시하여 컴파일러 경고를 억제 */
 #if __has_attribute(__fallthrough__)
 #define fio_fallthrough	 __attribute__((__fallthrough__))
 #else

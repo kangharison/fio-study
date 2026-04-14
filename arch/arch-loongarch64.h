@@ -15,6 +15,7 @@
 
 #define FIO_ARCH	(arch_loongarch64)
 
+/* [한국어] dbar 0 = Data Barrier with hint 0 (완전 배리어) - 읽기/쓰기 모두 차단 */
 #define read_barrier()		__asm__ __volatile__("dbar 0": : :"memory")
 #define write_barrier()		__asm__ __volatile__("dbar 0": : :"memory")
 #define nop			__asm__ __volatile__("dbar 0": : :"memory")

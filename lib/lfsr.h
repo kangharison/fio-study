@@ -33,14 +33,14 @@ struct lfsr_taps {
 
 
 struct fio_lfsr {
-	uint64_t xormask;
-	uint64_t last_val;
-	uint64_t cached_bit;
-	uint64_t max_val;
-	uint64_t num_vals;
-	uint64_t cycle_length;
-	uint64_t cached_cycle_length;
-	unsigned int spin;
+	uint64_t xormask;		/* [한국어] XOR 피드백 마스크 (탭 위치를 비트로 인코딩) */
+	uint64_t last_val;		/* [한국어] 현재 LFSR 상태값 (= 마지막으로 생성된 값) */
+	uint64_t cached_bit;		/* [한국어] 최상위 비트 캐시 (1 << (비트수-1)) */
+	uint64_t max_val;		/* [한국어] 최대 유효 값 (nums - 1). 이를 초과하면 건너뜀 */
+	uint64_t num_vals;		/* [한국어] 지금까지 생성된 값의 수. max_val 초과 시 종료 */
+	uint64_t cycle_length;		/* [한국어] 부분 순환 감지를 위한 카운터 (0이면 순환 없음) */
+	uint64_t cached_cycle_length;	/* [한국어] cycle_length의 초기값 캐시 (리셋용) */
+	unsigned int spin;		/* [한국어] 한 번에 실행할 LFSR 스텝 수 (0~15) */
 };
 
 int lfsr_next(struct fio_lfsr *fl, uint64_t *off);

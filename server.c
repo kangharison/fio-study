@@ -1,30 +1,30 @@
 /*
- * [한국어] server.c - fio 서버 모드 구현
+ * [한국어 설명] fio 서버 모드 구현 (server.c)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio의 서버 모드를 구현한다. 네트워크를 통해 원격 클라이언트로부터
- * 잡 설정을 수신하고, I/O 벤치마크를 실행한 뒤 결과를 클라이언트에게 전송한다.
+ * 잡 설정을 수신하고, I/O 벤치마크를 실행한 뒤 결과를 전송한다.
+ * 소켓 초기화, 연결 수락, 명령 디스패치, 통계/로그 전송을 담당한다.
  *
- * 주요 기능:
- *   1) fio_start_server()     - 서버 진입점. pidfile 지정 시 데몬으로 백그라운드 실행
- *   2) fio_server()           - 서버 메인 함수. 소켓 초기화 -> accept_loop
- *   3) accept_loop()          - 클라이언트 연결 수락 루프. 연결마다 fork하여 처리
- *   4) handle_connection()    - 단일 클라이언트 연결 처리. 명령 수신 -> 디스패치 -> 전송
- *   5) handle_command()       - 수신된 명령을 opcode별로 분기 처리
- *   6) fio_net_recv_cmd()     - 네트워크에서 명령 수신 (프래그먼트 재조립 포함)
- *   7) fio_net_send_cmd()     - 명령 전송 (큰 페이로드는 프래그먼트로 분할)
- *   8) fio_server_send_ts()   - 스레드 통계를 네트워크 바이트 오더로 변환 후 전송
- *   9) fio_send_iolog()       - I/O 로그 데이터를 (압축 후) 전송
+ * === 전체 아키텍처에서의 위치 ===
+ * main() [fio.c]에서 서버 모드 시 fio_start_server()로 진입한다.
+ * 호출 체인: fio_start_server → fio_server → accept_loop → fork
+ *   → handle_connection → handle_command → handle_run_cmd → fio_backend()
+ * 전송 아키텍처: 워커가 sk_out->list에 큐잉 → handle_xmits()가 소켓 전송
  *
- * 서버 동작 흐름:
- *   fio_start_server -> fio_server -> fio_init_server_connection -> accept_loop
- *     -> fork -> handle_connection -> handle_command (명령별 핸들러 호출)
- *       -> handle_run_cmd: fork하여 fio_backend() 실행
- *       -> 결과 통계/로그를 sk_out 큐를 통해 클라이언트에 전송
+ * === 타 모듈과의 연결 ===
+ * - fio.c: main()에서 서버 모드 분기 시 fio_start_server() 호출
+ * - backend.c: handle_run_cmd에서 fork 후 fio_backend() 실행
+ * - server.h: 네트워크 프로토콜(opcode, fio_net_cmd, sk_out) 정의
+ * - client.c: 이 서버와 통신하는 클라이언트 측 구현
+ * - stat.c: fio_server_send_ts()로 통계를 네트워크 바이트 오더로 변환 후 전송
  *
- * 전송 아키텍처:
- *   - 워커 스레드는 sk_out->list에 전송할 데이터를 큐잉
- *   - handle_xmits()가 큐에서 꺼내 실제 소켓 전송 수행
- *   - sk_out은 참조 카운팅으로 수명 관리
+ * === 주요 함수/구조체 요약 ===
+ * - fio_start_server(): 서버 진입점 (데몬 모드 지원)
+ * - accept_loop(): 클라이언트 연결 수락 루프 (연결마다 fork)
+ * - handle_connection(): 단일 클라이언트 연결 처리 (명령 수신→디스패치→전송)
+ * - fio_net_recv_cmd()/fio_net_send_cmd(): 네트워크 명령 수신/전송
+ * - fio_server_send_ts(): 스레드 통계를 바이트 오더 변환 후 전송
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

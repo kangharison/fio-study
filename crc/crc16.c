@@ -5,9 +5,22 @@
  * Version 2. See the file COPYING for more details.
  */
 
+/*
+ * [한국어 설명] CRC-16 체크섬 구현 (crc16.c)
+ *
+ * === 파일의 역할 ===
+ * 표준 CRC-16(다항식 0x8005)의 룩업 테이블과 계산 함수를 구현한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: verify.c → fio_crc16() [이 파일] → crc16_byte() [crc16.h]
+ *
+ * === 주요 함수 요약 ===
+ * - fio_crc16(): 버퍼 전체의 CRC-16 체크섬을 계산
+ */
 #include "crc16.h"
 
 /** CRC table for the CRC-16. The poly is 0x8005 (x^16 + x^15 + x^2 + 1) */
+/* [한국어] CRC-16 룩업 테이블: 다항식 0x8005로부터 미리 계산된 256개 항목 */
 unsigned short const crc16_table[256] = {
 	0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
 	0xC601, 0x06C0, 0x0780, 0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
@@ -43,12 +56,30 @@ unsigned short const crc16_table[256] = {
 	0x8201, 0x42C0, 0x4380, 0x8341, 0x4100, 0x81C1, 0x8081, 0x4040
 };
 
+/*
+ * [한국어]
+ * fio_crc16 - 버퍼 데이터의 CRC-16 체크섬 계산
+ *
+ * @buffer: CRC를 계산할 데이터 버퍼
+ * @len: 데이터 길이(바이트)
+ * @return: 계산된 16비트 CRC 값
+ *
+ * 초기값 0에서 시작하여 각 바이트마다 crc16_byte()를 호출하고 최종 CRC를 반환한다.
+ *
+ * 호출 체인:
+ *   verify.c / crc/test.c → [fio_crc16] → crc16_byte() [crc16.h]
+ */
 unsigned short fio_crc16(const void *buffer, unsigned int len)
 {
+	/* [한국어] void*를 바이트 단위 접근을 위해 unsigned char*로 캐스팅 - CRC는 바이트 스트림 기준 계산 */
 	const unsigned char *cp = (const unsigned char *) buffer;
+	/* [한국어] CRC 초기값 0 - 표준 CRC-16 (Modbus/USB)의 초기 seed */
 	unsigned short crc = 0;
 
+	/* [한국어] len을 감소시키며 0이 될 때까지 반복 - 후위 감소라 len==0이면 루프 종료 */
 	while (len--)
+		/* [한국어] 한 바이트씩 CRC에 반영: crc16_byte는 인라인 함수로 테이블 룩업 1회 수행 */
 		crc = crc16_byte(crc, *cp++);
+	/* [한국어] 누적된 16비트 CRC 반환 - 호출자(verify.c)가 verify_header에 저장/비교 */
 	return crc;
 }

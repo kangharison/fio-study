@@ -1,3 +1,26 @@
+/*
+ * [한국어 설명] Windows 플랫폼 OS 추상화 헤더 (os-windows.h)
+ *
+ * === 파일의 역할 ===
+ * Windows에서 fio가 동작할 수 있도록 POSIX/Linux API의 호환 계층을 정의한다.
+ * 누락된 POSIX 시그널(SIGPIPE, SIGUSR1 등), 프로세스 관리(fork, setsid),
+ * 파일 시스템 함수(fcntl, fsync) 등의 선언과 Windows API 기반 구현을 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 WIN32 감지 시 포함됨.
+ *
+ * === 타 모듈과의 연결 ===
+ * - windows/posix.h, windows/posix.c: POSIX 함수 에뮬레이션 구현
+ * - windows/cpu-affinity.c: Windows 프로세서 그룹 기반 CPU 친화성
+ * - os-windows-7.h: CPU 마스크 타입 정의
+ * - smalloc.h, debug.h, log.h: fio 내부 모듈
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): DeviceIoControl(IOCTL_DISK_GET_LENGTH_INFO)
+ * - init_random_seeds(): CryptGenRandom으로 난수 시드 초기화
+ * - fio_mkdir(): CreateDirectoryA 래퍼
+ * - os_phys_mem(): GlobalMemoryStatusEx
+ */
 #ifndef FIO_OS_WINDOWS_H
 #define FIO_OS_WINDOWS_H
 
@@ -27,11 +50,12 @@
 #define PTHREAD_STACK_MIN 65535
 #endif
 
-#define FIO_HAVE_ODIRECT
-#define FIO_HAVE_CPU_AFFINITY
-#define FIO_HAVE_CHARDEV_SIZE
-#define FIO_HAVE_GETTID
-#define FIO_EMULATED_MKDIR_TWO
+/* [한국어] Windows에서 지원/에뮬레이션하는 기능 플래그 */
+#define FIO_HAVE_ODIRECT		/* [한국어] O_DIRECT 에뮬레이션 (CreateFile에서 처리) */
+#define FIO_HAVE_CPU_AFFINITY		/* [한국어] CPU 친화성 (SetThreadGroupAffinity) */
+#define FIO_HAVE_CHARDEV_SIZE		/* [한국어] 캐릭터 디바이스 크기 조회 */
+#define FIO_HAVE_GETTID			/* [한국어] 스레드 ID (GetCurrentThreadId) */
+#define FIO_EMULATED_MKDIR_TWO		/* [한국어] mkdir 2인자 버전 에뮬레이션 */
 
 #define FIO_PREFERRED_ENGINE		"windowsaio"
 #define FIO_PREFERRED_CLOCK_SOURCE	CS_CGETTIME
@@ -82,6 +106,7 @@
 typedef int sigset_t;
 typedef int siginfo_t;
 
+/* [한국어] POSIX sigaction 구조체 에뮬레이션 - Windows signal() 함수로 매핑 */
 struct sigaction
 {
 	void (*sa_handler)(int);
@@ -90,6 +115,7 @@ struct sigaction
 	void* (*sa_sigaction)(int, siginfo_t *, void*);
 };
 
+/* [한국어] Windows에서 에뮬레이션하는 POSIX/Unix 함수 선언 (windows/posix.c에서 구현) */
 long sysconf(int name);
 
 int kill(pid_t pid, int sig);
@@ -112,6 +138,12 @@ ssize_t pwrite(int fildes, const void *buf, size_t nbyte,
 HANDLE windows_handle_connection(HANDLE hjob, int sk);
 HANDLE windows_create_job(void);
 
+/*
+ * [한국어]
+ * blockdev_size - Windows 블록 디바이스 크기 조회
+ * DeviceIoControl(IOCTL_DISK_GET_LENGTH_INFO)로 디스크 크기를 구함.
+ * POSIX fd와 Windows HANDLE 양쪽을 처리하는 이중 경로 포함.
+ */
 static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 {
 	int rc = 0;
@@ -168,6 +200,12 @@ static inline int gettid(void)
 }
 #endif
 
+/*
+ * [한국어]
+ * init_random_seeds - Windows 암호학적 난수 생성기로 시드 초기화
+ * CryptAcquireContext/CryptGenRandom API 사용.
+ * /dev/urandom이 없는 Windows에서의 대체 구현.
+ */
 static inline int init_random_seeds(uint64_t *rand_seeds, int size)
 {
 	HCRYPTPROV hCryptProv;
@@ -196,6 +234,7 @@ static inline int fio_set_sched_idle(void)
 	return (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE))? 0 : -1;
 }
 
+/* [한국어] Windows mkdir 에뮬레이션 - CreateDirectoryA 래퍼, 디바이스 네임스페이스 특별 처리 */
 static inline int fio_mkdir(const char *path, mode_t mode) {
 	DWORD dwAttr = GetFileAttributesA(path);
 
@@ -218,6 +257,7 @@ static inline int fio_mkdir(const char *path, mode_t mode) {
 	return 0;
 }
 
+/* [한국어] Windows CPU 친화성 함수 (windows/cpu-affinity.c에서 구현) */
 int first_set_cpu(os_cpu_mask_t *cpumask);
 int fio_setaffinity(int pid, os_cpu_mask_t cpumask);
 int fio_cpuset_init(os_cpu_mask_t *mask);

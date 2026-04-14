@@ -22,6 +22,16 @@
  * to chaining of merge() calls: null-terminated, no reserved or
  * sentinel head node, "prev" links not maintained.
  */
+/*
+ * [한국어] merge - 두 정렬된 리스트를 하나로 병합
+ *
+ * @priv: 비교 함수에 전달되는 사용자 데이터
+ * @cmp: 비교 함수 (음수: a가 먼저, 양수: b가 먼저, 0: 동일)
+ * @a, @b: 병합할 두 리스트의 첫 노드
+ * @return: 병합된 리스트의 첫 노드 (null-terminated, prev 미유지)
+ *
+ * 동일한 키의 원소는 a에서 먼저 가져와 안정 정렬(stable sort)을 보장한다.
+ */
 static struct flist_head *merge(void *priv,
 				int (*cmp)(void *priv, struct flist_head *a,
 					struct flist_head *b),
@@ -50,6 +60,12 @@ static struct flist_head *merge(void *priv,
  * runs faster than the tidier alternatives of either a separate final
  * prev-link restoration pass, or maintaining the prev links
  * throughout.
+ */
+/*
+ * [한국어] merge_and_restore_back_links - 최종 병합과 이중 연결 리스트 prev 링크 복원
+ *
+ * 마지막 병합 단계에서 prev 링크를 동시에 설정하여 별도의 복원 패스를 생략한다.
+ * head->prev = 마지막 노드, 마지막 노드->next = head로 원형 리스트를 완성한다.
  */
 static void merge_and_restore_back_links(void *priv,
 				int (*cmp)(void *priv, struct flist_head *a,
@@ -105,10 +121,24 @@ static void merge_and_restore_back_links(void *priv,
  * @b. If @a and @b are equivalent, and their original relative
  * ordering is to be preserved, @cmp must return 0.
  */
+/*
+ * [한국어] flist_sort - fio의 이중 연결 리스트를 O(n log n) 병합 정렬
+ *
+ * @priv: 비교 함수에 전달되는 사용자 데이터
+ * @head: 정렬할 리스트의 헤드
+ * @cmp: 비교 함수
+ *
+ * 바텀업 병합 정렬을 사용한다. part[i]에는 크기 2^i의 정렬된 부분 리스트가 저장되며,
+ * 새 원소가 올 때마다 같은 크기의 부분 리스트와 병합하여 상위로 올린다.
+ * 최종적으로 모든 부분 리스트를 병합하고 이중 연결 구조를 복원한다.
+ *
+ * 호출 체인: fio 내부 코드 → [flist_sort] → merge → merge_and_restore_back_links
+ */
 void flist_sort(void *priv, struct flist_head *head,
 		int (*cmp)(void *priv, struct flist_head *a,
 			struct flist_head *b))
 {
+	/* [한국어] part[i]: 크기 2^i의 정렬된 부분 리스트. 마지막 슬롯은 센티널 */
 	struct flist_head *part[MAX_LIST_LENGTH_BITS+1]; /* sorted partial lists
 						-- last slot is a sentinel */
 	int lev;  /* index into part[] */

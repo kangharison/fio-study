@@ -5,6 +5,19 @@
  *
  * 플랫폼에서 지원하지 않는 시스템 콜(fallocate, sync_file_range 등)에 대한
  * 폴백 함수 선언을 제공한다. 실제 구현은 helpers.c에 있다.
+ 
+ * === 파일의 역할 ===
+ * 플랫폼 미지원 시스템 콜의 폴백 함수 선언을 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * helpers.c와 짝을 이루는 헤더.
+ *
+ * === 타 모듈과의 연결 ===
+ * - helpers.c: 이 헤더의 함수 구현
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fallocate()/posix_fallocate(): 파일 공간 할당
+ * - sync_file_range()/syncfs(): 동기화
  */
 
 #include <sys/types.h>

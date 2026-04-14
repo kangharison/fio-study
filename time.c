@@ -8,6 +8,24 @@
  *   3) ramp_period_check/over()  - 워밍업(ramp) 기간 관리 (통계 수집 전 안정화 구간)
  *   4) fio_time_init()           - 시간 서브시스템 초기화 (nanosleep 정밀도 측정)
  *   5) set_genesis_time() / set_epoch_time() - 기준 시각 설정
+ 
+ * === 파일의 역할 ===
+ * fio에서 사용하는 시간 유틸리티를 구현한다. 마이크로초 대기, genesis 경과 시간,
+ * ramp period 관리, 시간 서브시스템 초기화를 담당한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio.c의 main()에서 fio_time_init()으로 초기화. backend.c, io_u.c에서
+ * 시간 관련 유틸리티를 광범위하게 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.c: fio_time_init()으로 시간 서브시스템 초기화
+ * - backend.c: ramp_period_check, time_since_genesis 사용
+ * - fio_time.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_time_init(): 시간 서브시스템 초기화 (nanosleep 정밀도 측정)
+ * - usec_spin()/usec_sleep(): 마이크로초 단위 대기
+ * - time_since_genesis(): fio 시작 이후 경과 시간
  */
 
 /* 표준 시간 관련 헤더 */

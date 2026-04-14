@@ -15,9 +15,9 @@
 #include <stddef.h>
 
 struct buf_output {
-	char *buf;
-	size_t buflen;
-	size_t max_buflen;
+	char *buf;		/* [한국어] 동적 할당된 버퍼 포인터 (NULL이면 미초기화) */
+	size_t buflen;		/* [한국어] 현재 사용 중인 바이트 수 */
+	size_t max_buflen;	/* [한국어] 할당된 총 바이트 수 (buflen <= max_buflen) */
 };
 
 void buf_output_init(struct buf_output *out);

@@ -8,6 +8,20 @@
  *   2) Jenkins 해시 (jhash): jhash()
  *      - 임의 길이 바이트 배열을 해싱. Bob Jenkins의 lookup3 기반
  *      - 해시 테이블, 체크섬 등에 사용
+ 
+ * === 파일의 역할 ===
+ * 황금비 해시(hash_long)와 Jenkins 해시(jhash) 두 가지 알고리즘을 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * filehash.c, client.c 등에서 해시 테이블 인덱싱에 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - filehash.c: 파일 해시 테이블 인덱싱
+ * - client.c: 클라이언트 해시 테이블
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - hash_long()/hash_ptr(): 황금비 해시
+ * - jhash(): Jenkins 해시 (바이트 배열)
  */
 #ifndef _LINUX_HASH_H
 #define _LINUX_HASH_H

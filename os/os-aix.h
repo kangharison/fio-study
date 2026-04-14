@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] AIX 플랫폼 OS 추상화 헤더 (os-aix.h)
+ *
+ * === 파일의 역할 ===
+ * IBM AIX에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * IOCINFO ioctl로 SCSI 디스크 크기 조회, sysconf(_SC_AIX_REALMEM)로
+ * 물리 메모리 조회. 바이트 스왑은 범용(FIO_USE_GENERIC_SWAP) 사용.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 _AIX 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): IOCINFO ioctl (devinfo 구조체)
+ * - os_phys_mem(): sysconf(_SC_AIX_REALMEM) * 1024
+ */
 #ifndef FIO_OS_AIX_H
 #define FIO_OS_AIX_H
 

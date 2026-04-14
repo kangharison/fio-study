@@ -2,22 +2,28 @@
  * blktrace support code for fio
  */
 /*
- * [한국어] blktrace.c - blktrace 지원 코드
+ * [한국어 설명] blktrace 지원 코드 (blktrace.c)
  *
- * 이 파일은 Linux blktrace 바이너리 파일을 읽고 재생하는 기능을 구현한다.
- * blktrace는 블록 레이어의 I/O 이벤트를 기록하는 도구이며, fio는 이 데이터를
- * 읽어 실제 I/O 패턴을 재현(replay)할 수 있다.
+ * === 파일의 역할 ===
+ * Linux blktrace 바이너리 파일을 읽고 재생하는 기능을 구현한다. blktrace는
+ * 블록 레이어의 I/O 이벤트를 기록하는 도구이며, fio는 이 데이터를 읽어
+ * 실제 I/O 패턴을 재현(replay)할 수 있다.
  *
- * 주요 기능:
- *   1) is_blktrace()        - 파일이 blktrace 바이너리 형식인지 매직 넘버로 판별
- *   2) init_blktrace_read() - blktrace 파일을 열고 io_piece 리스트로 로드
- *   3) read_blktrace()      - 트레이스 항목을 순차적으로 읽어 I/O 작업(io_piece)으로 변환
- *   4) merge_blktrace_iologs() - 여러 blktrace 파일을 시간순으로 병합
+ * === 전체 아키텍처에서의 위치 ===
+ * iolog.c의 read_iolog()에서 is_blktrace()로 형식을 판별하고,
+ * init_blktrace_read()로 트레이스를 로드한다.
+ * 호출 체인: read_iolog() [iolog.c] → is_blktrace() / init_blktrace_read() [이 파일]
  *
- * 트레이스 재생 흐름:
- *   blk_io_trace 읽기 -> 바이트 스왑(필요시) -> 매직/버전 검증 ->
- *   queue_trace()로 I/O 유형 분류 -> store_ipo()로 io_piece 저장 ->
- *   fio 메인 루프에서 순차 재생
+ * === 타 모듈과의 연결 ===
+ * - iolog.c: read_iolog()에서 blktrace 형식 판별 및 로드 호출
+ * - blktrace.h: API 선언, blk_io_trace 구조체
+ * - iolog.h: io_piece 구조체 (트레이스 → I/O 작업 변환)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - is_blktrace(): blktrace 바이너리 형식인지 매직 넘버로 판별
+ * - init_blktrace_read(): blktrace 파일을 열고 io_piece 리스트로 로드
+ * - read_blktrace(): 트레이스 항목을 순차적으로 읽어 io_piece로 변환
+ * - merge_blktrace_iologs(): 여러 blktrace 파일을 시간순으로 병합
  */
 
 /* 표준 라이브러리 헤더 */

@@ -43,6 +43,18 @@
 
 #include "rbtree.h"
 
+/*
+ * [한국어] __rb_rotate_left - 노드를 기준으로 좌회전
+ *
+ * node의 오른쪽 자식(right)이 node의 자리를 대체하고,
+ * node는 right의 왼쪽 자식이 된다. 트리 높이 균형을 조정하는 기본 연산.
+ *
+ *     node              right
+ *    /    \     →      /     \
+ *   T1   right       node    T3
+ *        /  \        /   \
+ *       T2   T3     T1    T2
+ */
 static void __rb_rotate_left(struct fio_rb_node *node, struct rb_root *root)
 {
 	struct fio_rb_node *right = node->rb_right;
@@ -66,6 +78,9 @@ static void __rb_rotate_left(struct fio_rb_node *node, struct rb_root *root)
 	rb_set_parent(node, right);
 }
 
+/*
+ * [한국어] __rb_rotate_right - 노드를 기준으로 우회전 (좌회전의 대칭)
+ */
 static void __rb_rotate_right(struct fio_rb_node *node, struct rb_root *root)
 {
 	struct fio_rb_node *left = node->rb_left;
@@ -89,10 +104,25 @@ static void __rb_rotate_right(struct fio_rb_node *node, struct rb_root *root)
 	rb_set_parent(node, left);
 }
 
+/*
+ * [한국어] rb_insert_color - 삽입 후 레드-블랙 트리 속성을 복원
+ *
+ * @node: 새로 삽입된 노드 (초기에 RED로 설정됨)
+ * @root: 트리 루트
+ *
+ * 삽입된 RED 노드의 부모도 RED이면 속성 위반이므로,
+ * 삼촌 노드의 색상에 따라 3가지 케이스를 처리한다:
+ * - 케이스 1: 삼촌이 RED → 부모와 삼촌을 BLACK으로, 조부모를 RED로 변경 후 상향
+ * - 케이스 2: 삼촌이 BLACK + 노드가 부모의 안쪽 자식 → 회전으로 케이스 3으로 변환
+ * - 케이스 3: 삼촌이 BLACK + 노드가 부모의 바깥 자식 → 색상 변경 + 회전
+ *
+ * 호출 체인: 사용자 삽입 코드 → rb_link_node() → [rb_insert_color]
+ */
 void rb_insert_color(struct fio_rb_node *node, struct rb_root *root)
 {
 	struct fio_rb_node *parent, *gparent;
 
+	/* [한국어] 부모가 RED인 동안 반복하여 속성 위반을 수정 */
 	while ((parent = rb_parent(node)) && rb_is_red(parent))
 	{
 		gparent = rb_parent(parent);
@@ -100,6 +130,7 @@ void rb_insert_color(struct fio_rb_node *node, struct rb_root *root)
 		if (parent == gparent->rb_left)
 		{
 			{
+				/* [한국어] 케이스 1: 삼촌이 RED → 색상만 변경하고 조부모로 상향 */
 				register struct fio_rb_node *uncle = gparent->rb_right;
 				if (uncle && rb_is_red(uncle))
 				{
@@ -111,6 +142,7 @@ void rb_insert_color(struct fio_rb_node *node, struct rb_root *root)
 				}
 			}
 
+			/* [한국어] 케이스 2: 안쪽 자식 → 좌회전으로 케이스 3으로 변환 */
 			if (parent->rb_right == node)
 			{
 				register struct fio_rb_node *tmp;
@@ -120,11 +152,13 @@ void rb_insert_color(struct fio_rb_node *node, struct rb_root *root)
 				node = tmp;
 			}
 
+			/* [한국어] 케이스 3: 바깥 자식 → 부모를 BLACK, 조부모를 RED로 변경 후 우회전 */
 			rb_set_black(parent);
 			rb_set_red(gparent);
 			__rb_rotate_right(gparent, root);
 		} else {
 			{
+				/* [한국어] 대칭 케이스: 부모가 조부모의 오른쪽 자식인 경우 */
 				register struct fio_rb_node *uncle = gparent->rb_left;
 				if (uncle && rb_is_red(uncle))
 				{
@@ -151,9 +185,20 @@ void rb_insert_color(struct fio_rb_node *node, struct rb_root *root)
 		}
 	}
 
+	/* [한국어] 루트는 항상 BLACK이어야 함 (레드-블랙 트리 속성 2) */
 	rb_set_black(root->rb_node);
 }
 
+/*
+ * [한국어] __rb_erase_color - 삭제 후 레드-블랙 트리 속성을 복원
+ *
+ * @node: 삭제된 노드의 자식 (NULL일 수 있음)
+ * @parent: node의 부모
+ * @root: 트리 루트
+ *
+ * BLACK 노드가 삭제되면 "이중 흑색" 문제가 발생한다. 형제(sibling) 노드의
+ * 색상과 형제 자식들의 색상에 따라 4가지 케이스를 처리하여 속성을 복원한다.
+ */
 static void __rb_erase_color(struct fio_rb_node *node,
 			     struct fio_rb_node *parent,
 			     struct rb_root *root)
@@ -241,6 +286,19 @@ static void __rb_erase_color(struct fio_rb_node *node,
 		rb_set_black(node);
 }
 
+/*
+ * [한국어] rb_erase - 레드-블랙 트리에서 노드를 삭제
+ *
+ * @node: 삭제할 노드
+ * @root: 트리 루트
+ *
+ * 삭제할 노드의 자식 수에 따라 처리가 달라진다:
+ * - 자식 0~1개: 자식으로 직접 교체
+ * - 자식 2개: 중위 순회 후계자(successor)를 찾아 교체 후 후계자 위치에서 삭제
+ * 삭제된 노드가 BLACK이면 __rb_erase_color()로 속성 복원.
+ *
+ * 호출 체인: fio 내부 코드 → [rb_erase] → __rb_erase_color
+ */
 void rb_erase(struct fio_rb_node *node, struct rb_root *root)
 {
 	struct fio_rb_node *child, *parent;

@@ -1,3 +1,9 @@
+/*
+ * [한국어 설명] Windows용 sys/shm.h 호환 헤더
+ * SysV 공유 메모리 API(shmget/shmat/shmdt/shmctl) 선언과 관련 구조체/상수 정의.
+ * IPC_RMID, IPC_CREAT 등의 명령 상수와 shmid_ds(공유 메모리 정보) 구조체 포함.
+ * 실제 구현은 windows/posix.c에서 CreateFileMapping/MapViewOfFile 기반.
+ */
 #ifndef SYS_SHM_H
 #define SYS_SHM_H
 

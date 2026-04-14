@@ -19,6 +19,17 @@
  */
 #include "ieee754.h"
 
+/*
+ * [한국어] pack754 - 부동소수점 값을 IEEE 754 형식의 정수로 직렬화
+ *
+ * @f: 변환할 부동소수점 값
+ * @bits: 전체 비트 수 (64=double, 32=float)
+ * @expbits: 지수 비트 수 (11=double, 8=float)
+ * @return: IEEE 754 형식으로 인코딩된 정수
+ *
+ * 부호, 정규화, 지수 계산, 유효숫자 추출 순서로 처리한다.
+ * 호출 체인: fio_double_to_uint64 매크로 → [pack754]
+ */
 uint64_t pack754(long double f, unsigned bits, unsigned expbits)
 {
 	long double fnorm;
@@ -61,6 +72,17 @@ uint64_t pack754(long double f, unsigned bits, unsigned expbits)
 	return (sign << (bits - 1)) | (exp << (bits-expbits - 1)) | significand;
 }
 
+/*
+ * [한국어] unpack754 - IEEE 754 형식의 정수를 부동소수점으로 역직렬화
+ *
+ * @i: IEEE 754 형식으로 인코딩된 정수
+ * @bits: 전체 비트 수
+ * @expbits: 지수 비트 수
+ * @return: 복원된 부동소수점 값
+ *
+ * 유효숫자 추출, 지수 적용, 부호 적용 순서로 처리한다.
+ * 호출 체인: fio_uint64_to_double 매크로 → [unpack754]
+ */
 long double unpack754(uint64_t i, unsigned bits, unsigned expbits)
 {
 	long double result;

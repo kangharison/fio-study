@@ -25,6 +25,32 @@
 
 /* Imported from mtd-utils by dehrenberg */
 
+/*
+ * [한국어 설명] MTD 라이브러리 레거시 구현 (libmtd_legacy.c)
+ *
+ * === 파일의 역할 ===
+ * Linux 커널 2.6.30 이전의 구형 커널을 위한 MTD 라이브러리 구현을 제공한다.
+ * 이 구형 커널은 /sys/class/mtd sysfs 인터페이스를 제공하지 않으므로,
+ * 대신 /proc/mtd 파일과 ioctl(MEMGETINFO)을 사용하여 MTD 장치 정보를 얻는다.
+ * 주요 제한: 서브페이지 크기(sub-page size)를 알 수 없음.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * libmtd.c에서 sysfs 미지원이 감지되면 이 파일의 legacy_* 함수를 호출한다:
+ *   libmtd.c::mtd_get_info() → legacy_mtd_get_info()
+ *   libmtd.c::mtd_get_dev_info() → legacy_get_dev_info()
+ *
+ * === 타 모듈과의 연결 ===
+ * - libmtd.c: sysfs 미지원 시 이 파일의 함수를 대체 호출
+ * - libmtd_int.h: legacy_* 함수 선언
+ * - libmtd_common.h: 에러 매크로, xmalloc() 등
+ * - <mtd/mtd-user.h>: MEMGETINFO 등 MTD ioctl 정의
+ *
+ * === 주요 함수 요약 ===
+ * - legacy_libmtd_open(): /proc/mtd 존재 여부로 MTD 시스템 확인
+ * - legacy_dev_present(): /proc/mtd 파싱으로 장치 존재 여부 확인
+ * - legacy_mtd_get_info(): /proc/mtd에서 장치 수/번호 범위 파악
+ * - legacy_get_dev_info(): ioctl + /proc/mtd로 장치 상세 정보 수집
+ */
 #include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -39,8 +65,11 @@
 #include "libmtd_int.h"
 #include "libmtd_common.h"
 
+/* [한국어] /proc/mtd: 구형 커널에서 MTD 장치 목록을 제공하는 proc 파일 */
 #define MTD_PROC_FILE "/proc/mtd"
+/* [한국어] MTD 장치 노드 패턴: /dev/mtd0, /dev/mtd1, ... */
 #define MTD_DEV_PATT  "/dev/mtd%d"
+/* [한국어] MTD 문자 장치의 major 번호 (리눅스 커널에서 고정) */
 #define MTD_DEV_MAJOR 90
 
 #define PROC_MTD_FIRST     "dev:    size   erasesize  name\n"
@@ -48,6 +77,12 @@
 #define PROC_MTD_MAX_LEN   4096
 #define PROC_MTD_PATT      "mtd%d: %llx %x"
 
+/*
+ * [한국어] /proc/mtd 파싱용 상태 구조체
+ * /proc/mtd 파일은 "dev:    size   erasesize  name\n" 헤더 후
+ * "mtdN: XXXXXXXX XXXX "이름"" 형태의 줄을 포함한다.
+ * 이 구조체로 파일 ���용을 버퍼에 읽고 순차적으로 파싱한다.
+ */
 /**
  * struct proc_parse_info - /proc/mtd parsing information.
  * @mtd_num: MTD device number
@@ -69,6 +104,16 @@ struct proc_parse_info
 	char *next;
 };
 
+/*
+ * [한국어]
+ * proc_parse_start - /proc/mtd 파일을 읽어 파싱 준비
+ *
+ * @pi: 파싱 상태 구조체 (buf, next 등이 초기화됨)
+ * @return: 성공 시 0, 실패 시 -1
+ *
+ * /proc/mtd를 열어 전체 내용을 메모리에 읽고, 헤더 줄을 검증한 후
+ * 데이터 줄의 시작 위치(pi->next)를 설정한다.
+ */
 static int proc_parse_start(struct proc_parse_info *pi)
 {
 	int fd, ret;
@@ -104,6 +149,16 @@ out_free:
 	return -1;
 }
 
+/*
+ * [한국어]
+ * proc_parse_next - /proc/mtd에서 다음 MTD 장치 항목을 파싱
+ *
+ * @pi: 파싱 상태 구조체
+ * @return: 성공 시 1 (항목 파싱됨), 데이터 끝이면 0, 에러 시 음수
+ *
+ * sscanf로 "mtdN: SIZE ERASESIZE" 패턴을 추출하고,
+ * 큰따옴표 안의 장치 이름을 파싱한다.
+ */
 static int proc_parse_next(struct proc_parse_info *pi)
 {
 	int ret, len, pos = pi->next - pi->buf;

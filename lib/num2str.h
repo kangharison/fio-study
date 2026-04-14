@@ -15,12 +15,12 @@
 #include <inttypes.h>
 
 enum n2s_unit {
-	N2S_NONE	= 0,
-	N2S_PERSEC	= 1,
-	N2S_BYTE	= 2,
-	N2S_BIT		= 3,
-	N2S_BYTEPERSEC	= 4,
-	N2S_BITPERSEC	= 5,
+	N2S_NONE	= 0,	/* [한국어] 단위 없음 (순수 숫자) */
+	N2S_PERSEC	= 1,	/* [한국어] "/s" (초당) */
+	N2S_BYTE	= 2,	/* [한국어] "B" (바이트) */
+	N2S_BIT		= 3,	/* [한국어] "bit" (비트, 값에 8을 곱함) */
+	N2S_BYTEPERSEC	= 4,	/* [한국어] "B/s" (초당 바이트) */
+	N2S_BITPERSEC	= 5,	/* [한국어] "bit/s" (초당 비트, 값에 8을 곱함) */
 };
 
 extern char *num2str(uint64_t, int, int, int, enum n2s_unit);

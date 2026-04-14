@@ -12,6 +12,23 @@
  *   log_err()      - 에러 메시지 출력 (stderr + f_err)
  *   log_info_buf() - 원시 버퍼 출력
  *   __log_buf()    - 버퍼에 포맷 문자열 추가 (지연 출력)
+ 
+ * === 파일의 역할 ===
+ * fio의 모든 로그 출력을 담당한다. 서버 모드(네트워크 전송), syslog 모드,
+ * 일반 모드(stdout/stderr)에 따라 출력 대상이 자동 전환된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 전체에서 log_info()/log_err()로 로그 출력. debug.c와 함께 로깅 인프라 구성.
+ *
+ * === 타 모듈과의 연결 ===
+ * - log.h: API 선언
+ * - debug.c: 디버그 메시지 출력에 log_prevalist() 사용
+ * - server.c: 서버 모드에서 네트워크 전송
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - log_info(): 정보 메시지 출력
+ * - log_err(): 에러 메시지 출력
+ * - log_info_buf(): 원시 버퍼 출력
  */
 #include "log.h"
 

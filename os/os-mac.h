@@ -1,3 +1,24 @@
+/*
+ * [한국어 설명] macOS(Apple) 플랫폼 OS 추상화 헤더 (os-mac.h)
+ *
+ * === 파일의 역할 ===
+ * macOS에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * F_NOCACHE를 통한 O_DIRECT 에뮬레이션, DKIOC* ioctl로 디스크 크기 조회,
+ * sysctl로 물리 메모리 조회, F_PREALLOCATE로 fallocate 에뮬레이션 등을 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __APPLE__ 감지 시 포함됨.
+ *
+ * === 타 모듈과의 연결 ===
+ * - mac/posix.h, mac/posix.c: posix_fadvise() 에뮬레이션
+ * - file.h: fio_file 구조체
+ *
+ * === 주요 함수 요약 ===
+ * - fio_set_odirect(): F_NOCACHE fcntl로 캐시 우회
+ * - blockdev_size(): DKIOCGETBLOCKCOUNT/DKIOCGETBLOCKSIZE ioctl
+ * - fio_fallocate(): F_PREALLOCATE fcntl + ftruncate
+ * - os_phys_mem(): sysctl(HW_PHYSMEM)
+ */
 #ifndef FIO_OS_APPLE_H
 #define FIO_OS_APPLE_H
 
@@ -37,6 +58,11 @@
 	pthread_getaffinity_np(pthread_self(), sizeof(mask), &(mask))
 #endif
 
+/*
+ * [한국어] macOS의 O_DIRECT 에뮬레이션
+ * macOS는 O_DIRECT를 지원하지 않으므로 F_NOCACHE fcntl로 캐시를 우회.
+ * direct=1 옵션 사용 시 호출됨.
+ */
 #define FIO_OS_DIRECTIO
 static inline int fio_set_odirect(struct fio_file *f)
 {
@@ -45,6 +71,7 @@ static inline int fio_set_odirect(struct fio_file *f)
 	return 0;
 }
 
+/* [한국어] macOS 블록 디바이스 크기 조회 - 블록 수 x 블록 크기 */
 static inline int blockdev_size(struct fio_file *f, unsigned long long *bytes)
 {
 	uint32_t block_size;
@@ -95,6 +122,7 @@ static inline int gettid(void)
 }
 #endif
 
+/* [한국어] macOS fallocate 에뮬레이션 - F_PREALLOCATE fcntl + ftruncate 조합 */
 static inline bool fio_fallocate(struct fio_file *f, uint64_t offset, uint64_t len)
 {
 	fstore_t store = {F_ALLOCATEALL, F_PEOFPOSMODE, offset, len};

@@ -21,6 +21,8 @@ struct seqlock {
 	std::atomic<unsigned int> sequence;
 #else
 	volatile unsigned int sequence;
+	/* [한국어] 시퀀스 카운터. 짝수=안정 상태, 홀수=쓰기 진행 중.
+	 * 쓰기 시작 시 +1(홀수), 완료 시 +1(짝수). 읽기 측은 변경 감지 후 재시도 */
 #endif
 };
 
@@ -29,6 +31,12 @@ static inline void seqlock_init(struct seqlock *s)
 	s->sequence = 0;
 }
 
+/*
+ * [한국어] read_seqlock_begin - 읽기 시작 시 시퀀스 번호를 읽음
+ *
+ * 시퀀스 번호가 홀수(쓰기 진행 중)이면 짝수가 될 때까지 spin 대기한다.
+ * 반환된 시퀀스 번호는 read_seqlock_retry()에서 쓰기 발생 여부 검사에 사용.
+ */
 static inline unsigned int read_seqlock_begin(struct seqlock *s)
 {
 	unsigned int seq;
@@ -43,17 +51,23 @@ static inline unsigned int read_seqlock_begin(struct seqlock *s)
 	return seq;
 }
 
+/*
+ * [한국어] read_seqlock_retry - 읽기 중 쓰기가 발생했는지 확인
+ * @return: true이면 쓰기 발생 → 읽기 재시도 필요
+ */
 static inline bool read_seqlock_retry(struct seqlock *s, unsigned int seq)
 {
 	read_barrier();
 	return s->sequence != seq;
 }
 
+/* [한국어] write_seqlock_begin - 쓰기 시작 (시퀀스를 홀수로 만듦) */
 static inline void write_seqlock_begin(struct seqlock *s)
 {
 	s->sequence = atomic_load_acquire(&s->sequence) + 1;
 }
 
+/* [한국어] write_seqlock_end - 쓰기 완료 (시퀀스를 짝수로 되돌림, release 시맨틱) */
 static inline void write_seqlock_end(struct seqlock *s)
 {
 	atomic_store_release(&s->sequence, s->sequence + 1);

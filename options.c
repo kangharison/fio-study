@@ -1,27 +1,29 @@
 /*
- * [한국어] options.c - fio 옵션 정의 및 파싱 콜백 구현
+ * [한국어 설명] fio 옵션 정의 및 파싱 콜백 구현 (options.c)
  *
- * 이 파일은 fio의 모든 옵션을 정의하는 핵심 파일이다.
- * 주요 구성:
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 모든 옵션(약 300개 이상)을 정의하는 핵심 파일이다.
+ * 각 옵션의 이름, 타입, 오프셋, 기본값, 도움말, posval을 fio_options[] 배열에
+ * 정의하고, 복잡한 옵션을 위한 커스텀 파싱 콜백 함수를 구현한다.
  *
- *   Part 1: 콜백 함수들 (1~1991줄)
- *     - str_bssplit_cb(): bssplit 옵션 파싱 (블록 크기 분포)
- *     - str_rw_cb(): I/O 패턴(rw) 옵션 파싱
- *     - str_filename_cb(): 파일명 옵션 파싱
- *     - str_random_distribution_cb(): 랜덤 분포 설정
- *     - str_steadystate_cb(): steady state 옵션 파싱
- *     - 기타 30여 개의 커스텀 파싱/검증 콜백
+ * === 전체 아키텍처에서의 위치 ===
+ * init.c의 parse_options()에서 parse.c의 파싱 엔진을 통해 이 파일의
+ * fio_options[] 배열을 참조하여 옵션을 파싱한다.
+ * 호출 체인: parse_options() [init.c] → parse_option() [parse.c] → fio_options[] [이 파일]
  *
- *   Part 2: fio_options[] 배열 (1992~5754줄)
- *     - 약 300개 이상의 fio 옵션 정의
- *     - 각 옵션의 이름, 타입, 오프셋, 기본값, 도움말, posval 등
- *     - 주요 카테고리: I/O, 파일, 통계, 로그, 검증, CPU, 메모리 등
+ * === 타 모듈과의 연결 ===
+ * - init.c: parse_cmd_line()/parse_jobs_ini()에서 fio_options[] 참조
+ * - parse.c: 파싱 엔진이 fio_options[]의 타입/오프셋/콜백으로 값을 저장
+ * - thread_options.h: 옵션 값이 저장되는 대상 구조체 (offsetof로 참조)
+ * - optgroup.c: 옵션 그룹/카테고리 정의
+ * - 데이터 흐름: 잡파일/CLI → parse.c → fio_options[].cb → thread_options
  *
- *   Part 3: API 함수들 (5755~끝)
- *     - fio_options_parse(): 잡 파일의 옵션 목록 파싱
- *     - fio_option_dup_subs(): $pagesize 등 키워드 치환
- *     - add_option(): I/O 엔진의 동적 옵션 추가
- *     - fio_option_is_set(): 옵션 설정 여부 확인
+ * === 주요 함수/구조체 요약 ===
+ * - fio_options[]: 약 300개 이상의 fio 옵션 정의 배열
+ * - str_rw_cb(): I/O 패턴(rw) 옵션 파싱 콜백
+ * - str_bssplit_cb(): 블록 크기 분포(bssplit) 파싱 콜백
+ * - fio_options_parse(): 잡 파일의 옵션 목록 파싱
+ * - fio_option_is_set(): 특정 옵션의 설정 여부 확인
  */
 #include <stdio.h>
 #include <stdlib.h>

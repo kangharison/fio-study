@@ -12,12 +12,38 @@
  * any later version.
  *
  */
+/*
+ * [한국어 설명] SHA-3 (Keccak) 해시 알고리즘 구현 (sha3.c)
+ *
+ * === 파일의 역할 ===
+ * NIST FIPS 202 표준의 SHA-3 해시 함수를 구현한다.
+ * SHA-3는 Keccak 스펀지 함수를 기반으로 하며, SHA-1/SHA-2와 완전히 다른 구조이다.
+ * 핵심은 1600비트 상태에 대한 Keccak-f[1600] 순열(24라운드)이다.
+ * 4개 변형(224/256/384/512비트)을 모두 지원한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: verify.c → fio_sha3_*_init → fio_sha3_update → fio_sha3_final
+ *                                                                → keccakf()
+ *
+ * === 타 모듈과의 연결 ===
+ * - sha3.h: 구조체와 인터페이스 정의
+ * - verify.c: verify=sha3-256 등 옵션 시 호출
+ * - os/os.h: cpu_to_le64() 바이트 순서 변환 매크로
+ *
+ * === 주요 함수 요약 ===
+ * - keccakf(): Keccak-f[1600] 순열 - Theta/Rho/Pi/Chi/Iota 5단계 × 24라운드
+ * - fio_sha3_init(): 스펀지 파라미터(rate, capacity) 설정
+ * - fio_sha3_224/256/384/512_init(): 각 변형별 초기화
+ * - fio_sha3_update(): 데이터를 rate 크기 블록 단위로 흡수(absorb)
+ * - fio_sha3_final(): 도메인 분리 패딩(0x06) 후 압착(squeeze)하여 해시 출력
+ */
 #include <string.h>
 
 #include "../os/os.h"
 
 #include "sha3.h"
 
+/* [한국어] Keccak-f[1600] 순열의 라운드 수 - FIPS 202 표준에서 24라운드로 정의 */
 #define KECCAK_ROUNDS 24
 
 #define ROTL64(x, y) (((x) << (y)) | ((x) >> (64 - (y))))

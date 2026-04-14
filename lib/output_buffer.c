@@ -16,8 +16,10 @@
 #include "output_buffer.h"
 #include "../minmax.h"
 
+/* [한국어] 버퍼 확장 시 최소 증가 단위 (바이트) */
 #define BUF_INC	1024
 
+/* [한국어] buf_output_init - 출력 버퍼를 빈 상태로 초기화 */
 void buf_output_init(struct buf_output *out)
 {
 	out->max_buflen = 0;
@@ -31,8 +33,19 @@ void buf_output_free(struct buf_output *out)
 	buf_output_init(out);
 }
 
+/*
+ * [한국어] buf_output_add - 출력 버퍼에 데이터를 추가 (필요시 자동 확장)
+ *
+ * @out: 출력 버퍼
+ * @buf: 추가할 데이터
+ * @len: 데이터 길이
+ * @return: 추가된 바이트 수 (항상 len)
+ *
+ * 남은 공간이 부족하면 BUF_INC(1024) 이상으로 realloc하여 확장한다.
+ */
 size_t buf_output_add(struct buf_output *out, const char *buf, size_t len)
 {
+	/* [한국어] 남은 공간 부족 시 자동 확장 */
 	if (out->max_buflen - out->buflen < len) {
 		size_t need = len - (out->max_buflen - out->buflen);
 		size_t old_max = out->max_buflen;

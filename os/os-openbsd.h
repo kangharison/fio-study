@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] OpenBSD 플랫폼 OS 추상화 헤더 (os-openbsd.h)
+ *
+ * === 파일의 역할 ===
+ * OpenBSD에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * DIOCGDINFO ioctl로 디스크 크기 조회, sysctl(HW_PHYSMEM64)로 물리 메모리 조회,
+ * uname 기반 SHM attach 지원 여부 확인 (OpenBSD 5.1 이상).
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __OpenBSD__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): DIOCGDINFO ioctl (disklabel)
+ * - shm_attach_to_open_removed(): OpenBSD 버전 체크 (5.1+)
+ */
 #ifndef FIO_OS_OPENBSD_H
 #define FIO_OS_OPENBSD_H
 
@@ -93,6 +108,12 @@ static inline unsigned long long get_fs_free_size(const char *path)
 #define FIO_MADV_FREE	MADV_FREE
 #endif
 
+/*
+ * [한국어]
+ * shm_attach_to_open_removed - 삭제된 SHM 세그먼트에 attach 가능 여부 확인
+ * OpenBSD 5.1 이상에서 지원. uname으로 버전을 파싱하여 확인.
+ * smalloc.c에서 공유 메모리 할당 시 사용.
+ */
 static inline int shm_attach_to_open_removed(void)
 {
 	struct utsname uts;

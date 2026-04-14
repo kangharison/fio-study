@@ -22,22 +22,32 @@
  *
  */
 /*
- * [한국어] backend.c - fio의 백엔드 실행 엔진
+ * [한국어 설명] fio 백엔드 실행 엔진 (backend.c)
  *
- * 이 파일은 fio의 핵심 I/O 실행 엔진을 구현한다.
- * 주요 기능:
- *   1) do_io()      - 메인 I/O 루프. get_io_u -> prep -> queue -> commit -> getevents -> put_io_u 흐름
- *   2) thread_main() - 각 워커 스레드/프로세스의 진입점. 초기화 -> do_io -> do_verify -> 정리
- *   3) run_threads() - 모든 작업(job)을 생성하고, 시작하고, 종료될 때까지 관리
- *   4) fio_backend() - 최상위 진입점. 프로파일 로드 -> run_threads -> 통계 출력
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 핵심 I/O 실행 엔진을 구현한다. 로컬 모드에서 워커 스레드/프로세스를
+ * 생성하고, 각 워커가 I/O 루프를 수행하며, 완료 후 통계를 집계하는 전체 백엔드
+ * 흐름을 담당한다. fio_backend()가 이 파일의 최상위 진입점이다.
  *
- * I/O 흐름 요약:
- *   get_io_u()   : freelist에서 io_u 구조체를 꺼내고, 오프셋/크기/방향을 결정
- *   td_io_prep() : I/O 엔진에 io_u를 준비시킴 (prep 콜백 호출)
- *   td_io_queue(): I/O 엔진에 io_u를 제출 (queue 콜백 호출)
- *   td_io_commit(): 배치 제출이 필요한 엔진에서 실제 제출을 수행
- *   io_u_queued_complete() / io_u_sync_complete(): 완료된 I/O를 수거
- *   put_io_u()  : 사용 완료된 io_u를 freelist로 반환
+ * === 전체 아키텍처에서의 위치 ===
+ * main() [fio.c] → fio_backend() [이 파일] → run_threads() → thread_main()
+ *   → do_io() → get_io_u() [io_u.c] → td_io_queue() [ioengines.c]
+ * fio의 I/O 실행에서 가장 핵심적인 위치에 있으며, I/O 엔진과 통계 시스템을
+ * 연결하는 중간 계층이다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.c: main()에서 fio_backend()를 호출하여 로컬 실행을 시작
+ * - io_u.c: get_io_u()/put_io_u()로 I/O 유닛의 할당/반환을 처리
+ * - ioengines.c: td_io_prep()/td_io_queue()/td_io_commit()/td_io_getevents()로 엔진 호출
+ * - stat.c: show_run_stats()로 최종 통계를 출력, add_*_sample()로 샘플 기록
+ * - verify.c: do_verify()로 데이터 무결성 검증 수행
+ * - 핵심 자료구조: thread_data(스레드 상태), io_u(I/O 요청 단위)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_backend(): 최상위 진입점. 프로파일 로드 → run_threads → 통계 출력
+ * - run_threads(): 모든 작업(job)을 생성하고 시작하고 종료까지 관리
+ * - thread_main(): 각 워커 스레드/프로세스의 진입점. 초기화 → do_io → do_verify → 정리
+ * - do_io(): 메인 I/O 루프. get_io_u → prep → queue → commit → getevents → put_io_u
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

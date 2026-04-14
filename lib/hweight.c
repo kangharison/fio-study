@@ -12,6 +12,14 @@
  */
 #include "hweight.h"
 
+/*
+ * [한국어] hweight8 - 8비트 정수의 설정된 비트 수(popcount)를 반환
+ *
+ * 비트 조작 트릭 (Hamming weight 알고리즘):
+ * 1단계: 인접 비트 쌍의 합을 계산 (0x55 마스크)
+ * 2단계: 4비트 그룹의 합을 계산 (0x33 마스크)
+ * 3단계: 8비트 전체 합을 계산 (0x0F 마스크)
+ */
 unsigned int hweight8(uint8_t w)
 {
 	unsigned int res = w - ((w >> 1) & 0x55);
@@ -20,6 +28,7 @@ unsigned int hweight8(uint8_t w)
 	return (res + (res >> 4)) & 0x0F;
 }
 
+/* [한국어] hweight32 - 32비트 popcount. hweight8과 동일한 알고리즘의 32비트 확장 */
 unsigned int hweight32(uint32_t w)
 {
 	unsigned int res = w - ((w >> 1) & 0x55555555);
@@ -30,9 +39,15 @@ unsigned int hweight32(uint32_t w)
 	return (res + (res >> 16)) & 0x000000FF;
 }
 
+/*
+ * [한국어] hweight64 - 64비트 popcount
+ * 32비트 시스템에서는 상위/하위 32비트를 각각 계산하여 합산하고,
+ * 64비트 시스템에서는 64비트 전용 마스크로 직접 계산한다.
+ */
 unsigned int hweight64(uint64_t w)
 {
 #if BITS_PER_LONG == 32
+	/* [한국어] 32비트 시스템: 상위/하위 절반을 각각 계산 후 합산 */
 	return hweight32((unsigned int)(w >> 32)) + hweight32((unsigned int)w);
 #else
 	uint64_t res = w - ((w >> 1) & 0x5555555555555555ULL);

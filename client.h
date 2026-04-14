@@ -1,16 +1,26 @@
 /*
- * [한국어] client.h - fio 클라이언트 모드 헤더 파일
+ * [한국어 설명] fio 클라이언트 모드 헤더 (client.h)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio의 클라이언트-서버 모드에서 클라이언트 측 구조체와 API를 정의한다.
- * 주요 내용:
- *   1) fio_client 구조체    - 원격 fio 서버와의 연결 상태 및 통신 정보를 보관
- *   2) client_ops 구조체    - 서버로부터 수신한 명령에 대한 콜백 함수 테이블
- *   3) client_eta 구조체    - 여러 클라이언트의 ETA(예상 완료 시간) 집계
- *   4) 외부 함수 선언       - 연결, 작업 전송, 결과 수신 등 클라이언트 API
+ * fio_client(서버 연결 상태), client_ops(수신 명령 콜백), client_eta(ETA 집계),
+ * 연결/전송/수신 API 함수를 선언한다.
  *
- * 동작 원리:
- *   fio --client=<host> 로 실행하면 이 헤더에 정의된 구조체/함수를 통해
- *   원격 서버에 잡 파일을 전송하고, 실행 결과(통계, ETA, 디스크 유틸 등)를 수신한다.
+ * === 전체 아키텍처에서의 위치 ===
+ * client.c와 짝을 이루는 헤더로, fio.c의 클라이언트 모드 분기에서 사용된다.
+ * client.h → client.c(구현) / fio.c(클라이언트 모드 진입)
+ *
+ * === 타 모듈과의 연결 ===
+ * - client.c: 이 헤더의 구조체와 함수의 구현
+ * - fio.c: main()에서 클라이언트 모드 시 client API 호출
+ * - server.h: 네트워크 프로토콜 정의 (opcode, fio_net_cmd 등)
+ * - stat.h: thread_stat/group_run_stats 구조체를 수신하여 출력
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct fio_client: 원격 서버와의 연결 상태 (소켓, 상태, 통계, 파일 등)
+ * - struct client_ops: 서버 수신 명령별 콜백 함수 테이블
+ * - struct client_eta: 여러 클라이언트의 ETA 집계
+ * - Client_created/connected/running/exited: 클라이언트 상태 열거형
  */
 #ifndef CLIENT_H
 #define CLIENT_H

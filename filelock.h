@@ -3,6 +3,19 @@
  *
  * 파일명 기반의 배타적 잠금(exclusive lock)을 제공한다.
  * 여러 fio job이 동일한 파일에 동시에 접근할 때 동기화를 보장한다.
+ 
+ * === 파일의 역할 ===
+ * 파일명 기반 배타적 잠금 API를 선언한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * filelock.c와 짝을 이루는 헤더.
+ *
+ * === 타 모듈과의 연결 ===
+ * - filelock.c: 이 헤더의 함수 구현
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_lock_file()/fio_unlock_file(): 잠금/해제
+ * - fio_filelock_init()/fio_filelock_exit(): 초기화/정리
  */
 #ifndef FIO_LOCK_FILE_H
 #define FIO_LOCK_FILE_H

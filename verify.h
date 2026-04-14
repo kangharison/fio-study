@@ -1,16 +1,27 @@
 /*
- * [한국어] verify.h - 데이터 무결성 검증 헤더
+ * [한국어 설명] 데이터 무결성 검증 헤더 (verify.h)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio의 I/O 데이터 무결성 검증에 필요한 구조체, 열거형, API를 정의한다.
- * 주요 내용:
- *   1) 검증 유형 열거형 - CRC7/16/32/64, MD5, SHA1/256/512, SHA3, xxHash 등
- *   2) verify_header 구조체 - 각 데이터 블록에 붙는 검증 헤더 (매직넘버, 오프셋, 시드 등)
- *   3) vhdr_* 구조체들 - 각 체크섬 알고리즘별 다이제스트 저장 구조체
- *   4) 검증 API 함수 선언 - populate, verify, fill_pattern 등
+ * 검증 유형 열거형(CRC, MD5, SHA 등), verify_header 구조체(블록 헤더),
+ * vhdr_* 구조체(알고리즘별 다이제스트), 검증 API 함수 선언을 포함한다.
  *
- * 동작 원리:
- *   쓰기 시: populate_verify_io_u()로 데이터 블록에 패턴 + 체크섬 헤더를 채움
- *   읽기 시: verify_io_u()로 읽어온 데이터의 체크섬을 재계산하여 헤더와 비교
+ * === 전체 아키텍처에서의 위치 ===
+ * verify.c의 구현부와 짝을 이루며, backend.c에서 검증 흐름을 제어한다.
+ * 쓰기 시 populate_verify_io_u()로 헤더 채움, 읽기 시 verify_io_u()로 검증.
+ * verify.h → verify.c(구현) / backend.c(호출) / io_u.c(버퍼 관리)
+ *
+ * === 타 모듈과의 연결 ===
+ * - verify.c: 이 헤더의 구조체와 함수의 구현
+ * - backend.c: do_io()/do_verify()에서 검증 함수 호출
+ * - io_u.h: io_u 구조체에 verify 관련 필드 포함
+ * - verify-state.h: 검증 상태 저장/복원 관련 정의
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - enum verify_type: 지원 알고리즘 (CRC7/16/32/64, MD5, SHA1/256/512, SHA3, xxHash 등)
+ * - struct verify_header: 블록 헤더 (매직넘버, 오프셋, 시드, 체크섬)
+ * - vhdr_md5/sha256/crc32 등: 알고리즘별 다이제스트 저장 구조체
+ * - FIO_HDR_MAGIC (0xacca): 헤더 유효성 판별 매직 넘버
  */
 #ifndef FIO_VERIFY_H
 #define FIO_VERIFY_H

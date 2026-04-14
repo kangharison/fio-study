@@ -1,16 +1,27 @@
 /*
- * [한국어] file.h - fio 파일 관련 구조체/상수/함수 선언 헤더
+ * [한국어 설명] fio 파일 관련 구조체/상수/함수 헤더 (file.h)
  *
- * 이 헤더 파일은 fio에서 사용하는 파일 관련 핵심 데이터 구조와 상수를 정의한다.
- * 주요 내용:
- *   1) enum fio_filetype    - 파일 유형 (일반 파일, 블록 디바이스, 캐릭터 디바이스 등)
- *   2) enum fio_file_flags  - 파일 상태 플래그 (열림, 닫는중, 확장 필요 등)
- *   3) enum file_lock_mode  - 파일 잠금 모드 (없음, 배타적, 읽기/쓰기)
- *   4) enum fio_fallocate_mode - 파일 사전 할당 방식
- *   5) struct fio_file      - 개별 파일의 모든 상태 정보를 담는 핵심 구조체
- *   6) struct fio_mount     - 파일 시스템 마운트 정보
- *   7) FILE_FLAG_FNS 매크로 - 파일 플래그 set/clear/test 인라인 함수 자동 생성
- *   8) 파일 셋업/해제/열기/닫기 등 외부 함수 선언
+ * === 파일의 역할 ===
+ * 이 헤더는 fio에서 사용하는 파일 관련 핵심 데이터 구조와 상수를 정의한다.
+ * fio_file 구조체(파일 상태), fio_filetype(파일 유형), fio_file_flags(상태 플래그),
+ * 파일 잠금 모드, fallocate 모드, 파일 셋업/열기/닫기 API를 포함한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio.h에서 이 헤더를 포함하여 thread_data가 fio_file 배열(files[])을 관리한다.
+ * filesetup.c에서 fio_file의 생성/확장/열기/닫기를 구현한다.
+ * file.h → filesetup.c(구현) / fio.h(thread_data에 포함) / ioengines.c(파일 열기/닫기)
+ *
+ * === 타 모듈과의 연결 ===
+ * - filesetup.c: fio_file의 생성, 확장, 열기, 닫기 구현
+ * - fio.h: thread_data에 files[] 배열로 포함
+ * - ioengines.c: td_io_open_file()/td_io_close_file()에서 fio_file 사용
+ * - filehash.c: 파일 해시 테이블로 동일 파일 공유 관리
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct fio_file: 개별 파일의 모든 상태 정보 (경로, 크기, fd, 오프셋, 플래그 등)
+ * - enum fio_filetype: 파일 유형 (일반 파일, 블록/캐릭터 디바이스, 파이프, 디렉토리)
+ * - enum fio_file_flags: 파일 상태 플래그 (열림, 닫는중, 확장 필요 등)
+ * - FILE_FLAG_FNS 매크로: 파일 플래그 set/clear/test 인라인 함수 자동 생성
  */
 #ifndef FIO_FILE_H
 #define FIO_FILE_H

@@ -2,29 +2,31 @@
  * Status and ETA code
  */
 /*
- * [한국어] eta.c - ETA(예상 완료 시간) 및 진행률 계산/표시
+ * [한국어 설명] ETA(예상 완료 시간) 및 진행률 계산/표시 (eta.c)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio 실행 중 터미널에 표시되는 상태 표시줄을 담당한다.
- * 주요 기능:
- *   1) check_str_update()     - 각 스레드의 현재 상태를 문자(r/w/R/W/V 등)로 변환
- *   2) eta_to_str()           - 남은 시간(초)을 "01d:02h:03m:04s" 형식 문자열로 변환
- *   3) thread_eta()           - 개별 스레드의 예상 남은 시간을 계산
- *   4) calc_rate()/calc_iops()- 구간별 대역폭(KiB/s) 및 IOPS 계산
- *   5) calc_thread_status()   - 모든 스레드를 순회하며 전체 ETA/속도/상태 집계
- *   6) gen_eta_str()          - 속도/IOPS 문자열 생성 ([r=xxx,w=xxx][r=xxx,w=xxx IOPS])
- *   7) display_thread_status()- 최종 상태 표시줄을 터미널에 출력
- *   8) get_jobs_eta()         - jobs_eta 구조체를 할당하고 계산 결과를 채워 반환
- *   9) print_thread_status()  - get_jobs_eta + display_thread_status 래퍼
- *  10) print_status_init()    - 상태 문자열 초기화 (스레드를 'P'(대기) 상태로 설정)
+ * 각 스레드의 상태를 문자로 변환하고, 대역폭/IOPS를 계산하며,
+ * 예상 남은 시간을 산출하여 실시간 진행률 표시줄을 출력한다.
+ * 출력 예시: Jobs: 2 (f=4): [RW][50.0%][r=100MiB/s,w=50MiB/s][eta 00m:30s]
  *
- * 상태 표시줄 출력 형식 예시:
- *   Jobs: 2 (f=4): [RW][50.0%][r=100MiB/s,w=50MiB/s][r=1000,w=500 IOPS][eta 00m:30s]
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 run_threads()에서 주기적으로 print_thread_status()를 호출한다.
+ * 서버 모드에서는 get_jobs_eta()로 ETA 정보를 수집하여 클라이언트에 전송.
+ * 호출 체인: run_threads() [backend.c] → print_thread_status() [이 파일]
  *
- * 스레드 상태 문자 매핑:
- *   P=미생성, C=생성됨, I=초기화됨, /=램프업, p=사전읽기,
- *   R/r=순차/랜덤 읽기, W/w=순차/랜덤 쓰기, M/m=순차/랜덤 혼합,
- *   D/d=순차/랜덤 트림, V=검증, F=fsync, f=마무리,
- *   E=종료, _=수거완료, X=에러종료, K=시그널종료
+ * === 타 모듈과의 연결 ===
+ * - backend.c: run_threads()에서 주기적으로 print_thread_status() 호출
+ * - server.c: get_jobs_eta()로 ETA 정보를 수집하여 클라이언트에 전송
+ * - stat.h: jobs_eta 구조체 정의 참조
+ * - 스레드 상태 문자: R/r=읽기, W/w=쓰기, V=검증, F=fsync 등
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - calc_thread_status(): 모든 스레드를 순회하며 전체 ETA/속도/상태 집계
+ * - display_thread_status(): 최종 상태 표시줄을 터미널에 출력
+ * - get_jobs_eta(): jobs_eta 구조체에 계산 결과를 채워 반환
+ * - thread_eta(): 개별 스레드의 예상 남은 시간 계산
+ * - eta_to_str(): 남은 시간(초)을 "01d:02h:03m:04s" 형식으로 변환
  */
 
 /* 표준 라이브러리 헤더 */

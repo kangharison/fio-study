@@ -1,20 +1,27 @@
 /*
- * [한국어] iolog.h - I/O 로그 관련 구조체 및 API 헤더
+ * [한국어 설명] I/O 로그 관련 구조체 및 API 헤더 (iolog.h)
  *
- * 이 헤더 파일은 fio의 I/O 로깅 시스템에서 사용하는 핵심 자료구조와 API를 정의한다.
- * 주요 내용:
- *   1) io_stat / io_hist       - I/O 통계 및 히스토그램 구조체
- *   2) io_sample / io_sample_value - 개별 I/O 샘플 데이터 표현
- *   3) io_log / io_logs        - 동적으로 증가하는 로그 저장소 (압축 지원)
- *   4) io_piece                - iolog 재생 시 개별 I/O 동작을 나타내는 구조체
- *   5) log_params              - 로그 설정 파라미터 구조체
- *   6) 각종 매크로/인라인 함수  - 로그 엔트리 크기 계산, 샘플 접근 등
+ * === 파일의 역할 ===
+ * 이 헤더는 fio의 I/O 로깅 시스템에서 사용하는 핵심 자료구조와 API를 정의한다.
+ * io_stat(통계), io_sample(샘플), io_log(로그 저장소), io_piece(재생 I/O 동작),
+ * 로그 플래그, 로그 엔트리 크기 계산 매크로/인라인 함수를 포함한다.
  *
- * 로그 플래그 비트:
- *   LOG_OFFSET_SAMPLE_BIT     - 오프셋 정보 포함 여부
- *   LOG_PRIO_SAMPLE_BIT       - 우선순위 정보 포함 여부
- *   LOG_AVG_MAX_SAMPLE_BIT    - 평균+최대값 동시 기록 여부
- *   LOG_ISSUE_TIME_SAMPLE_BIT - I/O 발행 시간 포함 여부
+ * === 전체 아키텍처에서의 위치 ===
+ * iolog.c와 짝을 이루는 헤더로, stat.c와 backend.c에서도 참조된다.
+ * iolog.h → iolog.c(구현) / stat.c(통계 구조체 참조) / stat.h(io_stat 포함)
+ *
+ * === 타 모듈과의 연결 ===
+ * - iolog.c: 이 헤더의 구조체와 함수의 구현
+ * - stat.c: io_stat 구조체로 온라인 통계(평균/분산) 계산
+ * - stat.h: io_stat을 포함하여 thread_stat에서 사용
+ * - server.c: I/O 로그를 네트워크로 전송 시 io_log 참조
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct io_stat: I/O 통계 (최대/최소/평균/분산, Welford 알고리즘)
+ * - struct io_sample: 개별 I/O 샘플 (값, 시간, 방향, 우선순위)
+ * - struct io_log: 동적 로그 저장소 (압축 지원, 히스토그램)
+ * - struct io_piece: iolog 재생 시 개별 I/O 동작 (오프셋, 크기, 방향)
+ * - LOG_*_SAMPLE_BIT: 로그 플래그 (오프셋, 우선순위, 발행 시간 포함 여부)
  */
 #ifndef FIO_IOLOG_H
 #define FIO_IOLOG_H

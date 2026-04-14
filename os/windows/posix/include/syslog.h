@@ -1,3 +1,8 @@
+/*
+ * [한국어 설명] Windows용 syslog.h 호환 헤더
+ * POSIX syslog API(openlog/syslog/closelog) 선언과 로그 우선순위/옵션 상수 정의.
+ * 실제 구현은 windows/posix.c에서 파일("syslog.txt")에 기록.
+ */
 #ifndef SYSLOG_H
 #define SYSLOG_H
 

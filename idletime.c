@@ -14,6 +14,20 @@
  *   4) fio_idle_prof_start() - 프로파일링 시작 (스레드 잠금 해제)
  *   5) fio_idle_prof_stop()  - 프로파일링 중지 및 유휴율 계산
  *   6) show_idle_prof_stats() - 결과 출력 (텍스트 및 JSON)
+ 
+ * === 파일의 역할 ===
+ * fio 실행 중 각 CPU의 유휴율을 측정. SCHED_IDLE 스레드로 유휴 시간 추정.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c에서 fio_idle_prof_init/start/stop으로 프로파일링 제어.
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: 프로파일링 시작/중지
+ * - idletime.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_idle_prof_init(): 초기화 (스레드 생성, 보정)
+ * - fio_idle_prof_start/stop(): 시작/중지
  */
 #include <math.h>
 #include "fio.h"

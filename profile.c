@@ -10,6 +10,22 @@
  *   2) unregister_profile() - 프로파일을 전역 리스트에서 제거
  *   3) load_profile()       - 이름으로 프로파일을 찾아 명령줄 옵션을 적용
  *   4) profile_add_hooks()  - 프로파일의 I/O 후크를 thread_data에 연결
+ 
+ * === 파일의 역할 ===
+ * 사전 정의된 워크로드 프로파일을 등록, 검색, 로드하는 기능을 구현.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * init.c에서 load_profile()로 프로파일 로드. profiles/*.c에서 register_profile().
+ *
+ * === 타 모듈과의 연결 ===
+ * - init.c: load_profile() 호출
+ * - profiles/*.c: 프로파일 등록 (act, tiobench)
+ * - profile.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - register_profile(): 프로파일 등록
+ * - load_profile(): 이름으로 프로파일 로드
+ * - profile_add_hooks(): I/O 후크 연결
  */
 #include "fio.h"
 #include "profile.h"

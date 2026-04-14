@@ -64,6 +64,7 @@
  * tree proposed by McCreight is too complex and memory-hungry for our purpose.
  */
 
+/* [한국어] get_index - 노드에서 radix(start)와 heap(last) 인덱스를 추출 */
 static void get_index(const struct prio_tree_node *node,
 		      unsigned long *radix, unsigned long *heap)
 {
@@ -73,6 +74,7 @@ static void get_index(const struct prio_tree_node *node,
 
 static unsigned long index_bits_to_maxindex[BITS_PER_LONG];
 
+/* [한국어] prio_tree_init - 비트 수별 최대 인덱스 테이블을 사전 계산 (생성자 함수) */
 static void fio_init prio_tree_init(void)
 {
 	unsigned int i;
@@ -458,6 +460,18 @@ static struct prio_tree_node *prio_tree_first(struct prio_tree_iter *iter)
  * prio_tree_next:
  *
  * Get the next prio_tree_node that overlaps with the input interval in iter
+ */
+/*
+ * [한국어] prio_tree_next - 쿼리 구간과 겹치는 다음 노드를 반환
+ *
+ * @iter: 순회 상태 (root, r_index, h_index로 쿼리 범위 지정)
+ * @return: 다음 겹치는 노드 (없으면 NULL)
+ *
+ * 전위 순회(pre-order)로 트리를 탐색하며, 겹치는 노드만 반환한다.
+ * iter->cur이 NULL이면 prio_tree_first()로 시작한다.
+ * 시간 복잡도: O(log n + m) (n=트리 크기, m=겹치는 노드 수)
+ *
+ * 호출 체인: gfio graph.c → prio_tree_iter_init → [prio_tree_next]
  */
 struct prio_tree_node *prio_tree_next(struct prio_tree_iter *iter)
 {

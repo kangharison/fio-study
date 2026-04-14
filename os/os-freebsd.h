@@ -1,3 +1,20 @@
+/*
+ * [한국어 설명] FreeBSD 플랫폼 OS 추상화 헤더 (os-freebsd.h)
+ *
+ * === 파일의 역할 ===
+ * FreeBSD에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * cpuset 기반 CPU 친화성, DIOCGMEDIASIZE ioctl로 디스크 크기 조회,
+ * DIOCGDELETE ioctl로 TRIM, thr_self()로 스레드 ID 조회 등을 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __FreeBSD__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): DIOCGMEDIASIZE ioctl
+ * - os_trim(): DIOCGDELETE ioctl로 TRIM/DISCARD
+ * - fio_setaffinity(): cpuset_setaffinity() 사용
+ * - shm_attach_to_open_removed(): kern.ipc.shm_allow_removed sysctl 확인
+ */
 #ifndef FIO_OS_FREEBSD_H
 #define FIO_OS_FREEBSD_H
 
@@ -15,6 +32,7 @@
 
 #include "../file.h"
 
+/* [한국어] FreeBSD에서 지원하는 기능 플래그 */
 #define FIO_HAVE_ODIRECT
 #define FIO_USE_GENERIC_INIT_RANDOM_STATE
 #define FIO_HAVE_CHARDEV_SIZE
@@ -54,6 +72,7 @@ static inline int fio_cpuset_exit(os_cpu_mask_t *mask)
         return 0;
 }
 
+/* [한국어] FreeBSD CPU 친화성 - cpuset_setaffinity/getaffinity 사용 */
 static inline int fio_setaffinity(int pid, os_cpu_mask_t cpumask)
 {
 	return cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, pid, sizeof(cpumask), &cpumask);

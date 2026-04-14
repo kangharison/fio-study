@@ -27,6 +27,7 @@
 #define read_barrier()	do { __sync_synchronize(); } while (0)
 #define write_barrier()	do { __sync_synchronize(); } while (0)
 
+/* [한국어] arch_ffz - RBIT(비트 반전) + CLZ(선행 제로 카운트) 조합으로 최하위 0 비트를 찾는다 */
 static inline int arch_ffz(unsigned long bitmask)
 {
 	unsigned long count, reversed_bits;
@@ -44,6 +45,10 @@ static inline int arch_ffz(unsigned long bitmask)
 
 #define isb()	asm volatile("isb" : : : "memory")
 
+/*
+ * [한국어] get_cpu_clock - CNTVCT_EL0(가상 타이머 카운터) 레지스터를 읽어 시간을 측정한다.
+ * ISB로 파이프라인을 동기화한 뒤 읽어야 정확한 값을 얻을 수 있다.
+ */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned long val;
@@ -62,6 +67,11 @@ static inline int arch_init(char *envp[])
 	return 0;
 }
 
+/*
+ * [한국어] AArch64 직접 시스템 콜 매크로 (__do_syscall0 ~ __do_syscall6)
+ * svc 0 명령어로 커널 시스템 콜을 직접 수행한다.
+ * AArch64 ABI: x8=시스콜번호, x0~x5=인자1~6
+ */
 #define __do_syscallN(...) ({						\
 	__asm__ volatile (						\
 		"svc 0"							\

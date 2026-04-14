@@ -5,40 +5,42 @@
  *
  */
 /*
- * [한국어 개요]
- * io_uring 엔진 - Linux 커널의 io_uring 인터페이스를 사용하는 fio I/O 엔진.
+ * [한국어 설명] io_uring 기반 Linux 비동기 I/O 엔진 (io_uring.c)
  *
- * === io_uring 아키텍처 개요 ===
- * io_uring은 리눅스 커널 5.1+에서 도입된 비동기 I/O 프레임워크로,
- * 기존 libaio 대비 다음과 같은 장점을 가짐:
+ * === 파일의 역할 ===
+ * 리눅스 커널 5.1+의 io_uring 서브시스템을 사용하는 fio I/O 엔진 세 종류
+ * ("io_uring", "io_uring_cmd")를 구현한다. SQ/CQ 링을 mmap으로 공유하고 시스템 콜
+ * (io_uring_setup/enter/register)로만 커널과 통신하며, libaio에 비해 시스콜 수를 줄이는
+ * 제출/완료 경로를 제공한다. hipri(IOPOLL), sqpoll(SQPOLL), fixedbufs(REGISTER_BUFFERS),
+ * registerfiles(REGISTER_FILES), nvme uring_cmd 패스스루(IO_URING_OP_URING_CMD) 등
+ * io_uring의 거의 모든 주요 기능을 fio 옵션으로 노출한다.
  *
- * 1. SQ/CQ Ring 구조:
- *    - SQ (Submission Queue) Ring: 유저 -> 커널로 I/O 요청을 제출하는 링 버퍼
- *    - CQ (Completion Queue) Ring: 커널 -> 유저로 I/O 완료를 통지하는 링 버퍼
- *    - 둘 다 mmap()으로 유저/커널 간 공유 메모리에 매핑됨
- *    - 시스템 콜 없이 링 버퍼의 head/tail 포인터만으로 통신 가능
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=io_uring / io_uring_cmd 로 선택되어 fio 플러그인 레지스트리에 등록된다.
+ * 실행 흐름: backend.c → td_io_init → fio_ioring_init → post_init(io_uring_queue_init/
+ * register) → I/O 루프에서 queue(=ring tail 증가)로 SQE를 채우고 commit(=io_uring_enter)
+ * 으로 커널에 알린 뒤 getevents가 CQ head를 전진시키며 CQE를 수확한다. SQPOLL 모드에서는
+ * 커널 워커가 SQ를 계속 폴링하므로 대부분의 commit에서 enter 시스콜을 생략한다. 실행
+ * 컨텍스트는 fio 잡 스레드 1개이며, SQPOLL 커널 스레드는 공유 메모리로만 동기화한다.
  *
- * 2. SQE (Submission Queue Entry): I/O 요청 하나를 기술하는 구조체
- *    - opcode, fd, offset, length, buffer 주소 등을 포함
- *    - SQ Ring의 array[]는 SQE 인덱스를 가리킴 (간접 참조)
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c, stat.c) 및 cmdprio/verify/zbd/nvme 모듈.
+ * 하단: 리눅스 커널 UAPI <linux/io_uring.h>(SQE/CQE/io_uring_params), 시스콜
+ *       io_uring_setup/io_uring_enter/io_uring_register, mmap, madvise, ioctl.
+ * 데이터 흐름: io_u->xfer_buf ↔ SQE.addr(또는 REGISTER_BUFFERS 인덱스) ↔ 커널 블록
+ * 디바이스 드라이버 ↔ CQE.res. nvme passthrough 경로에서는 SQE.cmd에 NVMe 커맨드를
+ * 직접 패킹한다(io_uring_cmd UAPI, nvme.h).
+ * 공유 상태: SQ/CQ 링 버퍼는 커널과 공유 메모리로 매핑되어 있으며, head/tail은
+ * 원자적 메모리 장벽(smp_*) 의미로 접근해야 한다.
  *
- * 3. CQE (Completion Queue Entry): I/O 완료 결과를 담는 구조체
- *    - user_data: 원래 SQE에서 설정한 값 (io_u 포인터로 사용)
- *    - res: I/O 결과 (성공 시 전송된 바이트 수, 실패 시 음수 에러코드)
- *
- * === libaio와의 주요 차이점 ===
- * - 커널 폴링 (IOPOLL): hipri 옵션으로 인터럽트 없이 폴링 기반 완료 확인
- * - SQ 폴링 (SQPOLL): 커널 스레드가 SQ를 지속 감시하여 시스콜 없이 제출
- * - 등록된 버퍼 (fixedbufs): 버퍼를 미리 커널에 등록하여 매번 pinning 비용 제거
- * - 등록된 파일 (registerfiles): fd를 미리 등록하여 매 I/O마다 fd lookup 비용 제거
- * - io_uring_cmd: NVMe passthrough 등 디바이스별 커맨드 직접 전달 지원
- *
- * === 주요 함수 흐름 ===
- * fio_ioring_queue()    → SQ Ring에 I/O 요청(SQE)을 추가 (tail 포인터 증가)
- * fio_ioring_commit()   → io_uring_enter() 시스콜로 커널에 제출 알림
- *                          (SQPOLL 모드에서는 NEED_WAKEUP일 때만 호출)
- * fio_ioring_getevents() → CQ Ring에서 완료된 I/O(CQE)를 수확
- *                          (CQ head 포인터를 전진시켜 커널에 소비 완료 통지)
+ * === 주요 함수/구조체 요약 ===
+ * - fio_ioring_init()/post_init(): 링 설정, mmap, REGISTER_BUFFERS/FILES.
+ * - fio_ioring_prep(): io_u를 SQE로 변환(읽기/쓰기/fsync/vector/fixed buffer 선택).
+ * - fio_ioring_queue()/fio_ioring_commit(): SQ tail 진행 + io_uring_enter 호출.
+ * - fio_ioring_getevents()/event(): CQ head 진행 + io_u 완료 보고.
+ * - fio_ioring_cmd_prep/queue: NVMe uring_cmd 패스스루용 특수 경로.
+ * - struct ioring_data: 링 상태(sq/cq 포인터, head/tail 그림자, iodepth 등).
+ * - struct ioring_options: hipri/sqpoll/fixedbufs/registerfiles/cmd_type 등 옵션.
  */
 /* 표준 라이브러리 헤더 */
 #include <stdlib.h>
@@ -208,12 +210,31 @@ enum uring_cmd_verify_mode {
  * io_uring은 공유 메모리의 포인터만 업데이트하므로 복사 비용이 없음.
  */
 struct io_sq_ring {
-	unsigned *head;          /* 커널이 소비한 위치 (커널이 업데이트) */
-	unsigned *tail;          /* 유저가 제출한 위치 (유저가 업데이트) */
-	unsigned *ring_mask;     /* 링 인덱스 마스크 (entries - 1, 2의 거듭제곱) */
-	unsigned *ring_entries;  /* 링의 총 엔트리 수 */
-	unsigned *flags;         /* 링 플래그 (예: IORING_SQ_NEED_WAKEUP - SQPOLL 스레드 깨우기 필요) */
-	unsigned *array;         /* SQE 인덱스 배열 - array[tail & mask] = sqe_index */
+	unsigned *head;
+	/* [한국어] SQ head (커널이 소비한 지점). 설정자: 커널. 읽는 자: 유저 queue()가 여유 공간 계산 시 참조.
+	 * 값 범위: 0..UINT32_MAX 단조증가(모듈로 ring_entries). 동기화: 커널이 release, 유저는 acquire로 읽음. */
+
+	unsigned *tail;
+	/* [한국어] SQ tail (유저가 SQE 채움 완료 지점). 설정자: 유저 queue()가 smp_store_release.
+	 * 읽는 자: 커널(또는 SQPOLL 스레드)이 acquire 로드. 값 범위: head <= tail <= head+ring_entries. */
+
+	unsigned *ring_mask;
+	/* [한국어] 인덱스 링 마스크(=entries-1). 설정자: 커널이 mmap 영역에 기록.
+	 * 읽는 자: queue()가 tail & mask로 array 인덱스. 값 범위: 2^n-1. 동기화: 읽기 전용. */
+
+	unsigned *ring_entries;
+	/* [한국어] SQ 링의 총 슬롯 수. 설정자: 커널. 읽는 자: sanity 체크용.
+	 * 값 범위: 2^n. 동기화: 읽기 전용. */
+
+	unsigned *flags;
+	/* [한국어] SQ 상태 플래그(IORING_SQ_NEED_WAKEUP, IORING_SQ_CQ_OVERFLOW).
+	 * 설정자: 커널 SQPOLL 스레드. 읽는 자: commit()이 NEED_WAKEUP 확인 후 enter(SQ_WAKEUP).
+	 * 값 범위: 비트 OR. 동기화: 커널 원자 기록 — 유저는 acquire 로드. */
+
+	unsigned *array;
+	/* [한국어] array[tail & mask] = sqes[] 인덱스 — 링 순서와 SQE 배열 분리를 위한 간접 인덱스.
+	 * 설정자: queue()가 io_u->index 저장. 읽는 자: 커널 제출 경로.
+	 * 값 범위: 각 원소 0..iodepth-1. 동기화: tail store-release 전에 기록 완료. */
 };
 
 /*
@@ -230,11 +251,24 @@ struct io_sq_ring {
  * io_uring은 CQE가 이미 공유 메모리에 있으므로 복사 비용이 없음.
  */
 struct io_cq_ring {
-	unsigned *head;                  /* 유저가 소비한 위치 (유저가 업데이트) */
-	unsigned *tail;                  /* 커널이 완료를 추가한 위치 (커널이 업데이트) */
-	unsigned *ring_mask;             /* 링 인덱스 마스크 */
-	unsigned *ring_entries;          /* 링의 총 엔트리 수 */
-	struct io_uring_cqe *cqes;       /* CQE 배열 포인터 - 실제 완료 결과가 저장됨 */
+	unsigned *head;
+	/* [한국어] CQ head (유저가 수확한 지점). 설정자: getevents/event가 smp_store_release로 전진.
+	 * 읽는 자: 커널이 CQ 가득 찼는지 판단. 값 범위: 0..UINT32_MAX. 동기화: 싱글 컨슈머. */
+
+	unsigned *tail;
+	/* [한국어] CQ tail (커널이 완료 기록한 지점). 설정자: 커널 release.
+	 * 읽는 자: getevents가 acquire 로드 후 tail-head 만큼 수확. 값 범위: head <= tail <= head+cq_entries. */
+
+	unsigned *ring_mask;
+	/* [한국어] CQ 인덱스 마스크(=cq_entries-1). 설정자: 커널. 읽는 자: event()가 (head+i)&mask. */
+
+	unsigned *ring_entries;
+	/* [한국어] CQ 링 총 슬롯 수. 설정자: 커널. 동기화: 읽기 전용. */
+
+	struct io_uring_cqe *cqes;
+	/* [한국어] 실제 완료 이벤트(CQE) 배열 — user_data/res/flags 포함.
+	 * 설정자: 커널이 tail 위치에 채움. 읽는 자: fio_ioring_event()가 io_u 복원과 결과 해석.
+	 * 값 범위: 길이 = cq_entries. 동기화: tail 업데이트 후 유저가 acquire로 안전 읽기. */
 };
 
 /*
@@ -243,8 +277,15 @@ struct io_cq_ring {
  * cleanup 시 munmap()에 필요한 포인터와 크기를 저장
  */
 struct ioring_mmap {
-	void *ptr;    /* mmap()으로 매핑된 메모리 주소 */
-	size_t len;   /* 매핑된 메모리 크기 */
+	void *ptr;
+	/* [한국어] mmap()으로 매핑된 영역의 시작 가상 주소.
+	 * 설정자: fio_ioring_mmap()이 mmap 반환값 저장. 읽는 자: fio_ioring_unmap()이 munmap에 전달.
+	 * 값 범위: 유효 주소 또는 MAP_FAILED 후 초기화 실패 경로. 동기화: 초기화/종료 시점만 접근. */
+
+	size_t len;
+	/* [한국어] 매핑 영역 바이트 길이(munmap에 필요).
+	 * 설정자: fio_ioring_mmap()이 params의 ring_size/sqe_off 기반으로 계산.
+	 * 읽는 자: unmap 경로. 값 범위: 양수. 동기화: 초기화 후 불변. */
 };
 
 /*
@@ -253,39 +294,154 @@ struct ioring_mmap {
  * io_uring 인스턴스의 모든 상태를 보관
  */
 struct ioring_data {
-	int ring_fd;              /* io_uring 인스턴스의 파일 디스크립터 (io_uring_setup()이 반환) */
+	int ring_fd;
+	/* [한국어] io_uring 인스턴스의 파일 디스크립터 (io_uring_setup() syscall 반환값).
+	 * 설정자: fio_ioring_queue_init()에서 syscall(__NR_io_uring_setup)의 반환값으로 저장.
+	 * 읽는 자: io_uring_enter()/io_uring_register()/mmap() 호출 시 첫 인자로 사용, cleanup에서 close().
+	 * 값 범위: 성공 시 >= 0 (일반 fd), 실패 시 -1 후 errno.
+	 * 동기화: 잡 스레드 1개만 소유하지만 SQPOLL 커널 스레드와 공유 메모리로 연결되는 핵심 핸들. */
 
-	struct io_u **io_u_index; /* io_u 포인터 배열 - 인덱스로 io_u를 빠르게 찾기 위함 */
-	char *md_buf;             /* 메타데이터 버퍼 - PI(Protection Information) 사용 시 */
-	char *pi_attr;            /* PI 속성 버퍼 - 각 I/O별 PI 속성 저장 */
+	struct io_u **io_u_index;
+	/* [한국어] 인덱스 → io_u 포인터 역참조 테이블. SQE/CQE의 user_data 매핑 보조용.
+	 * 설정자: fio_ioring_io_u_init()이 io_u->index 위치에 기록.
+	 * 읽는 자: fio_ioring_cmd_prep() 등에서 io_u->index로 접근.
+	 * 값 범위: 길이 = td->o.iodepth, 각 원소는 유효한 io_u 또는 NULL.
+	 * 동기화: 잡 스레드 단독 사용 — 별도 락 불필요. */
 
-	int *fds;                 /* 등록된 파일 디스크립터 배열 (registerfiles 옵션 사용 시) */
+	char *md_buf;
+	/* [한국어] PI(Protection Information) 사용 시 io_u 당 메타데이터 버퍼의 베이스 주소.
+	 * 설정자: post_init()에서 calloc/posix_memalign으로 md_per_io_size * iodepth 크기 할당.
+	 * 읽는 자: fio_ioring_prep_md()가 io_u->mmap_data에 오프셋을 저장하여 사용.
+	 * 값 범위: NULL(옵션 미사용) 또는 유효 포인터.
+	 * 동기화: 잡 스레드가 단독 할당/읽기, 커널은 DMA 시 디바이스 주소로 접근. */
 
-	struct io_sq_ring sq_ring;    /* SQ Ring 포인터들 */
-	struct io_uring_sqe *sqes;    /* SQE 배열 - 실제 I/O 요청 기술자가 저장되는 공간 */
-	struct iovec *iovecs;         /* I/O 벡터 배열 - scatter/gather I/O용 버퍼 기술자 */
-	unsigned sq_ring_mask;        /* SQ Ring 마스크의 로컬 캐시 (빠른 접근용) */
+	char *pi_attr;
+	/* [한국어] io_u 당 struct io_uring_attr_pi 속성 배열의 베이스.
+	 * 설정자: post_init()에서 iodepth 만큼 연속 할당.
+	 * 읽는 자: fio_ioring_prep_md()가 sqe->attr_ptr로 커널에 전달.
+	 * 값 범위: NULL 또는 유효 포인터.
+	 * 동기화: 잡 스레드가 준비하고 커널이 I/O 수행 중 읽기 — io_u 단위 배타적. */
 
-	struct io_cq_ring cq_ring;    /* CQ Ring 포인터들 */
-	unsigned cq_ring_mask;        /* CQ Ring 마스크의 로컬 캐시 */
+	int *fds;
+	/* [한국어] registerfiles 옵션 활성화 시 커널에 등록한 fd들의 로컬 사본 배열.
+	 * 설정자: fio_ioring_register_files()가 td->o.nr_files 크기로 채움.
+	 * 읽는 자: IORING_REGISTER_FILES_UPDATE / 닫기 경로.
+	 * 값 범위: NULL(미사용) 또는 길이 nr_files 배열, 각 원소는 유효 fd.
+	 * 동기화: 잡 스레드 단독 소유. */
 
-	int async_trim_fail;      /* 비동기 TRIM이 실패했는지 여부 (실패 시 동기 모드로 폴백) */
-	int queued;               /* 현재 SQ에 추가되었지만 아직 커널에 제출되지 않은 I/O 수 */
-	int cq_ring_off;          /* CQ Ring에서 이벤트 수확 시작 오프셋 */
-	unsigned iodepth;         /* io_uring 내부 큐 깊이 (2의 거듭제곱으로 반올림됨) */
-	int prepped;              /* force_async 카운터 - N번째마다 IOSQE_ASYNC 설정 */
+	struct io_sq_ring sq_ring;
+	/* [한국어] 커널과 mmap으로 공유하는 SQ 링의 유저스페이스 포인터 모음.
+	 * 설정자: fio_ioring_mmap()이 io_uring_params의 오프셋을 기반으로 각 필드 매핑.
+	 * 읽는 자: queue(tail 업데이트), commit(SQ_NEED_WAKEUP 확인), getevents.
+	 * 값 범위: head/tail 등 유효 포인터. 접근 시 smp_load_acquire/smp_store_release 의미 필요.
+	 * 동기화: 커널 SQPOLL 스레드와 공유 — 원자적 메모리 장벽으로 순서 보장. */
 
-	struct ioring_mmap mmap[3];   /* mmap 매핑 정보: [0]=SQ Ring, [1]=SQEs, [2]=CQ Ring */
+	struct io_uring_sqe *sqes;
+	/* [한국어] 실제 I/O 요청 기술자(SQE) 배열. mmap[1]에 매핑된 커널 공유 영역.
+	 * 설정자: fio_ioring_mmap()이 IORING_OFF_SQES로 매핑.
+	 * 읽는 자: fio_ioring_prep()/fio_ioring_cmd_prep()가 io_u->index 위치에 요청 기록.
+	 * 값 범위: 길이 = depth. 각 엔트리는 opcode/fd/addr/len/flags 등 포함.
+	 * 동기화: 커널이 SQ tail 사이 SQE를 읽으므로 tail 기록 전 SQE 완성 필수. */
 
-	struct cmdprio cmdprio;       /* 커맨드 우선순위 설정 */
+	struct iovec *iovecs;
+	/* [한국어] 벡터 I/O(READV/WRITEV) 시 SQE.addr이 가리키는 iovec 배열 (io_u 인덱스 병렬).
+	 * 설정자: fio_ioring_prep()가 iov_base/iov_len을 io_u->xfer_buf로 채움.
+	 * 읽는 자: 커널 io_uring 코드가 I/O 수행 중 dereference.
+	 * 값 범위: 길이 = iodepth. nonvectored=1이면 SQE에서 사용되지 않음.
+	 * 동기화: io_u 단위 배타적 — SQE 커널 소비 중엔 변경 금지. */
 
-	struct nvme_dsm *dsm;             /* NVMe Dataset Management (TRIM/DSM) 구조체 */
-	uint32_t cdw12_flags[DDIR_RWDIR_CNT]; /* NVMe CDW12 플래그 (FUA 등) - 읽기/쓰기 방향별 */
-	uint8_t write_opcode;             /* NVMe 쓰기 opcode (write, write_uncor, write_zeroes, verify) */
+	unsigned sq_ring_mask;
+	/* [한국어] *sq_ring.ring_mask의 로컬 캐시 (매번 포인터 역참조 피함).
+	 * 설정자: fio_ioring_mmap() 직후 저장.
+	 * 읽는 자: queue()에서 tail & mask로 SQ 배열 인덱스 계산.
+	 * 값 범위: (entries - 1), 2^n - 1 형태.
+	 * 동기화: 읽기 전용 상수 취급. */
 
-	bool is_uring_cmd_eng;            /* io_uring_cmd 엔진 여부 (NVMe passthrough 구분용) */
+	struct io_cq_ring cq_ring;
+	/* [한국어] 커널과 mmap 공유하는 CQ 링의 유저스페이스 포인터 모음.
+	 * 설정자: fio_ioring_mmap()이 IORING_OFF_CQ_RING 기반으로 매핑.
+	 * 읽는 자: fio_ioring_getevents()/event()가 head 증가시키며 CQE 수확.
+	 * 값 범위: 유효 포인터. head/tail 접근은 메모리 장벽 의미 필요.
+	 * 동기화: 커널(tail 기록) ↔ 유저(head 기록) 싱글 프로듀서/컨슈머. */
 
-	struct nvme_cmd_ext_io_opts ext_opts;  /* NVMe 확장 I/O 옵션 (PI 관련) */
+	unsigned cq_ring_mask;
+	/* [한국어] *cq_ring.ring_mask의 로컬 캐시.
+	 * 설정자: fio_ioring_mmap() 직후 저장. 읽는 자: getevents에서 head & mask.
+	 * 값 범위: (cq_entries - 1). 동기화: 읽기 전용 상수. */
+
+	int async_trim_fail;
+	/* [한국어] TRIM 경로가 비동기 실패(-EOPNOTSUPP 등)를 반환한 적이 있는지 표시.
+	 * 설정자: getevents 경로에서 TRIM 실패 감지 시 1로 설정.
+	 * 읽는 자: queue/commit 흐름에서 동기 모드 폴백 결정에 사용.
+	 * 값 범위: 0(정상) / 1(실패 감지). 동기화: 잡 스레드 단독. */
+
+	int queued;
+	/* [한국어] queue()로 SQ에 기록됐지만 아직 io_uring_enter()로 커널에 알리지 않은 SQE 수.
+	 * 설정자: fio_ioring_queue()가 1씩 증가, commit이 0으로 리셋.
+	 * 읽는 자: commit()이 enter()에 to_submit 인자로 전달.
+	 * 값 범위: 0 <= queued <= iodepth. 동기화: 잡 스레드 단독. */
+
+	int cq_ring_off;
+	/* [한국어] getevents가 직전에 확인한 CQ head 스냅샷(수확 시작 오프셋).
+	 * 설정자: fio_ioring_getevents()가 완료 대기 후 저장.
+	 * 읽는 자: fio_ioring_event()가 이 오프셋부터 CQE 접근.
+	 * 값 범위: 현재 CQ head 값 (0..cq_entries-1 이후에도 모듈로 동작).
+	 * 동기화: 잡 스레드 단독. */
+
+	unsigned iodepth;
+	/* [한국어] io_uring 내부에서 사용하는 실제 큐 깊이 (2의 거듭제곱으로 올림 가능).
+	 * 설정자: fio_ioring_queue_init()에서 roundup_pow2(td->o.iodepth).
+	 * 읽는 자: 링 할당 크기 계산, 루프 상한. 값 범위: >= td->o.iodepth 최소 2^n.
+	 * 동기화: 초기화 후 불변 — 읽기 전용. */
+
+	int prepped;
+	/* [한국어] force_async 주기 카운터. 매 SQE 준비 시 증가, force_async 도달 시 IOSQE_ASYNC 부여.
+	 * 설정자/읽는 자: fio_ioring_prep()/cmd_prep()가 증감.
+	 * 값 범위: 0..force_async. 동기화: 잡 스레드 단독. */
+
+	struct ioring_mmap mmap[3];
+	/* [한국어] mmap 매핑 3종 정보: [0]=SQ Ring, [1]=SQEs, [2]=CQ Ring.
+	 * 설정자: fio_ioring_mmap()이 각 영역 크기/주소 기록.
+	 * 읽는 자: fio_ioring_unmap()이 munmap 호출 시 참조.
+	 * 값 범위: 각 ptr은 유효 주소 또는 MAP_FAILED 이후 에러 처리됨.
+	 * 동기화: 초기화/종료 시점에만 접근. */
+
+	struct cmdprio cmdprio;
+	/* [한국어] cmdprio_percentage/bssplit 등 I/O 우선순위 정책 상태.
+	 * 설정자: fio_ioring_cmdprio_init()가 옵션 기반으로 채움.
+	 * 읽는 자: fio_ioring_cmdprio_prep()가 SQE의 ioprio를 재작성.
+	 * 값 범위: 정책 비활성 시 0 초기화. 동기화: 잡 스레드 단독. */
+
+	struct nvme_dsm *dsm;
+	/* [한국어] NVMe Dataset Management(TRIM) 커맨드용 range 배열의 베이스.
+	 * 설정자: fio_ioring_cmd_post_init()가 iodepth 만큼 할당.
+	 * 읽는 자: fio_ioring_cmd_prep()가 TRIM 방향일 때 해당 엔트리를 SQE에 연결.
+	 * 값 범위: NULL(미할당) 또는 유효 포인터.
+	 * 동기화: io_u 단위 배타적 사용. */
+
+	uint32_t cdw12_flags[DDIR_RWDIR_CNT];
+	/* [한국어] NVMe Command Dword12용 플래그(FUA, PRCHK 등)를 방향별로 캐시.
+	 * 설정자: fio_ioring_cmd_post_init()가 readfua/writefua/prchk로부터 계산.
+	 * 읽는 자: fio_ioring_cmd_prep()가 ddir에 맞는 값을 NVMe 커맨드에 기록.
+	 * 값 범위: 비트 OR 조합. 동기화: 초기화 후 불변. */
+
+	uint8_t write_opcode;
+	/* [한국어] write_mode 옵션에 따라 결정되는 NVMe 쓰기 opcode (Write/Write Uncor/Zeroes/Verify).
+	 * 설정자: fio_ioring_cmd_post_init()가 옵션 파싱 결과로 저장.
+	 * 읽는 자: fio_ioring_cmd_prep()가 방향이 WRITE일 때 사용.
+	 * 값 범위: NVMe 스펙 opcode(0x01/0x04/0x08/0x0C 등). 동기화: 불변. */
+
+	bool is_uring_cmd_eng;
+	/* [한국어] 현재 엔진이 io_uring_cmd(NVMe passthrough)인지 일반 io_uring인지 구분.
+	 * 설정자: fio_ioring_init()가 ioengine 이름으로 판단.
+	 * 읽는 자: 공통 경로에서 분기(prep/queue/cleanup)하기 위해 검사.
+	 * 값 범위: true/false. 동기화: 초기화 후 불변. */
+
+	struct nvme_cmd_ext_io_opts ext_opts;
+	/* [한국어] NVMe passthrough 시 PI(apptag/apptag_mask/io_flags 등)용 확장 옵션 묶음.
+	 * 설정자: fio_ioring_cmd_post_init()가 pi_act/apptag/prchk 옵션으로부터 채움.
+	 * 읽는 자: fio_ioring_cmd_prep()가 nvme_cmd_prep() 호출 시 전달.
+	 * 값 범위: 비트 플래그 + 정수. 동기화: 초기화 후 불변. */
 };
 
 /*
@@ -293,30 +449,128 @@ struct ioring_data {
  * fio 설정 파일에서 사용자가 지정할 수 있는 io_uring 관련 옵션들
  */
 struct ioring_options {
-	struct thread_data *td;           /* 소속 스레드 데이터 포인터 */
-	unsigned int hipri;               /* IOPOLL 사용 여부 - 인터럽트 없이 폴링으로 완료 확인 */
-	unsigned int readfua;             /* 읽기 시 FUA(Force Unit Access) 플래그 사용 여부 - 캐시 우회 */
-	unsigned int writefua;            /* 쓰기 시 FUA 플래그 사용 여부 */
-	unsigned int deac;                /* Write Zeroes 시 DEAC(Deallocate) 플래그 사용 여부 */
-	unsigned int write_mode;          /* 쓰기 모드 (write, uncor, zeroes, verify) */
-	unsigned int verify_mode;         /* 검증 모드 (read, compare) */
-	struct cmdprio_options cmdprio_options;  /* 커맨드 우선순위 옵션 */
-	unsigned int fixedbufs;           /* 사전 등록 버퍼 사용 - 커널 버퍼 pinning 비용 제거 */
-	unsigned int registerfiles;       /* 사전 등록 파일 사용 - fd lookup 비용 제거 */
-	unsigned int sqpoll_thread;       /* SQ 폴링 스레드 사용 - 커널 스레드가 SQ를 지속 감시 */
-	unsigned int sqpoll_set;          /* SQ 폴링 CPU가 명시적으로 설정되었는지 여부 */
-	unsigned int sqpoll_cpu;          /* SQ 폴링 스레드를 고정할 CPU 번호 */
-	unsigned int nonvectored;         /* 비벡터 I/O 사용 (IORING_OP_READ/WRITE vs READV/WRITEV) */
-	unsigned int uncached;            /* RWF_DONTCACHE 플래그 사용 (버퍼드 I/O 시 캐시 미사용) */
-	unsigned int nowait;              /* RWF_NOWAIT 플래그 사용 (블로킹 없이 즉시 반환) */
-	unsigned int force_async;         /* N번째 요청마다 IOSQE_ASYNC 강제 (비동기 처리 강제) */
-	unsigned int md_per_io_size;      /* I/O당 별도 메타데이터 버퍼 크기 */
-	unsigned int pi_act;              /* PI Action 비트 - 1이면 컨트롤러가 PI 처리 */
-	unsigned int apptag;              /* PI의 Application Tag 값 */
-	unsigned int apptag_mask;         /* Application Tag 마스크 */
-	unsigned int prchk;               /* PI 검사 플래그 (GUARD, REFTAG, APPTAG 조합) */
-	char *pi_chk;                     /* PI 검사 문자열 옵션 ("GUARD,REFTAG,APPTAG") */
-	enum uring_cmd_type cmd_type;     /* uring_cmd 타입 (현재 NVMe만) */
+	struct thread_data *td;
+	/* [한국어] 이 옵션 블록이 소속된 fio 잡(thread_data) 역참조 포인터.
+	 * 설정자: fio 옵션 파싱 프레임워크가 엔진 옵션 구조 할당 시 자동 저장.
+	 * 읽는 자: 옵션 콜백(fio_ioring_sqpoll_cb 등)이 td 기반 로깅/경고에 사용.
+	 * 값 범위: 반드시 유효한 td. 동기화: td와 동일 수명, 잡 스레드가 단독 접근. */
+
+	unsigned int hipri;
+	/* [한국어] IORING_SETUP_IOPOLL(폴링 완료) 사용 여부. O_DIRECT + 블록 디바이스에서만 유효.
+	 * 설정자: "hipri" 옵션 파서. 읽는 자: fio_ioring_queue_init()가 params.flags에 반영.
+	 * 값 범위: 0/1. 동기화: 초기화 시점 이후 불변. */
+
+	unsigned int readfua;
+	/* [한국어] 읽기 시 FUA(Force Unit Access) — 디바이스 캐시 우회하여 미디어에서 읽기.
+	 * 설정자: "readfua" 옵션. 읽는 자: uring_cmd 경로의 cdw12_flags 초기화.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int writefua;
+	/* [한국어] 쓰기 시 FUA — 비휘발 매체 도달 전까지 완료로 보고하지 않도록 강제.
+	 * 설정자: "writefua" 옵션. 읽는 자: cdw12_flags[WRITE]에 반영.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int deac;
+	/* [한국어] Write Zeroes 커맨드의 DEAC(Deallocate) 비트 — LBA 할당 해제 힌트.
+	 * 설정자: "deac" 옵션. 읽는 자: write_opcode가 ZEROES일 때 cdw12에 OR.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int write_mode;
+	/* [한국어] 쓰기 방향에서 사용할 NVMe 커맨드 종류 선택 (enum uring_cmd_write_mode).
+	 * 설정자: "write_mode" 옵션 문자열 → enum 변환.
+	 * 읽는 자: fio_ioring_cmd_post_init()가 write_opcode 결정.
+	 * 값 범위: WRITE(1)/UNCOR/ZEROES/VERIFY. 동기화: 불변. */
+
+	unsigned int verify_mode;
+	/* [한국어] verify 단계에서 사용할 NVMe 커맨드 (Read vs Compare).
+	 * 설정자: "verify_mode" 옵션. 읽는 자: cmd_prep()가 READ/COMPARE opcode 결정.
+	 * 값 범위: VMODE_READ(1)/VMODE_COMPARE. 동기화: 불변. */
+
+	struct cmdprio_options cmdprio_options;
+	/* [한국어] cmdprio_percentage/bssplit/class/level 등 우선순위 정책 원천 옵션.
+	 * 설정자: fio 옵션 파서. 읽는 자: cmdprio_init()가 파싱 후 런타임 상태로 변환.
+	 * 값 범위: 비활성 시 전 필드 0. 동기화: 불변. */
+
+	unsigned int fixedbufs;
+	/* [한국어] IORING_REGISTER_BUFFERS 사용 여부 — 버퍼 사전 등록으로 pin 비용 제거.
+	 * 설정자: "fixedbufs" 옵션. 읽는 자: post_init()이 등록 수행, prep()이 opcode 선택.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int registerfiles;
+	/* [한국어] IORING_REGISTER_FILES 사용 여부 — fd 사전 등록으로 lookup 비용 제거.
+	 * 설정자: "registerfiles" 옵션. 읽는 자: open_file/prep에서 SQE fd/플래그 결정.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int sqpoll_thread;
+	/* [한국어] IORING_SETUP_SQPOLL — 커널 스레드가 SQ를 폴링해 enter() 시스콜 최소화.
+	 * 설정자: "sqthread_poll" 옵션. 읽는 자: queue_init 시 params.flags.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int sqpoll_set;
+	/* [한국어] 사용자가 sqthread_poll_cpu를 명시적으로 지정했는지 플래그.
+	 * 설정자: fio_ioring_sqpoll_cb() 콜백에서 1로 설정.
+	 * 읽는 자: queue_init이 params.sq_thread_cpu 설정 여부 판단.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int sqpoll_cpu;
+	/* [한국어] SQPOLL 커널 스레드를 핀(pin)할 CPU 번호.
+	 * 설정자: sqpoll_cb. 읽는 자: queue_init의 params.sq_thread_cpu.
+	 * 값 범위: 0..N_CPU-1. 동기화: 불변. */
+
+	unsigned int nonvectored;
+	/* [한국어] 비벡터 opcode(READ/WRITE) 선호 (-1=자동, 0=벡터, 1=비벡터).
+	 * 설정자: "nonvectored" 옵션. 읽는 자: fio_ioring_prep()의 opcode 테이블 인덱스.
+	 * 값 범위: -1/0/1. 동기화: init 후 자동값 해소되어 불변. */
+
+	unsigned int uncached;
+	/* [한국어] 버퍼드 I/O에서 RWF_DONTCACHE 적용 여부 — 페이지 캐시 오염 방지.
+	 * 설정자: "uncached" 옵션. 읽는 자: prep()이 sqe->rw_flags에 OR.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int nowait;
+	/* [한국어] RWF_NOWAIT 사용 — 블로킹 불가시 즉시 -EAGAIN 반환.
+	 * 설정자: "nowait" 옵션. 읽는 자: prep()이 rw_flags에 OR.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int force_async;
+	/* [한국어] N번째 SQE마다 IOSQE_ASYNC 플래그 강제 — 비동기 워커 경로 테스트용.
+	 * 설정자: "force_async" 옵션. 읽는 자: prep()가 ld->prepped와 비교.
+	 * 값 범위: 0(비활성) 또는 양의 정수. 동기화: 불변. */
+
+	unsigned int md_per_io_size;
+	/* [한국어] PI 메타데이터 버퍼 크기(바이트) — 0이면 메타데이터 경로 비활성.
+	 * 설정자: "md_per_io_size" 옵션. 읽는 자: post_init()이 md_buf 크기 계산, prep_md() 경로.
+	 * 값 범위: 0 또는 양수. 동기화: 불변. */
+
+	unsigned int pi_act;
+	/* [한국어] PI Action 비트 — 1이면 컨트롤러가 PI 생성/검증, 0이면 호스트 책임.
+	 * 설정자: "pi_act" 옵션(기본 1). 읽는 자: ext_opts.io_flags에 반영.
+	 * 값 범위: 0/1. 동기화: 불변. */
+
+	unsigned int apptag;
+	/* [한국어] PI의 Application Tag 값 (기본 0x1234).
+	 * 설정자: "apptag" 옵션. 읽는 자: ext_opts에 저장되어 NVMe 커맨드에 삽입.
+	 * 값 범위: 16비트 정수. 동기화: 불변. */
+
+	unsigned int apptag_mask;
+	/* [한국어] Application Tag 검사 마스크 (기본 0xffff=완전일치).
+	 * 설정자: "apptag_mask" 옵션. 읽는 자: ext_opts.
+	 * 값 범위: 16비트 마스크. 동기화: 불변. */
+
+	unsigned int prchk;
+	/* [한국어] pi_chk 문자열 파싱 결과를 비트로 저장(GUARD|REFTAG|APPTAG).
+	 * 설정자: post_init()가 pi_chk 문자열 토큰화로 비트 구성.
+	 * 읽는 자: cdw12_flags/ext_opts 구성 시 OR. 값 범위: 3비트 조합. 동기화: 불변. */
+
+	char *pi_chk;
+	/* [한국어] "GUARD,REFTAG,APPTAG" 형식의 원문자열 (파싱 전).
+	 * 설정자: "pi_chk" 옵션 파서가 strdup. 읽는 자: post_init의 파싱 루프.
+	 * 값 범위: NULL 또는 유효 heap 문자열. 동기화: 잡 수명 내 불변(해제는 종료시). */
+
+	enum uring_cmd_type cmd_type;
+	/* [한국어] io_uring_cmd로 전달할 프로토콜 커맨드 종류(현재 NVMe만).
+	 * 설정자: "cmd_type" 옵션. 읽는 자: cmd_prep/cmd_post_init이 NVMe 분기.
+	 * 값 범위: FIO_URING_CMD_NVME(1). 동기화: 불변. */
 };
 
 /*

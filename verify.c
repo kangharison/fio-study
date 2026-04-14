@@ -2,25 +2,31 @@
  * IO verification helpers
  */
 /*
- * [한국어] verify.c - I/O 데이터 무결성 검증 엔진
+ * [한국어 설명] I/O 데이터 무결성 검증 엔진 (verify.c)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio가 쓴 데이터를 다시 읽어서 무결성을 확인하는 검증 기능을 구현한다.
- * 주요 기능:
- *   1) populate_verify_io_u()  - 쓰기 전 io_u 버퍼에 패턴 데이터 + 체크섬 헤더를 채움
- *   2) verify_io_u()           - 읽어온 데이터의 헤더 검증 + 체크섬 재계산으로 무결성 확인
- *   3) verify_io_u_async()     - 검증 작업을 별도 스레드로 오프로드
- *   4) verify_async_thread()   - 비동기 검증 워커 스레드의 메인 루프
- *   5) get_next_verify()       - io_hist에서 다음 검증할 I/O 조각을 꺼냄
- *   6) verify_save/load_state()- 검증 상태를 파일로 저장/복원 (재시작 지원)
+ * 쓰기 시 데이터 블록에 패턴 + 체크섬 헤더를 채우고, 읽기 시 체크섬을 재계산하여
+ * 데이터 손상 여부를 판별한다. CRC, MD5, SHA, xxHash 등 다양한 알고리즘을 지원한다.
  *
- * 검증 흐름:
- *   쓰기 경로: fill_verify_pattern() -> fill_pattern_headers() -> populate_hdr()
- *              패턴으로 버퍼를 채우고, 각 블록마다 verify_header + 체크섬을 기록
- *   읽기 경로: verify_io_u() -> verify_header() -> verify_io_u_<알고리즘>()
- *              헤더 유효성 확인 후, 데이터 영역의 체크섬을 재계산하여 비교
+ * === 전체 아키텍처에서의 위치 ===
+ * 쓰기 경로: backend.c의 do_io() → populate_verify_io_u() [이 파일]
+ * 검증 경로: backend.c의 do_verify() → get_next_verify() → verify_io_u() [이 파일]
+ * 비동기 검증: verify_async_thread()가 별도 스레드에서 검증 수행
  *
- * 지원 알고리즘: CRC7, CRC16, CRC32, CRC32C, CRC64, MD5, SHA1, SHA256, SHA512,
- *               SHA3-224/256/384/512, xxHash, 패턴 매칭
+ * === 타 모듈과의 연결 ===
+ * - backend.c: do_io()에서 쓰기 시 populate_verify_io_u() 호출, do_verify()에서 검증
+ * - io_u.c: io_u 버퍼에 검증 데이터를 채우고 검증 결과를 보고
+ * - verify.h: 검증 유형 열거형, verify_header 구조체, API 선언
+ * - crc/*.c: 각 체크섬/해시 알고리즘 구현 (md5, crc32, sha256 등)
+ * - 핵심 자료구조: verify_header(블록 헤더), io_u(I/O 요청)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - populate_verify_io_u(): 쓰기 전 io_u 버퍼에 패턴 + 체크섬 헤더 채움
+ * - verify_io_u(): 읽어온 데이터의 체크섬을 재계산하여 무결성 확인
+ * - verify_async_thread(): 비동기 검증 워커 스레드의 메인 루프
+ * - get_next_verify(): io_hist에서 다음 검증할 I/O 조각 꺼냄
+ * - verify_save/load_state(): 검증 상태를 파일로 저장/복원 (재시작 지원)
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

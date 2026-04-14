@@ -97,10 +97,25 @@ static uint8_t lfsr_taps[64][FIO_MAX_TAPS] =
 	{63, 62},		//Tap position for 63-bit LFSR
 };
 
+/*
+ * [한국어] __LFSR_NEXT 매크로 - XNOR LFSR의 한 스텝을 실행
+ *
+ * 동작: 1. 값을 1비트 우측 시프트하고 최상위에 cached_bit를 삽입
+ *       2. LSB가 0이면 xormask와 XOR (XNOR 피드백)
+ *       3. LSB가 1이면 (1-1=0이므로) XOR 없음
+ * XNOR LFSR에서 금지 상태는 all-ones (일반 LFSR의 all-zeros에 대응)
+ */
 #define __LFSR_NEXT(__fl, __v)						\
 	__v = ((__v >> 1) | __fl->cached_bit) ^			\
 			(((__v & 1ULL) - 1ULL) & __fl->xormask);
 
+/*
+ * [한국어] __lfsr_next - spin 횟수만큼 LFSR 스텝을 실행
+ *
+ * switch-case의 fall-through로 spin+1회의 스텝을 루프 없이 실행한다.
+ * 컴파일러가 점프 테이블을 생성하므로 O(1) 시간에 동작한다.
+ * spin이 클수록 연속 값 간의 상관성이 ��어들어 더 "랜덤"하게 보인다.
+ */
 static inline void __lfsr_next(struct fio_lfsr *fl, unsigned int spin)
 {
 	/*
@@ -160,8 +175,21 @@ static inline void __lfsr_next(struct fio_lfsr *fl, unsigned int spin)
  * c. Check if the calculated value exceeds the desirable range. In this case,
  *    go back to b, else return.
  */
+/*
+ * [한국어] lfsr_next - LFSR에서 다음 고유 오프셋을 생성
+ *
+ * @fl: LFSR 상태
+ * @off: 생성된 오프셋이 저장될 포인터
+ * @return: 0=성공, 1=모든 값을 소진함 (전체 범위를 한 번 순회 완료)
+ *
+ * spin에 의한 부분 순환(sub-cycle) 문제를 감지하면, 한 스텝을 추가로 실행하여
+ * 순환을 회피한다. max_val을 초과하는 값은 건너뛴다(do-while).
+ *
+ * 호출 체인: io_u.c (get_next_rand_offset_lfsr) → [lfsr_next]
+ */
 int lfsr_next(struct fio_lfsr *fl, uint64_t *off)
 {
+	/* [한국어] 모든 값을 소진했으면 1 반환 */
 	if (fl->num_vals++ > fl->max_val)
 		return 1;
 
@@ -177,6 +205,10 @@ int lfsr_next(struct fio_lfsr *fl, uint64_t *off)
 	return 0;
 }
 
+/*
+ * [한국어] lfsr_create_xormask - 탭 위치 배열에서 XOR 피드백 마스크를 생성
+ * 각 탭 위치 bit에 대해 (1 << (tap-1))을 OR하여 마스크를 구성한다.
+ */
 static uint64_t lfsr_create_xormask(uint8_t *taps)
 {
 	int i;
@@ -188,6 +220,11 @@ static uint64_t lfsr_create_xormask(uint8_t *taps)
 	return xormask;
 }
 
+/*
+ * [한국어] find_lfsr - 주어진 크기를 커버하는 최소 비트 수의 LFSR 탭을 찾음
+ * size보다 큰 최소 2^n을 찾아 해당 비트 수의 탭 위치를 반환한다.
+ * LFSR의 금지 상태(all-ones)가 있으므로 2^n > size인 n을 선택한다.
+ */
 static uint8_t *find_lfsr(uint64_t size)
 {
 	int i;
@@ -267,6 +304,21 @@ int lfsr_reset(struct fio_lfsr *fl, uint64_t seed)
 	return 0;
 }
 
+/*
+ * [한국어] lfsr_init - LFSR 생성기를 초기화
+ *
+ * @fl: LFSR 상태 구조체
+ * @nums: 전체 블록 수 (생성 범위: 0 ~ nums-1)
+ * @seed: 초기 시드 값
+ * @spin: 한 번에 실행할 LFSR 스텝 수 (상관성 감소)
+ * @return: 0=성공, 1=범위가 너무 크거나 spin이 과도하거나 시드가 금지 상태
+ *
+ * 적절한 비트 수의 LFSR 탭을 선택하고, XOR 마스크를 생성하고,
+ * spin에 의한 부분 순환 문제를 사전 분석(prepare_spin)한 뒤,
+ * 시드로 LFSR을 리셋한다.
+ *
+ * 호출 체인: init.c → [lfsr_init] → find_lfsr, prepare_spin, lfsr_reset
+ */
 int lfsr_init(struct fio_lfsr *fl, uint64_t nums, uint64_t seed,
 	      unsigned int spin)
 {

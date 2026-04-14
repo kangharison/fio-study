@@ -13,6 +13,16 @@
 #include <errno.h>
 #include "getrusage.h"
 
+/*
+ * [한국어] fio_getrusage - 스레드/프로세스의 리소스 사용량을 조회
+ *
+ * @ru: 결과가 저장될 rusage 구조체
+ * @return: 0=성공, -1=실패
+ *
+ * RUSAGE_THREAD(Linux 전용)를 먼저 시도하여 개별 스레드의 CPU 시간을 측정하고,
+ * 지원되지 않으면 RUSAGE_SELF(프로세스 단위)로 폴백한다.
+ * 호출 체인: stat.c (update_rusage_stat) → [fio_getrusage] → getrusage(2)
+ */
 int fio_getrusage(struct rusage *ru)
 {
 #ifdef CONFIG_RUSAGE_THREAD

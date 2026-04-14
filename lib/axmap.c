@@ -45,6 +45,8 @@
 #include "axmap.h"
 #include "../minmax.h"
 
+/* [한국어] 한 워드(unsigned long)에 포함되는 비트 수의 log2 값.
+ * 64비트 시스템에서는 6 (2^6=64비트), 32비트에서는 5 (2^5=32비트) */
 #if BITS_PER_LONG == 64
 #define UNIT_SHIFT		6
 #elif BITS_PER_LONG == 32
@@ -53,6 +55,7 @@
 #error "Number of arch bits unknown"
 #endif
 
+/* [한국어] 한 워드에 들어가는 비트(블록) 수와 마스크 */
 #define BLOCKS_PER_UNIT		(1U << UNIT_SHIFT)
 #define BLOCKS_PER_UNIT_MASK	(BLOCKS_PER_UNIT - 1)
 
@@ -87,8 +90,11 @@ static const unsigned long bit_masks[] = {
  */
 struct axmap_level {
 	int level;
+	/* [한국어] 이 레벨의 인덱스. 0이 최하위(실제 비트), 상위로 갈수록 요약 정보 */
 	unsigned long map_size;
+	/* [한국어] map 배열의 원소 수 (unsigned long 워드 수) */
 	unsigned long *map;
+	/* [한국어] 비트맵 배열. 레벨 0은 실제 블록 사용 여부, 상위 레벨은 하위 워드가 모두 찼는지 표시 */
 };
 
 /**
@@ -100,10 +106,18 @@ struct axmap_level {
  */
 struct axmap {
 	unsigned int nr_levels;
+	/* [한국어] 계층의 수. log64(nr_bits)로 결정됨 */
 	struct axmap_level *levels;
+	/* [한국어] 레벨 배열. levels[0]이 실제 비트, levels[nr_levels-1]이 최상위 요약 */
 	uint64_t nr_bits;
+	/* [한국어] 추적하는 전체 블록(비트) 수. 랜덤 I/O의 총 블록 수에 해당 */
 };
 
+/*
+ * [한국어] axmap_reset - 비트맵의 모든 비트를 0으로 초기화
+ * 전체 레벨의 비트맵을 memset(0)으로 클리어한다.
+ * 호출 체인: 새 잡 시작 시 또는 axmap_new() 내부에서 호출
+ */
 /* Remove all elements from the @axmap set */
 void axmap_reset(struct axmap *axmap)
 {
@@ -116,6 +130,7 @@ void axmap_reset(struct axmap *axmap)
 	}
 }
 
+/* [한국어] axmap_free - axmap과 모든 레벨의 메모리를 해제 */
 void axmap_free(struct axmap *axmap)
 {
 	unsigned int i;
@@ -130,6 +145,17 @@ void axmap_free(struct axmap *axmap)
 	free(axmap);
 }
 
+/*
+ * [한국어] axmap_new - nr_bits 크기의 다단계 계층적 비트맵을 생성
+ *
+ * @nr_bits: 추적할 총 블록(비트) 수
+ * @return: 생성된 axmap 포인터 (실패 시 NULL)
+ *
+ * 레벨 수를 log64(nr_bits)로 계산하고, 각 레벨의 비트맵 메모리를 할당한다.
+ * 레벨 0은 nr_bits/64개의 워드, 레벨 1은 그보다 64배 적은 워드 수를 가진다.
+ *
+ * 호출 체인: io_u.c (init_rand_distribution 등) → [axmap_new]
+ */
 /* Allocate memory for a set that can store the numbers 0 .. @nr_bits - 1. */
 struct axmap *axmap_new(uint64_t nr_bits)
 {
@@ -140,6 +166,7 @@ struct axmap *axmap_new(uint64_t nr_bits)
 	if (!axmap)
 		return NULL;
 
+	/* [한국어] 필요한 레벨 수 계산: 각 레벨은 하위 레벨의 1/64 크기 */
 	levels = 1;
 	i = (nr_bits + BLOCKS_PER_UNIT - 1) >> UNIT_SHIFT;
 	while (i > 1) {
@@ -232,8 +259,8 @@ static bool axmap_handler_topdown(struct axmap *axmap, uint64_t bit_nr,
 }
 
 struct axmap_set_data {
-	unsigned int nr_bits;
-	unsigned int set_bits;
+	unsigned int nr_bits;	/* [한국어] 설정하려는 비트 수 (입력) */
+	unsigned int set_bits;	/* [한국어] 실제 설정된 비트 수 (출력, 레벨 0에서만 갱신) */
 };
 
 /*
@@ -304,6 +331,14 @@ static void __axmap_set(struct axmap *axmap, uint64_t bit_nr,
 	axmap_handler(axmap, bit_nr, axmap_set_fn, data);
 }
 
+/*
+ * [한국어] axmap_set - 단일 비트를 설정 (블록을 사용됨으로 표시)
+ *
+ * @axmap: 비트맵
+ * @bit_nr: 설정할 비트 번호 (블록 번호)
+ *
+ * 호출 체인: io_u.c (mark_random_map 등) → [axmap_set] → __axmap_set → axmap_handler
+ */
 void axmap_set(struct axmap *axmap, uint64_t bit_nr)
 {
 	struct axmap_set_data data = { .nr_bits = 1, };
@@ -349,6 +384,16 @@ static bool axmap_isset_fn(struct axmap_level *al, uint64_t offset,
 	return (al->map[offset] & (1ULL << bit)) != 0;
 }
 
+/*
+ * [한국어] axmap_isset - 특정 비트가 설정되었는지 확인
+ *
+ * @axmap: 비트맵
+ * @bit_nr: 확인할 비트 번호
+ * @return: 설정되어 있으면 true
+ *
+ * 최상위 레벨부터 하향 탐색(topdown)하여 효율적으로 확인한다.
+ * 상위 레벨의 비트가 0이면 하위의 모든 비트도 0이므로 조기 종료 가능.
+ */
 bool axmap_isset(struct axmap *axmap, uint64_t bit_nr)
 {
 	if (bit_nr <= axmap->nr_bits)
@@ -430,6 +475,19 @@ found:
 /*
  * 'bit_nr' is already set. Find the next free bit after this one.
  * Return -1 if no free bits found.
+ */
+/*
+ * [한국어] axmap_next_free - bit_nr 다음의 미설정 비트를 찾아 반환
+ *
+ * @axmap: 비트맵
+ * @bit_nr: 현재 비트 번호 (이미 설정된 비트)
+ * @return: 다음 미설정 비트 번호 (없으면 -1ULL)
+ *
+ * 먼저 레벨 0의 현재 워드에서 빈 비트를 O(1)로 빠르게 확인하고,
+ * 없으면 axmap_find_first_free()로 최상위부터 하향 탐색한다.
+ * 맵 끝에 도달하면 처음부터 wrap-around하여 재탐색한다.
+ *
+ * 호출 체인: io_u.c (get_next_rand_offset 등) → [axmap_next_free]
  */
 uint64_t axmap_next_free(struct axmap *axmap, uint64_t bit_nr)
 {

@@ -27,6 +27,7 @@
 #define read_barrier()		__asm__ __volatile__("fence r, r": : :"memory")
 #define write_barrier()		__asm__ __volatile__("fence w, w": : :"memory")
 
+/* [한국어] get_cpu_clock - RDTIME 명령어로 플랫폼 타이머 값을 읽어 시간을 측정한다 */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned long val;
@@ -44,6 +45,11 @@ static inline int arch_init(char *envp[])
 	return 0;
 }
 
+/*
+ * [한국어] RISC-V 직접 시스템 콜 매크로 (__do_syscall0 ~ __do_syscall6)
+ * ecall 명령어로 커널 시스템 콜을 직접 수행한다.
+ * RISC-V ABI: a7=시스콜번호, a0~a5=인자1~6
+ */
 #define __do_syscallM(...) ({						\
 	__asm__ volatile (						\
 		"ecall"							\

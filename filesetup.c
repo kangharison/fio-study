@@ -1,23 +1,30 @@
 /*
- * [한국어] filesetup.c - fio 파일/디바이스 셋업 모듈
+ * [한국어 설명] fio 파일/디바이스 셋업 모듈 (filesetup.c)
  *
- * 이 파일은 fio가 I/O 테스트를 시작하기 전에 파일/디바이스를 준비하는 모든 로직을 구현한다.
- * 주요 기능:
- *   1) setup_files()       - 파일 셋업 메인 함수. 크기 확인, 파일 생성/확장, I/O 범위 계산
- *   2) extend_file()       - 파일을 필요한 크기까지 확장 (데이터 채우기 포함)
- *   3) pre_read_file()     - 파일 사전 읽기 (페이지 캐시 워밍)
- *   4) generic_open_file() - I/O 엔진의 기본 파일 열기 구현
- *   5) generic_close_file()- I/O 엔진의 기본 파일 닫기 구현
- *   6) add_file()          - 작업에 파일 추가 및 초기 설정
- *   7) init_random_map()   - 랜덤 I/O를 위한 블록 맵/LFSR 초기화
+ * === 파일의 역할 ===
+ * 이 파일은 fio가 I/O 테스트를 시작하기 전에 파일/디바이스를 준비하는 모든 로직을
+ * 구현한다. 파일 크기 확인, 생성/확장, I/O 범위 계산, 사전 읽기(캐시 워밍),
+ * 파일 열기/닫기, 랜덤 맵 초기화 등을 담당한다.
  *
- * 파일 셋업 흐름:
- *   setup_files() -> get_file_sizes() -> 크기/오프셋 계산 -> extend_file() (필요시)
- *   -> prepopulate (필요시) -> init_random_map() (thread_main에서 호출)
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 thread_main()에서 setup_files()를 호출하여 파일을 준비한 뒤,
+ * do_io()에서 실제 I/O를 수행한다.
+ * 호출 체인: thread_main() [backend.c] → setup_files() [이 파일]
+ *           → get_file_sizes() → extend_file() → init_random_map()
  *
- * 파일 열기/닫기 흐름:
- *   generic_open_file() -> file_lookup_open() (해시에서 조회) -> open()
- *   generic_close_file() -> remove_file_hash() -> close()
+ * === 타 모듈과의 연결 ===
+ * - backend.c: thread_main()에서 setup_files()/init_random_map() 호출
+ * - ioengines.c: td_io_open_file()/td_io_close_file()이 generic_open/close_file() 호출
+ * - filehash.c: 파일 해시 테이블로 동일 파일 공유 관리
+ * - file.h: fio_file 구조체 정의
+ * - 핵심 자료구조: fio_file(파일 정보), thread_data(스레드 상태)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - setup_files(): 파일 셋업 메인 함수 (크기 확인, 생성/확장, 범위 계산)
+ * - generic_open_file(): I/O 엔진의 기본 파일 열기 구현
+ * - generic_close_file(): I/O 엔진의 기본 파일 닫기 구현
+ * - extend_file(): 파일을 필요한 크기까지 확장
+ * - init_random_map(): 랜덤 I/O를 위한 블록 맵/LFSR 초기화
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

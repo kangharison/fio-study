@@ -12,6 +12,20 @@
  *
  * 참고: CONFIG_PSHARED가 정의되지 않은 플랫폼(NetBSD/OpenBSD)에서는
  *       PTHREAD_PROCESS_SHARED 설정을 건너뛴다.
+ 
+ * === 파일의 역할 ===
+ * PTHREAD_PROCESS_SHARED 속성을 가진 mutex/cond 초기화 유틸리티를 구현.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 전체에서 프로세스 간 공유 동기화 프리미티브 초기화에 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - pshared.h: API 선언
+ * - fio_sem.c, workqueue.c 등: 공유 뮤텍스/조건변수 초기화 시 호출
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - mutex_init_pshared(): 공유 뮤텍스 초기화
+ * - cond_init_pshared(): 공유 조건변수 초기화 (MONOTONIC 클럭)
  */
 #include <string.h>
 

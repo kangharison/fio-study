@@ -1,3 +1,32 @@
+/*
+ * [한국어 설명] CRC/해시 알고리즘 벤치마크 테스트 구현 (test.c)
+ *
+ * === 파일의 역할 ===
+ * fio의 --crctest 옵션으로 실행되는 해시/체크섬 알고리즘 성능 벤치마크이다.
+ * 131072바이트(128KB) × 2048회 = 256MB 데이터를 각 알고리즘으로 처리하고
+ * MiB/sec 단위 처리량을 측정하여 출력한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio --crctest [알고리즘,...] 명령으로 실행된다.
+ * 호출 체인: main() [fio.c] → fio_crctest() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.c: --crctest 명령줄 옵션에서 fio_crctest() 호출
+ * - crc/*.h: 각 해시/체크섬 알고리즘의 API
+ * - hash.h: jhash 함수
+ * - lib/rand.h: 테스트 데이터 생성용 난수
+ * - gettime.h: 성능 측정용 시간 함수
+ *
+ * === 지원 알고리즘 (17종) ===
+ * md5, crc64, crc32, crc32c, crc16, crc7,
+ * sha1, sha256, sha512, sha3-224/256/384/512,
+ * xxhash, murmur3, jhash, fnv
+ *
+ * === 주요 함수 요약 ===
+ * - fio_crctest(): 메인 벤치마크 함수 - 알고리즘 선택/실행/결과 출력
+ * - t_md5(), t_crc32(), ... : 각 알고리즘별 테스트 래퍼 함수
+ * - get_test_mask(): 문자열에서 테스트할 알고리즘 비트마스크 파싱
+ */
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,14 +54,20 @@
 
 #include "test.h"
 
+/* [한국어] 테스트 청크 크기: 128KB - 한 번에 처리하는 데이터 블록 */
 #define CHUNK		131072U
+/* [한국어] 청크 반복 횟수: 2048회 - 총 256MB(128KB × 2048) 데이터 처리 */
 #define NR_CHUNKS	  2048U
 
+/*
+ * [한국어] 테스트 알고리즘 정보 구조체
+ * 각 해시/체크섬 알고리즘의 이름, 비트마스크, 실행 함수를 정의한다.
+ */
 struct test_type {
-	const char *name;
-	unsigned int mask;
-	void (*fn)(struct test_type *, void *, size_t);
-	uint32_t output;
+	const char *name;       /* 알고리즘 이름 (예: "md5", "crc32c") */
+	unsigned int mask;      /* 비트마스크 - 여러 알고리즘 동시 선택용 */
+	void (*fn)(struct test_type *, void *, size_t);  /* 벤치마크 실행 함수 포인터 */
+	uint32_t output;        /* 해시 출력값 - 컴파일러 최적화 방지용 */
 };
 
 enum {

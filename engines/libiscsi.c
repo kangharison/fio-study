@@ -1,22 +1,34 @@
 /*
- * [한국어 설명] iSCSI I/O 엔진 구현 (libiscsi.c)
+ * [한국어 설명] 유저스페이스 iSCSI initiator 기반 I/O 엔진 (libiscsi.c)
  *
- * === 엔진 개요 ===
- * libiscsi 라이브러리를 사용하여 iSCSI 타겟에 직접 접근하는 I/O 엔진이다.
- * 커널 iSCSI initiator 없이 사용자 공간에서 iSCSI 프로토콜을 구현하며,
- * SCSI READ/WRITE 명령을 통해 원격 iSCSI LUN에 I/O를 수행한다.
+ * === 파일의 역할 ===
+ * libiscsi(유저스페이스 iSCSI initiator 라이브러리)를 사용해 원격 iSCSI 타겟/LUN에
+ * SCSI READ16/WRITE16 명령으로 직접 I/O를 수행하는 fio 엔진 "libiscsi"를 구현한다.
+ * 커널의 open-iscsi initiator나 tcm_loop에 의존하지 않고, poll(2) 기반 이벤트 루프로
+ * 비동기 완료를 처리한다. fio의 각 파일 이름은 iSCSI URL(iscsi://host/iqn/lun)로
+ * 해석되어 struct iscsi_lun 하나에 매핑된다.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * libiscsi - iSCSI 접근 (iscsi_create_context, iscsi_full_connect_sync,
- *            iscsi_pread16_iov_task, iscsi_pwrite16_iov_task 등)
- * poll() - iSCSI 소켓 이벤트 대기
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=libiscsi로 선택되는 플러그인. 실행 흐름: backend.c → td_io_init →
+ * fio_iscsi_setup/_init → open_file(iscsi_create_context + iscsi_full_connect_sync +
+ * READ CAPACITY로 block_size/num_blocks 확보) → I/O 루프(queue에서
+ * iscsi_pread16_iov_task/iscsi_pwrite16_iov_task 제출, getevents에서 poll+
+ * iscsi_service로 완료 수확) → cleanup. 실행 컨텍스트는 fio 잡 스레드 1개.
  *
- * === fio에서의 사용법 ===
- * --ioengine=libiscsi 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c, options.c).
+ * 하단: libiscsi(iscsi_create_context/destroy_context/full_connect_sync/
+ *       pread16_iov_task/pwrite16_iov_task/service/get_fd/which_events),
+ *       poll(2) 시스콜.
+ * 데이터 흐름: io_u->xfer_buf(iov 하나) ↔ SCSI CDB(READ16/WRITE16) ↔ TCP/IP ↔ 타겟 LBA.
+ * 공유 상태: iscsi_info(td->io_ops_data), 여러 LUN 배열(luns[]), 완료 이벤트 큐.
  *
- * === 구현하는 주요 콜백 ===
- * .setup, .init, .prep, .queue, .getevents, .event,
- * .cleanup, .open_file, .close_file
+ * === 주요 함수/구조체 요약 ===
+ * - fio_iscsi_setup()/_init(): 옵션 파싱과 iscsi_info 할당.
+ * - fio_iscsi_open_file(): iSCSI URL 파싱, 컨텍스트 생성, 동기 연결, READ CAPACITY.
+ * - fio_iscsi_queue(): READ16/WRITE16 비동기 제출, 완료 콜백에서 complete_events 등록.
+ * - fio_iscsi_getevents()/_event(): poll + iscsi_service 루프로 완료 수확.
+ * - struct iscsi_task/iscsi_lun/iscsi_info: 작업 단위/LUN/엔진 전역 상태.
  */
 
 /*
@@ -37,26 +49,29 @@
 struct iscsi_lun;
 struct iscsi_info;
 
+/* [한국어] 개별 iSCSI 작업 상태 구조체 */
 struct iscsi_task {
-	struct scsi_task	*scsi_task;
-	struct iscsi_lun	*iscsi_lun;
-	struct io_u		*io_u;
+	struct scsi_task	*scsi_task;	/* [한국어] libiscsi SCSI 작업 핸들 */
+	struct iscsi_lun	*iscsi_lun;	/* [한국어] 이 작업이 대상으로 하는 LUN */
+	struct io_u		*io_u;		/* [한국어] 대응하는 fio io_u */
 };
 
+/* [한국어] 개별 iSCSI LUN 정보 구조체 */
 struct iscsi_lun {
-	struct iscsi_info	*iscsi_info;
-	struct iscsi_context	*iscsi;
-	struct iscsi_url        *url;
-	int			 block_size;
-	uint64_t		 num_blocks;
+	struct iscsi_info	*iscsi_info;	/* [한국어] 상위 iscsi_info 구조체 참조 */
+	struct iscsi_context	*iscsi;		/* [한국어] libiscsi 연결 컨텍스트 */
+	struct iscsi_url        *url;		/* [한국어] 파싱된 iSCSI URL */
+	int			 block_size;	/* [한국어] LUN의 논리 블록 크기 */
+	uint64_t		 num_blocks;	/* [한국어] LUN의 총 블록 수 */
 };
 
+/* [한국어] iSCSI 엔진의 전체 상태 구조체 - thread_data->io_ops_data에 저장 */
 struct iscsi_info {
-	struct iscsi_lun	**luns;
-	int			  nr_luns;
-	struct pollfd		 *pfds;
-	struct iscsi_task	**complete_events;
-	int			  nr_events;
+	struct iscsi_lun	**luns;			/* [한국어] LUN 배열 - 각 파일이 하나의 LUN에 대응 */
+	int			  nr_luns;		/* [한국어] 열린 LUN 수 */
+	struct pollfd		 *pfds;			/* [한국어] poll용 파일 디스크립터 배열 */
+	struct iscsi_task	**complete_events;	/* [한국어] 완료된 작업 배열 */
+	int			  nr_events;		/* [한국어] 완료된 이벤트 수 */
 };
 
 struct iscsi_options {

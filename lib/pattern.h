@@ -40,9 +40,11 @@
  * be called to paste something inside the buffer.
  */
 struct pattern_fmt_desc {
-	const char  *fmt;
-	unsigned int len;
+	const char  *fmt;	/* [한국어] 포맷 문자열 (예: "%o" = 오프셋) */
+	unsigned int len;	/* [한국어] 이 포맷이 버퍼에서 차지하는 바이트 수 */
 	int (*paste)(char *buf, unsigned int len, void *priv);
+	/* [한국어] 런타임에 동적 값을 버퍼에 기록하는 콜백 함수.
+	 * priv는 io_u 등 컨텍스트 정보를 전달하는 데 사용됨 */
 };
 
 /**
@@ -50,8 +52,8 @@ struct pattern_fmt_desc {
  * Describes the exact position inside the xbuffer.
  */
 struct pattern_fmt {
-	unsigned int off;
-	const struct pattern_fmt_desc *desc;
+	unsigned int off;	/* [한국어] 이 포맷이 패턴 버퍼 내에서 시작하는 오프셋 */
+	const struct pattern_fmt_desc *desc;	/* [한국어] 이 포맷의 설명자 (fmt, len, paste 콜백) */
 };
 
 int parse_and_fill_pattern_alloc(const char *in, unsigned int in_len,

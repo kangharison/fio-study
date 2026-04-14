@@ -1,3 +1,18 @@
+/*
+ * [한국어 설명] QNX 플랫폼 OS 추상화 헤더 (os-qnx.h)
+ *
+ * === 파일의 역할 ===
+ * QNX RTOS에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * fstat으로 블록 디바이스 크기 조회, SYSPAGE를 통한 물리 메모리 계산,
+ * SHM 미지원(FIO_NO_HAVE_SHM_H) 등 QNX 고유 특성을 처리.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __QNX__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - blockdev_size(): fstat()으로 blocksize * nblocks 계산
+ * - os_phys_mem(): SYSPAGE asinfo에서 "ram" 영역 합산
+ */
 #ifndef FIO_OS_QNX_H
 #define FIO_OS_QNX_H
 
@@ -69,6 +84,12 @@ static inline int blockdev_invalidate_cache(struct fio_file *f)
 	return ENOTSUP;
 }
 
+/*
+ * [한국어]
+ * os_phys_mem - QNX 시스템 물리 메모리 조회
+ * QNX의 SYSPAGE(시스템 페이지)에서 asinfo 항목을 순회하며
+ * "ram" 타입 메모리 영역의 크기를 합산한다.
+ */
 static inline unsigned long long os_phys_mem(void)
 {
 	uint64_t mem = 0;

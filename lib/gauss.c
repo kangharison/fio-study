@@ -23,8 +23,18 @@
 #include "../hash.h"
 #include "gauss.h"
 
+/* [한국어] CLT(중심극한정리) 합산 횟수: 12개의 균등 난수를 합산하면 정규 분포에 근사 */
 #define GAUSS_ITERS	12
 
+/*
+ * [한국어] gauss_dev - 표준편차 범위 내에서 추가 편차를 생성
+ *
+ * @gs: 가우시안 상태
+ * @return: [-stddev/2, +stddev/2) 범위의 균등 분포 편차값
+ *
+ * 순수 CLT 분포에 추가적인 분산을 더하여 꼬리(tail) 부분을 확장하는 역할.
+ * stddev가 0이면 이 함수는 0을 반환하여 순수 CLT만 사용하게 된다.
+ */
 static int gauss_dev(struct gauss_state *gs)
 {
 	unsigned int r;
@@ -39,11 +49,24 @@ static int gauss_dev(struct gauss_state *gs)
 	return vr - gs->stddev / 2;
 }
 
+/*
+ * [한국어] gauss_next - 가우시안 분포를 따르는 다음 값을 생성
+ *
+ * @gs: 가우시안 상태
+ * @return: [0, nranges-1] 범위의 정규 분포 값
+ *
+ * 1. 12개의 균등 난수를 합산하여 CLT로 정규 분포를 근사
+ * 2. stddev가 설정되어 있으면 추가 편차를 더함 (범위 초과 방지 포함)
+ * 3. 해시로 공간적 편향을 분산시키고 중심 오프셋을 더함
+ *
+ * 호출 체인: io_u.c (get_next_rand_offset) → [gauss_next]
+ */
 unsigned long long gauss_next(struct gauss_state *gs)
 {
 	unsigned long long sum = 0;
 	int i;
 
+	/* [한국어] CLT: 12개 균등 난수의 합 → 평균을 취하면 정규 분포에 근사 */
 	for (i = 0; i < GAUSS_ITERS; i++)
 		sum += __rand(&gs->r) % (gs->nranges + 1);
 
@@ -52,17 +75,30 @@ unsigned long long gauss_next(struct gauss_state *gs)
 	if (gs->stddev) {
 		int dev = gauss_dev(gs);
 
+		/* [한국어] 편차를 더했을 때 범위를 초과하면 반으로 줄여 범위 내로 맞춤 */
 		while (dev + sum >= gs->nranges)
 			dev /= 2;
 		sum += dev;
 	}
 
+	/* [한국어] 해시로 연속적인 CLT 값을 공간적으로 분산 */
 	if (!gs->disable_hash)
 		sum = __hash_u64(sum);
 
 	return (sum + gs->rand_off) % gs->nranges;
 }
 
+/*
+ * [한국어] gauss_init - 가우시안 분포 생성기 초기화
+ *
+ * @gs: 초기화할 가우시안 상태
+ * @nranges: 전체 블록 범위
+ * @dev: 표준편차 백��율 (0이면 순수 CLT, 100이면 nranges/2)
+ * @center: 분포 중심 (0.0~1.0, -1이면 기본 중심)
+ * @seed: 난수 시드
+ *
+ * 호출 체인: init.c (init_rand_distribution) → [gauss_init]
+ */
 void gauss_init(struct gauss_state *gs, unsigned long nranges, double dev,
 		double center, unsigned int seed)
 {

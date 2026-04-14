@@ -28,6 +28,27 @@
  *     - zbd_adjust_ddir(): I/O 방향 조정 (빈 존 읽기 → 쓰기로 전환)
  *     - zbd_queue_io()/zbd_put_io(): I/O 후처리 (WP 업데이트, 존 상태 추적)
  *     - zbd_recover_write_error(): 쓰기 실패 시 존 상태 복구
+ *
+ * === 파일의 역할 ===
+ * NVMe ZNS, SMR HDD 등 존 기반 블록 디바이스를 위한 fio 확장을 구현한다.
+ * 존 관리(리셋/마감), 초기화(모델 감지, 존 정보 로드), I/O 조정(오프셋/방향)을 담당.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * init.c에서 zbd_init_files()로 ZBD를 초기화하고, backend.c의 do_io()에서
+ * zbd_adjust_block()으로 I/O를 존 제약에 맞게 조정한다.
+ * 호출 체인: do_io() [backend.c] → zbd_adjust_block() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: do_io()에서 zbd_adjust_block()/zbd_queue_io() 호출
+ * - init.c: zbd_init_files()로 초기화
+ * - zbd.h: API 선언, fio_zone_info 구조체
+ * - oslib/blkzoned.h: OS별 ZBD 인터페이스
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - zbd_adjust_block(): I/O 오프셋/크기를 존 제약에 맞게 조정 (핵심)
+ * - zbd_init_files(): ZBD 모델 감지 및 존 정보 로드
+ * - zbd_reset_zone(): 개별 존 리셋 (WP를 존 시작으로)
+ * - zone_lock()/zone_unlock(): 존 뮤텍스 관리 (데드락 방지)
  */
 #include <errno.h>
 #include <string.h>

@@ -24,11 +24,11 @@
 #include "rand.h"
 
 struct gauss_state {
-	struct frand_state r;
-	uint64_t nranges;
-	unsigned int stddev;
-	unsigned int rand_off;
-	bool disable_hash;
+	struct frand_state r;		/* [한국어] 내부 Tausworthe PRNG 상태 */
+	uint64_t nranges;		/* [한국어] 전체 블록 범위 (오프셋 수) */
+	unsigned int stddev;		/* [한국어] 표준편차 (dev%로부터 계산된 블록 수, 0이면 순수 CLT) */
+	unsigned int rand_off;		/* [한국어] 분포 중심 오프셋 */
+	bool disable_hash;		/* [한국어] true이면 해시 분산 비활성화 */
 };
 
 void gauss_init(struct gauss_state *gs, unsigned long nranges, double dev,

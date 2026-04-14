@@ -1,22 +1,47 @@
 /*
  * [한국어 설명] Ceph RADOS 오브젝트 스토어 I/O 엔진 구현 (rados.c)
  *
- * === 엔진 개요 ===
- * Ceph의 librados 라이브러리를 사용하여 RADOS 오브젝트 저장소에 직접 오브젝트 수준의
- * I/O를 수행하는 엔진이다. RBD와 달리 블록 디바이스가 아닌 오브젝트 단위로 접근하며,
- * Ceph OSD의 저수준 성능을 측정하는 데 적합하다. 비동기 I/O 작업을 지원한다.
+ * === 파일의 역할 ===
+ * 이 파일은 fio가 Ceph 분산 스토리지의 최하위 계층인 RADOS(Reliable Autonomic
+ * Distributed Object Store)에 직접 오브젝트 단위로 I/O를 발생시키게 하는 I/O 엔진이다.
+ * RBD 엔진(rbd.c)이 블록 디바이스 추상화를 테스트한다면, 이 엔진은 그 하위 계층인
+ * OSD(Object Storage Daemon)의 오브젝트 read/write/remove 경로 성능만을 고립해서
+ * 측정하기 위해 존재한다. 모든 I/O는 librados의 비동기(aio) API로 제출되며,
+ * RADOS 라이브러리가 완료 콜백(complete_callback)을 통해 fio로 완료를 통지한다.
+ * 엔진은 FIO_DISKLESSIO 플래그를 설정해 fio 코어가 실제 파일을 생성하지 않게 하고,
+ * 파일 이름 문자열을 오브젝트 이름으로 재사용한다.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * librados - RADOS 오브젝트 접근 (rados_aio_write, rados_aio_read, rados_aio_remove 등)
- * librados - 클러스터 연결 (rados_create, rados_connect, rados_ioctx_create)
- * pthread mutex/cond - 완료된 I/O 동기화
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 실행 흐름 main() → fio_backend() → load_ioengine("rados") 과정에서
+ * fio_rados_register()(파일 끝) 가 모듈 초기화 시 이 엔진을 등록한다.
+ * 잡 스레드는 td_io_init → fio_rados_setup → _fio_rados_connect 로 클러스터에
+ * 연결한 뒤, 잡 루프에서 get_io_u → td_io_queue(=fio_rados_queue) 로 I/O를
+ * 제출하고 td_io_getevents(=fio_rados_getevents) 로 완료를 수확한다.
+ * 완료는 librados 내부 메신저 스레드가 complete_callback 을 호출해 알려주므로,
+ * 실행 컨텍스트가 "잡 스레드"와 "librados 콜백 스레드" 두 곳으로 나뉜다.
  *
- * === fio에서의 사용법 ===
- * --ioengine=rados 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * 상위: ioengines.c(td_io_* 래퍼) → 이 파일의 ioengine_ops 콜백.
+ * 하위: librados (rados_create/connect/ioctx_create, rados_aio_write/read,
+ *        rados_create_write_op + rados_write_op_zero 로 TRIM 구현).
+ * 공유 상태: rados_data(클러스터·ioctx 핸들, 완료 리스트, 뮤텍스/조건변수) 를
+ *            td->io_ops_data 로 fio 코어와 공유하고, io_u 당 fio_rados_iou 를
+ *            io_u->engine_data 로 매달아 queue→callback→getevents 사이에서 추적한다.
+ * 데이터 흐름: fio가 버퍼를 채워 io_u 로 넘겨주면 → queue 가 librados AIO 호출로
+ *              OSD에 보내고 → 콜백 스레드가 완료 리스트에 넣고 → getevents 가 뽑아
+ *              aio_events[] 로 fio 에 반환한다.
  *
- * === 구현하는 주요 콜백 ===
- * .setup, .queue, .getevents, .event, .cleanup,
- * .open_file, .invalidate, .io_u_init, .io_u_free
+ * === 주요 함수/구조체 요약 ===
+ * - fio_rados_setup: 잡 스레드 1회. 상태 구조체 할당 후 클러스터에 연결.
+ * - _fio_rados_connect: cluster_name/client_name 규칙(`client.<id>`)에 맞춰
+ *   rados_create2/rados_create 선택, conf 읽고 풀 ioctx 생성, touch_objects
+ *   옵션일 때 오브젝트 0바이트 write 로 "존재"를 만든다.
+ * - fio_rados_queue: ddir 별로 rados_aio_write / rados_aio_read / write_op+zero
+ *   (TRIM) 분기. 각 호출마다 rados_completion_t 를 새로 만든다.
+ * - complete_callback: librados 콜백 스레드에서 실행. 완료 리스트에 링크하고
+ *   조건변수로 잡 스레드를 깨움.
+ * - fio_rados_getevents: min/max 를 만족할 때까지 대기하며 완료 리스트를 드레인.
+ * - struct rados_data: 엔진 전역 상태. struct fio_rados_iou: io_u 당 완료 핸들.
  */
 
 /*
@@ -27,63 +52,154 @@
  *
  */
 
-#include <rados/librados.h>
-#include <pthread.h>
-#include "fio.h"
-#include "../optgroup.h"
+#include <rados/librados.h>     /* [한국어] librados C API (rados_t, rados_ioctx_t, rados_aio_*). Ceph 클러스터에 오브젝트 I/O 를 보내는 유일한 외부 의존성. */
+#include <pthread.h>            /* [한국어] 완료 리스트를 보호하는 뮤텍스와 잡 스레드를 깨우는 조건변수를 사용하기 위해 필요. librados 콜백 스레드와의 공유가 있으므로 필수. */
+#include "fio.h"                /* [한국어] fio 코어 자료구조(thread_data, io_u, fio_file, ioengine_ops 등) 선언. 모든 엔진의 공통 의존성. */
+#include "../optgroup.h"        /* [한국어] FIO_OPT_C_ENGINE / FIO_OPT_G_RBD 옵션 그룹 상수 정의. options[] 의 category/group 에 필요. */
 
+/*
+ * [한국어] struct rados_data — RADOS 엔진이 잡(td) 당 보유하는 내부 상태.
+ * td->io_ops_data 로 연결되며, _fio_setup_rados_data 에서 calloc 되고
+ * fio_rados_cleanup 에서 해제된다. 완료 리스트는 잡 스레드(소비자)와
+ * librados 콜백 스레드(생산자) 가 공유하므로 뮤텍스·조건변수로 보호한다.
+ */
 struct rados_data {
 	rados_t cluster;
+	/* [한국어] RADOS 클러스터 핸들(불투명 포인터).
+	 * 설정자: _fio_rados_connect 의 rados_create/rados_create2.
+	 * 읽는 자: rados_connect, rados_ioctx_create, rados_shutdown.
+	 * 값 범위: 유효한 클러스터 핸들 또는 NULL(연결 전/해제 후).
+	 * 동기화: 잡 스레드 안에서만 조작되므로 별도 락 불필요. */
+
 	rados_ioctx_t io_ctx;
+	/* [한국어] 특정 풀(pool)에 대한 I/O 컨텍스트. 오브젝트 수준 R/W/TRIM 에 사용.
+	 * 설정자: rados_ioctx_create 성공 후 저장.
+	 * 읽는 자: queue() 내 rados_aio_write/read/write_op_operate, cleanup 의 remove.
+	 * 값 범위: 유효한 ioctx 또는 NULL.
+	 * 동기화: librados 내부적으로 thread-safe. 우리는 덮어쓰지 않으므로 락 불필요. */
+
 	struct io_u **aio_events;
+	/* [한국어] getevents 가 채워 fio 에 돌려주는 완료된 io_u 포인터 배열.
+	 * 설정자: fio_rados_getevents 가 인덱스 순으로 저장.
+	 * 읽는 자: fio_rados_event(td, i) 가 i 번째 완료 io_u 를 반환할 때.
+	 * 크기: td->o.iodepth. 동기화: getevents 와 event 는 같은 잡 스레드에서 순차 실행되므로 락 불필요. */
+
 	bool connected;
+	/* [한국어] 클러스터에 성공적으로 connect 했는지 여부. setup 에서 true 로 바뀐다.
+	 * cleanup 경로가 반쯤 초기화된 상태를 만날 때 분기 지표로 사용될 수 있다. */
+
 	pthread_mutex_t completed_lock;
+	/* [한국어] completed_operations 리스트와 ops_completed 카운터를 보호.
+	 * 생산자: librados 콜백 스레드(complete_callback).
+	 * 소비자: 잡 스레드(fio_rados_getevents, fio_rados_cleanup). */
+
 	pthread_cond_t completed_more_io;
+	/* [한국어] 완료가 발생했음을 잡 스레드에 통지하는 조건변수.
+	 * signal: complete_callback. wait: getevents(min 만족 전) 와 cleanup(drain). */
+
 	struct flist_head completed_operations;
+	/* [한국어] 완료된 fio_rados_iou 들의 연결 리스트(FIFO).
+	 * flist_add_tail 로 push, flist_first_entry/flist_del 로 pop.
+	 * completed_lock 필수. */
+
 	uint64_t ops_scheduled;
+	/* [한국어] queue() 가 librados 로 AIO 를 제출한 누적 수. cleanup 에서 drain 조건에 사용. */
+
 	uint64_t ops_completed;
+	/* [한국어] complete_callback 이 누적한 완료 수. scheduled==completed 이면 in-flight 0. */
 };
 
+/*
+ * [한국어] struct fio_rados_iou — io_u 하나에 묶이는 엔진 고유 컨텍스트.
+ * io_u_init 에서 할당되어 io_u->engine_data 에 매달리며 io_u_free 에서 해제된다.
+ * queue→callback→getevents 사이에서 완료 핸들과 write_op 를 전달하는 매개체이다.
+ */
 struct fio_rados_iou {
 	struct flist_head list;
+	/* [한국어] rados_data->completed_operations 에 매다는 링크 필드.
+	 * 설정자: complete_callback. 읽는 자: getevents. 동기화: completed_lock. */
+
 	struct thread_data *td;
+	/* [한국어] 이 io_u 가 소속된 잡의 thread_data 역참조.
+	 * 콜백이 io_ops_data(=rados_data) 에 접근할 수 있게 하는 경로이다.
+	 * io_u_init 에서 설정, io_u_free 에서 NULL 로 클리어. */
+
 	struct io_u *io_u;
+	/* [한국어] 이 엔진 컨텍스트에 대응하는 fio io_u.
+	 * 설정자: io_u_init. 읽는 자: getevents 가 aio_events[] 에 저장할 때.
+	 * 값 범위: 유효한 io_u 포인터(NULL 불가). */
+
 	rados_completion_t completion;
+	/* [한국어] librados 비동기 완료 핸들. rados_aio_create_completion 으로 queue 시 생성,
+	 * complete_callback 등록. getevents 에서 rados_aio_release 로 해제 후 NULL.
+	 * 동기화: librados 내부 상태는 thread-safe. */
+
 	rados_write_op_t write_op;
+	/* [한국어] TRIM(DDIR_TRIM) 처리용 write_op. rados_write_op_zero 로 영역 무효화.
+	 * READ/WRITE 경로에서는 NULL 로 남는다.
+	 * 해제: getevents 또는 io_u_free 에서 rados_release_write_op. */
 };
 
+/*
+ * [한국어] struct rados_options — 잡 파일/CLI 에서 파싱된 엔진 전용 옵션.
+ * pad 선행 필드는 fio option 파서가 offsetof 계산 시 기준점으로 사용하는 관례.
+ */
 /* fio configuration options read from the job file */
 struct rados_options {
 	void *pad;
+	/* [한국어] fio 옵션 파싱 시 option_struct_size 와 함께 기준 주소로 사용되는 패딩.
+	 * 코드상 의미 없는 값이지만 규약상 첫 필드로 둔다. */
+
 	char *cluster_name;
+	/* [한국어] Ceph 클러스터 이름. NULL 이면 rados_create(기본 "ceph") 경로로 fallback.
+	 * 설정자: --clustername. 읽는 자: _fio_rados_connect. */
+
 	char *pool_name;
+	/* [한국어] 대상 풀 이름. 필수. NULL 이면 connect 에서 에러.
+	 * 설정자: --pool. 읽는 자: rados_ioctx_create. */
+
 	char *client_name;
+	/* [한국어] RADOS 클라이언트 ID. cluster_name 지정 시 "client." 접두어를 자동 부여.
+	 * 설정자: --clientname. */
+
 	char *conf;
+	/* [한국어] ceph.conf 파일 경로. 기본 /etc/ceph/ceph.conf. rados_conf_read_file 에서 사용. */
+
 	int busy_poll;
+	/* [한국어] 완료 수확 시 busy-poll 여부. 현 코드 상 조건변수 대기를 사용하므로
+	 * 옵션은 파싱되지만 실제 분기 영향은 제한적(호환용 플래그). */
+
 	int touch_objects;
+	/* [한국어] setup 시 0바이트 write 로 오브젝트를 "생성"할지 여부. 기본 1.
+	 * 미존재 오브젝트에 대한 read 가 ENOENT 가 되는 것을 방지. */
 };
 
+/*
+ * [한국어] options[] — fio 옵션 파서에 등록할 엔진 옵션 테이블.
+ * 각 항목은 name, 타입, 저장 오프셋, 카테고리/그룹(=RBD 그룹과 공유) 로 구성된다.
+ * 테이블 끝은 .name = NULL 로 마감한다.
+ */
 static struct fio_option options[] = {
 	{
-		.name     = "clustername",
-		.lname    = "ceph cluster name",
-		.type     = FIO_OPT_STR_STORE,
-		.help     = "Cluster name for ceph",
-		.off1     = offsetof(struct rados_options, cluster_name),
-		.category = FIO_OPT_C_ENGINE,
-		.group    = FIO_OPT_G_RBD,
+		.name     = "clustername",                                          /* [한국어] CLI/잡파일에서 사용할 옵션 이름. */
+		.lname    = "ceph cluster name",                                    /* [한국어] long name(도움말 표기용). */
+		.type     = FIO_OPT_STR_STORE,                                      /* [한국어] 문자열을 그대로 저장하는 타입. */
+		.help     = "Cluster name for ceph",                                /* [한국어] --help 출력 설명. */
+		.off1     = offsetof(struct rados_options, cluster_name),           /* [한국어] 파싱 결과를 저장할 구조체 내 오프셋. */
+		.category = FIO_OPT_C_ENGINE,                                       /* [한국어] 엔진 카테고리. */
+		.group    = FIO_OPT_G_RBD,                                          /* [한국어] RBD/RADOS 공용 옵션 그룹. */
 	},
 	{
-		.name     = "pool",
+		.name     = "pool",                                                 /* [한국어] Ceph 풀 이름 지정. 필수 옵션. */
 		.lname    = "pool name to use",
 		.type     = FIO_OPT_STR_STORE,
 		.help     = "Ceph pool name to benchmark against",
-		.off1     = offsetof(struct rados_options, pool_name),
+		.off1     = offsetof(struct rados_options, pool_name),              /* [한국어] rados_options.pool_name 에 저장. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "clientname",
+		.name     = "clientname",                                           /* [한국어] RADOS 클라이언트 ID. */
 		.lname    = "rados engine clientname",
 		.type     = FIO_OPT_STR_STORE,
 		.help     = "Name of the ceph client to access RADOS engine",
@@ -92,426 +208,580 @@ static struct fio_option options[] = {
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "conf",
+		.name     = "conf",                                                 /* [한국어] ceph.conf 경로. */
 		.lname    = "ceph configuration file path",
 		.type     = FIO_OPT_STR_STORE,
 		.help     = "Path of the ceph configuration file",
 		.off1     = offsetof(struct rados_options, conf),
-		.def      = "/etc/ceph/ceph.conf",
+		.def      = "/etc/ceph/ceph.conf",                                  /* [한국어] 미지정 시 기본 경로. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "busy_poll",
+		.name     = "busy_poll",                                            /* [한국어] busy-poll 수확 모드 on/off. */
 		.lname    = "busy poll mode",
 		.type     = FIO_OPT_BOOL,
 		.help     = "Busy poll for completions instead of sleeping",
 		.off1     = offsetof(struct rados_options, busy_poll),
-		.def	  = "0",
+		.def	  = "0",                                                    /* [한국어] 기본 OFF(조건변수 대기). */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "touch_objects",
+		.name     = "touch_objects",                                        /* [한국어] setup 시 오브젝트 프리터치. */
 		.lname    = "touch objects on start",
 		.type     = FIO_OPT_BOOL,
 		.help     = "Touch (create) objects on start",
 		.off1     = offsetof(struct rados_options, touch_objects),
-		.def	  = "1",
+		.def	  = "1",                                                    /* [한국어] 기본 ON. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = NULL,
+		.name     = NULL,                                                   /* [한국어] 테이블 종단 표식. */
 	},
 };
 
+/*
+ * [한국어]
+ * _fio_setup_rados_data - 엔진 상태 구조체(rados_data)를 할당·초기화한다.
+ *
+ * @td: 이 잡의 thread_data. 이미 io_ops_data 가 있으면 재사용.
+ * @rados_data_ptr: 출력 파라미터. 성공 시 할당된 rados_data 포인터가 기록된다.
+ * @return: 0 성공, 1 실패(할당 실패 등). 호출자는 실패 시 cleanup 경로로 간다.
+ *
+ * 왜 필요한가: 클러스터 핸들, 완료 동기화 객체, 완료 리스트, aio_events 배열을
+ *              한 덩어리로 묶어 관리하기 위해서이다.
+ * 실행 컨텍스트: fio_rados_setup 에서 잡 스레드가 1회 호출한다.
+ * 호출 체인: fio_rados_setup → _fio_setup_rados_data → calloc/pthread_*_init.
+ */
 static int _fio_setup_rados_data(struct thread_data *td,
 				struct rados_data **rados_data_ptr)
 {
-	struct rados_data *rados;
+	struct rados_data *rados;                                               /* [한국어] 할당할 엔진 상태 임시 포인터. */
 
-	if (td->io_ops_data)
+	if (td->io_ops_data)                                                    /* [한국어] 이미 세팅되어 있으면 중복 할당 방지. */
 		return 0;
 
-	rados = calloc(1, sizeof(struct rados_data));
-	if (!rados)
+	rados = calloc(1, sizeof(struct rados_data));                           /* [한국어] 0으로 초기화된 상태 구조체 할당(플래그·포인터 안전). */
+	if (!rados)                                                             /* [한국어] OOM 시 failed 로. */
 		goto failed;
 
-	rados->connected = false;
+	rados->connected = false;                                               /* [한국어] connect 성공 시점에만 true 로 바꾼다. */
 
-	rados->aio_events = calloc(td->o.iodepth, sizeof(struct io_u *));
-	if (!rados->aio_events)
+	rados->aio_events = calloc(td->o.iodepth, sizeof(struct io_u *));       /* [한국어] 완료 반환 배열. 크기는 잡의 iodepth. */
+	if (!rados->aio_events)                                                 /* [한국어] 배열 할당 실패 시 failed 로. */
 		goto failed;
-	pthread_mutex_init(&rados->completed_lock, NULL);
-	pthread_cond_init(&rados->completed_more_io, NULL);
-	INIT_FLIST_HEAD(&rados->completed_operations);
-	rados->ops_scheduled = 0;
-	rados->ops_completed = 0;
-	*rados_data_ptr = rados;
-	return 0;
+	pthread_mutex_init(&rados->completed_lock, NULL);                       /* [한국어] 완료 리스트용 뮤텍스 초기화. */
+	pthread_cond_init(&rados->completed_more_io, NULL);                     /* [한국어] "완료 이벤트 왔음" 신호용 조건변수 초기화. */
+	INIT_FLIST_HEAD(&rados->completed_operations);                          /* [한국어] flist 헤드 자기 참조 초기화. */
+	rados->ops_scheduled = 0;                                               /* [한국어] 제출 카운터 0. */
+	rados->ops_completed = 0;                                               /* [한국어] 완료 카운터 0. */
+	*rados_data_ptr = rados;                                                /* [한국어] 호출자에게 상태 포인터 반환. */
+	return 0;                                                               /* [한국어] 성공. */
 
 failed:
-	if (rados) {
+	if (rados) {                                                            /* [한국어] 부분 할당된 상태를 풀어준다(누수 방지). */
 		if (rados->aio_events)
 			free(rados->aio_events);
 		free(rados);
 	}
-	return 1;
+	return 1;                                                               /* [한국어] 실패 코드. */
 }
 
+/*
+ * [한국어]
+ * _fio_rados_rm_objects - 잡이 사용한 오브젝트들을 풀에서 제거한다.
+ *
+ * @td: 잡의 thread_data. td->files[] 가 오브젝트 이름(file_name) 소스.
+ * @rados: 유효한 ioctx 를 가진 엔진 상태.
+ *
+ * 왜 필요한가: 테스트 종료 시 남은 오브젝트를 청소해 반복 실행 간 상태를 깨끗이 유지.
+ * 실행 컨텍스트: cleanup 또는 setup 실패 롤백 경로에서 잡 스레드가 호출.
+ * 에러 처리: rados_remove 의 반환값은 무시한다(존재하지 않아도 문제없음).
+ */
 static void _fio_rados_rm_objects(struct thread_data *td, struct rados_data *rados)
 {
-	size_t i;
-	for (i = 0; i < td->o.nr_files; i++) {
-		struct fio_file *f = td->files[i];
-		rados_remove(rados->io_ctx, f->file_name);
+	size_t i;                                                               /* [한국어] 파일 순회 인덱스. */
+	for (i = 0; i < td->o.nr_files; i++) {                                  /* [한국어] 잡의 모든 파일(오브젝트) 순회. */
+		struct fio_file *f = td->files[i];                              /* [한국어] 해당 fio_file. */
+		rados_remove(rados->io_ctx, f->file_name);                      /* [한국어] 오브젝트 이름=파일 이름 으로 RADOS 에서 삭제 요청. */
 	}
 }
 
+/*
+ * [한국어]
+ * _fio_rados_connect - Ceph 클러스터에 연결하고 ioctx 를 만든 뒤, 필요 시 오브젝트를 프리터치.
+ *
+ * @td: 잡 스레드의 thread_data.
+ * @return: 0 성공, 1 실패(클라 생성/설정파일/connect/ioctx/오브젝트 생성 중 하나라도 실패).
+ *
+ * 왜 필요한가: 실제 I/O 를 내보내기 전에 클러스터·풀·오브젝트 존재를 보장해야 측정 노이즈를 줄일 수 있다.
+ * 실행 컨텍스트: 잡 스레드(setup 단계)에서 1회 호출.
+ * 호출 체인: fio_rados_setup → _fio_rados_connect → librados(rados_create*/rados_connect/rados_ioctx_create/rados_write).
+ * 에러 경로: 단계별 failed_* 라벨을 통해 이미 생성된 자원을 역순으로 롤백한다.
+ */
 static int _fio_rados_connect(struct thread_data *td)
 {
-	struct rados_data *rados = td->io_ops_data;
-	struct rados_options *o = td->eo;
-	int r;
+	struct rados_data *rados = td->io_ops_data;                             /* [한국어] setup 에서 할당된 엔진 상태. */
+	struct rados_options *o = td->eo;                                       /* [한국어] 파싱된 엔진 옵션. */
+	int r;                                                                  /* [한국어] librados 반환값 저장용. */
 	const uint64_t file_size =
-		td->o.size / (td->o.nr_files ? td->o.nr_files : 1u);
-	struct fio_file *f;
-	uint32_t i;
+		td->o.size / (td->o.nr_files ? td->o.nr_files : 1u);            /* [한국어] 파일별 균등 분배 크기. 0 나눗셈 방지. */
+	struct fio_file *f;                                                     /* [한국어] 순회 임시 포인터. */
+	uint32_t i;                                                             /* [한국어] 파일 순회 인덱스. */
 
-	if (o->cluster_name) {
-		char *client_name = NULL;
+	if (o->cluster_name) {                                                  /* [한국어] 사용자가 클러스터 이름을 지정했을 때. */
+		char *client_name = NULL;                                       /* [한국어] "client." 접두어를 합친 문자열을 담을 임시 포인터. */
 
 		/*
 		* If we specify cluster name, the rados_create2
 		* will not assume 'client.'. name is considered
 		* as a full type.id namestr
 		*/
-		if (o->client_name) {
-			if (!index(o->client_name, '.')) {
+		if (o->client_name) {                                           /* [한국어] 클라이언트 이름이 주어졌다면 규칙을 보정한다. */
+			if (!index(o->client_name, '.')) {                      /* [한국어] '.' 이 없으면 type prefix 가 없다는 뜻 → "client." 를 붙인다. */
 				client_name = calloc(1, strlen("client.") +
-					strlen(o->client_name) + 1);
-				strcat(client_name, "client.");
-				strcat(client_name, o->client_name);
+					strlen(o->client_name) + 1);            /* [한국어] 접두어+ID+NUL 길이로 버퍼 확보. */
+				strcat(client_name, "client.");                 /* [한국어] 접두어 복사. */
+				strcat(client_name, o->client_name);            /* [한국어] 사용자 지정 ID 이어붙이기. */
 			} else {
-				client_name = o->client_name;
+				client_name = o->client_name;                   /* [한국어] 이미 "type.id" 형태이면 그대로 사용. */
 			}
 		}
 
 		r = rados_create2(&rados->cluster, o->cluster_name,
-			client_name, 0);
+			client_name, 0);                                        /* [한국어] cluster/client 를 모두 명시하는 rados_create2 호출. */
 
-		if (client_name && !index(o->client_name, '.'))
+		if (client_name && !index(o->client_name, '.'))                 /* [한국어] 우리가 새로 할당한 경우에만 해제(사용자 문자열 건드리지 않음). */
 			free(client_name);
 	} else
-		r = rados_create(&rados->cluster, o->client_name);
+		r = rados_create(&rados->cluster, o->client_name);              /* [한국어] 클러스터 미지정 시 기본 클러스터("ceph") 가정. */
 
-	if (o->pool_name == NULL) {
+	if (o->pool_name == NULL) {                                             /* [한국어] 풀 이름은 필수 — 없으면 바로 실패. */
 		log_err("rados pool name must be provided.\n");
 		goto failed_early;
 	}
 
-	if (r < 0) {
+	if (r < 0) {                                                            /* [한국어] rados_create* 실패. */
 		log_err("rados_create failed.\n");
 		goto failed_early;
 	}
 
-	r = rados_conf_read_file(rados->cluster, o->conf);
+	r = rados_conf_read_file(rados->cluster, o->conf);                      /* [한국어] ceph.conf 를 읽어 클라이언트 설정 적용. */
 	if (r < 0) {
 		log_err("rados_conf_read_file failed.\n");
 		goto failed_early;
 	}
 
-	r = rados_connect(rados->cluster);
+	r = rados_connect(rados->cluster);                                      /* [한국어] 모니터에 접속하여 클러스터 map 을 얻는다. */
 	if (r < 0) {
 		log_err("rados_connect failed.\n");
 		goto failed_early;
 	}
 
-	r = rados_ioctx_create(rados->cluster, o->pool_name, &rados->io_ctx);
+	r = rados_ioctx_create(rados->cluster, o->pool_name, &rados->io_ctx);   /* [한국어] 지정 풀의 I/O 컨텍스트 생성. */
 	if (r < 0) {
 		log_err("rados_ioctx_create failed.\n");
-		goto failed_shutdown;
+		goto failed_shutdown;                                           /* [한국어] 클러스터는 이미 연결됐으므로 shutdown 까지 롤백. */
 	}
 
-	for (i = 0; i < td->o.nr_files; i++) {
-		f = td->files[i];
-		f->real_file_size = file_size;
-		if (o->touch_objects) {
-			r = rados_write(rados->io_ctx, f->file_name, "", 0, 0);
+	for (i = 0; i < td->o.nr_files; i++) {                                  /* [한국어] 각 파일(오브젝트)에 대해. */
+		f = td->files[i];                                               /* [한국어] fio_file 획득. */
+		f->real_file_size = file_size;                                  /* [한국어] fio 코어에 파일의 "실제 크기" 를 알린다(offset 생성 기준). */
+		if (o->touch_objects) {                                         /* [한국어] 프리터치 옵션이 켜져 있으면. */
+			r = rados_write(rados->io_ctx, f->file_name, "", 0, 0); /* [한국어] 0바이트 write 로 오브젝트를 존재시킨다(read-before-write 의 ENOENT 방지). */
 			if (r < 0) {
-				goto failed_obj_create;
+				goto failed_obj_create;                         /* [한국어] 일부만 생성된 오브젝트들을 롤백해야 함. */
 			}
 		}
 	}
-	return 0;
+	return 0;                                                               /* [한국어] 모든 단계 성공. */
 
 failed_obj_create:
-	_fio_rados_rm_objects(td, rados);
-	rados_ioctx_destroy(rados->io_ctx);
-	rados->io_ctx = NULL;
+	_fio_rados_rm_objects(td, rados);                                       /* [한국어] 부분 생성된 오브젝트 제거. */
+	rados_ioctx_destroy(rados->io_ctx);                                     /* [한국어] ioctx 해제. */
+	rados->io_ctx = NULL;                                                   /* [한국어] dangling 방지. */
 failed_shutdown:
-	rados_shutdown(rados->cluster);
-	rados->cluster = NULL;
+	rados_shutdown(rados->cluster);                                         /* [한국어] 클러스터 연결 종료. */
+	rados->cluster = NULL;                                                  /* [한국어] dangling 방지. */
 failed_early:
-	return 1;
+	return 1;                                                               /* [한국어] 실패 반환. */
 }
 
+/*
+ * [한국어]
+ * _fio_rados_disconnect - ioctx 와 클러스터 핸들을 안전하게 해제한다.
+ *
+ * @rados: 엔진 상태. NULL 안전.
+ * 실행 컨텍스트: 잡 스레드(cleanup).
+ */
 static void _fio_rados_disconnect(struct rados_data *rados)
 {
-	if (!rados)
+	if (!rados)                                                             /* [한국어] NULL 가드. */
 		return;
 
-	if (rados->io_ctx) {
+	if (rados->io_ctx) {                                                    /* [한국어] ioctx 가 유효하면 파괴. */
 		rados_ioctx_destroy(rados->io_ctx);
 		rados->io_ctx = NULL;
 	}
 
-	if (rados->cluster) {
+	if (rados->cluster) {                                                   /* [한국어] 클러스터 핸들이 유효하면 shutdown. */
 		rados_shutdown(rados->cluster);
 		rados->cluster = NULL;
 	}
 }
 
+/*
+ * [한국어]
+ * fio_rados_cleanup - 엔진 종료 시 in-flight I/O 가 모두 완료될 때까지 기다린 뒤 자원 해제.
+ *
+ * @td: 잡 스레드의 thread_data.
+ * 실행 컨텍스트: 잡 스레드가 잡 루프 종료 후 1회 호출.
+ * 호출 체인: backend.c(do_io 끝) → td_io_cleanup → fio_rados_cleanup.
+ * 주의: 조건변수 대기 중에는 반드시 mutex 를 쥔 상태여야 하며, scheduled==completed 이어야 drain 완료.
+ */
 static void fio_rados_cleanup(struct thread_data *td)
 {
-	struct rados_data *rados = td->io_ops_data;
-	if (rados) {
-		pthread_mutex_lock(&rados->completed_lock);
-		while (rados->ops_scheduled != rados->ops_completed)
-			pthread_cond_wait(&rados->completed_more_io, &rados->completed_lock);
-		pthread_mutex_unlock(&rados->completed_lock);
-		_fio_rados_rm_objects(td, rados);
-		_fio_rados_disconnect(rados);
-		free(rados->aio_events);
-		free(rados);
+	struct rados_data *rados = td->io_ops_data;                             /* [한국어] 엔진 상태 확보. */
+	if (rados) {                                                            /* [한국어] setup 실패로 NULL 일 수 있음. */
+		pthread_mutex_lock(&rados->completed_lock);                     /* [한국어] 카운터 읽기·대기 전 락. */
+		while (rados->ops_scheduled != rados->ops_completed)            /* [한국어] 아직 미완료 I/O 가 있으면 대기 반복. */
+			pthread_cond_wait(&rados->completed_more_io, &rados->completed_lock); /* [한국어] 콜백이 signal 할 때까지 대기(mutex 자동 해제/재획득). */
+		pthread_mutex_unlock(&rados->completed_lock);                   /* [한국어] 드레인 완료 후 락 해제. */
+		_fio_rados_rm_objects(td, rados);                               /* [한국어] 테스트 오브젝트 청소. */
+		_fio_rados_disconnect(rados);                                   /* [한국어] ioctx/클러스터 해제. */
+		free(rados->aio_events);                                        /* [한국어] 완료 반환 배열 해제. */
+		free(rados);                                                    /* [한국어] 엔진 상태 해제. */
 	}
 }
 
+/*
+ * [한국어]
+ * complete_callback - librados 가 비동기 I/O 완료를 알리기 위해 호출하는 콜백.
+ *
+ * @cb: 완료된 rados_completion_t. (assert 이외에는 사용하지 않음, fri 에서 참조)
+ * @arg: 우리가 rados_aio_create_completion 에 넘긴 사용자 포인터(=fio_rados_iou*).
+ *
+ * 실행 컨텍스트: **librados 내부 메신저 스레드**. 잡 스레드와 경쟁하므로 반드시 락으로 보호.
+ * 동작: 완료 리스트에 tail 추가 → 완료 카운터 증가 → 조건변수 signal 로 잡 스레드 깨움.
+ * 주의: 여기서는 rados_aio_release 등 자원 해제는 수행하지 않고 getevents 에서 일괄 처리.
+ */
 static void complete_callback(rados_completion_t cb, void *arg)
 {
-	struct fio_rados_iou *fri = (struct fio_rados_iou *)arg;
-	struct rados_data *rados = fri->td->io_ops_data;
-	assert(fri->completion);
-	assert(rados_aio_is_complete(fri->completion));
-	pthread_mutex_lock(&rados->completed_lock);
-	flist_add_tail(&fri->list, &rados->completed_operations);
-	rados->ops_completed++;
-	pthread_mutex_unlock(&rados->completed_lock);
-	pthread_cond_signal(&rados->completed_more_io);
+	struct fio_rados_iou *fri = (struct fio_rados_iou *)arg;                /* [한국어] 우리가 넘긴 사용자 포인터 복원. */
+	struct rados_data *rados = fri->td->io_ops_data;                        /* [한국어] 해당 잡의 엔진 상태로 점프. */
+	assert(fri->completion);                                                /* [한국어] 완료 핸들이 세팅되어 있어야 함. */
+	assert(rados_aio_is_complete(fri->completion));                         /* [한국어] 실제로 완료 상태인지 sanity check. */
+	pthread_mutex_lock(&rados->completed_lock);                             /* [한국어] 공유 상태 보호 시작. */
+	flist_add_tail(&fri->list, &rados->completed_operations);               /* [한국어] 완료 FIFO 의 꼬리에 enqueue. */
+	rados->ops_completed++;                                                 /* [한국어] 완료 카운터 증가. */
+	pthread_mutex_unlock(&rados->completed_lock);                           /* [한국어] 락 해제. */
+	pthread_cond_signal(&rados->completed_more_io);                         /* [한국어] 대기 중인 잡 스레드 1개 깨움. */
 }
 
+/*
+ * [한국어]
+ * fio_rados_queue - ioengine_ops.queue 콜백. io_u 1개를 librados 로 비동기 제출.
+ *
+ * @td: 잡 스레드의 thread_data.
+ * @io_u: 제출할 I/O 유닛(버퍼/오프셋/방향 포함).
+ * @return: FIO_Q_QUEUED(제출 성공, 완료는 나중에), FIO_Q_COMPLETED(즉시 실패).
+ *
+ * 왜 이렇게: fio 는 엔진에 "큐에 넣기만" 요청하고 완료는 getevents 에서 수확한다.
+ * 실행 컨텍스트: 잡 스레드.
+ * 호출 체인: td_io_queue → fio_rados_queue → rados_aio_create_completion + rados_aio_write/read/write_op_operate.
+ * 에러 경로: failed_write_op → failed_comp → failed 순서로 이미 할당된 자원 역순 해제.
+ */
 static enum fio_q_status fio_rados_queue(struct thread_data *td,
 					 struct io_u *io_u)
 {
-	struct rados_data *rados = td->io_ops_data;
-	struct fio_rados_iou *fri = io_u->engine_data;
-	char *object = io_u->file->file_name;
-	int r = -1;
+	struct rados_data *rados = td->io_ops_data;                             /* [한국어] 엔진 상태(ioctx 접근용). */
+	struct fio_rados_iou *fri = io_u->engine_data;                          /* [한국어] io_u 당 컨텍스트(완료 핸들 저장소). */
+	char *object = io_u->file->file_name;                                   /* [한국어] 대상 오브젝트 이름 = fio 파일 이름. */
+	int r = -1;                                                             /* [한국어] librados 반환값. 실패 기본값. */
 
-	fio_ro_check(td, io_u);
+	fio_ro_check(td, io_u);                                                 /* [한국어] readonly 잡에서 write 요청이 오면 에러 처리. */
 
-	if (io_u->ddir == DDIR_WRITE) {
+	if (io_u->ddir == DDIR_WRITE) {                                         /* [한국어] 쓰기 분기. */
 		 r = rados_aio_create_completion(fri, complete_callback,
-			NULL, &fri->completion);
+			NULL, &fri->completion);                                /* [한국어] 완료 콜백 등록 핸들 생성. 1st cb=완료, 2nd cb=safe(미사용). */
 		if (r < 0) {
 			log_err("rados_aio_create_completion failed.\n");
-			goto failed;
+			goto failed;                                            /* [한국어] 핸들 생성 실패 → 완료 처리 즉시 실패로. */
 		}
 
 		r = rados_aio_write(rados->io_ctx, object, fri->completion,
-			io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
+			io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);       /* [한국어] 비동기 write 제출. OSD 가 처리 후 콜백. */
 		if (r < 0) {
 			log_err("rados_write failed.\n");
-			goto failed_comp;
+			goto failed_comp;                                       /* [한국어] 이미 만든 completion 을 release 해야 함. */
 		}
-		rados->ops_scheduled++;
-		return FIO_Q_QUEUED;
-	} else if (io_u->ddir == DDIR_READ) {
+		rados->ops_scheduled++;                                         /* [한국어] 제출 카운터 증가. */
+		return FIO_Q_QUEUED;                                            /* [한국어] fio 코어에 "큐됨" 통지. */
+	} else if (io_u->ddir == DDIR_READ) {                                   /* [한국어] 읽기 분기. */
 		r = rados_aio_create_completion(fri, complete_callback,
-			NULL, &fri->completion);
+			NULL, &fri->completion);                                /* [한국어] 완료 핸들 생성. */
 		if (r < 0) {
 			log_err("rados_aio_create_completion failed.\n");
 			goto failed;
 		}
 		r = rados_aio_read(rados->io_ctx, object, fri->completion,
-			io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);
+			io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);       /* [한국어] 비동기 read 제출. xfer_buf 로 결과가 채워진다. */
 		if (r < 0) {
 			log_err("rados_aio_read failed.\n");
 			goto failed_comp;
 		}
-		rados->ops_scheduled++;
+		rados->ops_scheduled++;                                         /* [한국어] 제출 카운터 증가. */
 		return FIO_Q_QUEUED;
-	} else if (io_u->ddir == DDIR_TRIM) {
+	} else if (io_u->ddir == DDIR_TRIM) {                                   /* [한국어] TRIM 분기 - RADOS 는 직접 TRIM 이 없으므로 write_op_zero 로 대체. */
 		r = rados_aio_create_completion(fri, complete_callback,
-			NULL , &fri->completion);
+			NULL , &fri->completion);                               /* [한국어] 완료 핸들 생성. */
 		if (r < 0) {
 			log_err("rados_aio_create_completion failed.\n");
 			goto failed;
 		}
-		fri->write_op = rados_create_write_op();
+		fri->write_op = rados_create_write_op();                        /* [한국어] 복합 write 오퍼레이션 객체 생성(여러 op 를 한 트랜잭션으로 묶음). */
 		if (fri->write_op == NULL) {
 			log_err("rados_create_write_op failed.\n");
 			goto failed_comp;
 		}
 		rados_write_op_zero(fri->write_op, io_u->offset,
-			io_u->xfer_buflen);
+			io_u->xfer_buflen);                                     /* [한국어] 해당 영역을 0으로 채우는 op 추가(논리적 TRIM). */
 		r = rados_aio_write_op_operate(fri->write_op, rados->io_ctx,
-			fri->completion, object, NULL, 0);
+			fri->completion, object, NULL, 0);                      /* [한국어] write_op 를 비동기로 실행(완료는 콜백). */
 		if (r < 0) {
 			log_err("rados_aio_write_op_operate failed.\n");
-			goto failed_write_op;
+			goto failed_write_op;                                   /* [한국어] write_op 까지 만든 상태이므로 추가 해제 필요. */
 		}
-		rados->ops_scheduled++;
+		rados->ops_scheduled++;                                         /* [한국어] 제출 카운터 증가. */
 		return FIO_Q_QUEUED;
 	 }
 
-	log_err("WARNING: Only DDIR_READ, DDIR_WRITE and DDIR_TRIM are supported!");
+	log_err("WARNING: Only DDIR_READ, DDIR_WRITE and DDIR_TRIM are supported!"); /* [한국어] 지원하지 않는 방향(sync, flush 등)이면 경고 후 실패 처리. */
 
 failed_write_op:
-	rados_release_write_op(fri->write_op);
+	rados_release_write_op(fri->write_op);                                  /* [한국어] 만들어진 write_op 해제. */
 failed_comp:
-	rados_aio_release(fri->completion);
+	rados_aio_release(fri->completion);                                     /* [한국어] 완료 핸들 해제. */
 failed:
-	io_u->error = -r;
-	td_verror(td, io_u->error, "xfer");
-	return FIO_Q_COMPLETED;
+	io_u->error = -r;                                                       /* [한국어] errno 양수로 저장(관례). */
+	td_verror(td, io_u->error, "xfer");                                     /* [한국어] fio 에 에러 등록(verror=verbose error). */
+	return FIO_Q_COMPLETED;                                                 /* [한국어] 즉시 실패 완료 — fio 는 getevents 없이 바로 처리. */
 }
 
+/*
+ * [한국어]
+ * fio_rados_event - ioengine_ops.event 콜백. getevents 가 채운 완료 배열에서 event 번째 io_u 반환.
+ *
+ * @td: 잡 스레드의 thread_data.
+ * @event: 0 ≤ event < getevents 반환값 범위의 인덱스.
+ * @return: 해당 완료된 io_u 포인터.
+ *
+ * 실행 컨텍스트: 잡 스레드. getevents 직후 연속 호출됨.
+ */
 static struct io_u *fio_rados_event(struct thread_data *td, int event)
 {
-	struct rados_data *rados = td->io_ops_data;
-	return rados->aio_events[event];
+	struct rados_data *rados = td->io_ops_data;                             /* [한국어] 엔진 상태 확보. */
+	return rados->aio_events[event];                                        /* [한국어] getevents 에서 채워둔 배열에서 꺼내 반환. */
 }
 
+/*
+ * [한국어]
+ * fio_rados_getevents - ioengine_ops.getevents 콜백. 완료 리스트에서 min..max 건을 수확.
+ *
+ * @td: 잡 스레드의 thread_data.
+ * @min: 최소 수확 개수(미만이면 대기).
+ * @max: 최대 수확 개수(aio_events 배열 크기 이내).
+ * @t: 타임아웃(현 구현에서는 사용하지 않음 — 무한 대기).
+ * @return: 실제 수확한 이벤트 수.
+ *
+ * 실행 컨텍스트: 잡 스레드. 콜백 스레드가 생산자, 이 함수가 소비자.
+ * 호출 체인: td_io_getevents → fio_rados_getevents → (이후 fio_rados_event 가 io_u 하나씩 꺼내감).
+ */
 int fio_rados_getevents(struct thread_data *td, unsigned int min,
 	unsigned int max, const struct timespec *t)
 {
-	struct rados_data *rados = td->io_ops_data;
-	unsigned int events = 0;
-	struct fio_rados_iou *fri;
+	struct rados_data *rados = td->io_ops_data;                             /* [한국어] 엔진 상태 확보. */
+	unsigned int events = 0;                                                /* [한국어] 이번 호출에서 수확한 개수. */
+	struct fio_rados_iou *fri;                                              /* [한국어] 리스트에서 꺼낸 엔트리. */
 
-	pthread_mutex_lock(&rados->completed_lock);
-	while (events < min) {
-		while (flist_empty(&rados->completed_operations)) {
-			pthread_cond_wait(&rados->completed_more_io, &rados->completed_lock);
+	pthread_mutex_lock(&rados->completed_lock);                             /* [한국어] 공유 상태 보호 시작. */
+	while (events < min) {                                                  /* [한국어] 최소 개수 만족할 때까지 반복. */
+		while (flist_empty(&rados->completed_operations)) {             /* [한국어] 리스트가 비어있으면 콜백이 넣어줄 때까지 대기. */
+			pthread_cond_wait(&rados->completed_more_io, &rados->completed_lock); /* [한국어] 대기(spurious wakeup 대비 while 안에서). */
 		}
-		assert(!flist_empty(&rados->completed_operations));
-		
-		fri = flist_first_entry(&rados->completed_operations, struct fio_rados_iou, list);
-		assert(fri->completion);
-		assert(rados_aio_is_complete(fri->completion));
-		if (fri->write_op != NULL) {
+		assert(!flist_empty(&rados->completed_operations));             /* [한국어] 깨어난 시점에 반드시 하나 이상 있어야 함. */
+
+		fri = flist_first_entry(&rados->completed_operations, struct fio_rados_iou, list); /* [한국어] FIFO 의 머리 엔트리 얻기. */
+		assert(fri->completion);                                        /* [한국어] 완료 핸들이 유효해야 함. */
+		assert(rados_aio_is_complete(fri->completion));                 /* [한국어] 실제 완료 상태 확인. */
+		if (fri->write_op != NULL) {                                    /* [한국어] TRIM 경로였다면 write_op 도 함께 해제. */
 			rados_release_write_op(fri->write_op);
 			fri->write_op = NULL;
 		}
-		rados_aio_release(fri->completion);
-		fri->completion = NULL;
+		rados_aio_release(fri->completion);                             /* [한국어] 완료 핸들 해제. */
+		fri->completion = NULL;                                         /* [한국어] dangling 방지. */
 
-		rados->aio_events[events] = fri->io_u;
-		events ++;
-		flist_del(&fri->list);
-		if (events >= max) break;
+		rados->aio_events[events] = fri->io_u;                          /* [한국어] 반환 배열에 기록(나중에 event() 가 꺼냄). */
+		events ++;                                                      /* [한국어] 수확 개수 증가. */
+		flist_del(&fri->list);                                          /* [한국어] 완료 리스트에서 제거. */
+		if (events >= max) break;                                       /* [한국어] 최대 개수 도달 시 종료. */
 	}
-	pthread_mutex_unlock(&rados->completed_lock);
-	return events;
+	pthread_mutex_unlock(&rados->completed_lock);                           /* [한국어] 락 해제. */
+	return events;                                                          /* [한국어] 수확 개수 반환. */
 }
 
+/*
+ * [한국어]
+ * fio_rados_setup - ioengine_ops.setup 콜백. 엔진 상태 생성 및 클러스터 연결.
+ *
+ * @td: 잡 스레드의 thread_data.
+ * @return: 0 성공, 음수/양수 실패 코드(호출자는 잡을 중단).
+ *
+ * 실행 컨텍스트: 잡 스레드. 잡 루프 이전 초기화 단계.
+ * 부가 효과: td->o.use_thread = 1 강제 — RADOS 클라이언트가 프로세스 fork 와 호환되지 않으므로.
+ */
 static int fio_rados_setup(struct thread_data *td)
 {
-	struct rados_data *rados = NULL;
-	int r;
+	struct rados_data *rados = NULL;                                        /* [한국어] 엔진 상태 출력 포인터. */
+	int r;                                                                  /* [한국어] 에러 코드. */
 	/* allocate engine specific structure to deal with librados. */
-	r = _fio_setup_rados_data(td, &rados);
+	r = _fio_setup_rados_data(td, &rados);                                  /* [한국어] 상태 구조체 할당/초기화. */
 	if (r) {
 		log_err("fio_setup_rados_data failed.\n");
 		goto cleanup;
 	}
-	td->io_ops_data = rados;
+	td->io_ops_data = rados;                                                /* [한국어] fio 코어에 엔진 상태 등록(이후 모든 콜백에서 재사용). */
 
 	/* Force single process mode.
 	*/
-	td->o.use_thread = 1;
+	td->o.use_thread = 1;                                                   /* [한국어] 프로세스 fork 대신 pthread 사용 강제(librados 상태 보호). */
 
 	/* connect in the main thread to determine to determine
 	* the size of the given RADOS block device. And disconnect
 	* later on.
 	*/
-	r = _fio_rados_connect(td);
+	r = _fio_rados_connect(td);                                             /* [한국어] 클러스터 연결 + ioctx 생성 + 오브젝트 프리터치. */
 	if (r) {
 		log_err("fio_rados_connect failed.\n");
 		goto cleanup;
 	}
-	rados->connected = true;
+	rados->connected = true;                                                /* [한국어] 이후 cleanup 경로가 참조 가능하도록 표시. */
 
-	return 0;
+	return 0;                                                               /* [한국어] 성공. */
 cleanup:
-	fio_rados_cleanup(td);
-	return r;
+	fio_rados_cleanup(td);                                                  /* [한국어] 부분 초기화 상태를 정리. */
+	return r;                                                               /* [한국어] 상위로 실패 전파. */
 }
 
 /* open/invalidate are noops. we set the FIO_DISKLESSIO flag in ioengine_ops to
    prevent fio from creating the files
 */
+/*
+ * [한국어]
+ * fio_rados_open - ioengine_ops.open_file 콜백. RADOS 는 파일 대신 오브젝트 이름을 쓰므로 no-op.
+ * FIO_DISKLESSIO 플래그 덕분에 fio 코어가 open(2) 를 호출하지 않아도 된다.
+ * @return: 0 항상 성공.
+ */
 static int fio_rados_open(struct thread_data *td, struct fio_file *f)
 {
-	return 0;
+	return 0;                                                               /* [한국어] 아무 것도 하지 않고 성공 반환. */
 }
+
+/*
+ * [한국어]
+ * fio_rados_invalidate - ioengine_ops.invalidate 콜백. 페이지 캐시 무효화가 의미 없으므로 no-op.
+ * @return: 0 항상 성공.
+ */
 static int fio_rados_invalidate(struct thread_data *td, struct fio_file *f)
 {
-	return 0;
+	return 0;                                                               /* [한국어] OSD 측 캐시는 클라이언트에서 제어 불가 → no-op. */
 }
 
+/*
+ * [한국어]
+ * fio_rados_io_u_free - ioengine_ops.io_u_free 콜백. io_u 당 fio_rados_iou 해제.
+ *
+ * @td: 잡 스레드 thread_data.
+ * @io_u: 반환되는 I/O 유닛.
+ *
+ * 실행 컨텍스트: 잡 스레드(정리 단계). 잔존 completion/write_op 가 있으면 함께 해제.
+ */
 static void fio_rados_io_u_free(struct thread_data *td, struct io_u *io_u)
 {
-	struct fio_rados_iou *fri = io_u->engine_data;
+	struct fio_rados_iou *fri = io_u->engine_data;                          /* [한국어] io_u 에 붙어 있던 엔진 컨텍스트. */
 
-	if (fri) {
-		io_u->engine_data = NULL;
-		fri->td = NULL;
-		if (fri->completion)
+	if (fri) {                                                              /* [한국어] 할당되지 않은 경우 대비. */
+		io_u->engine_data = NULL;                                       /* [한국어] 먼저 링크 끊어 double-free 방지. */
+		fri->td = NULL;                                                 /* [한국어] 역참조 클리어(dangling 방지). */
+		if (fri->completion)                                            /* [한국어] 혹시 남은 completion 해제. */
 			rados_aio_release(fri->completion);
-		if (fri->write_op)
+		if (fri->write_op)                                              /* [한국어] 혹시 남은 write_op 해제. */
 			rados_release_write_op(fri->write_op);
-		free(fri);
+		free(fri);                                                      /* [한국어] 컨텍스트 해제. */
 	}
 }
 
+/*
+ * [한국어]
+ * fio_rados_io_u_init - ioengine_ops.io_u_init 콜백. io_u 당 fio_rados_iou 할당.
+ *
+ * @td: 잡 스레드 thread_data.
+ * @io_u: 초기화 대상 I/O 유닛.
+ * @return: 0 성공(이 구현은 실패 시에도 0 반환 — calloc 실패 체크 부재).
+ *
+ * 실행 컨텍스트: 잡 스레드(잡 초기화 단계, io_u 풀 생성 시).
+ */
 static int fio_rados_io_u_init(struct thread_data *td, struct io_u *io_u)
 {
-	struct fio_rados_iou *fri;
-	fri = calloc(1, sizeof(*fri));
-	fri->io_u = io_u;
-	fri->td = td;
-	INIT_FLIST_HEAD(&fri->list);
-	io_u->engine_data = fri;
-	return 0;
+	struct fio_rados_iou *fri;                                              /* [한국어] 새 컨텍스트. */
+	fri = calloc(1, sizeof(*fri));                                          /* [한국어] 0 초기화 할당(포인터/리스트 헤드 안전). */
+	fri->io_u = io_u;                                                       /* [한국어] 역참조 연결. */
+	fri->td = td;                                                           /* [한국어] 콜백에서 io_ops_data 찾을 경로. */
+	INIT_FLIST_HEAD(&fri->list);                                            /* [한국어] 완료 리스트 링크 노드 초기화. */
+	io_u->engine_data = fri;                                                /* [한국어] io_u 에 엔진 컨텍스트 부착. */
+	return 0;                                                               /* [한국어] 성공. */
 }
 
+/*
+ * [한국어] ioengine — fio 코어가 엔진을 호출할 때 사용하는 콜백 테이블.
+ * get_ioengine()(ioengines.c) 가 이름으로 조회하며, 각 필드는 잡 루프의 특정 훅에 매핑된다.
+ */
 /* ioengine_ops for get_ioengine() */
 FIO_STATIC struct ioengine_ops ioengine = {
-	.name = "rados",
-	.version		= FIO_IOOPS_VERSION,
-	.flags			= FIO_DISKLESSIO,
-	.setup			= fio_rados_setup,
-	.queue			= fio_rados_queue,
-	.getevents		= fio_rados_getevents,
-	.event			= fio_rados_event,
-	.cleanup		= fio_rados_cleanup,
-	.open_file		= fio_rados_open,
-	.invalidate		= fio_rados_invalidate,
-	.options		= options,
-	.io_u_init		= fio_rados_io_u_init,
-	.io_u_free		= fio_rados_io_u_free,
-	.option_struct_size	= sizeof(struct rados_options),
+	.name = "rados",                                                        /* [한국어] --ioengine=rados 로 선택되는 이름. */
+	.version		= FIO_IOOPS_VERSION,                            /* [한국어] ABI 버전 검사용. 불일치 시 로드 거부. */
+	.flags			= FIO_DISKLESSIO,                               /* [한국어] 실제 파일을 만들지 말라는 플래그(오브젝트 스토리지이므로). */
+	.setup			= fio_rados_setup,                              /* [한국어] 초기화 훅. */
+	.queue			= fio_rados_queue,                              /* [한국어] I/O 제출 훅. */
+	.getevents		= fio_rados_getevents,                          /* [한국어] 완료 수확 훅. */
+	.event			= fio_rados_event,                              /* [한국어] 수확된 이벤트 인덱스 → io_u 매핑. */
+	.cleanup		= fio_rados_cleanup,                            /* [한국어] 종료 시 자원 해제. */
+	.open_file		= fio_rados_open,                               /* [한국어] no-op(오브젝트는 open 불필요). */
+	.invalidate		= fio_rados_invalidate,                         /* [한국어] no-op. */
+	.options		= options,                                      /* [한국어] 엔진 옵션 테이블. */
+	.io_u_init		= fio_rados_io_u_init,                          /* [한국어] io_u 당 컨텍스트 할당. */
+	.io_u_free		= fio_rados_io_u_free,                          /* [한국어] io_u 당 컨텍스트 해제. */
+	.option_struct_size	= sizeof(struct rados_options),                 /* [한국어] 옵션 구조체 크기 — 파서가 per-job 복제본을 만들 때 사용. */
 };
 
+/*
+ * [한국어]
+ * fio_rados_register - 모듈 로드 시점에 엔진을 fio 코어에 등록.
+ * fio_init 속성은 컴파일러/링커가 constructor 로 실행하게 하는 매크로(compiler/compiler.h).
+ */
 static void fio_init fio_rados_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine);                                           /* [한국어] ioengines.c 의 전역 리스트에 이 엔진을 추가. */
 }
 
+/*
+ * [한국어]
+ * fio_rados_unregister - 모듈 언로드 시 엔진을 목록에서 제거.
+ * fio_exit 속성은 destructor 로 실행된다.
+ */
 static void fio_exit fio_rados_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine);                                         /* [한국어] ioengines.c 전역 리스트에서 제거. */
 }

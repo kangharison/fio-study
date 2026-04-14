@@ -1,3 +1,14 @@
+/*
+ * [한국어 설명] NVMe CRC-64 룩업 테이블 (crc64table.h)
+ *
+ * === 파일의 역할 ===
+ * NVMe 규격에서 정의한 64비트 CRC의 룩업 테이블(256개 항목)을 제공한다.
+ * crc64.c의 fio_crc64_nvme() 함수에서 CONFIG_LIBISAL64가 미정의일 때 사용한다.
+ * NVMe 다항식은 crc64.c 상단 주석에 정의된 64차 다항식이다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: fio_crc64_nvme() [crc64.c] → crc64nvmetable[] [이 파일] 참조
+ */
 static const unsigned long long crc64nvmetable[256] = {
 	0x0000000000000000ULL, 	0x7f6ef0c830358979ULL,
 	0xfedde190606b12f2ULL, 	0x81b31158505e9b8bULL,

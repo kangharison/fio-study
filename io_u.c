@@ -1,19 +1,30 @@
-/* [한국어] io_u.c - fio의 I/O 유닛(io_u) 관리 핵심 파일
+/*
+ * [한국어 설명] fio I/O 유닛(io_u) 관리 핵심 파일 (io_u.c)
  *
- * 이 파일은 fio 벤치마크 도구에서 I/O 요청의 전체 생명주기를 관리한다.
- * io_u는 하나의 I/O 작업을 나타내는 구조체로, 다음 과정을 거친다:
+ * === 파일의 역할 ===
+ * 이 파일은 fio에서 I/O 요청의 전체 생명주기를 관리한다. io_u는 하나의 I/O 작업을
+ * 나타내는 구조체로, 할당 → 설정(오프셋/크기/방향) → 제출 → 완료 → 반환의 과정을
+ * 거친다. 랜덤/순차 오프셋 결정, 블록 크기 결정, 랜덤 맵 추적 등 핵심 로직을 포함한다.
  *
- *   1. 할당(Allocation): get_io_u() / __get_io_u()에서 프리리스트로부터 io_u를 꺼냄
- *   2. 설정(Setup): fill_io_u()에서 오프셋, 버퍼 길이, 데이터 방향 결정
- *   3. 제출(Submit): io_u_queued()에서 제출 레이턴시 기록
- *   4. 완료(Completion): io_u_sync_complete() / io_u_queued_complete()에서 완료 처리
- *   5. 반환(Return): put_io_u()에서 프리리스트로 io_u를 되돌림
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 do_io() 루프에서 get_io_u()로 I/O 유닛을 할당받고,
+ * ioengines.c를 통해 엔진에 제출한 뒤, 완료 시 put_io_u()로 반환한다.
+ * 호출 체인: do_io() [backend.c] → get_io_u() [이 파일] → td_io_queue() [ioengines.c]
+ *           → io_u_queued_complete() [이 파일] → put_io_u() [이 파일]
  *
- * 주요 개념:
- *   - offset 결정: 순차(sequential) 또는 랜덤(random) 방식으로 I/O 위치 결정
- *   - buflen 결정: min_bs ~ max_bs 범위 내에서 블록 크기 결정
- *   - ddir 결정: read/write/trim/sync 등 데이터 방향 결정
- *   - random map: 랜덤 I/O 시 이미 접근한 블록을 추적하여 전체 범위 커버
+ * === 타 모듈과의 연결 ===
+ * - backend.c: do_io()에서 get_io_u()/put_io_u() 호출
+ * - ioengines.c: td_io_prep()/td_io_queue()에 io_u를 전달
+ * - stat.c: 완료 시 add_clat_sample()/add_slat_sample()로 레이턴시 기록
+ * - verify.c: 검증 모드에서 io_u 버퍼의 패턴/체크섬 검증
+ * - 핵심 자료구조: io_u(I/O 요청), thread_data(스레드 상태), io_completion_data(완료 정보)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - get_io_u(): 프리리스트에서 io_u를 꺼내고 오프셋/크기/방향을 설정
+ * - put_io_u(): 사용 완료된 io_u를 프리리스트로 반환
+ * - io_u_sync_complete(): 동기 I/O 완료 처리 (레이턴시 기록, 통계 갱신)
+ * - io_u_queued_complete(): 비동기 I/O 완료 처리 (getevents 후 일괄 처리)
+ * - io_completion_data: I/O 완료 시 결과 정보(nr, error, bytes_done, time)를 저장
  */
 #include <unistd.h>
 #include <string.h>

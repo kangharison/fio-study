@@ -1,7 +1,26 @@
+/*
+ * [한국어 설명] Windows CPU 친화성 구현 (windows/cpu-affinity.c)
+ *
+ * === 파일의 역할 ===
+ * Windows의 프로세서 그룹(Processor Group) 시스템에서 CPU 친화성을 관리한다.
+ * Windows는 64개 CPU를 하나의 프로세서 그룹으로 묶으므로, fio의 os_cpu_mask_t
+ * (512비트)를 그룹+마스크 조합으로 변환하여 SetThreadGroupAffinity 호출.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os-windows.h에서 함수 선언 → 이 파일에서 구현
+ * backend.c의 스레드 생성 시 cpus_allowed 옵션 처리에 사용.
+ *
+ * === 주요 함수 요약 ===
+ * - fio_setaffinity(): CPU 마스크 → 프로세서 그룹+그룹 마스크 변환 후 설정
+ * - fio_getaffinity(): 프로세스의 현재 CPU 친화성을 마스크로 변환
+ * - fio_cpu_set/clear/isset/count(): 비트 마스크 조작 함수
+ * - first_set_cpu(): 마스크에서 최하위 설정 CPU 인덱스 반환
+ */
 #include "os/os.h"
 
 #include <windows.h>
 
+/* [한국어] 디버그용 CPU 마스크 출력 */
 static void print_mask(os_cpu_mask_t *cpumask)
 {
 	for (int i = 0; i < FIO_CPU_MASK_ROWS; i++)
@@ -73,6 +92,17 @@ static int last_set_cpu(os_cpu_mask_t *cpumask)
 	return mask_last_cpu;
 }
 
+/*
+ * [한국어]
+ * mask_to_group_mask - fio CPU 마스크를 Windows 프로세서 그룹+마스크로 변환
+ * @cpumask: fio의 512비트 CPU 마스크
+ * @processor_group: 결과 프로세서 그룹 번호
+ * @affinity_mask: 결과 그룹 내 CPU 마스크
+ * @return: 0=성공, 1=실패
+ *
+ * 제약: 모든 설정된 CPU가 동일 프로세서 그룹에 속해야 함.
+ * 서로 다른 그룹의 CPU를 동시에 지정하면 에러.
+ */
 static int mask_to_group_mask(os_cpu_mask_t *cpumask, int *processor_group, uint64_t *affinity_mask)
 {
 	WORD online_groups, group, group_size;
@@ -152,6 +182,15 @@ static int mask_to_group_mask(os_cpu_mask_t *cpumask, int *processor_group, uint
 	return 0;
 }
 
+/*
+ * [한국어]
+ * fio_setaffinity - Windows 스레드 CPU 친화성 설정
+ * @pid: 스레드 ID (OpenThread로 핸들 얻음)
+ * @cpumask: fio CPU 마스크
+ *
+ * mask_to_group_mask()로 프로세서 그룹/마스크 변환 후
+ * SetThreadGroupAffinity()로 설정. Reserved 멤버를 0으로 초기화해야 함.
+ */
 int fio_setaffinity(int pid, os_cpu_mask_t cpumask)
 {
 	HANDLE handle = NULL;
@@ -211,6 +250,15 @@ int fio_cpuset_init(os_cpu_mask_t *mask)
  * fio_getaffinity() should not be called once a fio_setaffinity() call has
  * been made because fio_setaffinity() may put the process into multiple
  * processor groups
+ */
+/*
+ * [한국어]
+ * fio_getaffinity - 프로세스의 현재 CPU 친화성을 fio 마스크로 변환
+ * @pid: 프로세스 ID
+ * @mask: 결과 fio CPU 마스크
+ *
+ * 주의: fio_setaffinity() 호출 후에는 사용하면 안 됨 (다중 그룹 문제).
+ * GetProcessGroupAffinity/GetProcessAffinityMask로 조회 후 변환.
  */
 int fio_getaffinity(int pid, os_cpu_mask_t *mask)
 {

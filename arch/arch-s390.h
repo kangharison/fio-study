@@ -21,6 +21,11 @@
 #define read_barrier()	asm volatile("bcr 15,0" : : : "memory")
 #define write_barrier()	asm volatile("bcr 15,0" : : : "memory")
 
+/*
+ * [한국어] get_cpu_clock - STCK/STCKF 명령어로 TOD(Time of Day) 클록을 읽는다.
+ * z196 이상에서는 STCKF(fast 버전)를 사용하고, 구형에서는 STCK를 사용한다.
+ * 반환값을 12비트 우시프트하여 마이크로초 단위로 변환한다.
+ */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned long long clk;

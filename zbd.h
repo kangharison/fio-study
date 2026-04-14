@@ -18,6 +18,23 @@
  *   - 쓰기 포인터(WP): 다음 쓰기 위치를 추적, 반드시 WP 위치에서만 쓰기 가능
  *   - 존 리셋: WP를 존 시작으로 되돌림 (데이터 삭제)
  *   - 활성 존 제한: 동시에 쓸 수 있는 존 수가 디바이스에 의해 제한
+ 
+ * === 파일의 역할 ===
+ * ZBD(NVMe ZNS, SMR HDD)를 위한 fio 확장을 정의한다. fio_zone_info(존 정보),
+ * zoned_block_device_info(ZBD 특성), io_u_action(I/O 조정 결과), ZBD API를 포함.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * zbd.c와 짝을 이루는 헤더. backend.c, io_u.c에서 ZBD 관련 함수 호출 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - zbd.c: 이 헤더의 함수 구현
+ * - backend.c: do_io()에서 zbd_adjust_block() 호출
+ * - oslib/blkzoned.h: OS별 ZBD 인터페이스
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct fio_zone_info: 개별 존 정보 (시작, WP, 상태)
+ * - struct zoned_block_device_info: ZBD 전체 특성 (존 크기, 수, 활성 제한)
+ * - zbd_adjust_block(): I/O를 존 제약에 맞게 조정
  */
 #ifndef FIO_ZBD_H
 #define FIO_ZBD_H

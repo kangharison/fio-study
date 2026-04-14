@@ -3,6 +3,19 @@
  *
  * fio 실행 중 CPU 유휴율을 측정하기 위한 구조체, 상수, API를 정의한다.
  * 각 CPU에 SCHED_IDLE 우선순위 스레드를 배치하여 유휴 시간을 추정한다.
+ 
+ * === 파일의 역할 ===
+ * CPU 유휴율 측정을 위한 구조체, 상수, API를 정의.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * idletime.c와 짝을 이루는 헤더.
+ *
+ * === 타 모듈과의 연결 ===
+ * - idletime.c: 이 헤더의 함수 구현
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct idle_prof_thread: CPU별 프로파일링 스레드
+ * - fio_idle_prof_init/start/stop(): 프로파일링 API
  */
 #ifndef FIO_IDLETIME_H
 #define FIO_IDLETIME_H

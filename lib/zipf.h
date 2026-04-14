@@ -25,14 +25,14 @@
 #include "types.h"
 
 struct zipf_state {
-	uint64_t nranges;
-	double theta;
-	double zeta2;
-	double zetan;
-	double pareto_pow;
-	struct frand_state rand;
-	uint64_t rand_off;
-	bool disable_hash;
+	uint64_t nranges;	/* [한국어] 전체 블록 범위 (오프셋 수) */
+	double theta;		/* [한국어] Zipf 매개변수 (>1: 편중 증가, =1: 균등에 가까움) */
+	double zeta2;		/* [한국어] H(2, theta) = 1 + 0.5^theta (사전 계산된 zeta 값) */
+	double zetan;		/* [한국어] H(N, theta) = sum(1/i^theta) (정규화 상수) */
+	double pareto_pow;	/* [한국어] Pareto 지수 = log(h)/log(1-h) (Pareto 모드 전용) */
+	struct frand_state rand;	/* [한국어] 내부 Tausworthe PRNG 상태 */
+	uint64_t rand_off;	/* [한국어] 분포의 중심 오프셋 (center 파라미터로 설정) */
+	bool disable_hash;	/* [한국어] true이면 해시를 적용하지 않아 순위 기반 접근 패턴 유지 */
 };
 
 void zipf_init(struct zipf_state *zs, uint64_t nranges, double theta,

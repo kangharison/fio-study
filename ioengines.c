@@ -10,32 +10,33 @@
  *
  */
 /*
- * [한국어 설명]
- * fio 도구의 I/O 엔진 프레임워크 핵심 파일이다.
- * 이 파일은 I/O 엔진의 로딩, 등록/해제, 초기화/종료,
- * 그리고 I/O 요청의 준비(prep) -> 큐잉(queue) -> 커밋(commit) -> 완료 수집(getevents)
- * 전체 생명주기를 관리하는 중간 계층(glue layer)을 제공한다.
+ * [한국어 설명] fio I/O 엔진 프레임워크 (ioengines.c)
  *
- * 각 I/O 엔진(libaio, io_uring, sync 등)은 ioengine_ops 구조체의 콜백 함수를
- * 구현하여 이 프레임워크에 등록한다. td_io_*() 함수들은 상위 계층(backend.c 등)에서
- * 호출되며, 내부적으로 등록된 엔진의 콜백을 호출한다.
+ * === 파일의 역할 ===
+ * 이 파일은 I/O 엔진의 로딩, 등록/해제, 초기화/종료, 그리고 I/O 요청의
+ * 준비(prep) → 큐잉(queue) → 커밋(commit) → 완료 수집(getevents) 전체 생명주기를
+ * 관리하는 중간 계층(glue layer)을 제공한다. 각 I/O 엔진(libaio, io_uring, sync 등)은
+ * ioengine_ops 구조체의 콜백을 구현하여 이 프레임워크에 등록한다.
  *
- * ioengine_ops 구조체의 주요 콜백 호출 시점:
- *   - init()       : td_io_init()에서 호출. 엔진별 초기화 (예: io_uring 링 설정)
- *   - prep()       : td_io_prep()에서 호출. I/O 요청 제출 전 준비 작업
- *   - queue()      : td_io_queue()에서 호출. 실제 I/O 요청을 엔진에 제출
- *   - commit()     : td_io_commit()에서 호출. 큐에 쌓인 요청들을 OS에 일괄 제출
- *   - getevents()  : td_io_getevents()에서 호출. 완료된 I/O 이벤트 수집
- *   - event()      : 개별 완료 이벤트에서 io_u를 가져올 때 호출
- *   - open_file()  : td_io_open_file()에서 호출. 파일 열기
- *   - close_file() : td_io_close_file()에서 호출. 파일 닫기
- *   - cleanup()    : close_ioengine()에서 호출. 엔진 자원 해제
- *   - get_file_size(): td_io_get_file_size()에서 호출. 파일 크기 조회
- *   - unlink_file(): td_io_unlink_file()에서 호출. 파일 삭제
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 do_io()가 td_io_*() 함수를 호출하고, 이 함수들이 내부적으로
+ * 등록된 엔진의 콜백을 호출한다.
+ * 호출 체인: backend.c → td_io_prep/queue/commit/getevents [이 파일] → engines/*.c
+ * 엔진 로드: init.c → load_ioengine() [이 파일] → dlopen()/정적 링크
  *
- * I/O 흐름 요약:
- *   load_ioengine() -> td_io_init() -> [td_io_prep() -> td_io_queue()
- *   -> td_io_commit() -> td_io_getevents()] (반복) -> close_ioengine()
+ * === 타 모듈과의 연결 ===
+ * - backend.c: do_io()/thread_main()에서 td_io_*() 함수 호출
+ * - init.c: ioengine_load()에서 load_ioengine() 호출
+ * - engines/*.c: 각 엔진이 ioengine_ops를 구현하고 register_ioengine()으로 등록
+ * - io_u.c: io_u 구조체를 td_io_queue()에 전달
+ * - filesetup.c: td_io_open_file()/td_io_close_file()로 파일 관리
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - load_ioengine(): I/O 엔진을 이름으로 찾아 로드 (동적/정적)
+ * - td_io_init(): 엔진 초기화 콜백 호출
+ * - td_io_queue(): I/O 요청을 엔진에 제출
+ * - td_io_getevents(): 완료된 I/O 이벤트 수집
+ * - close_ioengine(): 엔진 자원 해제 및 정리
  */
 
 /* 표준 라이브러리 헤더 */

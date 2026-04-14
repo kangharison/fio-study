@@ -5,35 +5,41 @@
  *
  */
 /*
- * [한국어 설명]
- * libaio 엔진 - Linux 네이티브 비동기 I/O (AIO) 인터페이스를 사용하는 fio I/O 엔진
+ * [한국어 설명] Linux 네이티브 AIO(libaio) 기반 I/O 엔진 (libaio.c)
  *
- * === 핵심 동작 흐름 ===
- * 1. fio_libaio_init()      : 엔진 초기화 - 링 버퍼, iocb 배열, io_event 배열 등 할당
- * 2. fio_libaio_post_init() : io_queue_init()으로 커널 AIO 컨텍스트 생성
- * 3. fio_libaio_prep()      : 각 I/O 요청에 대한 iocb 구조체 준비 (read/write/fsync)
- * 4. fio_libaio_queue()     : I/O 요청을 내부 링 버퍼에 추가 (아직 커널에 제출하지 않음)
- * 5. fio_libaio_commit()    : 링 버퍼에 쌓인 요청들을 io_submit()으로 커널에 일괄 제출
- * 6. fio_libaio_getevents() : io_getevents()로 완료된 I/O 이벤트 수확(reap)
- * 7. fio_libaio_event()     : 개별 완료 이벤트에서 io_u 추출 및 결과 확인
- * 8. fio_libaio_cleanup()   : 자원 해제 및 AIO 컨텍스트 파괴
+ * === 파일의 역할 ===
+ * 리눅스 커널의 AIO 시스콜(io_setup/io_submit/io_getevents/io_cancel/io_destroy)을
+ * 래핑한 libaio 라이브러리를 사용하는 fio I/O 엔진 "libaio"를 구현한다. fio의 queue
+ * 단계에서 iocb를 내부 링 버퍼에 쌓고, commit 단계에서 io_submit으로 한꺼번에 커널에
+ * 넘긴 뒤, getevents에서 io_getevents(또는 userspace reap)로 완료를 수확한다.
+ * RWF_NOWAIT, I/O 우선순위(cmdprio), 사용자 공간 링 직접 reap 등 libaio가 제공하는
+ * 대부분의 옵션을 지원한다.
  *
- * === Linux AIO 시스템 콜 관계 ===
- * - io_queue_init() : 커널 AIO 컨텍스트(io_context_t) 생성 (내부적으로 io_setup 호출)
- * - io_submit()     : 준비된 iocb 배열을 커널에 제출하여 비동기 I/O 시작
- * - io_getevents()  : 완료된 I/O 이벤트를 커널에서 가져옴 (블로킹/논블로킹 가능)
- * - io_destroy()    : AIO 컨텍스트 파괴 및 자원 해제
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=libaio로 선택되어 fio_init 생성자에서 ioengine 레지스트리에 등록된다.
+ * 실행 흐름: backend.c → td_io_init → fio_libaio_init(버퍼 할당) →
+ * fio_libaio_post_init(io_queue_init으로 io_context_t 생성) → I/O 루프에서
+ * td_io_prep→queue(iocb 채움) / commit(io_submit) / getevents(io_getevents 또는 usr reap).
+ * 단일 잡 스레드(유저스페이스)에서 실행되며, 커널 AIO 컨텍스트는 그 스레드가 소유한다.
  *
- * === 링 버퍼 구조 ===
- * iocbs[]와 io_us[] 배열이 링 버퍼로 사용됨:
- * - head: queue()에서 증가 (새 요청 추가 위치)
- * - tail: commit()에서 증가 (커널에 제출된 위치)
- * - queued: 현재 링 버퍼에 대기 중인 요청 수 (head - tail)
- * - entries: 링 버퍼 크기 (= iodepth)
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c, verify.c, stat.c, cmdprio.c).
+ * 하단: libaio API(io_queue_init/io_prep_*/io_submit/io_getevents/io_destroy),
+ *       커널 AIO 시스콜(io_setup/io_submit/io_getevents/io_destroy), RWF_NOWAIT 플래그.
+ * 데이터 흐름: io_u ↔ libaio_data->iocbs[] ↔ io_submit → 커널 블록 I/O 스택
+ *           → 완료 후 io_events[] ↔ fio_libaio_event → fio 코어 completion.
+ * 공유 상태: io_context_t(struct libaio_data::aio_ctx)는 커널이 관리하는 객체이며
+ * 프로세스 주소 공간에 매핑된 AIO 링을 사용해 "userspace reap" 최적화가 가능하다.
  *
- * === userspace reap ===
- * 커널의 AIO 링 버퍼를 직접 사용자 공간에서 읽어 io_getevents() 시스템 콜을
- * 우회하는 최적화 기법. 시스템 콜 오버헤드를 줄여 성능을 향상시킴.
+ * === 주요 함수/구조체 요약 ===
+ * - fio_libaio_init()/post_init(): 내부 배열과 io_context_t 생성.
+ * - fio_libaio_prep(): io_u를 io_prep_pread/pwrite/fdsync 형태의 iocb로 준비.
+ * - fio_libaio_queue(): iocbs[head]에 포인터 저장, queued 증가.
+ * - fio_libaio_commit(): io_submit(aio_ctx, n, iocbs+tail)로 일괄 제출.
+ * - fio_libaio_getevents()/event(): io_getevents 또는 usr reap로 완료 수집.
+ * - fio_libaio_cancel()/cleanup(): io_cancel/io_destroy.
+ * - struct libaio_data: 링 버퍼(iocbs, io_us, io_events) + aio_ctx + cmdprio.
+ * - struct libaio_options: userspace_reap, cmdprio_* 등 엔진 옵션.
  */
 
 /* 표준 라이브러리 헤더 */
@@ -80,22 +86,55 @@ static int fio_libaio_init(struct thread_data *td);
  * libaio 엔진의 모든 상태를 관리한다.
  */
 struct libaio_data {
-	io_context_t aio_ctx;           /* 커널 AIO 컨텍스트 핸들.
-	                                 * io_queue_init()으로 생성되며, io_submit()과
-	                                 * io_getevents()에서 사용됨. */
-	struct io_event *aio_events;    /* 완료된 I/O 이벤트를 저장하는 배열.
-	                                 * io_getevents()가 이 배열에 결과를 채워넣음.
-	                                 * 크기: entries (= iodepth) */
-	struct iocb **iocbs;            /* I/O 제어 블록(iocb) 포인터 배열 (링 버퍼).
-	                                 * io_submit()에 전달할 iocb 포인터들을 저장.
-	                                 * queue()에서 추가, commit()에서 소비. */
-	struct io_u **io_us;            /* io_u 포인터 배열 (링 버퍼).
-	                                 * iocbs[]와 1:1 대응. commit 시 타임스탬프 기록 등에 사용. */
+	io_context_t aio_ctx;
+	/* [한국어] 커널이 발급한 AIO 컨텍스트 핸들 (불투명 포인터 타입).
+	 * 설정자: fio_libaio_post_init()의 io_queue_init() → 내부적으로 io_setup(2)
+	 *         시스콜이 호출되어 커널 내 AIO 링 페이지가 mmap 매핑되고 그 주소가 반환된다.
+	 * 읽는 자: io_submit(2), io_getevents(2), io_destroy(2), io_cancel(2), 그리고
+	 *          userspace reap 모드에서는 struct aio_ring*로 캐스팅되어 직접 접근됨.
+	 * 값 범위: 성공 시 커널이 매핑한 유저 주소(0이 아님). 실패 시 설정되지 않음.
+	 * 동기화: 한 잡 스레드가 전용으로 소유 — 다른 스레드와 공유하지 않음. 커널 측
+	 *         aio_ring의 head/tail은 atomic_store_release/load_acquire로만 접근한다. */
 
-	struct io_u **io_u_index;       /* io_u 인덱스 배열 (현재 사용되지 않는 것으로 보임) */
+	struct io_event *aio_events;
+	/* [한국어] io_getevents(2) 또는 user_io_getevents()가 채워넣는 완료 이벤트 배열.
+	 * 설정자: fio_libaio_init()에서 calloc(entries, sizeof(io_event))로 할당.
+	 *         fio_libaio_getevents()가 호출할 때마다 커널/링으로부터 덮어쓰여짐.
+	 * 읽는 자: fio_libaio_event(td, idx) — aio_events[idx]의 res/res2/obj를 참조해
+	 *          대응 io_u의 error/resid를 설정하고 fio 코어에 반환.
+	 * 값 범위: 배열 크기는 정확히 entries(=iodepth). 각 요소는 {data, obj, res, res2}.
+	 *          res>=0이면 전송 바이트 수, res<0이면 -errno.
+	 * 동기화: 단일 잡 스레드에서만 접근되므로 락 불필요. */
+
+	struct iocb **iocbs;
+	/* [한국어] io_submit(2)에 넘겨줄 iocb 포인터들의 링 버퍼(제출 대기 큐).
+	 * 설정자: fio_libaio_queue()가 iocbs[head] = &io_u->iocb로 포인터를 등록하며 head++.
+	 * 읽는 자: fio_libaio_commit()가 iocbs + tail부터 연속 구간을 io_submit에 전달.
+	 * 값 범위: 배열 크기 entries. 원소는 해당 슬롯이 대기 중일 때만 유효한 iocb 포인터.
+	 * 동기화: 단일 잡 스레드 전용. head는 queue()에서만, tail은 commit()에서만 갱신. */
+
+	struct io_u **io_us;
+	/* [한국어] iocbs[]와 1:1 인덱스 대응하는 io_u 포인터 링 버퍼.
+	 * 설정자: fio_libaio_queue()에서 io_us[head] = io_u로 기록.
+	 * 읽는 자: fio_libaio_queued()가 io_submit 성공 후 [tail, tail+ret) 구간을 돌며
+	 *          issue_time(제출 시각)을 찍는다. 수확은 iocb→container_of로 역추적.
+	 * 값 범위: 배열 크기 entries. 유효 구간은 [tail, head) (링 래핑 적용).
+	 * 동기화: 단일 잡 스레드 전용. */
+
+	struct io_u **io_u_index;
+	/* [한국어] 현재 libaio 엔진에서는 사용되지 않는 예비/레거시 포인터.
+	 * 설정자/읽는 자: 없음 (calloc조차 하지 않음).
+	 * 값 범위: 항상 NULL로 남아있는 0-초기화 필드.
+	 * 동기화: 접근 없음. */
+
 	struct iovec *iovecs;		/* for vectored requests */
-	                                /* [한국어] 벡터 I/O (readv/writev) 요청에 사용되는 iovec 배열.
-	                                 * libaio_vectored 옵션이 활성화되면 preadv/pwritev 사용. */
+	/* [한국어] libaio_vectored=1일 때 preadv/pwritev에 전달할 iovec 배열.
+	 * 설정자: fio_libaio_init()에서 calloc(entries, sizeof(iovec))로 확보.
+	 *         fio_libaio_prep()에서 io_u->index를 인덱스로 iov_base/iov_len을 채움.
+	 * 읽는 자: io_prep_preadv/pwritev가 iocb 내부에 이 iovec의 주소와 개수를 저장 →
+	 *          io_submit 시 커널이 이를 참조하여 scatter/gather I/O를 수행.
+	 * 값 범위: 배열 크기 entries, 각 원소는 {iov_base=xfer_buf, iov_len=xfer_buflen}.
+	 * 동기화: io_u.index가 전역적으로 유일하므로 잡 스레드 내 경합 없음. */
 
 	/*
 	 * Basic ring buffer. 'head' is incremented in _queue(), and
@@ -118,14 +157,50 @@ struct libaio_data {
 	 *   queue() 호출 → iocbs[head]에 저장, head++, queued++
 	 *   commit() 호출 → iocbs[tail]부터 io_submit(), tail++, queued--
 	 */
-	int is_pow2;                    /* entries가 2의 거듭제곱인지 여부 (최적화용) */
-	unsigned int entries;           /* 링 버퍼 크기 (= td->o.iodepth) */
-	unsigned int queued;            /* 현재 큐에 대기 중인 I/O 요청 수 */
-	unsigned int head;              /* 링 버퍼의 헤드 인덱스 (다음 삽입 위치) */
-	unsigned int tail;              /* 링 버퍼의 테일 인덱스 (다음 제출 위치) */
+	int is_pow2;
+	/* [한국어] entries가 2의 거듭제곱인지 판별한 캐시 값.
+	 * 설정자: fio_libaio_init()에서 is_power_of_2(entries) 결과로 1회 고정.
+	 * 읽는 자: ring_inc() — true면 AND 마스크(& entries-1) 경로, false면 모듈로 경로.
+	 * 값 범위: 0 또는 1. 1일 때 링 인덱스 갱신이 한 사이클에 끝나는 빠른 경로.
+	 * 동기화: 초기화 이후 read-only. */
 
-	struct cmdprio cmdprio;         /* 명령 우선순위(cmdprio) 설정 구조체.
-	                                 * I/O 요청별로 다른 우선순위를 적용할 수 있음. */
+	unsigned int entries;
+	/* [한국어] 링 버퍼 용량(슬롯 개수) = td->o.iodepth (사용자 지정 큐 깊이).
+	 * 설정자: fio_libaio_init()에서 td->o.iodepth 복사.
+	 * 읽는 자: ring_inc(), fio_libaio_commit()의 wrap 보호(entries - tail).
+	 * 값 범위: 1 이상 정수. 너무 크면 io_setup 단계에서
+	 *          /proc/sys/fs/aio-max-nr 한도에 걸려 실패할 수 있음.
+	 * 동기화: 초기화 후 read-only. */
+
+	unsigned int queued;
+	/* [한국어] "queue()에 쌓였지만 아직 io_submit이 끝나지 않은" 요청 수.
+	 * 설정자: fio_libaio_queue()에서 ++, fio_libaio_commit()에서 성공분만큼 --.
+	 * 읽는 자: queue()가 iodepth 포화 여부 판정, commit() 루프 지속 조건,
+	 *          EAGAIN/ENOMEM 시 "다른 대기 요청 존재 여부"로 에러 처리 분기.
+	 * 값 범위: [0, entries]. head == tail 조건과 결합해 빈/참 상태 구분.
+	 * 동기화: 단일 잡 스레드 전용이므로 원자성 불필요. */
+
+	unsigned int head;
+	/* [한국어] 링 버퍼의 생산자(producer) 인덱스 — 다음에 iocb를 넣을 슬롯.
+	 * 설정자: fio_libaio_queue() 말미의 ring_inc(ld, &head, 1).
+	 * 읽는 자: queue()에서 iocbs[head]/io_us[head] 접근 시 사용.
+	 * 값 범위: [0, entries-1]. 래핑 방식은 is_pow2에 따라 AND 또는 MOD.
+	 * 동기화: 단일 잡 스레드 전용. */
+
+	unsigned int tail;
+	/* [한국어] 링 버퍼의 소비자(consumer) 인덱스 — 다음에 io_submit으로 내보낼 슬롯.
+	 * 설정자: fio_libaio_commit()가 io_submit 성공 반환 수(ret)만큼 ring_inc.
+	 * 읽는 자: commit()가 iocbs+tail, io_us+tail로 제출 구간 기준점을 잡음.
+	 * 값 범위: [0, entries-1]. tail ≤ head (링에서 모듈로 거리).
+	 * 동기화: 단일 잡 스레드 전용. */
+
+	struct cmdprio cmdprio;
+	/* [한국어] 요청별 I/O 우선순위(cmdprio) 정책 상태.
+	 * 설정자: fio_libaio_init()의 fio_cmdprio_init()이 옵션 파싱 결과로 초기화.
+	 * 읽는 자: fio_libaio_cmdprio_prep()가 mode/percentage를 보고 ioprio 결정 후
+	 *          iocb.aio_reqprio 및 IOCB_FLAG_IOPRIO 세팅.
+	 * 값 범위: mode ∈ {NONE, PERCENT, BSSPLIT, ...}. 상세는 cmdprio.h 참고.
+	 * 동기화: 잡 스레드 내 단독 소유. 내부 난수 소비에 별도 락 불필요. */
 };
 
 /*
@@ -135,16 +210,40 @@ struct libaio_data {
  * 예: userspace_reap=1, nowait=1, libaio_vectored=1
  */
 struct libaio_options {
-	struct thread_data *td;             /* 부모 thread_data에 대한 역참조 포인터 */
-	unsigned int userspace_reap;        /* 1이면 커널 시스템 콜 대신 사용자 공간에서
-	                                     * AIO 링 버퍼를 직접 읽어 완료 이벤트를 수확.
-	                                     * io_getevents() 시스템 콜 오버헤드를 줄임. */
-	struct cmdprio_options cmdprio_options; /* 명령 우선순위 관련 옵션 */
-	unsigned int nowait;                /* 1이면 RWF_NOWAIT 플래그를 설정.
-	                                     * I/O가 즉시 완료될 수 없으면 블로킹 대신
-	                                     * -EAGAIN을 반환하도록 함. */
-	unsigned int vectored;              /* 1이면 pread/pwrite 대신 preadv/pwritev 사용.
-	                                     * scatter/gather I/O를 활용. */
+	struct thread_data *td;
+	/* [한국어] 옵션 구조체에서 thread_data로 되돌아가는 역포인터.
+	 * 설정자: fio 옵션 파서(parse.c)가 옵션 구조체를 td마다 할당할 때 세팅.
+	 * 읽는 자: fio_option 콜백(cb)이 옵션 변경 시점에 td 컨텍스트에 접근해야 할 때.
+	 * 값 범위: 유효한 thread_data* (NULL 아님).
+	 * 동기화: 옵션은 잡 시작 전에 파싱되어 이후 read-only. */
+
+	unsigned int userspace_reap;
+	/* [한국어] 1이면 io_getevents(2) 대신 aio_ring을 유저스페이스에서 직접 polling.
+	 * 설정자: FIO_OPT_STR_SET 파서가 "userspace_reap" 옵션 등장 시 1로 세팅.
+	 * 읽는 자: fio_libaio_getevents()가 actual_min==0일 때 분기 선택에 사용.
+	 * 값 범위: 0 또는 1. 1일 때 시스콜 진입 비용이 사라지지만, 블로킹 대기는 불가.
+	 * 동기화: read-only. */
+
+	struct cmdprio_options cmdprio_options;
+	/* [한국어] cmdprio 하위 옵션(class, percentage, bssplit 등)을 담는 집합 구조체.
+	 * 설정자: CMDPRIO_OPTIONS() 매크로가 확장한 개별 옵션들을 fio 파서가 채움.
+	 * 읽는 자: fio_cmdprio_init()가 ld->cmdprio로 변환/검증하는 입력.
+	 * 값 범위: cmdprio.h 정의에 의존.
+	 * 동기화: read-only. */
+
+	unsigned int nowait;
+	/* [한국어] 1이면 각 iocb에 RWF_NOWAIT 플래그를 세팅해 비차단 I/O를 요청.
+	 * 설정자: FIO_OPT_BOOL 파서가 "nowait=1"을 인식할 때 1로 세팅.
+	 * 읽는 자: fio_libaio_prep()가 DDIR_READ/WRITE 분기 내에서 iocb->aio_rw_flags에 OR.
+	 * 값 범위: 0 또는 1. 1이면 페이지 캐시 미스/잠금 경합 시 -EAGAIN 반환.
+	 * 동기화: read-only. */
+
+	unsigned int vectored;
+	/* [한국어] 1이면 io_prep_preadv/pwritev 경로(벡터 I/O)를 선택.
+	 * 설정자: FIO_OPT_BOOL 파서가 "libaio_vectored=1" 인식 시 1.
+	 * 읽는 자: fio_libaio_prep()가 분기에서 확인, iovecs[io_u->index] 사용.
+	 * 값 범위: 0 또는 1. iov_count는 1로 고정이라 성능 이득보다 API 테스트 용도.
+	 * 동기화: read-only. */
 };
 
 /*
@@ -205,21 +304,22 @@ static struct fio_option options[] = {
 };
 
 /*
- * [한국어] 링 버퍼 인덱스 증가 함수
+ * [한국어] ring_inc - 링 버퍼 인덱스 증가(래핑 포함)
  *
- * @역할: 링 버퍼의 인덱스(head 또는 tail)를 add만큼 증가시킨다.
- *        링 크기(entries)가 2의 거듭제곱이면 AND 비트 연산으로,
- *        아니면 모듈로(%) 연산으로 래핑(wrapping)한다.
- * @파라미터:
- *   - ld: libaio_data 포인터 (링 버퍼 메타데이터 포함)
- *   - val: 증가시킬 인덱스의 포인터 (&head 또는 &tail)
- *   - add: 증가량
- * @반환값: 없음 (val이 직접 수정됨)
+ * @param ld:  libaio_data 포인터. entries/is_pow2 메타데이터 소스.
+ * @param val: &ld->head 또는 &ld->tail — in-place로 갱신될 대상 인덱스.
+ * @param add: 증가량(보통 1 또는 io_submit 성공 개수).
+ * @return: 없음(val이 직접 수정됨).
  *
- * @성능 최적화:
- *   entries가 2의 거듭제곱일 때: (*val + add) & (entries - 1)
- *   → 모듈로 연산보다 빠른 비트 AND 연산 사용
- *   예: entries=8 → entries-1=7=0b0111, (5+4)&7 = 9&7 = 1
+ * 실행 컨텍스트: 단일 잡 스레드(유저스페이스). 동기화 불필요.
+ * 호출 체인:
+ *   fio_libaio_queue() → [ring_inc] (head 전진)
+ *   fio_libaio_commit() → [ring_inc] (tail 전진)
+ *
+ * 성능 최적화:
+ *   entries가 2의 거듭제곱일 때 (*val + add) & (entries - 1)로 모듈로 회피.
+ *   예: entries=8, mask=7=0b0111, (5+4)&7 = 1.
+ * 에러 경로: 없음 (인자가 잘못되면 상위에서 필터링됨).
  */
 static inline void ring_inc(struct libaio_data *ld, unsigned int *val,
 			    unsigned int add)
@@ -233,26 +333,30 @@ static inline void ring_inc(struct libaio_data *ld, unsigned int *val,
 }
 
 /*
- * [한국어] I/O 요청 준비 함수
+ * [한국어] fio_libaio_prep - io_u를 Linux AIO용 iocb로 변환하는 ioengine_ops.prep 콜백
  *
- * @역할: io_u 구조체의 정보를 기반으로 Linux AIO용 iocb 구조체를 설정한다.
- *        읽기/쓰기 방향, 파일 디스크립터, 버퍼, 오프셋 등을 iocb에 채운다.
- * @파라미터:
- *   - td: fio 스레드 데이터 (엔진 옵션 등 포함)
- *   - io_u: fio의 I/O 유닛 (하나의 I/O 요청을 나타냄)
- * @반환값: 항상 0 (성공)
+ * @param td:   fio 잡의 thread_data. td->eo로 libaio_options, td->io_ops_data로 libaio_data 접근.
+ * @param io_u: 준비할 I/O 유닛. ddir/offset/xfer_buf/xfer_buflen/file 필드가 확정된 상태.
+ * @return: 항상 0 (현재 구현상 실패 경로 없음).
  *
- * @Linux AIO 관계:
- *   io_prep_pread()   → iocb를 비동기 읽기용으로 설정
- *   io_prep_pwrite()  → iocb를 비동기 쓰기용으로 설정
- *   io_prep_preadv()  → iocb를 벡터 비동기 읽기용으로 설정
- *   io_prep_pwritev() → iocb를 벡터 비동기 쓰기용으로 설정
- *   io_prep_fsync()   → iocb를 비동기 fsync용으로 설정
- *   이 함수들은 libaio 라이브러리가 제공하는 헬퍼로,
- *   iocb의 opcode, fd, buf, nbytes, offset 등의 필드를 채워준다.
+ * 배경: libaio는 io_submit(2)에 iocb 배열을 넘겨야 하므로, 각 io_u에 내장된
+ * iocb 필드(opcode, fd, buf, nbytes, offset, aio_rw_flags, aio_reqprio)를 채워야 한다.
+ * 이 작업을 queue() 전에 완료해 커널 제출 경로를 가볍게 유지한다.
  *
- * @흐름: fio 프레임워크가 각 io_u에 대해 이 함수를 호출한 뒤,
- *        queue() → commit() 순서로 진행.
+ * 동작:
+ *   - DDIR_READ: vectored 옵션에 따라 io_prep_preadv 또는 io_prep_pread.
+ *   - DDIR_WRITE: 동일 분기. RWF_ATOMIC(+oatomic) 지원 빌드에선 원자 쓰기 플래그.
+ *   - ddir_sync: io_prep_fsync (비동기 fsync).
+ *   - nowait 옵션: aio_rw_flags |= RWF_NOWAIT (블로킹 대기 대신 -EAGAIN 반환 유도).
+ *
+ * 실행 컨텍스트: 잡 스레드(유저스페이스), td_io_prep 경로에서 한 io_u당 1회.
+ * 호출 체인:
+ *   backend.c 루프 → td_io_prep(ioengines.c) → [fio_libaio_prep]
+ *                                              → io_prep_pread/pwrite/preadv/pwritev/fsync (libaio 헬퍼)
+ * 에러 경로: 없음. 잘못된 ddir은 상위에서 필터링.
+ *
+ * Linux AIO 헬퍼 요약:
+ *   io_prep_pread/pwrite/preadv/pwritev/fsync — aio_abi.h의 iocb 필드 초기화.
  */
 static int fio_libaio_prep(struct thread_data *td, struct io_u *io_u)
 {
@@ -318,20 +422,22 @@ static int fio_libaio_prep(struct thread_data *td, struct io_u *io_u)
 }
 
 /*
- * [한국어] 명령 우선순위(cmdprio) 준비 함수
+ * [한국어] fio_libaio_cmdprio_prep - I/O별 ioprio를 iocb에 주입(인라인 헬퍼)
  *
- * @역할: cmdprio 기능이 활성화된 경우, I/O 요청에 우선순위를 설정한다.
- *        특정 비율의 I/O 요청에 높은/낮은 우선순위를 부여하여
- *        QoS(Quality of Service) 시나리오를 시뮬레이션할 수 있다.
- * @파라미터:
- *   - td: 스레드 데이터
- *   - io_u: 우선순위를 설정할 I/O 유닛
- * @반환값: 없음
+ * @param td:   잡 thread_data (td->io_ops_data에서 libaio_data 획득).
+ * @param io_u: 우선순위 적용 대상 I/O 유닛.
+ * @return: 없음 (io_u->iocb 필드만 수정).
  *
- * @상세:
- *   fio_cmdprio_set_ioprio()가 true를 반환하면 (이 요청에 우선순위 적용 결정),
- *   iocb의 aio_reqprio에 우선순위 값을 설정하고
- *   IOCB_FLAG_IOPRIO 플래그를 켜서 커널이 이 우선순위를 인식하도록 함.
+ * 배경: Linux 블록 계층의 ioprio를 AIO 경로에서도 사용하려면 iocb.aio_reqprio에
+ * 우선순위 값을 넣고 IOCB_FLAG_IOPRIO를 set해야 커널이 이를 BIO에 전파한다.
+ *
+ * 동작: fio_cmdprio_set_ioprio()가 cmdprio 정책(percentage/bssplit 등)에 따라
+ *       이 io_u에 우선순위를 적용할지 결정하고 io_u->ioprio를 채우면,
+ *       iocb 필드 두 개(aio_reqprio, u.c.flags)에 복사.
+ *
+ * 실행 컨텍스트: 잡 스레드, fio_libaio_queue()에서 cmdprio.mode != NONE일 때만 호출.
+ * 호출 체인: fio_libaio_queue() → [fio_libaio_cmdprio_prep] → fio_cmdprio_set_ioprio()
+ * 에러 경로: 없음.
  */
 static inline void fio_libaio_cmdprio_prep(struct thread_data *td,
 					   struct io_u *io_u)
@@ -347,23 +453,29 @@ static inline void fio_libaio_cmdprio_prep(struct thread_data *td,
 }
 
 /*
- * [한국어] 개별 완료 이벤트 처리 함수
+ * [한국어] fio_libaio_event - ioengine_ops.event 콜백 (완료 이벤트 인덱스 → io_u)
  *
- * @역할: getevents()로 수확한 완료 이벤트 배열에서 특정 인덱스의 이벤트를 가져와
- *        대응하는 io_u를 반환하고, I/O 결과(성공/실패/부분완료)를 확인한다.
- * @파라미터:
- *   - td: 스레드 데이터
- *   - event: 이벤트 배열 내 인덱스 (0부터 시작)
- * @반환값: 해당 이벤트에 대응하는 io_u 포인터
+ * @param td:    잡 thread_data.
+ * @param event: fio_libaio_getevents()가 이전 호출에서 수확한 aio_events[] 인덱스 (0-base).
+ * @return: 해당 완료 이벤트에 대응하는 io_u 포인터. error/resid는 res 기반으로 갱신됨.
  *
- * @상세:
- *   io_event 구조체의 필드:
- *   - obj: 원래 제출한 iocb의 포인터
- *   - res: I/O 결과 (성공 시 전송된 바이트 수, 실패 시 음수 에러 코드)
- *   - res2: 보조 결과 (보통 0)
+ * 배경: fio 코어는 getevents()가 N개를 수확했다고 보고받으면 i=0..N-1로 event(td, i)를
+ * 호출해 각 io_u를 확인한다. 이 함수는 커널이 기록한 완료 정보(io_event)를
+ * fio가 이해하는 io_u 에러/잔여바이트 표현으로 변환한다.
  *
- *   container_of() 매크로로 iocb 포인터에서 io_u 포인터를 역추적.
- *   이는 io_u 구조체 내에 iocb가 내장되어 있기 때문에 가능.
+ * 동작:
+ *   1) ev = &ld->aio_events[event]
+ *   2) io_u = container_of(ev->obj, struct io_u, iocb) — iocb는 io_u 내 임베디드.
+ *   3) ev->res가 요청 길이와 다르면:
+ *       - res > xfer_buflen: 사실상 음수(-errno)가 unsigned로 해석된 것 → io_u->error = -ev->res
+ *       - res < xfer_buflen: 부분 완료(short I/O) → resid에 미전송 바이트 수
+ *      같으면 error=0.
+ *
+ * 실행 컨텍스트: 잡 스레드, getevents() 직후.
+ * 호출 체인: backend → td_io_getevents 루프 → [fio_libaio_event] → io_u 상태 갱신.
+ * 에러 경로: ev->obj가 유효하지 않으면 container_of가 잘못된 포인터 반환(발생해선 안 됨).
+ *
+ * io_event 필드: {data, obj(=iocb*), res, res2}. POSIX AIO와 달리 유저가 명시 제공.
  */
 static struct io_u *fio_libaio_event(struct thread_data *td, int event)
 {
@@ -409,22 +521,62 @@ static struct io_u *fio_libaio_event(struct thread_data *td, int event)
  */
 struct aio_ring {
 	unsigned id;		 /** kernel internal index number */
-	                     /* [한국어] 커널 내부 인덱스 번호 */
+	/* [한국어] 커널 AIO 컨텍스트의 내부 식별자 (fs/aio.c에서 부여).
+	 * 설정자: io_setup(2) 성공 시 커널이 AIO 링 첫 페이지에 기록.
+	 * 읽는 자: 유저스페이스에서는 디버깅 외에는 직접 사용하지 않음.
+	 * 값 범위: 커널 내부 의미. 유저는 해석하지 않는다.
+	 * 동기화: 커널이 쓰고 유저가 읽는 read-only 메타 필드. */
+
 	unsigned nr;		 /** number of io_events */
-	                     /* [한국어] 링에 저장 가능한 io_event 개수 */
-	unsigned head;       /* [한국어] 링 버퍼의 head (소비자 측 - 읽기 위치) */
-	unsigned tail;       /* [한국어] 링 버퍼의 tail (생산자 측 - 커널이 새 이벤트를 추가하는 위치) */
+	/* [한국어] 링이 보관할 수 있는 io_event 슬롯 수 (io_setup의 maxevents 기반).
+	 * 설정자: 커널의 aio_setup_ring()이 페이지 크기에 맞춰 계산 후 기록.
+	 * 읽는 자: user_io_getevents()의 (head + 1) % ring->nr — 링 래핑 계산에 필수.
+	 * 값 범위: maxevents 이상(정렬/헤더 때문에 약간 더 클 수 있음).
+	 * 동기화: read-only. */
 
-	unsigned magic;              /* [한국어] 매직 넘버 (AIO_RING_MAGIC = 0xa10a10a1).
-	                              * 이 값으로 링 버퍼가 유효한 AIO 링인지 검증. */
-	unsigned compat_features;    /* [한국어] 호환 가능한 기능 플래그 */
-	unsigned incompat_features;  /* [한국어] 비호환 기능 플래그 */
+	unsigned head;
+	/* [한국어] 소비자(유저스페이스) 측 인덱스 — 다음에 읽을 이벤트 위치.
+	 * 설정자: user_io_getevents()가 atomic_store_release로 (head+1)%nr 진행.
+	 * 읽는 자: 커널이 "링에 빈 공간이 있는지" 판단할 때 읽음. 유저는 루프 조건에 사용.
+	 * 값 범위: [0, nr-1].
+	 * 동기화: release 스토어로 업데이트 — 직전 events[head] 읽기가 완료된 후에만
+	 *         커널이 관측하도록 메모리 순서를 강제. */
+
+	unsigned tail;
+	/* [한국어] 생산자(커널) 측 인덱스 — 커널이 다음에 완료 이벤트를 써넣을 위치.
+	 * 설정자: 커널이 I/O 완료 시 events[tail]에 기록하고 tail을 증가.
+	 * 읽는 자: user_io_getevents()가 head == tail로 "빈 링" 여부를 확인.
+	 * 값 범위: [0, nr-1].
+	 * 동기화: 커널은 acquire로 head를 읽고 release로 tail을 증가시킨다. */
+
+	unsigned magic;
+	/* [한국어] 링 유효성 검증용 매직 넘버 (AIO_RING_MAGIC = 0xa10a10a1).
+	 * 설정자: io_setup(2) 시 커널이 기록.
+	 * 읽는 자: fio_libaio_getevents()가 userspace reap 분기 진입 전 검사.
+	 * 값 범위: 정상일 때 0xa10a10a1 고정. 불일치면 userspace reap 불가(시스콜 폴백).
+	 * 동기화: read-only. */
+
+	unsigned compat_features;
+	/* [한국어] 무시해도 되는 호환 기능 비트 필드.
+	 * 설정자: 커널이 설정. 읽는 자: 특정 기능 감지 시 사용(여기선 미사용).
+	 * 값 범위: 기능 비트마스크. 동기화: read-only. */
+
+	unsigned incompat_features;
+	/* [한국어] 인식하지 못하면 링을 사용하면 안 되는 필수 기능 비트 필드.
+	 * 설정자: 커널. 읽는 자: 안전한 링 접근을 요구하는 라이브러리. 여기선 미검사.
+	 * 값 범위: 기능 비트마스크. 동기화: read-only. */
+
 	unsigned header_length;	/** size of aio_ring */
-	                        /* [한국어] aio_ring 헤더의 크기 (바이트) */
+	/* [한국어] aio_ring 헤더(이 구조체의 고정부) 크기(바이트).
+	 * 설정자: 커널. 읽는 자: events[] 실제 시작 오프셋 계산이 필요할 때.
+	 * 값 범위: 통상 >= sizeof(struct aio_ring). 동기화: read-only. */
 
-	struct io_event events[0];   /* [한국어] 유연한 배열 멤버 (flexible array member).
-	                              * 실제 완료 이벤트가 저장되는 배열.
-	                              * 크기는 nr에 의해 결정됨. */
+	struct io_event events[0];
+	/* [한국어] 유연한 배열 멤버(C99 FAM) — 실제 완료 이벤트들이 연속 배치되는 구간.
+	 * 설정자: 커널이 I/O 완료 시 events[tail] 슬롯에 {data, obj, res, res2} 기록.
+	 * 읽는 자: user_io_getevents()가 events[head]를 복사.
+	 * 값 범위: 인덱스 [0, nr-1]. 각 원소는 struct io_event.
+	 * 동기화: tail/head의 release/acquire 쌍으로 순서 보호. */
 };
 
 /* [한국어] AIO 링 버퍼 유효성 검증을 위한 매직 넘버.
@@ -432,22 +584,27 @@ struct aio_ring {
 #define AIO_RING_MAGIC	0xa10a10a1
 
 /*
- * [한국어] 사용자 공간 이벤트 수확 함수 (userspace reap)
+ * [한국어] user_io_getevents - io_getevents 시스콜을 우회한 유저스페이스 링 폴링
  *
- * @역할: io_getevents() 시스템 콜을 사용하지 않고, 커널의 AIO 링 버퍼를
- *        직접 사용자 공간에서 읽어 완료된 I/O 이벤트를 수확한다.
- *        시스템 콜 오버헤드를 완전히 제거하여 높은 IOPS 워크로드에서 성능 향상.
- * @파라미터:
- *   - aio_ctx: 커널 AIO 컨텍스트 (실제로는 aio_ring 구조체의 주소)
- *   - max: 최대 수확할 이벤트 수
- *   - events: 수확한 이벤트를 저장할 배열
- * @반환값: 실제 수확한 이벤트 수
+ * @param aio_ctx: io_setup으로 받은 컨텍스트. 실상은 aio_ring 첫 페이지의 유저 매핑 주소.
+ * @param max:     이번 호출에서 최대 수확할 이벤트 수 (ld->aio_events 잔여 공간).
+ * @param events:  수확 결과를 기록할 호출자 소유 io_event 배열.
+ * @return: 실제로 링에서 복사한 이벤트 개수 (0..max).
  *
- * @커널 AIO 링 버퍼 동작:
- *   - 커널은 I/O 완료 시 ring->tail 위치에 이벤트를 추가하고 tail을 증가
- *   - 사용자는 ring->head 위치에서 이벤트를 읽고 head를 증가
- *   - head == tail이면 더 이상 읽을 이벤트가 없음
- *   - atomic_store_release로 head를 업데이트하여 커널과의 동기화 보장
+ * 배경: AIO 링 페이지는 io_setup 시 커널이 프로세스 주소 공간에 매핑해주므로,
+ * head == tail 체크와 events[head] 복사만으로 시스콜 없이 완료를 수확할 수 있다.
+ * 고 IOPS(수백만 IOPS급) 워크로드에서 시스콜 엔트리/메모리 배리어 비용을 제거해 유용.
+ *
+ * 제약: 이 경로는 "대기"를 할 수 없다 — tail이 진전되지 않으면 즉시 0 반환.
+ *       따라서 호출 측은 actual_min==0(논블로킹)일 때만 이 경로를 선택한다.
+ *
+ * 실행 컨텍스트: 잡 스레드. 링은 커널-유저 양쪽이 touch하므로 release/acquire 필수.
+ * 호출 체인: fio_libaio_getevents() (조건: userspace_reap=1 && magic 매치) → [user_io_getevents]
+ * 에러 경로: 자체 실패 없음. aio_ctx가 잘못되면 상위의 magic 검사에서 걸린다.
+ *
+ * 링 동작:
+ *   커널: 완료 시 events[tail] 기록 → tail을 release 스토어로 증가.
+ *   유저: events[head] 복사 → head를 release 스토어로 증가(커널이 다음 write 가능하도록).
  */
 static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
 			     struct io_event *events)
@@ -486,27 +643,34 @@ static int user_io_getevents(io_context_t aio_ctx, unsigned int max,
 }
 
 /*
- * [한국어] 완료 이벤트 수확 함수 (getevents)
+ * [한국어] fio_libaio_getevents - ioengine_ops.getevents 콜백 (완료 이벤트 수집 루프)
  *
- * @역할: 커널에서 완료된 I/O 이벤트를 가져온다.
- *        최소 min개, 최대 max개의 이벤트를 수확할 때까지 반복.
- *        userspace_reap 옵션에 따라 커널 시스템 콜 또는 직접 링 버퍼 접근 사용.
- * @파라미터:
- *   - td: 스레드 데이터
- *   - min: 최소 수확해야 할 이벤트 수
- *   - max: 최대 수확할 이벤트 수
- *   - t: 타임아웃 (NULL이면 무한 대기 가능)
- * @반환값: 수확한 이벤트 수 (성공), 음수 에러 코드 (실패)
+ * @param td:  잡 thread_data.
+ * @param min: 반드시 수확해야 할 최소 이벤트 수. 0이면 논블로킹.
+ * @param max: 이번 호출에서 수확 가능한 최대 이벤트 수(=td->cur_depth 이하).
+ * @param t:   io_getevents 타임아웃 timespec. NULL이면 min개 도달까지 무한 대기.
+ * @return: 수확한 이벤트 수(>=0) 또는 음수 -errno.
  *
- * @핵심 흐름:
- *   1. userspace_reap이면 user_io_getevents()로 직접 수확 시도
- *   2. 아니면 io_getevents() 시스템 콜로 커널에서 수확
- *   3. 이벤트를 충분히 수확하지 못하면 commit()을 호출하여 대기 중인 요청 제출
- *   4. min개 이상 수확할 때까지 반복
+ * 배경: 커널 AIO는 완료가 비동기로 발생하므로 최소/최대 제약을 지키며 대기/폴링한다.
+ * userspace_reap 옵션이 켜지고 논블로킹 모드이며 링 매직이 유효하면 시스콜 없이 수확.
  *
- * @fio 흐름에서의 위치:
- *   queue() → commit() → getevents() → event()
- *   getevents()는 commit()으로 제출된 I/O가 완료되기를 기다림.
+ * 핵심 동작:
+ *   1) 타임아웃 원본 보호를 위해 지역 복사본 lt 사용.
+ *   2) 루프:
+ *      a) 조건 충족 시 user_io_getevents()로 링 직접 읽기.
+ *      b) 아니면 io_getevents(ctx, actual_min, max-events, buf+events, lt).
+ *      c) r>0이면 events에 누적, actual_min 감소.
+ *      d) r==0 또는 -EAGAIN이면 fio_libaio_commit()으로 대기 요청 추가 제출하고
+ *         (actual_min>0일 때) 10us sleep 후 재시도.
+ *      e) -EINTR면 재시도, 그 외 에러는 루프 탈출.
+ *   3) events >= min이 될 때까지 반복.
+ *
+ * 실행 컨텍스트: 잡 스레드(유저스페이스). 시그널 수신 시 EINTR 경로 존재.
+ * 호출 체인: backend → td_io_getevents → [fio_libaio_getevents]
+ *              → io_getevents(2) 또는 user_io_getevents → (필요 시) fio_libaio_commit
+ * 에러 경로: io_getevents의 -errno(예: -EFAULT, -EINVAL)를 그대로 상향 반환.
+ *
+ * fio 흐름 상 위치: queue() → commit() → [getevents] → event() (per-iter).
  */
 static int fio_libaio_getevents(struct thread_data *td, unsigned int min,
 				unsigned int max, const struct timespec *t)
@@ -576,24 +740,31 @@ static int fio_libaio_getevents(struct thread_data *td, unsigned int min,
 }
 
 /*
- * [한국어] I/O 요청 큐잉 함수 (queue)
+ * [한국어] fio_libaio_queue - ioengine_ops.queue 콜백 (io_u를 제출 대기 링에 적재)
  *
- * @역할: 하나의 I/O 요청(io_u)을 내부 링 버퍼에 추가한다.
- *        이 시점에서는 아직 커널에 제출하지 않음 - 실제 제출은 commit()에서 수행.
- *        이렇게 큐잉 후 일괄 제출하는 방식으로 io_submit() 시스템 콜 횟수를 줄여
- *        배치 효율을 높인다.
- * @파라미터:
- *   - td: 스레드 데이터
- *   - io_u: 큐에 추가할 I/O 유닛
- * @반환값:
- *   - FIO_Q_QUEUED: 큐에 성공적으로 추가됨 (아직 제출되지 않음)
- *   - FIO_Q_BUSY: 큐가 꽉 참 (iodepth에 도달)
- *   - FIO_Q_COMPLETED: 동기적으로 즉시 완료됨 (TRIM, SYNCFS)
+ * @param td:   잡 thread_data.
+ * @param io_u: 이미 prep된 I/O 유닛.
+ * @return:
+ *   - FIO_Q_QUEUED:    링에 들어갔고 commit() 시 io_submit으로 전달될 예정.
+ *   - FIO_Q_BUSY:      링/iodepth 포화 또는 TRIM/SYNCFS 직전 비동기 대기분 잔존 — 호출측이 먼저 reap 필요.
+ *   - FIO_Q_COMPLETED: TRIM/SYNCFS를 동기 실행으로 즉시 완료.
  *
- * @핵심 흐름:
- *   fio_libaio_queue() → 링 버퍼에 추가
- *   → fio_libaio_commit() → io_submit()으로 커널에 제출
- *   → fio_libaio_getevents() → io_getevents()로 완료 수확
+ * 배경: 큐잉-배치-제출 분리로 io_submit(2) 호출 횟수를 줄이고, iodepth 만큼의
+ * 요청을 한 번에 커널에 내려 throughput을 끌어올리는 libaio 전형 패턴.
+ *
+ * 동작:
+ *   1) fio_ro_check: read-only 위반 체크(쓰기 시 abort).
+ *   2) queued == iodepth → FIO_Q_BUSY 반환(완료 먼저 수확 유도).
+ *   3) DDIR_TRIM/SYNCFS: libaio 백엔드가 지원하지 않아 동기 호출 후 즉시 완료 마크.
+ *      단, 이전에 비동기 요청이 대기 중이면 순서 보호를 위해 FIO_Q_BUSY.
+ *   4) cmdprio 활성이면 fio_libaio_cmdprio_prep으로 ioprio 주입.
+ *   5) iocbs[head]/io_us[head]에 포인터 저장, head 전진, queued++ → FIO_Q_QUEUED.
+ *
+ * 실행 컨텍스트: 잡 스레드(유저스페이스).
+ * 호출 체인: backend → td_io_queue → [fio_libaio_queue]
+ *              → (sync 분기) do_io_u_trim / do_io_u_sync
+ *              → (async 분기) ring_inc / fio_libaio_cmdprio_prep
+ * 에러 경로: ro 위반은 fio_ro_check가 td 상태를 ERROR로 전환. 링 적재 자체는 실패 없음.
  */
 static enum fio_q_status fio_libaio_queue(struct thread_data *td,
 					  struct io_u *io_u)
@@ -644,16 +815,25 @@ static enum fio_q_status fio_libaio_queue(struct thread_data *td,
 }
 
 /*
- * [한국어] 제출된 I/O의 타임스탬프 기록 함수
+ * [한국어] fio_libaio_queued - io_submit 성공분에 issue_time 찍기(지연 시간 측정용)
  *
- * @역할: commit()에서 io_submit() 성공 후 호출되어,
- *        제출된 각 io_u에 제출 시각(issue_time)을 기록한다.
- *        이 타임스탬프는 지연 시간(latency) 측정에 사용됨.
- * @파라미터:
- *   - td: 스레드 데이터
- *   - io_us: 제출된 io_u 포인터 배열
- *   - nr: 제출된 io_u 개수
- * @반환값: 없음
+ * @param td:    잡 thread_data.
+ * @param io_us: 이번 io_submit에서 커널이 받아들인 io_u 포인터 배열의 시작(=io_us+tail).
+ * @param nr:    성공적으로 제출된 io_u 개수(io_submit의 양수 반환값).
+ * @return: 없음.
+ *
+ * 배경: fio의 submission latency/completion latency를 분리 측정하려면 "커널에 실제 넘긴
+ * 시각"이 필요하다. FIO_ASYNCIO_SETS_ISSUE_TIME 플래그가 설정된 엔진은 이 값을 직접 기록한다.
+ *
+ * 동작:
+ *   1) fio_fill_issue_time(td) 체크 — 이 잡이 issue_time 기록을 원하는지 확인.
+ *   2) fio_gettime으로 nr개 모두에 동일 시각을 찍어 gettime 호출 비용 최소화.
+ *   3) 각 io_u->issue_time을 채우고 io_u_queued()로 fio 코어 통계 훅 실행.
+ *   4) read_iolog_file 모드면 td->last_issue도 갱신(iolog 재생 페이싱 기준).
+ *
+ * 실행 컨텍스트: 잡 스레드, fio_libaio_commit 내부.
+ * 호출 체인: fio_libaio_commit → [fio_libaio_queued] → fio_gettime / io_u_queued.
+ * 에러 경로: 없음.
  */
 static void fio_libaio_queued(struct thread_data *td, struct io_u **io_us,
 			      unsigned int nr)
@@ -688,29 +868,38 @@ static void fio_libaio_queued(struct thread_data *td, struct io_u **io_us,
 }
 
 /*
- * [한국어] I/O 요청 일괄 제출 함수 (commit)
+ * [한국어] fio_libaio_commit - ioengine_ops.commit 콜백 (링 → 커널 일괄 제출)
  *
- * @역할: queue()에서 링 버퍼에 쌓아둔 I/O 요청들을 io_submit() 시스템 콜로
- *        커널에 일괄 제출한다. 여러 요청을 한 번의 시스템 콜로 제출하여
- *        시스템 콜 오버헤드를 최소화.
- * @파라미터:
- *   - td: 스레드 데이터
- * @반환값: 0 (성공), 음수 에러 코드 (실패)
+ * @param td: 잡 thread_data.
+ * @return: 0 (더 이상 제출할 게 없거나 부분 성공으로 상위가 reap해야 함),
+ *          또는 음수 -errno (치명적 실패).
  *
- * @핵심 동작:
- *   1. 링 버퍼의 tail부터 queued개 만큼의 iocb를 io_submit()으로 제출
- *   2. 링 버퍼가 끝에서 래핑되는 경우, 끝까지만 먼저 제출하고 다음 루프에서 나머지 제출
- *   3. EAGAIN, EINTR, ENOMEM 등의 에러를 적절히 처리
+ * 배경: queue()는 iocb를 링에만 쌓아두므로, 실제 커널 진입은 이 함수가 담당한다.
+ * 한 번의 io_submit(2)로 다수의 iocb를 내려 syscall 오버헤드를 분산시키는 것이 핵심.
  *
- * @io_submit() 관계:
- *   io_submit(ctx, nr, iocbs[]) - nr개의 iocb를 커널 AIO에 제출
- *   반환값 > 0: 성공적으로 제출된 iocb 수
- *   반환값 == 0: 아무것도 제출되지 않음
- *   반환값 < 0: 에러 코드 (-EAGAIN, -ENOMEM 등)
+ * 핵심 동작:
+ *   1) queued==0이면 즉시 0 반환.
+ *   2) 루프:
+ *      nr = min(queued, entries - tail)  // 링 끝 래핑 구간만큼만 한 번에
+ *      ret = io_submit(aio_ctx, nr, iocbs + tail)
+ *      ret>0: queued()로 issue_time 기록, io_u_mark_submit, queued-=ret, tail 전진.
+ *      ret==-EINTR 또는 0: 재시도.
+ *      ret==-EAGAIN: 커널 AIO 슬롯 포화 →
+ *         다른 제출 성공분 있으면 break(상위가 reap 후 재시도),
+ *         없으면 30초까지 1us busy-wait, 초과 시 에러로 포기.
+ *      ret==-ENOMEM: queued 잔존 시 상위 reap 유도(메모리 회수), 아니면 치명.
+ *      그 외 에러: break.
+ *   3) queued>0 동안 반복.
  *
- * @fio 흐름:
- *   queue()에서 링 버퍼에 추가 → commit()에서 io_submit()으로 커널에 제출
- *   → getevents()에서 완료 대기 및 수확
+ * 실행 컨텍스트: 잡 스레드. getevents()에서도 내부적으로 호출됨.
+ * 호출 체인: backend → td_io_commit → [fio_libaio_commit] → io_submit(2)
+ *              → (간접) 커널 AIO → VFS → 블록 계층 → 드라이버.
+ * 에러 경로: 30초 stall 감지 시 "aio appears to be stalled" 로그 후 ret 반환.
+ *
+ * io_submit 반환 관례:
+ *   >0: 제출된 iocb 수 (nr 이하일 수 있음 — partial submit).
+ *   0: 아무것도 제출 안 됨(드묾, EINTR과 유사 처리).
+ *   <0: -errno.
  */
 static int fio_libaio_commit(struct thread_data *td)
 {
@@ -806,18 +995,24 @@ static int fio_libaio_commit(struct thread_data *td)
 }
 
 /*
- * [한국어] 엔진 정리/해제 함수 (cleanup)
+ * [한국어] fio_libaio_cleanup - ioengine_ops.cleanup 콜백 (잡 종료 시 자원 해제)
  *
- * @역할: libaio 엔진이 사용한 모든 자원을 해제한다.
- *        AIO 컨텍스트 파괴, 메모리 해제 등을 수행.
- * @파라미터:
- *   - td: 스레드 데이터
- * @반환값: 없음
+ * @param td: 잡 thread_data.
+ * @return: 없음.
  *
- * @주의사항:
- *   io_destroy()는 부모 프로세스에서만 호출.
- *   자식 프로세스(TD_F_CHILD)에서는 exit_aio()에서 병렬로 처리되어
- *   RCU(Read-Copy-Update) 지연을 줄임.
+ * 배경: io_destroy(2)는 커널이 내부적으로 AIO 링을 RCU로 유예-해제하기 때문에
+ * 많은 잡에서 동시에 호출되면 rcu_sched stall이 발생하는 것으로 알려져 있다.
+ * 이를 우회하기 위해 자식 프로세스 경로(TD_F_CHILD)는 이 cleanup에서 destroy를 하지 않고,
+ * 부모의 exit_aio()가 병렬로 처리한다.
+ *
+ * 동작:
+ *   1) ld이 NULL이 아니면:
+ *      - TD_F_CHILD가 꺼져 있으면 io_destroy(aio_ctx) 직접 호출.
+ *      - cmdprio / iovecs / aio_events / iocbs / io_us / ld 자체를 free.
+ *
+ * 실행 컨텍스트: 잡 스레드(또는 부모) 종료 시.
+ * 호출 체인: backend → td_io_cleanup → [fio_libaio_cleanup] → io_destroy(2) / free.
+ * 에러 경로: io_destroy 실패는 무시(종료 경로라 복구 의미 없음).
  */
 static void fio_libaio_cleanup(struct thread_data *td)
 {
@@ -849,20 +1044,24 @@ static void fio_libaio_cleanup(struct thread_data *td)
 }
 
 /*
- * [한국어] 엔진 사후 초기화 함수 (post_init)
+ * [한국어] fio_libaio_post_init - ioengine_ops.post_init 콜백 (AIO 컨텍스트 생성)
  *
- * @역할: init() 이후에 호출되어 커널 AIO 컨텍스트를 생성한다.
- *        init()과 분리된 이유는, AIO 컨텍스트 생성이 fork() 전에 이루어져야 하며
- *        리소스 제한 등의 설정이 완료된 후에 수행되어야 하기 때문.
- * @파라미터:
- *   - td: 스레드 데이터
- * @반환값: 0 (성공), 1 (실패)
+ * @param td: 잡 thread_data.
+ * @return: 0 성공, 1 실패(td_verror로 에러가 기록됨).
  *
- * @Linux AIO 관계:
- *   io_queue_init(maxevents, &ctx) = io_setup(maxevents, &ctx)
- *   - maxevents: 동시에 처리할 수 있는 최대 I/O 요청 수 (= iodepth)
- *   - ctx: 생성된 AIO 컨텍스트가 저장될 변수
- *   실패 시 /proc/sys/fs/aio-max-nr 값을 확인할 필요가 있음.
+ * 배경: init()과 분리된 이유는 (a) 메모리/옵션 유효성 검증을 먼저 끝내고
+ * (b) fork 이전에 AIO 컨텍스트가 자식에 상속되도록 해야 하며 (c) nofile/memlock
+ * rlimit을 먼저 올린 뒤 io_setup을 해야 aio-max-nr 실패를 줄일 수 있기 때문.
+ *
+ * 동작: io_queue_init(iodepth, &ld->aio_ctx) → 내부적으로 io_setup(iodepth, &ctx).
+ *       커널은 이 요청에 대해 aio-nr을 iodepth만큼 차감하고 AIO 링 페이지를 mmap.
+ *
+ * 실행 컨텍스트: 잡 스레드(유저스페이스). 한 번 성공하면 이후 재호출 없음.
+ * 호출 체인: backend → td_io_init 이후 → [fio_libaio_post_init] → io_queue_init → io_setup(2)
+ * 에러 경로:
+ *   - -EAGAIN: /proc/sys/fs/aio-max-nr 초과(시스템 전역 한도).
+ *   - -ENOMEM: 커널 메모리 부족.
+ *   실패 시 td_verror 호출로 잡 상태 ERROR 전환.
  */
 static int fio_libaio_post_init(struct thread_data *td)
 {
@@ -885,22 +1084,25 @@ static int fio_libaio_post_init(struct thread_data *td)
 }
 
 /*
- * [한국어] 엔진 초기화 함수 (init)
+ * [한국어] fio_libaio_init - ioengine_ops.init 콜백 (엔진 상태 할당)
  *
- * @역할: libaio 엔진의 데이터 구조체를 할당하고 초기화한다.
- *        링 버퍼, iocb 배열, io_event 배열, iovec 배열 등을 할당.
- *        이 함수는 실제 AIO 컨텍스트를 생성하지 않음 (post_init에서 수행).
- * @파라미터:
- *   - td: 스레드 데이터
- * @반환값: 0 (성공), 1 (실패)
+ * @param td: 잡 thread_data. td->eo는 파싱 완료된 libaio_options.
+ * @return: 0 성공, 1 실패.
  *
- * @메모리 할당:
- *   - libaio_data: 엔진의 메인 데이터 구조체
- *   - aio_events[entries]: io_getevents() 결과를 저장할 배열
- *   - iocbs[entries]: iocb 포인터 배열 (링 버퍼)
- *   - io_us[entries]: io_u 포인터 배열 (링 버퍼)
- *   - iovecs[entries]: 벡터 I/O용 iovec 배열
- *   여기서 entries = iodepth (사용자가 설정한 I/O 깊이)
+ * 배경: AIO 컨텍스트 생성은 자원 제한 설정 이후(post_init)로 미루되, 링 배열/
+ * 옵션 의존 상태(cmdprio)는 fork 전에 준비해둬야 하므로 여기서 일괄 할당한다.
+ *
+ * 할당 목록(크기 모두 entries = iodepth):
+ *   - libaio_data (자체)
+ *   - aio_events[] : io_event 완료 슬롯
+ *   - iocbs[]      : iocb 포인터 링
+ *   - io_us[]      : io_u 포인터 링
+ *   - iovecs[]     : vectored 경로용 iovec
+ * 메타: is_pow2 = is_power_of_2(iodepth)로 ring_inc 경로 결정.
+ *
+ * 실행 컨텍스트: 잡 스레드.
+ * 호출 체인: backend → td_io_init → [fio_libaio_init] → calloc / fio_cmdprio_init.
+ * 에러 경로: calloc 실패는 현재 미검사(레거시). cmdprio_init 실패 시 td_verror 후 1 반환.
  */
 static int fio_libaio_init(struct thread_data *td)
 {
@@ -984,11 +1186,17 @@ FIO_STATIC struct ioengine_ops ioengine = {
 };
 
 /*
- * [한국어] 엔진 등록 함수 (생성자)
+ * [한국어] fio_libaio_register - fio_init 생성자 (engine 레지스트리 등록)
  *
- * @역할: fio 프로그램 시작 시 자동으로 호출되어 libaio 엔진을 fio에 등록한다.
- * @속성: fio_init - __attribute__((constructor))와 유사하게 main() 전에 실행됨.
- *        이를 통해 fio가 "ioengine=libaio"를 인식할 수 있게 됨.
+ * @param: 없음.
+ * @return: 없음.
+ *
+ * 배경: fio_init 매크로는 gcc의 __attribute__((constructor))로 확장되어 main() 진입
+ * 전에 자동 실행된다. 각 엔진 .c는 이 패턴으로 자신을 런타임 플러그인 테이블에 등록한다.
+ *
+ * 실행 컨텍스트: 프로세스 초기화 단계(main 이전). 단일 스레드.
+ * 호출 체인: 프로그램 로더/CRT → [fio_libaio_register] → register_ioengine(ioengines.c).
+ * 에러 경로: register_ioengine 실패는 이름 중복 등 극히 예외적 상황.
  */
 static void fio_init fio_libaio_register(void)
 {
@@ -996,10 +1204,17 @@ static void fio_init fio_libaio_register(void)
 }
 
 /*
- * [한국어] 엔진 해제 함수 (소멸자)
+ * [한국어] fio_libaio_unregister - fio_exit 소멸자 (engine 레지스트리 해제)
  *
- * @역할: fio 프로그램 종료 시 자동으로 호출되어 libaio 엔진 등록을 해제한다.
- * @속성: fio_exit - __attribute__((destructor))와 유사하게 프로그램 종료 시 실행됨.
+ * @param: 없음.
+ * @return: 없음.
+ *
+ * 배경: fio_exit는 __attribute__((destructor)) 확장. 프로세스 정상 종료 시 자동 호출되어
+ * 전역 ioengine_list에서 엔트리를 떼어낸다.
+ *
+ * 실행 컨텍스트: 프로세스 종료(atexit 경로). 단일 스레드.
+ * 호출 체인: _exit/atexit 체인 → [fio_libaio_unregister] → unregister_ioengine.
+ * 에러 경로: 없음.
  */
 static void fio_exit fio_libaio_unregister(void)
 {

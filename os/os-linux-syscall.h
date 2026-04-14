@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] Linux 아키텍처별 시스템 콜 번호 정의 (os-linux-syscall.h)
+ *
+ * === 파일의 역할 ===
+ * Linux에서 fio가 사용하는 시스템 콜(ioprio_set/get, fadvise64, splice, preadv2/pwritev2)의
+ * 아키텍처별 번호를 정의한다. 커널 헤더가 제공하지 않는 경우를 대비한 폴백.
+ * x86, x86_64, PPC, IA64, Alpha, S390, SPARC, ARM, MIPS, SH, HPPA, AArch64,
+ * LoongArch64, RISC-V 아키텍처를 지원한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os-linux.h에서 포함됨. 시스템 콜 번호는 ioprio_set(), preadv2() 등에서 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - arch/arch.h: 아키텍처 감지 매크로 (ARCH_X86_H, ARCH_X86_64_H 등)
+ * - os/os-linux.h: 이 번호를 사용하여 syscall()로 직접 호출
+ */
 #ifndef FIO_OS_LINUX_SYSCALL_H
 #define FIO_OS_LINUX_SYSCALL_H
 

@@ -13,6 +13,23 @@
  * cgroup v1(blkio)과 cgroup v2 모두 지원하며,
  * /proc/mounts에서 마운트 포인트를 자동 탐지한다.
  * blkio.weight를 통해 I/O 가중치 설정이 가능하다 (cgroup v1 전용).
+ 
+ * === 파일의 역할 ===
+ * fio 작업을 Linux cgroup의 blkio 컨트롤러에 할당하는 기능을 구현.
+ * cgroup v1/v2 모두 지원하며, 마운트 포인트를 자동 탐지한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 thread_main()에서 cgroup_setup()으로 cgroup에 작업 등록.
+ * 호출 체인: thread_main() [backend.c] → cgroup_setup() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: thread_main()에서 cgroup_setup/shutdown 호출
+ * - cgroup.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - cgroup_setup(): cgroup 디렉토리 생성 및 PID 등록
+ * - cgroup_shutdown(): cgroup에서 PID 제거
+ * - cgroup_kill(): cgroup 디렉토리 삭제
  */
 #include <stdio.h>
 #include <stdlib.h>

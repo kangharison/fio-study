@@ -15,6 +15,7 @@
 #ifndef ARCH_X86_H
 #define ARCH_X86_H
 
+/* [한국어] do_cpuid - 32비트 환경용 CPUID 래퍼 (PIC 호환을 위해 ebx를 xchg로 보존) */
 static inline void do_cpuid(unsigned int *eax, unsigned int *ebx,
 			    unsigned int *ecx, unsigned int *edx)
 {
@@ -28,18 +29,20 @@ static inline void do_cpuid(unsigned int *eax, unsigned int *ebx,
 
 #define FIO_ARCH	(arch_x86)
 
-#define	FIO_HUGE_PAGE		4194304
+#define	FIO_HUGE_PAGE		4194304		/* [한국어] 4MB - 32비트 x86 huge page 크기 */
 
 #define nop		__asm__ __volatile__("rep;nop": : :"memory")
 #define read_barrier()	__asm__ __volatile__("": : :"memory")
 #define write_barrier()	__asm__ __volatile__("": : :"memory")
 
+/* [한국어] arch_ffz - BSFL(Bit Scan Forward Long) 명령어로 최하위 0 비트 위치를 찾는다 */
 static inline unsigned long arch_ffz(unsigned long bitmask)
 {
 	__asm__("bsfl %1,%0" :"=r" (bitmask) :"r" (~bitmask));
 	return bitmask;
 }
 
+/* [한국어] get_cpu_clock - RDTSC로 64비트 TSC 값을 읽는다 ("=A" 제약조건으로 EDX:EAX를 한 번에 반환) */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned long long ret;

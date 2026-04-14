@@ -15,10 +15,17 @@
 
 #include <inttypes.h>
 
+/*
+ * [한국어] ffs64 - 64비트 워드에서 최하위 설정 비트(LSB)의 위치를 반환
+ *
+ * 이진 탐색 방식으로 O(log 64) = O(6) 스텝에 찾는다.
+ * 하위 절반에 비트가 없으면 상위 절반으로 이동하며 위치를 누적한다.
+ */
 static inline int ffs64(uint64_t word)
 {
 	int r = 0;
 
+	/* [한국어] 하위 32비트가 모두 0이면 상위 32비트로 이동 */
 	if ((word & 0xffffffff) == 0) {
 		r += 32;
 		word >>= 32;
@@ -47,6 +54,7 @@ static inline int ffs64(uint64_t word)
 
 #ifndef ARCH_HAVE_FFZ
 
+/* [한국어] ffz - 첫 번째 0 비트를 찾음. 비트마스크를 반전(~)시켜 ffs64로 찾기 */
 static inline int ffz(unsigned long bitmask)
 {
 	return ffs64(~bitmask);

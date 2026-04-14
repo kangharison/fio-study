@@ -1,12 +1,26 @@
 /*
- * [한국어] options.h - fio 옵션 시스템 헤더
+ * [한국어 설명] fio 옵션 시스템 헤더 (options.h)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio 옵션 관련 API와 전역 변수를 선언한다.
- * 주요 내용:
- *   1) fio_options[] 배열 — 모든 fio 옵션 정의 (최대 512개)
- *   2) 옵션 관리 API — 추가, 삭제, 검색, 파싱, 메모리 관리
- *   3) fio_option_is_set() — 특정 옵션이 사용자에 의해 명시적으로 설정되었는지 확인
- *   4) o_match() — 옵션 이름/별칭 매칭 헬퍼
+ * fio_options[] 배열(최대 512개), 옵션 관리 API(추가/삭제/검색/파싱),
+ * fio_option_is_set() 확인 함수, o_match() 매칭 헬퍼를 포함한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * options.c와 짝을 이루는 헤더로, init.c와 parse.c에서 옵션 처리 시 참조된다.
+ * options.h → options.c(구현) / init.c(파싱 호출) / parse.c(파싱 엔진)
+ *
+ * === 타 모듈과의 연결 ===
+ * - options.c: fio_options[] 배열과 API 함수의 구현
+ * - init.c: parse_options()에서 fio_options[] 참조
+ * - parse.c: 파싱 엔진이 fio_option 구조체를 처리
+ * - ioengines.c: I/O 엔진이 add_option()으로 동적 옵션 추가
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_options[FIO_MAX_OPTS]: 모든 fio 옵션 정의 배열
+ * - add_option(): I/O 엔진의 동적 옵션 추가
+ * - fio_option_is_set(): 옵션이 사용자에 의해 명시적으로 설정되었는지 확인
+ * - o_match(): 옵션 이름/별칭 매칭 헬퍼
  */
 #ifndef FIO_OPTION_H
 #define FIO_OPTION_H

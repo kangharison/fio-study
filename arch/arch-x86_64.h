@@ -17,6 +17,7 @@
 #ifndef ARCH_X86_64_H
 #define ARCH_X86_64_H
 
+/* [한국어] do_cpuid - 64비트 환경용 CPUID 명령어 래퍼 (레지스터를 직접 전달) */
 static inline void do_cpuid(unsigned int *eax, unsigned int *ebx,
 			    unsigned int *ecx, unsigned int *edx)
 {
@@ -30,23 +31,30 @@ static inline void do_cpuid(unsigned int *eax, unsigned int *ebx,
 
 #define FIO_ARCH	(arch_x86_64)
 
-#define	FIO_HUGE_PAGE		2097152
+#define	FIO_HUGE_PAGE		2097152		/* [한국어] 2MB - x86_64 huge page 크기 */
 
-#define nop		__asm__ __volatile__("rep;nop": : :"memory")
-#define read_barrier()	__asm__ __volatile__("":::"memory")
-#define write_barrier()	__asm__ __volatile__("":::"memory")
+#define nop		__asm__ __volatile__("rep;nop": : :"memory")  /* [한국어] CPU 양보 힌트 (하이퍼스레딩 친화적) */
+#define read_barrier()	__asm__ __volatile__("":::"memory")   /* [한국어] 컴파일러 읽기 배리어 */
+#define write_barrier()	__asm__ __volatile__("":::"memory")  /* [한국어] 컴파일러 쓰기 배리어 */
 
+/* [한국어] arch_ffz - BSF(Bit Scan Forward) 명령어로 최하위 0 비트의 위치를 찾는다 */
 static inline unsigned long arch_ffz(unsigned long bitmask)
 {
 	__asm__("bsf %1,%0" :"=r" (bitmask) :"r" (~bitmask));
 	return bitmask;
 }
 
+/* [한국어] tsc_barrier - mfence 명령어로 TSC 읽기 전후의 메모리 순서를 보장한다 */
 static inline void tsc_barrier(void)
 {
 	__asm__ __volatile__("mfence":::"memory");
 }
 
+/*
+ * [한국어] get_cpu_clock - RDTSC 명령어로 CPU 타임스탬프 카운터를 읽는다
+ * 하위 32비트(EAX)와 상위 32비트(EDX)를 합쳐 64비트 카운터 값을 반환한다.
+ * fio의 고정밀 시간 측정에 사용되며, tsc_reliable이 true일 때만 신뢰할 수 있다.
+ */
 static inline unsigned long long get_cpu_clock(void)
 {
 	unsigned int lo, hi;
@@ -59,10 +67,12 @@ static inline unsigned long long get_cpu_clock(void)
 #define ARCH_HAVE_SSE4_2
 #define ARCH_HAVE_CPU_CLOCK
 
+/* [한국어] RDRAND/RDSEED 하드웨어 난수 명령어 (바이트 코드로 직접 인코딩) */
 #define RDRAND_LONG	".byte 0x48,0x0f,0xc7,0xf0"
 #define RDSEED_LONG	".byte 0x48,0x0f,0xc7,0xf8"
-#define RDRAND_RETRY	100
+#define RDRAND_RETRY	100	/* [한국어] RDRAND 실패 시 최대 재시도 횟수 */
 
+/* [한국어] arch_rand_long - RDRAND 명령어로 64비트 하드웨어 난수를 생성한다 */
 static inline int arch_rand_long(unsigned long *val)
 {
 	int ok;
@@ -78,6 +88,7 @@ static inline int arch_rand_long(unsigned long *val)
 	return ok;
 }
 
+/* [한국어] arch_rand_seed - RDSEED 명령어로 하드웨어 시드 값을 생성한다 */
 static inline int arch_rand_seed(unsigned long *seed)
 {
 	unsigned char ok;
@@ -89,6 +100,12 @@ static inline int arch_rand_seed(unsigned long *seed)
 	return 0;
 }
 
+/*
+ * [한국어] 직접 시스템 콜 매크로 (__do_syscall0 ~ __do_syscall6)
+ * syscall 명령어를 인라인 어셈블리로 직접 호출하여 glibc를 우회한다.
+ * io_uring 등에서 커널 시스템 콜을 직접 수행할 때 사용된다.
+ * x86_64 ABI: RAX=시스콜번호, RDI/RSI/RDX/R10/R8/R9=인자1~6
+ */
 #define __do_syscall0(NUM) ({			\
 	intptr_t rax;				\
 						\

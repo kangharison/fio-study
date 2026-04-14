@@ -8,6 +8,21 @@
  *   3) json_object_add_*()    - 객체에 키-값 쌍 추가
  *   4) json_array_add_*()     - 배열에 값 추가
  *   5) json_print_*()         - JSON 트리를 문자열로 출력 (들여쓰기 포함)
+ 
+ * === 파일의 역할 ===
+ * fio 통계 결과를 JSON 형식으로 출력하는 기능을 구현한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * stat.c에서 JSON 출력 시 이 파일의 함수를 호출한다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - stat.c: JSON 형식 통계 출력 시 사용
+ * - json.h: API 및 자료구조 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - json_create_object/array/value(): JSON 노드 생성
+ * - json_object_add_value_*(): 객체에 값 추가
+ * - json_print_object(): JSON 트리 출력
  */
 
 /* 표준 라이브러리 헤더 */

@@ -1,22 +1,36 @@
 /*
- * [한국어 설명] NVIDIA GPUDirect Storage (cuFile) I/O 엔진 구현 (libcufile.c)
+ * [한국어 설명] NVIDIA cuFile(GPUDirect Storage) I/O 엔진 (libcufile.c)
  *
- * === 엔진 개요 ===
- * NVIDIA cuFile API를 사용하여 GPU 메모리와 스토리지 간 직접 데이터 전송을 수행하는
- * I/O 엔진이다. GPUDirect Storage 기술을 통해 CPU를 거치지 않고 GPU 메모리에
- * 직접 I/O하며, cuFile I/O와 POSIX I/O 모드를 모두 지원한다.
+ * === 파일의 역할 ===
+ * NVIDIA의 GPUDirect Storage를 위한 cuFile API를 사용해 GPU 메모리(Device Memory)로
+ * 직접 스토리지 I/O를 수행하는 fio 엔진 "libcufile"을 구현한다. cuFile 경로와 POSIX
+ * 경로(pread/pwrite + cudaMemcpy 시뮬레이션) 두 가지를 cuda_io 옵션으로 선택할 수
+ * 있으며, iomem_alloc/free 훅을 통해 fio의 io_u->buf를 cudaMalloc 메모리로 치환한다.
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * cuFile API - GPU 직접 I/O (cuFileDriverOpen, cuFileHandleRegister, cuFileRead, cuFileWrite)
- * CUDA Runtime - GPU 메모리 관리 (cudaMalloc, cudaMemcpy, cudaSetDevice)
- * POSIX I/O - 대체 I/O 경로 (pread, pwrite)
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=libcufile로 선택된다. 실행 흐름: backend.c → td_io_init →
+ * fio_libcufile_init(cuFileDriverOpen 1회, GPU 선택) → iomem_alloc(cudaMalloc) →
+ * open_file(cuFileHandleRegister) → I/O 루프(queue에서 cuFileRead/Write 또는
+ * pread/pwrite + cudaMemcpy) → close_file(cuFileHandleDeregister) → cleanup
+ * (cuFileDriverClose). 동기 엔진(FIO_SYNCIO 아님에도 내부적으로 blocking)이며 fio
+ * 잡 스레드(유저스페이스) + CUDA 런타임 드라이버가 실행 컨텍스트이다.
  *
- * === fio에서의 사용법 ===
- * --ioengine=libcufile 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c).
+ * 하단: cuFile API(cuFileDriverOpen/Close/HandleRegister/Deregister/Read/Write),
+ *       CUDA Runtime(cudaMalloc/Free/Memcpy/SetDevice/GetErrorString),
+ *       POSIX I/O(pread/pwrite) 대체 경로.
+ * 데이터 흐름: (cuFile 경로) 스토리지 → NIC/NVMe DMA → GPU Device Memory
+ *             (POSIX 경로) 스토리지 → 호스트 버퍼 → cudaMemcpy → GPU.
+ * 공유 상태: libcufile_options는 잡 단위(td->eo), fio_libcufile_data는 파일 단위.
  *
- * === 구현하는 주요 콜백 ===
- * .init, .queue, .get_file_size, .open_file, .close_file,
- * .iomem_alloc, .iomem_free, .cleanup
+ * === 주요 함수/구조체 요약 ===
+ * - fio_libcufile_init()/_cleanup(): 드라이버 open/close + 잡별 GPU 고정.
+ * - fio_libcufile_iomem_alloc()/_free(): cudaMalloc/cudaFree로 GPU 메모리 확보.
+ * - fio_libcufile_open_file()/_close_file(): cuFileHandleRegister/Deregister.
+ * - fio_libcufile_queue(): cuFileRead/Write 또는 pread/pwrite 수행.
+ * - struct libcufile_options: 엔진 옵션(gpu_ids, cuda_io 등).
+ * - struct fio_libcufile_data: 파일별 cuFile descriptor/handle 쌍.
  */
 
 /*
@@ -58,23 +72,22 @@ enum {
 	IO_POSIX     = 2
 };
 
+/* [한국어] cuFile 엔진 전용 옵션 구조체 */
 struct libcufile_options {
-	struct thread_data *td;
-	char               *gpu_ids;       /* colon-separated list of GPU ids,
-					      one per job */
-	void               *cu_mem_ptr;    /* GPU memory */
-	void               *junk_buf;      /* buffer to simulate cudaMemcpy with
-					      posix I/O write */
-	int                 my_gpu_id;     /* GPU id to use for this job */
-	unsigned int        cuda_io;       /* Type of I/O to use with CUDA */
-	size_t              total_mem;     /* size for cu_mem_ptr and junk_buf */
-	int                 logged;        /* bitmask of log messages that have
-					      been output, prevent flood */
+	struct thread_data *td;			/* [한국어] 소속 스레드 데이터 */
+	char               *gpu_ids;		/* [한국어] GPU ID 리스트 (콜론 구분, 잡당 하나) */
+	void               *cu_mem_ptr;		/* [한국어] CUDA로 ���당한 GPU 메모리 포인터 */
+	void               *junk_buf;		/* [한국어] POSIX I/O 쓰기 시 cudaMemcpy 시뮬레이션용 버퍼 */
+	int                 my_gpu_id;		/* [한국어] 이 잡이 사용할 GPU ID */
+	unsigned int        cuda_io;		/* [한국어] I/O 유형 (cuFile 직접 I/O 또는 POSIX I/O) */
+	size_t              total_mem;		/* [한국어] cu_mem_ptr과 junk_buf의 총 할당 크기 */
+	int                 logged;		/* [한국어] 중복 방지용 로그 메시지 비트마스크 */
 };
 
+/* [한국어] 파일별 cuFile 핸들 상태 구조체 */
 struct fio_libcufile_data {
-	CUfileDescr_t  cf_descr;
-	CUfileHandle_t cf_handle;
+	CUfileDescr_t  cf_descr;	/* [한국어] cuFile 디스크립터 (파일 유형, fd 등) */
+	CUfileHandle_t cf_handle;	/* [한국어] cuFile 핸들 - GPU ���접 I/O 수행용 */
 };
 
 static struct fio_option options[] = {

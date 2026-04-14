@@ -3,26 +3,30 @@
  * that can be shared across processes and threads
  */
 /*
- * [한국어] smalloc.c - 공유 메모리 할당기 (mmap 기반)
+ * [한국어 설명] 공유 메모리 할당기 (smalloc.c)
  *
- * 이 파일은 mmap()을 사용하여 프로세스/스레드 간 공유 가능한 메모리를 할당하는
- * 간단한 메모리 할당기를 구현한다.
+ * === 파일의 역할 ===
+ * mmap()을 사용하여 프로세스/스레드 간 공유 가능한 메모리를 할당하는 간단한
+ * 메모리 할당기를 구현한다. 비트맵으로 블록 사용 여부를 관리하며,
+ * 레드존으로 메모리 corruption을 탐지한다.
  *
- * 주요 구조:
- *   - pool: mmap으로 확보한 메모리 영역. 비트맵으로 블록 사용 여부를 관리
- *   - block_hdr: 각 할당 블록의 헤더 (크기 + 선택적 레드존)
- *   - bitmap: 각 비트가 SMALLOC_BPB(32)바이트 블록 하나에 대응
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 프로세스 모드에서 thread_data, thread_stat 등 공유 데이터를 이 할당기로
+ * 관리한다. initialize_fio() [libfio.c]에서 sinit()로 초기화.
+ * 호출 체인: initialize_fio() → sinit() [이 파일] / init.c → smalloc() [이 파일]
  *
- * 할당 흐름:
- *   smalloc() -> smalloc_pool() -> __smalloc_pool()
- *     비트맵에서 연속된 빈 블록을 찾아 할당하고, 블록 헤더를 설정
+ * === 타 모듈과의 연결 ===
+ * - libfio.c: sinit()/scleanup()으로 할당기 초기화/정리
+ * - init.c: get_new_job()에서 smalloc()으로 thread_data 할당
+ * - iolog.c: 공유 로그 데이터 할당
+ * - smalloc.h: API 선언 (smalloc, sfree, scalloc 등)
  *
- * 해제 흐름:
- *   sfree() -> sfree_pool()
- *     포인터가 속한 풀을 찾아 비트맵의 해당 비트를 클리어
- *
- * 레드존(SMALLOC_REDZONE):
- *   메모리 corruption 탐지를 위해 블록 앞뒤에 매직 값을 기록/검증
+ * === 주요 함수/구조체 요약 ===
+ * - smalloc(): 공유 메모리 할당 (malloc 대응)
+ * - sfree(): 공유 메모리 해제 (free 대응)
+ * - sinit()/scleanup(): 할당기 초기화/정리
+ * - pool: mmap 기반 메모리 영역, 비트맵으로 블록 관리
+ * - block_hdr: 할당 블록 헤더 (크기 + 레드존)
  */
 
 /* 시스템 헤더 */

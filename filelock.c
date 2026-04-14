@@ -14,6 +14,21 @@
  *   fio_trylock_file()   - 파일 잠금 시도 (비차단)
  *   fio_unlock_file()    - 파일 잠금 해제
  *   fio_filelock_exit()  - 잠금 시스템 종료 및 자원 해제
+ 
+ * === 파일의 역할 ===
+ * 파일명의 해시값을 키로 사용하여 동일 파일에 대한 동시 접근을 동기화.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * libfio.c에서 fio_filelock_init()으로 초기화. filesetup.c에서 잠금 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - libfio.c: 초기화/정리
+ * - filesetup.c: 파일 열기/닫기 시 잠금
+ * - filelock.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_lock_file(): 파일 잠금 획득 (차단)
+ * - fio_unlock_file(): 파일 잠금 해제
  */
 
 /*

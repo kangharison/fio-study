@@ -1,3 +1,21 @@
+/*
+ * [한국어 설명] DragonFlyBSD 플랫폼 OS 추상화 헤더 (os-dragonfly.h)
+ *
+ * === 파일의 역할 ===
+ * DragonFlyBSD에서 fio가 사용하는 플랫폼 전용 기능을 정의한다.
+ * usched_set(2)로 CPU 친화성 설정, DIOCGPART ioctl로 디스크 크기 조회,
+ * DAIOCTRIM으로 TRIM, 리눅스 스타일 ioprio를 BSD 스타일로 매핑.
+ * x86_64 전용 cpumask_t 매크로를 포함.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os.h에서 __DragonFly__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - fio_setaffinity(): usched_set(USCHED_SET_CPU/ADD_CPU)
+ * - blockdev_size(): DIOCGPART ioctl (partinfo)
+ * - os_trim(): DAIOCTRIM ioctl
+ * - ioprio_value/ioprio_set: Linux ioprio를 BSD 스타일로 매핑
+ */
 #ifndef FIO_OS_DRAGONFLY_H
 #define FIO_OS_DRAGONFLY_H
 
@@ -47,6 +65,7 @@
 /* This is supposed to equal (sizeof(cpumask_t)*8) */
 #define FIO_MAX_CPUS	SMP_MAXCPU
 
+/* [한국어] DragonFly CPU 마스크 = cpumask_t (256비트, 4x uint64_t 배열) */
 typedef cpumask_t os_cpu_mask_t;
 
 /*
@@ -124,6 +143,12 @@ static inline bool fio_cpu_isset(os_cpu_mask_t *mask, int cpu)
 	return CPUMASK_TESTBIT(*mask, cpu) != 0;
 }
 
+/*
+ * [한국어]
+ * fio_setaffinity - DragonFly CPU 친화성 설정
+ * usched_set(2) 사용. 첫 CPU는 USCHED_SET_CPU, 이후 CPU는 USCHED_ADD_CPU.
+ * 주의: pid=0만 유효 (현재 스레드만 가능, usched_set(2) BUGS 참조).
+ */
 static inline int fio_setaffinity(int pid, os_cpu_mask_t mask)
 {
 	int i, firstcall = 1;

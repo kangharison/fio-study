@@ -8,6 +8,21 @@
  * 이 파일이 fio_sem.c에서 분리된 이유:
  *   fio_sem.c의 함수들은 smalloc 자체에서 사용되므로,
  *   smalloc에 의존하는 함수를 같은 파일에 두면 순환 의존성이 발생한다.
+ 
+ * === 파일의 역할 ===
+ * smalloc(fio 공유 메모리 할당기) 기반 세마포어 생성/해제를 구현한다.
+ * fio_sem.c와 분리된 이유는 smalloc ↔ fio_sem 순환 의존성 방지.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio_sem.c의 보조 파일. smalloc 기반 세마포어가 필요한 곳에서 사용.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio_sem.c: 기본 세마포어 구현 (mmap 기반)
+ * - smalloc.c: 공유 메모리 할당기 (이 파일이 의존)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - fio_sem_init(): smalloc으로 세마포어 할당
+ * - fio_sem_remove(): smalloc 세마포어 해제
  */
 
 /*

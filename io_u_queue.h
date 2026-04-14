@@ -6,6 +6,19 @@
  * io_u 구조체의 freelist를 관리하기 위한 두 가지 자료구조를 정의한다:
  *   - io_u_queue: 스택(LIFO) 기반 배열 큐 (push/pop)
  *   - io_u_ring:  원형 버퍼(FIFO) 기반 링 (rpush/rpop)
+ 
+ * === 파일의 역할 ===
+ * io_u 스택(LIFO) 큐와 원형 버퍼(FIFO) 링의 구조체/API를 정의.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * io_u_queue.c와 짝을 이루는 헤더.
+ *
+ * === 타 모듈과의 연결 ===
+ * - io_u_queue.c: 이 헤더의 함수 구현
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - struct io_u_queue: 스택(LIFO) 큐
+ * - struct io_u_ring: 원형 버퍼(FIFO) 링
  */
 
 #include <assert.h>

@@ -1,25 +1,29 @@
 /*
- * [한국어] parse.c - fio 옵션 파싱 엔진
+ * [한국어 설명] fio 옵션 파싱 엔진 (parse.c)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio의 INI 파일(잡 파일) 및 커맨드라인 옵션을 파싱하는 핵심 엔진이다.
- * 주요 기능:
- *   1) __handle_option()   - 개별 옵션의 실제 파싱 로직 (타입별 분기)
- *   2) handle_option()     - 콤마/콜론으로 구분된 복수 값을 순회하며 __handle_option 호출
- *   3) parse_option()      - "opt=val" 문자열에서 옵션 이름과 값을 분리 후 handle_option 호출
- *   4) parse_cmd_option()  - 커맨드라인 --name val 형식 파싱
- *   5) str_to_decimal()    - 단위 접미사(k/m/g, s/ms/us)가 붙은 문자열을 정수로 변환
- *   6) string_distance()   - 레벤슈타인 편집 거리 (오타 옵션명 추천용)
- *   7) fill_default_options() - 기본값 적용
- *   8) options_init()      - 옵션 배열 초기화 및 무결성 검증
+ * "opt=val" 형식의 문자열을 분리하고, 타입별로 분기하여 값을 변환한 뒤
+ * thread_options 구조체에 저장한다. 단위 접미사 처리, 오타 추천, 기본값 적용도 수행한다.
  *
- * 파싱 흐름:
- *   잡 파일의 "bs=4k" → parse_option("bs=4k")
- *     → get_option()으로 "bs"와 "4k" 분리
- *     → fio_options[]에서 "bs" 옵션 찾기
- *     → handle_option(o, "4k", td->o)
- *       → __handle_option()에서 FIO_OPT_STR_VAL 타입으로 분기
- *         → check_str_bytes("4k") → 4096
- *         → val_store()로 td->o.bs[DDIR_READ] = 4096 저장
+ * === 전체 아키텍처에서의 위치 ===
+ * init.c의 parse_jobs_ini()/parse_cmd_line()에서 이 파일의 parse_option()을 호출한다.
+ * 호출 체인: init.c → parse_option() [이 파일] → handle_option() → __handle_option()
+ * 파싱 예시: "bs=4k" → get_option()으로 분리 → FIO_OPT_STR_VAL 타입 →
+ *           check_str_bytes("4k") → 4096 → val_store()로 td->o.bs 저장
+ *
+ * === 타 모듈과의 연결 ===
+ * - init.c: parse_jobs_ini()/parse_cmd_line()에서 parse_option() 호출
+ * - options.c: fio_options[] 배열을 참조하여 옵션 정의를 찾음
+ * - parse.h: fio_option 구조체, 파싱 API 선언
+ * - thread_options.h: 파싱 결과가 저장되는 대상 구조체
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - parse_option(): "opt=val" 문자열 파싱의 최상위 진입점
+ * - __handle_option(): 타입별 실제 파싱 로직 (STR_VAL, INT, BOOL, RANGE 등)
+ * - str_to_decimal(): 단위 접미사(k/m/g, s/ms/us) 문자열을 정수로 변환
+ * - string_distance(): 레벤슈타인 편집 거리 (오타 옵션명 추천용)
+ * - fill_default_options(): 미설정 옵션에 기본값 적용
  */
 #include <stdio.h>
 #include <stdlib.h>

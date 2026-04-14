@@ -16,6 +16,23 @@
  * any later version.
  *
  */
+/*
+ * [한국어 설명] SHA-256 해시 알고리즘 구현 (sha256.c)
+ *
+ * === 파일의 역할 ===
+ * SHA-256(256비트 다이제스트)을 구현한다. SHA-2 계열 해시 함수로,
+ * 512비트 입력 블록을 64스텝으로 처리하여 256비트 해시를 생성한다.
+ * Linux 커널의 crypto/sha256.c에서 가져온 코드이다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: verify.c → fio_sha256_init/update/final → sha256_transform
+ *
+ * === 주요 함수 요약 ===
+ * - sha256_transform(): 512비트 블록을 64스텝으로 처리하는 핵심 변환
+ * - fio_sha256_init(): 8개 해시 워드를 FIPS 180 초기값으로 설정
+ * - fio_sha256_update(): 데이터를 블록 단위로 변환 적용
+ * - fio_sha256_final(): 패딩 추가 후 최종 해시 확정
+ */
 #include <string.h>
 
 #include "../lib/bswap.h"

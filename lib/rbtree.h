@@ -121,19 +121,24 @@ static inline struct page * rb_insert_page_cache(struct inode * inode,
 struct fio_rb_node
 {
 	intptr_t rb_parent_color;
+	/* [한국어] 부모 포인터와 색상 비트를 하나의 필드에 인코딩.
+	 * 하위 2비트: 색상 (0=RED, 1=BLACK), 나머지: 부모 노드 포인터.
+	 * sizeof(long) 정렬로 하위 비트가 항상 0이므로 색상 저장에 활용 가능 */
 #define	RB_RED		0
 #define	RB_BLACK	1
-	struct fio_rb_node *rb_right;
-	struct fio_rb_node *rb_left;
+	struct fio_rb_node *rb_right;	/* [한국어] 오른쪽 자식 (키가 큰 쪽) */
+	struct fio_rb_node *rb_left;	/* [한국어] 왼쪽 자식 (키가 작은 쪽) */
 } __attribute__((aligned(sizeof(long))));
     /* The alignment might seem pointless, but allegedly CRIS needs it */
 
 struct rb_root
 {
 	struct fio_rb_node *rb_node;
+	/* [한국어] 트리의 루트 노드 포인터. NULL이면 빈 트리 */
 };
 
 
+/* [한국어] rb_parent_color 필드에서 부모 포인터와 색상을 추출/설정하는 매크로 */
 #define rb_parent(r)   ((struct fio_rb_node *)((r)->rb_parent_color & ~3))
 #define rb_color(r)   ((r)->rb_parent_color & 1)
 #define rb_is_red(r)   (!rb_color(r))
@@ -164,6 +169,15 @@ extern void rb_erase(struct fio_rb_node *, struct rb_root *);
 extern struct fio_rb_node *rb_first(struct rb_root *);
 extern struct fio_rb_node *rb_next(const struct fio_rb_node *);
 
+/*
+ * [한국어] rb_link_node - 새 노드를 트리에 연결 (색상 조정 전)
+ *
+ * @node: 삽입할 새 노드
+ * @parent: 새 노드의 부모가 될 노드
+ * @rb_link: 부모의 left 또는 right 포인터의 주소
+ *
+ * 이 함수 호출 후 반드시 rb_insert_color()를 호출해야 트리 균형이 유지된다.
+ */
 static inline void rb_link_node(struct fio_rb_node * node,
 				struct fio_rb_node * parent,
 				struct fio_rb_node ** rb_link)

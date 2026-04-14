@@ -4,6 +4,36 @@
  * and to avoid unnecessary copies into the context array.
  */
 
+/*
+ * [한국어 설명] SHA-1 해시 알고리즘 구현 (sha1.c)
+ *
+ * === 파일의 역할 ===
+ * SHA-1(Secure Hash Algorithm 1)을 구현한다.
+ * 임의 길이 입력 데이터를 160비트(20바이트) 해시로 변환한다.
+ * FIPS 180 표준을 따르며, Mozilla SHA-1 기반으로 워드 단위 접근 최적화되었다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 verify 기능에서 SHA-1 해시를 사용한 데이터 무결성 검증에 사용된다.
+ * 호출 체인: verify.c → fio_sha1_init/update/final → blk_SHA1Block
+ *
+ * === 타 모듈과의 연결 ===
+ * - verify.c: verify=sha1 옵션 시 호출
+ * - sha1.h: 구조체와 인터페이스 정의
+ * - crc/test.c: 벤치마크 테스트
+ *
+ * === 주요 함수 요약 ===
+ * - fio_sha1_init(): FIPS 180 초기값으로 상태 초기화
+ * - fio_sha1_update(): 데이터를 64바이트 블록 단위로 처리
+ * - fio_sha1_final(): 패딩 추가 후 최종 해시 확정
+ * - blk_SHA1Block(): 512비트 블록을 80스텝(4라운드)으로 처리하는 핵심 변환 함수
+ *
+ * === SHA-1 라운드 구조 ===
+ * - 라운드 1 (T_0_15/T_16_19): (((C^D)&B)^D) + 0x5A827999
+ * - 라운드 2 (T_20_39): (B^C^D) + 0x6ED9EBA1
+ * - 라운드 3 (T_40_59): ((B&C)+(D&(B^C))) + 0x8F1BBCDC
+ * - 라운드 4 (T_60_79): (B^C^D) + 0xCA62C1D6
+ */
+
 #include <string.h>
 #include <arpa/inet.h>
 

@@ -16,6 +16,10 @@
 #include <inttypes.h>
 
 #ifdef CONFIG_LITTLE_ENDIAN
+/*
+ * [한국어] __be32_to_cpu - 빅엔디언 32비트 값을 리틀엔디언(CPU 네이티브)으로 변환
+ * 각 바이트를 추출하여 역순으로 재조합한다.
+ */
 static inline uint32_t __be32_to_cpu(uint32_t val)
 {
 	uint32_t c1, c2, c3, c4;
@@ -28,6 +32,7 @@ static inline uint32_t __be32_to_cpu(uint32_t val)
 	return c1 | c2 << 8 | c3 << 16 | c4 << 24;
 }
 
+/* [한국어] __be64_to_cpu - 빅엔디언 64비트 값을 리틀엔디언으로 변환 */
 static inline uint64_t __be64_to_cpu(uint64_t val)
 {
 	uint64_t c1, c2, c3, c4, c5, c6, c7, c8;
@@ -44,6 +49,7 @@ static inline uint64_t __be64_to_cpu(uint64_t val)
 	return c1 | c2 << 8 | c3 << 16 | c4 << 24 | c5 << 32 | c6 << 40 | c7 << 48 | c8 << 56;
 }
 #else
+/* [한국어] 빅엔디언 시스템에서는 변환 불필요 - 값을 그대로 반환 */
 static inline uint64_t __be64_to_cpu(uint64_t val)
 {
 	return val;

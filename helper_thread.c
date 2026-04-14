@@ -1,16 +1,27 @@
 /*
- * [한국어] helper_thread.c - fio 헬퍼 스레드 구현
+ * [한국어 설명] fio 헬퍼 스레드 구현 (helper_thread.c)
  *
- * 메인 I/O 스레드와 별도로 동작하며, 주기적으로 다음 작업을 수행:
- *   1) 디스크 유틸리티 업데이트 (update_io_ticks) - I/O 통계 수집
- *   2) 실시간 상태 출력 (status_interval 옵션)
- *   3) Steady State 도달 여부 체크 (steadystate_check)
- *   4) Ramp period 완료 체크 (ramp_period_check)
- *   5) 로그 샘플링 주기 계산 및 로그 기록
+ * === 파일의 역할 ===
+ * 메인 I/O 스레드와 별도로 동작하며, 주기적으로 디스크 유틸리티 업데이트,
+ * 실시간 상태 출력, Steady State 체크, Ramp period 체크, 로그 샘플링을 수행한다.
+ * 파이프를 통해 메인 스레드로부터 액션(RESET, DO_STAT, EXIT)을 수신한다.
  *
- * 통신 방식:
- *   파이프(pipe)를 통해 메인 스레드로부터 액션(A_RESET, A_DO_STAT, A_EXIT)을 수신.
- *   interval_timer 배열로 주기적 타이머를 관리하며, select()로 대기.
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 run_threads()에서 helper_thread_create()로 생성.
+ * 주기적 타이머와 select()로 대기하며, 메인 스레드와 파이프로 통신.
+ * 호출 체인: run_threads() [backend.c] → helper_thread_create() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: run_threads()에서 헬퍼 스레드 생성/종료
+ * - diskutil.c: update_io_ticks()로 디스크 I/O 통계 수집
+ * - steadystate.c: steadystate_check()로 정상 상태 도달 여부 확인
+ * - helper_thread.h: API 선언
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - helper_thread_create(): 헬퍼 스레드 생성
+ * - helper_thread_exit(): 헬퍼 스레드 종료 및 join
+ * - helper_do_stat(): 즉시 통계 출력 요청 (파이프 통신)
+ * - helper_reset(): 타이머 리셋 요청
  */
 
 #include <errno.h>

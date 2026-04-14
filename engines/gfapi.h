@@ -13,17 +13,19 @@
 #include <glusterfs/api/glfs.h>
 #include "../fio.h"
 
+/* [한국어] GlusterFS 엔진 전용 옵션 구조체 */
 struct gf_options {
-	void *pad;
-	char *gf_vol;
-	char *gf_brick;
-	int gf_single_instance;
+	void *pad;			/* [한국어] fio 옵션 구조체 정렬 패딩 */
+	char *gf_vol;			/* [한국어] GlusterFS 볼륨 이름 */
+	char *gf_brick;			/* [한국어] 연결할 GlusterFS 브릭 주소 */
+	int gf_single_instance;		/* [한국어] 동일 볼륨에 대해 glfs 인스턴스를 공유할지 여부 */
 };
 
+/* [한국어] GlusterFS 엔진의 내부 상태 구조체 */
 struct gf_data {
-	glfs_t *fs;
-	glfs_fd_t *fd;
-	struct io_u **aio_events;
+	glfs_t *fs;			/* [한국어] GlusterFS 파일 시스템 핸들 */
+	glfs_fd_t *fd;			/* [한국어] 열린 GlusterFS 파일 디스크립터 */
+	struct io_u **aio_events;	/* [한국어] 비동기 모드에서 완료된 io_u 배열 */
 };
 
 extern struct fio_option gfapi_options[];

@@ -7,6 +7,16 @@
  * 지원되는 모든 아키텍처를 정의하며, 원자적 연산 매크로와 io_uring 시스템 콜 번호 등
  * 공통 인프라를 제공한다.
  *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio 전체에서 #include "arch/arch.h"로 포함되며, 아키텍처별 get_cpu_clock(),
+ * arch_ffz(), read_barrier()/write_barrier() 등의 구현을 투명하게 제공한다.
+ * gettime.c에서 get_cpu_clock()을, io_u.c에서 arch_ffz()를 사용한다.
+ *
+ * === 타 모듈과의 연결 ===
+ * - 각 arch-*.h: 아키텍처별 구체 구현 (get_cpu_clock, arch_ffz, tsc_barrier 등)
+ * - lib/ffz.h: arch_ffz 미지원 시 소프트웨어 폴백 FFZ 구현
+ * - t/io_uring.c: __do_syscall 매크로로 io_uring 시스템 콜 직접 호출
+ *
  * === 제공하는 기능 ===
  * - arch_x86_64, arch_arm, arch_ppc 등 아키텍처 열거형 (arch_t enum)
  * - atomic_add, atomic_sub, atomic_load_relaxed 등 원자적 연산 매크로
@@ -24,30 +34,32 @@
 
 #include "../lib/types.h"
 
+/* [한국어] 지원되는 CPU 아키텍처 열거형 - 각 값은 아키텍처별 헤더와 1:1 대응 */
 enum {
-	arch_x86_64 = 1,
-	arch_x86,
-	arch_ppc,
-	arch_ia64,
-	arch_s390,
-	arch_alpha,
-	arch_sparc,
-	arch_sparc64,
-	arch_arm,
-	arch_sh,
-	arch_hppa,
-	arch_mips,
-	arch_aarch64,
-	arch_loongarch64,
-	arch_riscv64,
+	arch_x86_64 = 1,	/* 64비트 x86 (AMD64/Intel 64) */
+	arch_x86,		/* 32비트 x86 (i386) */
+	arch_ppc,		/* PowerPC (32/64비트) */
+	arch_ia64,		/* Intel Itanium (IA-64) */
+	arch_s390,		/* IBM System/390 메인프레임 */
+	arch_alpha,		/* DEC Alpha */
+	arch_sparc,		/* SPARC 32비트 */
+	arch_sparc64,		/* SPARC 64비트 */
+	arch_arm,		/* ARM 32비트 */
+	arch_sh,		/* Renesas SuperH */
+	arch_hppa,		/* HP PA-RISC */
+	arch_mips,		/* MIPS (32/64비트) */
+	arch_aarch64,		/* ARM 64비트 (AArch64) */
+	arch_loongarch64,	/* LoongArch 64비트 */
+	arch_riscv64,		/* RISC-V 64비트 */
 
-	arch_generic,
+	arch_generic,		/* 미지원 아키텍처용 범용 폴백 */
 
-	arch_nr,
+	arch_nr,		/* 아키텍처 총 개수 (배열 크기용 센티널) */
 };
 
+/* [한국어] 아키텍처별 기능 플래그 - arch_init()에서 설정, 런타임 기능 분기에 사용 */
 enum {
-	ARCH_FLAG_1	= 1 << 0,
+	ARCH_FLAG_1	= 1 << 0,	/* 예: PPC의 ATB(Alternate Time Base) 사용 여부 */
 	ARCH_FLAG_2	= 1 << 1,
 	ARCH_FLAG_3	= 1 << 2,
 	ARCH_FLAG_4	= 1 << 3,
@@ -57,6 +69,7 @@ extern unsigned long arch_flags;
 
 #define ARCH_CPU_CLOCK_WRAPS
 
+/* [한국어] 원자적 연산 매크로 - C++과 C11 _Atomic을 추상화하여 스레드 안전 카운터 등에 사용 */
 #ifdef __cplusplus
 #define atomic_add(p, v)						\
 	std::atomic_fetch_add(p, (v))
@@ -128,6 +141,7 @@ extern unsigned long arch_flags;
 #include "arch-generic.h"
 #endif
 
+/* [한국어] x86_64 이외의 아키텍처에서 TSC 읽기 전후의 메모리 배리어 (x86_64는 mfence 사용) */
 #if !defined(__x86_64__) && defined(CONFIG_SYNC_SYNC)
 static inline void tsc_barrier(void)
 {
@@ -138,6 +152,7 @@ static inline void tsc_barrier(void)
 #include "../lib/ffz.h"
 /* IWYU pragma: end_exports */
 
+/* [한국어] 아키텍처 초기화 기본 구현 - ARCH_HAVE_INIT 미정의 시 빈 함수로 대체 */
 #ifndef ARCH_HAVE_INIT
 static inline int arch_init(char *envp[])
 {
@@ -145,6 +160,11 @@ static inline int arch_init(char *envp[])
 }
 #endif
 
+/*
+ * [한국어] io_uring 시스템 콜 번호 정의
+ * Alpha만 별도 번호(535~537)를 사용하고 나머지 아키텍처는 공통 번호(425~427)를 사용한다.
+ * 커널 헤더에 정의가 없는 구형 환경에서도 io_uring을 직접 호출할 수 있도록 폴백을 제공한다.
+ */
 #ifdef __alpha__
 /*
  * alpha is the only exception, all other architectures

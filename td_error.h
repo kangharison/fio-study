@@ -1,8 +1,21 @@
 /*
- * [한국어] td_error.h - 스레드 에러 처리 헤더
+ * [한국어 설명] 스레드 에러 처리 헤더 (td_error.h)
  *
+ * === 파일의 역할 ===
  * I/O 에러의 유형 분류 및 처리를 위한 열거형과 함수 선언을 제공한다.
- * continue_on_error와 ignore_error 옵션에 의해 에러 처리 동작이 결정된다.
+ * continue_on_error/ignore_error 옵션에 의해 에러 처리 동작이 결정된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * td_error.c와 짝을 이루는 헤더. backend.c에서 에러 처리 시 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - td_error.c: 이 헤더의 함수 구현
+ * - backend.c: I/O 에러 시 에러 분류/처리 호출
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - enum error_type_bit: 에러 유형 (ERROR_STR_READ/WRITE/VERIFY)
+ * - td_non_fatal_error(): 비치명적 에러 판별
+ * - update_error_count(): 에러 카운터 갱신
  */
 #ifndef FIO_TD_ERROR_H
 #define FIO_TD_ERROR_H

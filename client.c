@@ -1,23 +1,27 @@
 /*
- * [한국어] client.c - fio 클라이언트 모드 구현
+ * [한국어 설명] fio 클라이언트 모드 구현 (client.c)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio의 클라이언트-서버 모드에서 클라이언트 측 로직을 구현한다.
- * fio --client=<host> 명령으로 원격 서버에 잡(job)을 전송하고 결과를 수집한다.
+ * fio --client=<host> 명령으로 원격 서버에 잡을 전송하고, poll 기반 이벤트 루프로
+ * 실행 결과(통계, ETA, 로그)를 수신한다. 바이트 오더 변환도 처리한다.
  *
- * 주요 함수:
- *   1) fio_client_add()          - 클라이언트 객체를 생성하고 리스트에 추가
- *   2) fio_client_connect()      - 서버에 TCP/소켓 연결 수립, probe 전송
- *   3) fio_clients_send_ini()    - 모든 클라이언트에 잡 설정 파일 전송
- *   4) fio_start_all_clients()   - 모든 클라이언트에 실행 명령 전송
- *   5) fio_handle_clients()      - 메인 이벤트 루프 (poll 기반), 결과 수신 및 처리
- *   6) fio_handle_client()       - 개별 클라이언트의 수신 명령을 opcode별로 분기 처리
+ * === 전체 아키텍처에서의 위치 ===
+ * main() [fio.c]에서 nr_clients > 0이면 클라이언트 모드로 진입한다.
+ * 호출 체인: main() → fio_start_all_clients() → fio_handle_clients() [이 파일]
+ * 통신 흐름: connect → probe → send_ini(잡 파일) → start → poll 루프 → 종료
  *
- * 통신 흐름:
- *   connect → probe → send_ini(잡 파일) → start(실행) → poll 루프(ETA/통계/로그 수신) → 종료
+ * === 타 모듈과의 연결 ===
+ * - fio.c: main()에서 클라이언트 모드 분기 시 호출
+ * - server.h: 네트워크 프로토콜(opcode, fio_net_cmd 등) 정의 참조
+ * - stat.c: convert_ts()/convert_gs()로 수신한 통계를 바이트 오더 변환
+ * - client.h: fio_client 구조체, client_ops 콜백 테이블 정의
  *
- * 바이트 오더:
- *   네트워크에서 수신한 데이터는 리틀엔디안으로 인코딩되어 있으며,
- *   convert_ts(), convert_gs() 등의 함수로 호스트 바이트 오더로 변환한다.
+ * === 주요 함수/구조체 요약 ===
+ * - fio_client_connect(): 서버에 TCP/소켓 연결 수립 및 probe 전송
+ * - fio_clients_send_ini(): 모든 클라이언트에 잡 설정 파일 전송
+ * - fio_handle_clients(): poll 기반 메인 이벤트 루프 (결과 수신/처리)
+ * - fio_handle_client(): 개별 클라이언트의 수신 명령을 opcode별로 분기 처리
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */

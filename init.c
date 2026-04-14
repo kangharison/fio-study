@@ -1,15 +1,35 @@
 /*
  * This file contains job initialization and setup functions.
  */
-/* 이 파일은 fio의 job 초기화 및 설정 함수들을 포함합니다.
- * fio의 전체 초기화 흐름:
- *   1. parse_options() → 명령줄 인수 파싱 및 옵션 초기화
- *   2. parse_cmd_line() → CLI 옵션 파싱 (--name, --ioengine 등)
- *   3. parse_jobs_ini() → job 파일(.fio) 파싱 ([global], [jobname] 섹션)
- *   4. get_new_job() → thread_data 구조체 할당 (공유 메모리 세그먼트에서)
- *   5. ioengine_load() → IO 엔진 동적 로드 (libaio, io_uring 등)
- *   6. fixup_options() → 옵션 간 의존성 및 충돌 해결
- *   7. add_job() → 최종 job 등록 (로그 설정, 난수 시드, rate 설정 등)
+/*
+ * [한국어 설명] fio 잡 초기화 및 설정 (init.c)
+ *
+ * === 파일의 역할 ===
+ * 이 파일은 fio의 job 초기화 및 설정 함수들을 포함한다.
+ * 명령줄 인수와 잡 파일(.fio)을 파싱하여 thread_data 구조체를 구성하고,
+ * I/O 엔진을 로드하며, 옵션 간 의존성/충돌을 해결한 뒤 최종 잡을 등록한다.
+ * parse_options()가 이 파일의 주요 진입점이다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * main() [fio.c] → parse_options() [이 파일] → fio_backend() [backend.c]
+ * 초기화 흐름:
+ *   parse_options() → parse_cmd_line() → parse_jobs_ini()
+ *     → get_new_job() → ioengine_load() → fixup_options() → add_job()
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.c: main()에서 parse_options()를 호출
+ * - parse.c: 옵션 파싱 엔진 (parse_option(), fill_default_options())
+ * - ioengines.c: load_ioengine()으로 I/O 엔진 동적 로드
+ * - options.c: fio_options[] 배열에서 옵션 정의 참조
+ * - smalloc.c: 공유 메모리에서 thread_data 할당
+ * - 핵심 자료구조: thread_data, thread_options
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - parse_options(): 명령줄 인수 파싱 및 옵션 초기화 (최상위 진입점)
+ * - parse_cmd_line(): CLI 옵션 파싱 (--name, --ioengine 등)
+ * - parse_jobs_ini(): job 파일(.fio) 파싱 ([global], [jobname] 섹션)
+ * - get_new_job(): thread_data 구조체 할당 (공유 메모리 세그먼트에서)
+ * - add_job(): 최종 job 등록 (로그 설정, 난수 시드, rate 설정 등)
  */
 
 /* 표준 C 라이브러리 헤더 파일들 */

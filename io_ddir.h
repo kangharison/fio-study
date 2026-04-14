@@ -9,6 +9,20 @@
  * 매크로:
  *   - td_read(), td_write() 등 : 작업의 I/O 방향 확인
  *   - ddir_rw_sum() : 읽기+쓰기+trim 합산
+ 
+ * === 파일의 역할 ===
+ * fio에서 I/O 방향(읽기, 쓰기, trim, sync)을 정의하는 열거형과 매크로를 제공.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * fio의 가장 기본적인 헤더 중 하나. 거의 모든 모듈에서 참조.
+ *
+ * === 타 모듈과의 연결 ===
+ * - fio.h에서 포함. io_u.h, stat.h 등에서 참조
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - enum fio_ddir: I/O 방향 (DDIR_READ/WRITE/TRIM/SYNC 등)
+ * - enum td_ddir: 작업 수준 I/O 모드 (비트 플래그 조합)
+ * - td_read()/td_write() 매크로: 방향 확인
  */
 #ifndef FIO_DDIR_H
 #define FIO_DDIR_H

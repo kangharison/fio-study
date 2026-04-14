@@ -1,13 +1,23 @@
 /*
- * [한국어] td_error.c - 스레드 에러 처리 모듈
+ * [한국어 설명] 스레드 에러 처리 모듈 (td_error.c)
  *
+ * === 파일의 역할 ===
  * fio 작업 스레드에서 발생하는 I/O 에러를 분류하고 처리하는 기능을 담당한다.
- * continue_on_error 옵션과 함께 사용되어 특정 에러를 무시하고 계속 실행할 수 있다.
+ * continue_on_error/ignore_error 옵션으로 특정 에러를 무시하고 계속 실행 가능.
  *
- * 주요 기능:
- *   1) td_error_type()      - 에러를 읽기/쓰기/검증 유형으로 분류
- *   2) td_non_fatal_error() - 해당 에러가 치명적이지 않은지(무시 가능한지) 판별
- *   3) update_error_count() - 에러 카운터 업데이트 및 첫 번째 에러 기록
+ * === 전체 아키텍처에서의 위치 ===
+ * backend.c의 do_io()에서 I/O 에러 발생 시 td_non_fatal_error()를 호출.
+ * 호출 체인: do_io() [backend.c] → td_non_fatal_error() [이 파일]
+ *
+ * === 타 모듈과의 연결 ===
+ * - backend.c: I/O 에러 발생 시 에러 분류/처리 호출
+ * - td_error.h: 에러 타입 열거형 및 함수 선언
+ * - io_ddir.h: I/O 방향 정의 (읽기/쓰기/검증)
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - td_error_type(): 에러를 읽기/쓰기/검증 유형으로 분류
+ * - td_non_fatal_error(): 에러가 치명적이지 않은지 판별
+ * - update_error_count(): 에러 카운터 업데이트 및 첫 에러 기록
  */
 
 #include "fio.h"       /* fio 핵심 구조체 및 매크로 */

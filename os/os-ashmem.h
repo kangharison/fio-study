@@ -1,3 +1,20 @@
+/*
+ * [한국어 설명] Android ashmem 기반 SysV 공유 메모리 에뮬레이션 (os-ashmem.h)
+ *
+ * === 파일의 역할 ===
+ * Android의 Bionic C 라이브러리가 SysV 공유 메모리(shmget/shmat/shmdt/shmctl)를
+ * 지원하지 않으므로, ashmem(Android Shared Memory) 디바이스를 사용하여 에뮬레이션.
+ * fio의 smalloc.c에서 공유 메모리 할당 시 사용됨.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os/os-linux.h에서 __ANDROID__ 감지 시 포함됨.
+ *
+ * === 주요 함수 요약 ===
+ * - shmget(): ashmem 디바이스 열기 + 이름/크기 설정
+ * - shmat(): mmap으로 ashmem 영역 매핑 (크기를 앞 8바이트에 저장)
+ * - shmdt(): munmap으로 해제 (저장된 크기 사용)
+ * - shmctl(IPC_RMID): ashmem 언핀 + 닫기
+ */
 #ifndef CONFIG_NO_SHM
 /*
  * Bionic doesn't support SysV shared memory, so implement it using ashmem
@@ -14,6 +31,7 @@
 #define shmid_ds shmid64_ds
 #define SHM_HUGETLB    04000
 
+/* [한국어] SysV shmctl 에뮬레이션 - IPC_RMID 시 ashmem 언핀 후 fd 닫기 */
 static inline int shmctl(int __shmid, int __cmd, struct shmid_ds *__buf)
 {
 	int ret=0;
@@ -64,6 +82,7 @@ error:
 }
 #endif
 
+/* [한국어] shmat 에뮬레이션 - mmap 후 앞 8바이트에 크기 저장 (shmdt에서 사용) */
 static inline void *shmat(int __shmid, const void *__shmaddr, int __shmflg)
 {
 	size_t size = ioctl(__shmid, ASHMEM_GET_SIZE, NULL);

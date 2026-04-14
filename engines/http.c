@@ -1,21 +1,35 @@
 /*
- * [한국어 설명] HTTP/HTTPS I/O 엔진 구현 (http.c)
+ * [한국어 설명] HTTP/HTTPS 오브젝트 스토리지 I/O 엔진 (http.c)
  *
- * === 엔진 개요 ===
- * libcurl을 사용하여 HTTP(S) GET/PUT 요청으로 I/O를 수행하는 엔진이다.
- * S3 호환 오브젝트 스토리지, WebDAV, OpenStack Swift 프로토콜을 지원하며,
- * AWS Signature V4 인증, HTTPS, MD5 체크섬 등의 기능을 포함한다.
+ * === 파일의 역할 ===
+ * libcurl easy interface로 HTTP(S) GET/PUT 요청을 보내 S3/Swift/WebDAV 프로토콜의
+ * 오브젝트 스토리지에 I/O를 수행하는 fio 엔진 "http"를 구현한다. 요청 본문/응답 본문은
+ * io_u->xfer_buf에 직접 매핑되고, S3 모드에서는 AWS Signature V4(HMAC-SHA256 + SHA256)
+ * 로 요청을 서명한다. 또한 --verify=md5 등 fio 검증 경로와 맞물려 PUT 시 Content-MD5를
+ * 덧붙일 수 있다. HTTP Range 기반 접근과 "object-per-block" 접근 두 가지 객체 매핑을
+ * 지원한다(FIO_HTTP_OBJECT_RANGE/FIO_HTTP_OBJECT_BLOCK).
  *
- * === 사용하는 시스템 호출/라이브러리 ===
- * libcurl - HTTP 요청 수행 (curl_easy_init, curl_easy_perform, curl_easy_setopt 등)
- * OpenSSL - HMAC-SHA256 서명, SHA256 해시, MD5 체크섬 (S3 인증용)
+ * === 전체 아키텍처에서의 위치 ===
+ * --ioengine=http로 선택되는 플러그인이며, setup에서 curl 핸들을 스레드별로 할당한다.
+ * fio 잡 스레드 1개당 하나의 CURL*을 사용해 blocking하게 수행하므로 구현 측면에서는
+ * 동기 엔진에 가깝지만, fio 관점에서는 queue→getevents→event의 비동기 인터페이스 형태로
+ * 노출된다. HTTPS 모드에서 CURLOPT_SSL_VERIFYPEER/HOST를 FIO_HTTPS_INSECURE일 때 끈다.
+ * 실행 컨텍스트는 fio 잡 스레드(유저스페이스).
  *
- * === fio에서의 사용법 ===
- * --ioengine=http 옵션으로 선택
+ * === 타 모듈과의 연결 ===
+ * 상단: fio 코어(backend.c, ioengines.c)의 plugin 경로로 호출된다.
+ * 하단: libcurl(curl_easy_*, curl_slist_*)과 OpenSSL(HMAC, SHA256, MD5)을 사용한다.
+ * 데이터 흐름: io_u->xfer_buf ↔ curl read/write callback ↔ HTTPS socket ↔ 원격 S3 버킷.
+ * 공유 상태: http_options(td->eo) — 잡 단위 설정. http_data(td->io_ops_data) — 스레드
+ * 단위 CURL 핸들 상태.
  *
- * === 구현하는 주요 콜백 ===
- * .setup, .queue, .getevents, .event, .cleanup,
- * .open_file, .invalidate
+ * === 주요 함수/구조체 요약 ===
+ * - fio_http_setup(): CURL* 생성과 옵션 적용(HTTPS, 인증, verbose).
+ * - fio_http_prep()/_queue(): S3 서명 생성 후 curl_easy_perform()로 단일 오브젝트 요청.
+ * - _curl_read_data()/_curl_write_data(): libcurl 콜백으로 io_u->xfer_buf와 데이터 복사.
+ * - _aws_s3_sign_v4(): AWS Signature V4 canonical request 구성과 HMAC-SHA256 체인.
+ * - struct http_options: 엔진 옵션(https, host, user, key, s3 관련 인증 등).
+ * - struct http_data: CURL 핸들과 매 요청에서 쓰이는 상태 포인터.
  */
 
 /*
@@ -67,27 +81,29 @@ enum {
 	FIO_HTTP_OBJECT_RANGE	= 1,
 };
 
+/* [한국어] HTTP 엔진의 내부 상태 구조체 */
 struct http_data {
-	CURL *curl;
+	CURL *curl;	/* [한국어] libcurl easy 핸들 - HTTP 요청 수행용 */
 };
 
+/* [한국어] HTTP 엔진 전용 옵션 구조체 */
 struct http_options {
-	void *pad;
-	unsigned int https;
-	char *host;
-	char *user;
-	char *pass;
-	char *s3_key;
-	char *s3_keyid;
-	char *s3_security_token;
-	char *s3_region;
-	char *s3_sse_customer_key;
-	char *s3_sse_customer_algorithm;
-	char *s3_storage_class;
-	char *swift_auth_token;
-	int verbose;
-	unsigned int mode;
-	unsigned int object_mode;
+	void *pad;				/* [한국어] fio 옵션 구조체 정렬 패딩 */
+	unsigned int https;			/* [한국어] HTTPS 모드 (off/on/insecure) */
+	char *host;				/* [한국어] HTTP 서버 호스트 URL */
+	char *user;				/* [한국어] 기본 인증 사용자명 (WebDAV) */
+	char *pass;				/* [한국어] 기본 인증 비밀번호 (WebDAV) */
+	char *s3_key;				/* [한국어] AWS S3 비밀 액세스 키 */
+	char *s3_keyid;				/* [한국어] AWS S3 액세스 키 ID */
+	char *s3_security_token;		/* [한국어] AWS S3 임시 보안 토큰 (STS) */
+	char *s3_region;			/* [한국어] AWS S3 리전 */
+	char *s3_sse_customer_key;		/* [한국어] S3 SSE-C 고객 암호화 키 */
+	char *s3_sse_customer_algorithm;	/* [한국어] S3 SSE-C 암호화 알고리즘 */
+	char *s3_storage_class;			/* [한국어] S3 스토리지 클래스 (STANDARD, GLACIER 등) */
+	char *swift_auth_token;			/* [한국어] OpenStack Swift 인증 토큰 */
+	int verbose;				/* [한국어] libcurl 상세 로깅 활성화 */
+	unsigned int mode;			/* [한국어] HTTP 모드 (WebDAV/S3/Swift) */
+	unsigned int object_mode;		/* [한국어] 오브젝트 접근 모드 (블록/범위) */
 };
 
 struct http_curl_stream {

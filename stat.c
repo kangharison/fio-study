@@ -1,32 +1,30 @@
 /*
- * [한국어] stat.c - fio 통계 수집, 계산, 출력 엔진
+ * [한국어 설명] fio 통계 수집, 계산, 출력 엔진 (stat.c)
  *
+ * === 파일의 역할 ===
  * 이 파일은 fio의 성능 측정 결과를 수집하고 출력하는 핵심 파일이다.
- * 주요 기능:
+ * 레이턴시 퍼센타일 계산, 대역폭/IOPS 통계 집계, 결과 출력(normal/terse/JSON),
+ * 그리고 실시간 샘플 수집을 담당한다. show_run_stats()가 최종 보고서를 생성한다.
  *
- *   Part 1: 퍼센타일 계산 (74~280줄)
- *     - plat_val_to_idx(): 레이턴시 값 → 로그 스케일 버킷 인덱스 변환
- *     - plat_idx_to_val(): 버킷 인덱스 → 대표 레이턴시 값 변환
- *     - calc_clat_percentiles(): 버킷 히스토그램에서 퍼센타일 계산
+ * === 전체 아키텍처에서의 위치 ===
+ * I/O 완료 시 io_u.c에서 add_*_sample()을 호출하여 샘플을 수집하고,
+ * 실행 완료 후 backend.c에서 show_run_stats()를 호출하여 최종 통계를 출력한다.
+ * 호출 체인: io_u_complete [io_u.c] → add_clat_sample/add_bw_sample [이 파일]
+ *           fio_backend [backend.c] → show_run_stats [이 파일]
  *
- *   Part 2: 통계 출력 (280~2040줄)
- *     - show_ddir_status(): 방향별 상세 통계 출력 (normal 형식)
- *     - show_thread_status_normal(): 스레드 통계 전체 출력
- *     - show_thread_status_terse(): terse(간결) 형식 출력
- *     - add_ddir_status_json(): JSON 형식 출력
- *     - show_group_stats(): 그룹 집계 통계 출력
- *     - print_disk_util(): 디스크 유틸리티 통계 출력
+ * === 타 모듈과의 연결 ===
+ * - io_u.c: I/O 완료 시 add_clat_sample()/add_slat_sample() 호출
+ * - backend.c: fio_backend()에서 show_run_stats() 호출
+ * - server.c: fio_server_send_ts()로 원격 클라이언트에 통계 전송
+ * - iolog.c: 로그 샘플 기록 (calc_log_samples)
+ * - 핵심 자료구조: thread_stat(스레드 통계), group_run_stats(그룹 통계)
  *
- *   Part 3: 통계 집계 (2040~2520줄)
- *     - sum_thread_stats(): 여러 스레드의 통계를 합산
- *     - __show_run_stats(): 최종 통계 보고서 생성
- *
- *   Part 4: 샘플 수집 (3067~끝)
- *     - add_clat_sample(): 완료 레이턴시 샘플 추가
- *     - add_slat_sample(): 제출 레이턴시 샘플 추가
- *     - add_bw_sample(): 대역폭 샘플 추가
- *     - add_iops_sample(): IOPS 샘플 추가
- *     - calc_log_samples(): 주기적 로그 샘플 계산
+ * === 주요 함수/구조체 요약 ===
+ * - add_clat_sample(): 완료 레이턴시 샘플을 퍼센타일 버킷에 추가
+ * - show_run_stats() / __show_run_stats(): 최종 통계 보고서 생성 및 출력
+ * - sum_thread_stats(): 여러 스레드의 통계를 합산
+ * - calc_clat_percentiles(): 로그 스케일 히스토그램에서 퍼센타일 계산
+ * - show_thread_status_normal/terse/json(): 각 형식별 출력 함수
  */
 #include <stdio.h>
 #include <string.h>

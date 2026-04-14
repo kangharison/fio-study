@@ -1,3 +1,19 @@
+/*
+ * [한국어 설명] macOS posix_fadvise 에뮬레이션 구현 (mac/posix.c)
+ *
+ * === 파일의 역할 ===
+ * macOS가 지원하지 않는 posix_fadvise()를 에뮬레이션한다.
+ * POSIX_FADV_RANDOM/SEQUENTIAL은 F_RDAHEAD fcntl로, POSIX_FADV_DONTNEED는
+ * mmap+msync(MS_INVALIDATE)+munmap으로 페이지 캐시를 해제한다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * os-mac.h → mac/posix.h → mac/posix.c
+ * filesetup.c, io_u.c 등에서 posix_fadvise() 호출 시 사용.
+ *
+ * === 주요 함수 요약 ===
+ * - posix_fadvise(): 어드바이스에 따라 readahead 또는 캐시 해제 수행
+ * - discard_pages(): mmap+msync로 페이지 캐시 무효화 (16GB 단위 청크)
+ */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -10,10 +26,22 @@
 
 #include "posix.h"
 
+/* [한국어] 한 번에 mmap할 최대 크기 (16GB) - 대용량 파일을 청크 단위로 처리 */
 #define MMAP_CHUNK_SIZE		(16LL * 1024 * 1024 * 1024)
 
 /*
  * NB: performance of discard_pages() will be slower under Rosetta.
+ */
+/*
+ * [한국어]
+ * discard_pages - 페이지 캐시 무효화 (POSIX_FADV_DONTNEED 에뮬레이션)
+ * @fd: 대상 파일 디스크립터
+ * @offset: 시작 오프셋
+ * @len: 해제할 길이
+ *
+ * mmap(PROT_NONE) → msync(MS_INVALIDATE) → munmap 순서로
+ * 커널에 해당 페이지를 폐기하도록 요청. 16GB 청크 단위로 반복.
+ * Rosetta(x86 에뮬레이션) 환경에서는 성능이 느릴 수 있음.
  */
 static int discard_pages(int fd, off_t offset, off_t len)
 {
@@ -63,6 +91,7 @@ static int discard_pages(int fd, off_t offset, off_t len)
 	return 0;
 }
 
+/* [한국어] F_RDAHEAD fcntl로 readahead 활성/비활성화 */
 static inline int set_readhead(int fd, bool enabled) {
 	int ret;
 
@@ -74,6 +103,18 @@ static inline int set_readhead(int fd, bool enabled) {
 	return ret;
 }
 
+/*
+ * [한국어]
+ * posix_fadvise - macOS용 posix_fadvise 에뮬레이션
+ * @fd: 파일 디스크립터
+ * @offset: 시작 오프셋
+ * @len: 길이
+ * @advice: POSIX_FADV_* 상수
+ * @return: 0=성공, 에러코드=실패
+ *
+ * FADV_RANDOM → readahead 끄기, FADV_SEQUENTIAL → readahead 켜기,
+ * FADV_DONTNEED → 페이지 캐시 해제 (discard_pages).
+ */
 int posix_fadvise(int fd, off_t offset, off_t len, int advice)
 {
 	int ret;

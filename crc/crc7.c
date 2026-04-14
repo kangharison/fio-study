@@ -5,9 +5,23 @@
  * Version 2. See the file COPYING for more details.
  */
 
+/*
+ * [한국어 설명] CRC-7 체크섬 구현 (crc7.c)
+ *
+ * === 파일의 역할 ===
+ * CRC-7 체크섬(다항식 x^7 + x^3 + 1)의 룩업 테이블과 계산 함수를 구현한다.
+ * 7비트 CRC로, 출력 범위가 0~127이며 간단한 오류 검출에 사용된다.
+ *
+ * === 전체 아키텍처에서의 위치 ===
+ * 호출 체인: verify.c → fio_crc7() [이 파일] → crc7_byte() [crc7.h]
+ *
+ * === 주요 함수 요약 ===
+ * - fio_crc7(): 버퍼 전체의 CRC-7 체크섬을 바이트 단위로 계산
+ */
 #include "crc7.h"
 
 /* Table for CRC-7 (polynomial x^7 + x^3 + 1) */
+/* [한국어] CRC-7 신드롬 테이블: 다항식 x^7 + x^3 + 1로부터 미리 계산된 256개 항목 */
 const unsigned char crc7_syndrome_table[256] = {
 	0x00, 0x09, 0x12, 0x1b, 0x24, 0x2d, 0x36, 0x3f,
 	0x48, 0x41, 0x5a, 0x53, 0x6c, 0x65, 0x7e, 0x77,
@@ -43,11 +57,29 @@ const unsigned char crc7_syndrome_table[256] = {
 	0x46, 0x4f, 0x54, 0x5d, 0x62, 0x6b, 0x70, 0x79
 };
 
+/*
+ * [한국어]
+ * fio_crc7 - 버퍼 데이터의 CRC-7 체크섬 계산
+ *
+ * @buffer: CRC를 계산할 데이터 버퍼
+ * @len: 데이터 길이(바이트)
+ * @return: 계산된 7비트 CRC 값 (0~127)
+ *
+ * 초기값 0에서 시작하여 각 바이트마다 crc7_byte()를 호출하고
+ * 최종 CRC 값을 반환한다.
+ *
+ * 호출 체인:
+ *   verify.c / crc/test.c → [fio_crc7] → crc7_byte() [crc7.h]
+ */
 unsigned char fio_crc7(const unsigned char *buffer, unsigned int len)
 {
+	/* [한국어] CRC-7 초기값 0 - 다항식 x^7+x^3+1의 표준 초기 시드 */
 	unsigned char crc = 0;
 
+	/* [한국어] 바이트 단위로 감소 루프 - len==0이 되면 종료, 후위 감소로 마지막 바이트까지 처리 */
 	while (len--)
+		/* [한국어] 한 바이트를 CRC-7에 반영: crc7_byte()는 인라인으로 syndrome 테이블 룩업 수행 */
 		crc = crc7_byte(crc, *buffer++);
+	/* [한국어] 누적된 7비트 CRC 반환 - 상위 1비트는 0, 호출자(verify.c)가 검증 데이터로 사용 */
 	return crc;
 }
