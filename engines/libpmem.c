@@ -403,28 +403,59 @@ static int fio_libpmem_close_file(struct thread_data *td, struct fio_file *f)
 }
 
 /*
- * [한국어] 이 엔진을 fio에 노출하는 ioengine_ops 정의.
- * flags의 의미:
- *  - FIO_SYNCIO: 동기 엔진(큐/완료 분리 없음)
- *  - FIO_RAWIO : 원시 장치급 I/O(부가 검증 완화)
- *  - FIO_DISKLESSIO: 실제 디스크 없이 동작 가능(파일 크기 자동 확장 금지 등)
- *  - FIO_NOEXTEND: 파일 확장 금지(크기 사전 결정)
- *  - FIO_NODISKUTIL: diskutil 통계 수집 제외
- *  - FIO_BARRIER: pmem_drain 등 배리어 의미를 코어에 알림
- *  - FIO_MEMALIGN: 버퍼 메모리 정렬 요구
+ * [한국어] ioengine_ops — libpmem 엔진 vtable.
+ * 이 구조체가 fio 코어↔엔진 사이의 공식 계약이며, 필드 하나당 하나의 역할을 갖는다.
+ * 누가 설정/읽는지, 계약상 호출 시점, 미설정 시 기본 동작을 각 필드 주석에서 명시.
+ * 설정자: 정적 초기화(파일 전역). 읽는 자: fio 코어(backend.c, ioengines.c).
+ * 값 범위: FIO_IOOPS_VERSION과 일치해야 하며, 콜백 포인터는 NULL 또는 유효 함수.
+ * 동기화: 읽기 전용 구조체 — 초기화 이후 수정되지 않음.
  */
 FIO_STATIC struct ioengine_ops ioengine = {
 	.name		= "libpmem",
+	/* [한국어] 엔진 식별자. ioengine=libpmem 잡 옵션이 이 이름과 매칭된다.
+	 * 설정자: 정적 초기화. 읽는 자: load_ioengine→find_ioengine 탐색. */
+
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] 엔진 ABI 버전 상수. fio 코어가 자신의 빌드 버전과 비교해
+	 * 불일치하면 로드 거부하여 외부 .so 엔진의 ABI 드리프트를 막는다. */
+
 	.init		= fio_libpmem_init,
+	/* [한국어] 잡 시작 1회 — 옵션 정합성 검증(페이지 정렬 + fsync 조합 불가).
+	 * 호출 시점: td_io_init(). 실패(1) 시 fio 코어가 잡을 중단. */
+
 	.prep		= fio_libpmem_prep,
+	/* [한국어] io_u의 offset을 매핑된 가상 주소로 변환해 io_u->mmap_data에 저장.
+	 * 호출 시점: get_io_u 이후 queue 직전. mmap 계열 엔진 공통 패턴. */
+
 	.queue		= fio_libpmem_queue,
+	/* [한국어] I/O 1건 실행. memcpy/pmem_memcpy/pmem_drain로 동기 완료.
+	 * 반환값: FIO_Q_COMPLETED(항상). 동기 엔진이라 commit/getevents 미사용. */
+
 	.open_file	= fio_libpmem_open_file,
+	/* [한국어] pmem_map_file로 DAX 파일 매핑. generic_open_file 대신 전용 구현을
+	 * 제공하는 이유는 read/write syscall 대신 가상주소 기반 memcpy를 쓰기 때문. */
+
 	.close_file	= fio_libpmem_close_file,
+	/* [한국어] pmem_unmap + fdd free. open_file과 짝. */
+
 	.get_file_size	= generic_get_file_size,
+	/* [한국어] stat(2) 기반 공통 구현. DAX 파일도 일반 파일시스템 위에 있어 동일. */
+
 	.prepopulate_file = generic_prepopulate_file,
+	/* [한국어] fio가 요청 크기만큼 사전 채움(fallocate/write) 수행 시 공통 구현 사용. */
+
 	.flags		= FIO_SYNCIO | FIO_RAWIO | FIO_DISKLESSIO | FIO_NOEXTEND |
 				FIO_NODISKUTIL | FIO_BARRIER | FIO_MEMALIGN,
+	/* [한국어] 엔진 특성 플래그 비트마스크:
+	 *  - FIO_SYNCIO    : 동기 엔진 — queue() 반환 = 완료. fio 코어가 submit/complete를
+	 *                    자동 기록하고 commit/getevents 호출을 건너뜀.
+	 *  - FIO_RAWIO     : 원시(raw) I/O 의미 — 블록 디바이스처럼 정렬 제약이 있음을 알림.
+	 *  - FIO_DISKLESSIO: 실제 디스크 I/O 없음(페이지 캐시·블록 레이어 우회). DAX mmap 모델.
+	 *  - FIO_NOEXTEND  : 파일 크기 자동 확장 금지. 매핑은 고정 크기에서 이뤄지므로
+	 *                    잡 실행 중 크기 변동이 있으면 SIGBUS 발생 위험.
+	 *  - FIO_NODISKUTIL: /proc/diskstats 기반 디스크 사용률 통계 수집 제외.
+	 *  - FIO_BARRIER   : pmem_drain이 메모리 배리어 역할을 하므로 fio가 배리어 의미를 추적.
+	 *  - FIO_MEMALIGN  : io_u 버퍼 메모리 정렬 요구(NT-store에 필요한 정렬 수호). */
 };
 
 /*

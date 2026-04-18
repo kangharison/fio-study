@@ -4,44 +4,85 @@
  * === 파일의 역할 ===
  * 이 파일은 fio가 Ceph 분산 스토리지의 최하위 계층인 RADOS(Reliable Autonomic
  * Distributed Object Store)에 직접 오브젝트 단위로 I/O를 발생시키게 하는 I/O 엔진이다.
- * RBD 엔진(rbd.c)이 블록 디바이스 추상화를 테스트한다면, 이 엔진은 그 하위 계층인
- * OSD(Object Storage Daemon)의 오브젝트 read/write/remove 경로 성능만을 고립해서
- * 측정하기 위해 존재한다. 모든 I/O는 librados의 비동기(aio) API로 제출되며,
- * RADOS 라이브러리가 완료 콜백(complete_callback)을 통해 fio로 완료를 통지한다.
- * 엔진은 FIO_DISKLESSIO 플래그를 설정해 fio 코어가 실제 파일을 생성하지 않게 하고,
- * 파일 이름 문자열을 오브젝트 이름으로 재사용한다.
+ * RBD 엔진(rbd.c)이 "librados + librbd" 2계층으로 블록 디바이스 추상화(스냅샷/클론/
+ * 스트라이프 단위 4MiB 오브젝트 자동 분해/캐시/이미지 락)를 테스트한다면, 이 엔진은
+ * 그 아래 계층인 OSD(Object Storage Daemon)의 "한 오브젝트 단위 read/write/append/
+ * zero(=TRIM)/remove" 경로만 고립해서 측정하기 위해 존재한다. 모든 I/O는 librados의
+ * 비동기(aio) API(rados_aio_create_completion → rados_aio_write/read/write_op_operate
+ * → 완료 콜백)로 제출되며, RADOS 라이브러리가 내부 메신저(Messenger) 스레드에서
+ * 완료 콜백(complete_callback)을 호출해 fio로 완료를 통지한다. 엔진은 FIO_DISKLESSIO
+ * 플래그로 fio 코어가 실제 파일을 생성하지 않게 하고, 파일 이름 문자열을 오브젝트
+ * 이름으로 재사용한다(fio_file 하나 ↔ RADOS 오브젝트 하나). 또한 FIO_NODISKUTIL
+ * 은 설정하지 않지만, diskless 경로이므로 블록 디바이스 utilization 통계는 비게 된다.
+ *
+ * RADOS vs RBD 핵심 차이:
+ *   - RBD: 블록 디바이스 추상 — 하나의 "image" 가 4MiB 오브젝트 여러 개로 투명
+ *          스트라이핑됨. snap/clone/resize/journal/exclusive-lock 등 블록 의미론.
+ *          librbd 콜백이 librados 콜백 위에 한 겹 더 있음(2계층 비동기).
+ *   - RADOS(본 엔진): "한 오브젝트 하나" 가 전체 단위. 오브젝트 크기 상한(기본
+ *          osd_max_object_size ~ 128MiB, 실제로 4MiB 경계로 쓰는 것이 전형)을
+ *          클라이언트가 직접 관리해야 함. TRIM 은 rados_write_op_zero(논리적 zero-fill)
+ *          로 에뮬레이션. 스냅샷/클론 없음. 콜백 1계층.
  *
  * === 전체 아키텍처에서의 위치 ===
  * fio 실행 흐름 main() → fio_backend() → load_ioengine("rados") 과정에서
- * fio_rados_register()(파일 끝) 가 모듈 초기화 시 이 엔진을 등록한다.
- * 잡 스레드는 td_io_init → fio_rados_setup → _fio_rados_connect 로 클러스터에
- * 연결한 뒤, 잡 루프에서 get_io_u → td_io_queue(=fio_rados_queue) 로 I/O를
- * 제출하고 td_io_getevents(=fio_rados_getevents) 로 완료를 수확한다.
- * 완료는 librados 내부 메신저 스레드가 complete_callback 을 호출해 알려주므로,
- * 실행 컨텍스트가 "잡 스레드"와 "librados 콜백 스레드" 두 곳으로 나뉜다.
+ * fio_rados_register()(파일 끝, __attribute__((constructor))) 가 _start →
+ * __libc_start_main 의 .init_array 단계에서 이 엔진 vtable 을 engine_list 에 등록한다.
+ * 잡 스레드는 td_io_init → fio_rados_setup → _fio_setup_rados_data + _fio_rados_connect
+ * 로 상태를 할당하고 Ceph 모니터(MON) 에 TCP 연결 + CephX 인증 + cluster map 수신 후
+ * 지정 풀에 대한 ioctx 를 만든 뒤, 잡 루프에서 get_io_u → td_io_queue(=fio_rados_queue)
+ * 로 오브젝트 I/O 를 librados 에 비동기 제출하고 td_io_getevents(=fio_rados_getevents)
+ * 로 완료를 수확한다. 완료는 librados 내부 메신저 스레드가 complete_callback 을 호출해
+ * 알려주므로, 실행 컨텍스트가 "잡 스레드(생산자 of submit, 소비자 of completion)"
+ * 와 "librados 메신저 콜백 스레드(생산자 of completion)" 두 곳으로 나뉘며
+ * completed_lock/completed_more_io 로 경합을 직렬화한다.
+ *
+ * CephX 인증/ceph.conf/keyring 경로:
+ *   - rados_create(&cluster, id)          : 기본 클러스터명 "ceph", client id 지정.
+ *   - rados_create2(&cluster, name, full, 0): 클러스터명(Zone)과 "type.id"(예: "client.admin")
+ *     를 모두 지정. client_name 옵션이 '.' 없는 순수 ID 면 "client." 접두어 자동 부여.
+ *   - rados_conf_read_file(cluster, path) : ceph.conf 에서 MON 주소/keyring 경로/auth 방식
+ *     적용. 기본 "/etc/ceph/ceph.conf". keyring 내 CephX secret 으로 MON 과 rendezvous.
+ *   - rados_connect(cluster)              : MON 포트(기본 3300 msgr2 / 6789 legacy)에
+ *     TCP 접속, OSDMap/MonMap 수신. 이후 OSD 와 직접 통신.
+ *   - rados_ioctx_create(cluster, pool, &ioctx): 특정 풀에 바인딩된 I/O 컨텍스트 생성.
  *
  * === 타 모듈과의 연결 ===
- * 상위: ioengines.c(td_io_* 래퍼) → 이 파일의 ioengine_ops 콜백.
- * 하위: librados (rados_create/connect/ioctx_create, rados_aio_write/read,
- *        rados_create_write_op + rados_write_op_zero 로 TRIM 구현).
- * 공유 상태: rados_data(클러스터·ioctx 핸들, 완료 리스트, 뮤텍스/조건변수) 를
- *            td->io_ops_data 로 fio 코어와 공유하고, io_u 당 fio_rados_iou 를
- *            io_u->engine_data 로 매달아 queue→callback→getevents 사이에서 추적한다.
- * 데이터 흐름: fio가 버퍼를 채워 io_u 로 넘겨주면 → queue 가 librados AIO 호출로
- *              OSD에 보내고 → 콜백 스레드가 완료 리스트에 넣고 → getevents 가 뽑아
- *              aio_events[] 로 fio 에 반환한다.
+ * 상위: ioengines.c(td_io_* 래퍼) → 이 파일의 ioengine_ops 콜백(setup/queue/getevents/
+ *        event/cleanup/open_file/invalidate/io_u_init/io_u_free).
+ * 하위: librados (rados_create/create2/conf_read_file/connect/ioctx_create/aio_*
+ *        /write/read/write_op_operate/create_write_op/write_op_zero/release_write_op/
+ *        aio_release/aio_is_complete/remove/shutdown/ioctx_destroy).
+ * 병렬: pthread(완료 리스트용 뮤텍스/조건변수).
+ * 공유 상태: rados_data(클러스터·ioctx 핸들, 완료 리스트, 뮤텍스/조건변수, scheduled/
+ *            completed 카운터) 를 td->io_ops_data 로 fio 코어와 공유하고, io_u 당
+ *            fio_rados_iou 를 io_u->engine_data 로 매달아 queue→callback→getevents
+ *            사이에서 완료 핸들/write_op 를 추적한다.
+ * 데이터 흐름: fio 가 버퍼를 채워 io_u 로 넘겨주면 → queue 가 librados AIO 호출로
+ *              primary OSD 에 오브젝트 I/O 를 보내고(OSD 는 replication/erasure coding
+ *              으로 복제본에 전파 후 ACK) → 메신저 콜백 스레드가 완료 리스트에 push
+ *              → getevents 가 pop 해서 aio_events[] 로 fio 에 반환 → fio_rados_event()
+ *              가 인덱스로 io_u 를 코어에 돌려준다.
  *
  * === 주요 함수/구조체 요약 ===
- * - fio_rados_setup: 잡 스레드 1회. 상태 구조체 할당 후 클러스터에 연결.
- * - _fio_rados_connect: cluster_name/client_name 규칙(`client.<id>`)에 맞춰
- *   rados_create2/rados_create 선택, conf 읽고 풀 ioctx 생성, touch_objects
- *   옵션일 때 오브젝트 0바이트 write 로 "존재"를 만든다.
+ * - fio_rados_setup: 잡 스레드 1회. 상태 구조체 할당 후 클러스터에 연결 + ioctx 생성
+ *   + (touch_objects=1 이면) 대상 오브젝트를 0바이트 write 로 생성. use_thread=1 강제
+ *   (librados 가 fork 후 안전하지 않아 pthread 모드를 요구).
+ * - _fio_rados_connect: cluster_name/client_name 규칙("client.<id>")에 맞춰
+ *   rados_create2/rados_create 선택, conf 읽고 풀 ioctx 생성, touch_objects 옵션일
+ *   때 오브젝트 0바이트 write 로 "존재" 를 만든다(READ 시 ENOENT 방지).
  * - fio_rados_queue: ddir 별로 rados_aio_write / rados_aio_read / write_op+zero
- *   (TRIM) 분기. 각 호출마다 rados_completion_t 를 새로 만든다.
- * - complete_callback: librados 콜백 스레드에서 실행. 완료 리스트에 링크하고
- *   조건변수로 잡 스레드를 깨움.
+ *   (TRIM) 분기. 각 호출마다 rados_completion_t 를 새로 만들고 콜백을 등록한다.
+ *   FIO_Q_QUEUED(비동기 수락) 또는 FIO_Q_COMPLETED(즉시 에러) 반환.
+ * - complete_callback: librados 메신저 콜백 스레드에서 실행. 완료 리스트에 링크하고
+ *   ops_completed 증가 후 조건변수로 잡 스레드를 깨움. 자원 해제는 getevents 가 수행.
  * - fio_rados_getevents: min/max 를 만족할 때까지 대기하며 완료 리스트를 드레인.
- * - struct rados_data: 엔진 전역 상태. struct fio_rados_iou: io_u 당 완료 핸들.
+ *   각 엔트리에서 rados_aio_release + rados_release_write_op(TRIM 한정) 로 자원 회수.
+ * - fio_rados_cleanup: scheduled==completed 까지 대기 후 오브젝트 제거 + disconnect.
+ * - struct rados_data: 엔진 전역 상태(잡 1개당 1개).
+ * - struct fio_rados_iou: io_u 당 완료 핸들/write_op 보관.
+ * - struct rados_options: CLI/잡파일 옵션(clustername/pool/clientname/conf/busy_poll/
+ *   touch_objects).
  */
 
 /*
@@ -176,69 +217,113 @@ struct rados_options {
 
 /*
  * [한국어] options[] — fio 옵션 파서에 등록할 엔진 옵션 테이블.
- * 각 항목은 name, 타입, 저장 오프셋, 카테고리/그룹(=RBD 그룹과 공유) 로 구성된다.
- * 테이블 끝은 .name = NULL 로 마감한다.
+ *
+ * 공통 규약:
+ *   - .name: CLI 단축/잡 파일 키. `--clustername=ceph` 같은 형태로 노출.
+ *   - .lname: --help/--ioengine=rados --enghelp 시 사람이 읽는 라벨.
+ *   - .type: FIO_OPT_STR_STORE(strdup 후 포인터 저장) / FIO_OPT_BOOL(0|1 정수) 사용.
+ *   - .off1: 파서가 결과를 기록할 rados_options 내 오프셋. FIO_OPT_C_ENGINE 가 있는
+ *     엔진 옵션은 td->eo(엔진별 옵션 복제본, option_struct_size 바이트) 기준.
+ *   - .def: 값 미지정 시 기본(문자열). 내부적으로 타입에 맞게 재파싱됨.
+ *   - .help: --cmdhelp/--enghelp 출력용 한 줄 설명.
+ *   - .category/.group: --cmdhelp 분류용. RADOS 는 RBD 와 한 그룹(FIO_OPT_G_RBD)을
+ *     공유해 Ceph 관련 옵션이 --cmdhelp 에서 같이 묶여 표시되도록 한다.
+ *   - 테이블 끝은 .name = NULL 센티널로 마감해 파서 순회 루프가 종료 조건으로 인식.
  */
 static struct fio_option options[] = {
 	{
-		.name     = "clustername",                                          /* [한국어] CLI/잡파일에서 사용할 옵션 이름. */
-		.lname    = "ceph cluster name",                                    /* [한국어] long name(도움말 표기용). */
-		.type     = FIO_OPT_STR_STORE,                                      /* [한국어] 문자열을 그대로 저장하는 타입. */
-		.help     = "Cluster name for ceph",                                /* [한국어] --help 출력 설명. */
-		.off1     = offsetof(struct rados_options, cluster_name),           /* [한국어] 파싱 결과를 저장할 구조체 내 오프셋. */
-		.category = FIO_OPT_C_ENGINE,                                       /* [한국어] 엔진 카테고리. */
-		.group    = FIO_OPT_G_RBD,                                          /* [한국어] RBD/RADOS 공용 옵션 그룹. */
+		.name     = "clustername",
+		/* [한국어] CLI/잡파일 키 — `clustername=<name>` 형태. rados_create2 의 첫 인자로
+		 * 전달될 Ceph 클러스터 이름(일반적으로 "ceph"). 미지정이면 rados_create 로
+		 * fallback 하여 기본 클러스터명을 librados 가 가정한다. */
+		.lname    = "ceph cluster name",
+		/* [한국어] --help/--enghelp 표시용 긴 이름. */
+		.type     = FIO_OPT_STR_STORE,
+		/* [한국어] 문자열을 strdup 해서 off1 위치에 포인터로 저장. cleanup 시 libc free
+		 * 대상은 fio 공통 옵션 해제 경로가 처리. */
+		.help     = "Cluster name for ceph",
+		/* [한국어] --cmdhelp clustername 에 출력되는 설명. */
+		.off1     = offsetof(struct rados_options, cluster_name),
+		/* [한국어] rados_options.cluster_name 에 저장 — _fio_rados_connect 가 읽음. */
+		.category = FIO_OPT_C_ENGINE,
+		/* [한국어] 엔진 전용 카테고리(코어/로그/verify 와 구분). */
+		.group    = FIO_OPT_G_RBD,
+		/* [한국어] RBD/RADOS Ceph 공용 그룹 — 같은 --cmdhelp 섹션에 묶임. */
 	},
 	{
-		.name     = "pool",                                                 /* [한국어] Ceph 풀 이름 지정. 필수 옵션. */
+		.name     = "pool",
+		/* [한국어] 필수 옵션. Ceph 풀 이름 — rados_ioctx_create 의 대상.
+		 * 미지정 시 _fio_rados_connect 가 에러 로그 후 실패 반환. */
 		.lname    = "pool name to use",
+		/* [한국어] 도움말 표시용 긴 이름. */
 		.type     = FIO_OPT_STR_STORE,
+		/* [한국어] 풀 이름 문자열 저장. */
 		.help     = "Ceph pool name to benchmark against",
-		.off1     = offsetof(struct rados_options, pool_name),              /* [한국어] rados_options.pool_name 에 저장. */
+		/* [한국어] --cmdhelp pool 출력. */
+		.off1     = offsetof(struct rados_options, pool_name),
+		/* [한국어] rados_options.pool_name 에 저장 — _fio_rados_connect 가 읽음. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "clientname",                                           /* [한국어] RADOS 클라이언트 ID. */
+		.name     = "clientname",
+		/* [한국어] RADOS 클라이언트 ID. 값에 '.' 이 없으면 _fio_rados_connect 가
+		 * "client." 접두어를 붙여 "client.<ID>" 형태로 rados_create2 에 전달(CephX
+		 * principal 이름). 이미 "type.id" 형태면 그대로 사용. 기본 "client.admin". */
 		.lname    = "rados engine clientname",
 		.type     = FIO_OPT_STR_STORE,
 		.help     = "Name of the ceph client to access RADOS engine",
 		.off1     = offsetof(struct rados_options, client_name),
+		/* [한국어] rados_options.client_name 에 저장. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "conf",                                                 /* [한국어] ceph.conf 경로. */
+		.name     = "conf",
+		/* [한국어] ceph.conf 경로 — rados_conf_read_file 이 읽어 MON 주소, keyring
+		 * 경로, auth 방식, 네트워크 옵션 등을 적용한다. */
 		.lname    = "ceph configuration file path",
 		.type     = FIO_OPT_STR_STORE,
 		.help     = "Path of the ceph configuration file",
 		.off1     = offsetof(struct rados_options, conf),
-		.def      = "/etc/ceph/ceph.conf",                                  /* [한국어] 미지정 시 기본 경로. */
+		/* [한국어] rados_options.conf 에 저장. */
+		.def      = "/etc/ceph/ceph.conf",
+		/* [한국어] 미지정 시 표준 Ceph 배포의 관례 경로를 기본값으로 사용. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "busy_poll",                                            /* [한국어] busy-poll 수확 모드 on/off. */
+		.name     = "busy_poll",
+		/* [한국어] 완료 수확 정책 힌트 — 코드에 변수만 존재하고 실제 분기는 없음
+		 * (조건변수 wait 경로 고정). 호환용/향후 튜닝용 예약 플래그로 보이며,
+		 * RBD 엔진과 동일 옵션명을 맞춰 두어 사용자 학습 일관성을 제공한다. */
 		.lname    = "busy poll mode",
 		.type     = FIO_OPT_BOOL,
+		/* [한국어] 0/1 부울 값. */
 		.help     = "Busy poll for completions instead of sleeping",
 		.off1     = offsetof(struct rados_options, busy_poll),
-		.def	  = "0",                                                    /* [한국어] 기본 OFF(조건변수 대기). */
+		.def	  = "0",
+		/* [한국어] 기본 OFF — 조건변수 대기 모드로 CPU 를 쉬게 한다. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = "touch_objects",                                        /* [한국어] setup 시 오브젝트 프리터치. */
+		.name     = "touch_objects",
+		/* [한국어] setup 단계에서 대상 오브젝트를 0바이트 rados_write 로 "존재"시킬지.
+		 * 켜두면 read-only 잡이나 읽기 우선 잡에서 ENOENT(-2) 가 나지 않는다. */
 		.lname    = "touch objects on start",
 		.type     = FIO_OPT_BOOL,
 		.help     = "Touch (create) objects on start",
 		.off1     = offsetof(struct rados_options, touch_objects),
-		.def	  = "1",                                                    /* [한국어] 기본 ON. */
+		.def	  = "1",
+		/* [한국어] 기본 ON — 안전한 기본값. 이미 존재하는 오브젝트 측정 시에도
+		 * 0바이트 write 는 tail size 에 영향을 주지 않아 부작용이 작다. */
 		.category = FIO_OPT_C_ENGINE,
 		.group    = FIO_OPT_G_RBD,
 	},
 	{
-		.name     = NULL,                                                   /* [한국어] 테이블 종단 표식. */
+		.name     = NULL,
+		/* [한국어] 테이블 종단 센티널 — 파서가 .name==NULL 을 보면 루프 종료. */
 	},
 };
 
@@ -745,43 +830,139 @@ static int fio_rados_io_u_init(struct thread_data *td, struct io_u *io_u)
 }
 
 /*
- * [한국어] ioengine — fio 코어가 엔진을 호출할 때 사용하는 콜백 테이블.
- * get_ioengine()(ioengines.c) 가 이름으로 조회하며, 각 필드는 잡 루프의 특정 훅에 매핑된다.
+ * [한국어] ioengine — fio 코어가 엔진을 호출할 때 사용하는 콜백 vtable.
+ * get_ioengine()(ioengines.c) 가 이름 "rados" 로 engine_list 에서 조회하며, 각 필드는
+ * 잡 루프의 특정 훅에 매핑된다. FIO_STATIC 매크로는 이 심볼이 내장(static 링크) 에서는
+ * extern 가시성, 외부 공유라이브러리 빌드(.so)에서는 static 가시성을 갖도록 전환한다.
+ *
+ * 이 vtable 의 반환 코드 계약 요약:
+ *   - queue 의 FIO_Q_QUEUED: 비동기 수락(완료는 나중에 getevents 로 수확).
+ *   - queue 의 FIO_Q_COMPLETED: 즉시 완료(동기 에러 경로). 코어가 put_io_u 까지 수행.
+ *   - queue 의 FIO_Q_BUSY: 사용 안 함(이 엔진은 제출 포화로 인한 백프레셔 경로 없음).
+ * 실행 컨텍스트는 모두 잡 스레드(단 complete_callback 만 librados 메신저 스레드).
  */
 /* ioengine_ops for get_ioengine() */
 FIO_STATIC struct ioengine_ops ioengine = {
-	.name = "rados",                                                        /* [한국어] --ioengine=rados 로 선택되는 이름. */
-	.version		= FIO_IOOPS_VERSION,                            /* [한국어] ABI 버전 검사용. 불일치 시 로드 거부. */
-	.flags			= FIO_DISKLESSIO,                               /* [한국어] 실제 파일을 만들지 말라는 플래그(오브젝트 스토리지이므로). */
-	.setup			= fio_rados_setup,                              /* [한국어] 초기화 훅. */
-	.queue			= fio_rados_queue,                              /* [한국어] I/O 제출 훅. */
-	.getevents		= fio_rados_getevents,                          /* [한국어] 완료 수확 훅. */
-	.event			= fio_rados_event,                              /* [한국어] 수확된 이벤트 인덱스 → io_u 매핑. */
-	.cleanup		= fio_rados_cleanup,                            /* [한국어] 종료 시 자원 해제. */
-	.open_file		= fio_rados_open,                               /* [한국어] no-op(오브젝트는 open 불필요). */
-	.invalidate		= fio_rados_invalidate,                         /* [한국어] no-op. */
-	.options		= options,                                      /* [한국어] 엔진 옵션 테이블. */
-	.io_u_init		= fio_rados_io_u_init,                          /* [한국어] io_u 당 컨텍스트 할당. */
-	.io_u_free		= fio_rados_io_u_free,                          /* [한국어] io_u 당 컨텍스트 해제. */
-	.option_struct_size	= sizeof(struct rados_options),                 /* [한국어] 옵션 구조체 크기 — 파서가 per-job 복제본을 만들 때 사용. */
+	.name			= "rados",
+	/* [한국어] 엔진 이름 — `--ioengine=rados` 로 선택되는 키.
+	 * 설정자: 이 정적 초기화. 읽는 자: register_ioengine → engine_list 링크 + 추후
+	 *         load_ioengine 이 이름으로 탐색.
+	 * 값 범위: 고정 상수 "rados". 다른 엔진과 충돌 금지.
+	 * 동기화: read-only 전역. */
+
+	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] ioengine_ops ABI 버전(fio.h 정의). fio 코어와 버전 불일치 시 load 단계
+	 * 에서 check_engine_ops 가 거부하여 잡 전체를 실패시킨다.
+	 * 설정자: 컴파일 타임 매크로. 읽는 자: register_ioengine/check_engine_ops. */
+
+	.flags			= FIO_DISKLESSIO,
+	/* [한국어] 엔진 동작 힌트 비트마스크.
+	 *   FIO_DISKLESSIO(1<<7 근방): "실제 파일 시스템 파일이 아님" — fio 코어가 파일
+	 *     open/스캔/stat 으로 크기 계산을 시도하지 않고, 엔진이 real_file_size 를
+	 *     직접 주입하도록 위임. 오브젝트 스토리지/네트워크 스토리지 엔진의 표준 플래그.
+	 * 미설정 비트: FIO_SYNCIO(비동기 엔진이므로), FIO_RAWIO(블록디바이스 직접 아님),
+	 *   FIO_NOEXTEND(오브젝트 크기 확장 허용), FIO_NODISKUTIL(설정 안 함 — 하지만
+	 *   대상이 디스크가 아니라 utility 통계는 실질적으로 비어있음), FIO_MEMALIGN(정렬
+	 *   요구 없음), FIO_BARRIER/FIO_UNIDIR 등. */
+
+	.setup			= fio_rados_setup,
+	/* [한국어] 잡 초기화 훅 — td_io_setup 에서 init 보다 먼저 호출되어 엔진 상태
+	 * 할당과 Ceph 클러스터 연결을 수행한다.
+	 * 설정자: 이 초기화. 읽는 자: backend.c/init.c 의 td_io_setup.
+	 * 역할: use_thread=1 강제, 상태 구조체 할당, 클러스터 connect + ioctx create
+	 *       + (touch_objects 이면) 오브젝트 프리터치.
+	 * 동기화: 잡 스레드가 단독 실행. */
+
+	.queue			= fio_rados_queue,
+	/* [한국어] io_u 한 개를 비동기 제출. 반환값:
+	 *   FIO_Q_QUEUED   - 정상 제출. 완료는 콜백을 통해 getevents 에서 수확.
+	 *   FIO_Q_COMPLETED - 즉시 에러 완료(td_verror 세팅 후). 코어가 put_io_u 처리.
+	 * 호출자: td_io_queue(ioengines.c). 호출 시점: get_io_u 이후 do_io 루프. */
+
+	.getevents		= fio_rados_getevents,
+	/* [한국어] 완료 이벤트 수집(min..max). completed_lock 을 잡고 completed_operations
+	 * 리스트를 드레인하며, 최소 개수 미달 시 조건변수 wait.
+	 * 반환: 실제 수집 이벤트 수(>=min 보장). aio_events[] 에 io_u 포인터를 기록한다. */
+
+	.event			= fio_rados_event,
+	/* [한국어] getevents 가 N 을 반환한 뒤, 인덱스 0..N-1 로 호출되어 io_u* 를 반환.
+	 * rados->aio_events[event] 를 그대로 돌려주는 경량 조회 함수. */
+
+	.cleanup		= fio_rados_cleanup,
+	/* [한국어] 잡 종료 시 1회 호출 — scheduled==completed 까지 드레인 대기 → 오브젝트
+	 * 제거(_fio_rados_rm_objects) → ioctx/cluster 해제(_fio_rados_disconnect) →
+	 * aio_events/상태 구조체 free. io_u 모두 소멸(io_u_free) 이후에 호출됨을 코어가 보장. */
+
+	.open_file		= fio_rados_open,
+	/* [한국어] 파일 단위 open 콜백(no-op). RADOS 는 "파일" 이 없고 오브젝트 이름
+	 * 문자열만 필요하므로 실제 open 작업이 없다. FIO_DISKLESSIO 덕분에 fio 코어가
+	 * 이 훅을 건너뛸 수도 있으나 vtable 에 명시해 두면 모든 경로에서 안전하다. */
+
+	.invalidate		= fio_rados_invalidate,
+	/* [한국어] 로컬 호스트 캐시 무효화 훅(no-op). OSD 측 캐시는 클라이언트에서 제어
+	 * 불가(풀 단위 cache tier/writeback 정책은 OSD 가 관리). 따라서 아무 작업도 없이
+	 * 성공 반환한다. */
+
+	.options		= options,
+	/* [한국어] 엔진 전용 옵션 테이블 포인터. NULL 센티널로 끝나는 fio_option 배열.
+	 * 파서가 이 배열을 순회하며 FIO_OPT_C_ENGINE/FIO_OPT_G_RBD 그룹으로 등록한다. */
+
+	.io_u_init		= fio_rados_io_u_init,
+	/* [한국어] io_u 최초 생성 시 호출 — per-io_u fio_rados_iou 를 calloc 하여 부착.
+	 * 잡 초기화 중 io_u 풀(iodepth 개)을 만들 때 각 io_u 마다 한 번씩 호출된다.
+	 * 동기화: 잡 스레드 단독 실행(io_u 풀 생성 단계). */
+
+	.io_u_free		= fio_rados_io_u_free,
+	/* [한국어] io_u 파괴 시 fri 해제. completion/write_op 가 남아 있으면 마저 해제.
+	 * cleanup 이전에 코어가 모든 io_u 에 대해 호출함을 보장. */
+
+	.option_struct_size	= sizeof(struct rados_options),
+	/* [한국어] td->eo 로 할당될 옵션 구조체 크기. 파서가 잡마다 독립된 옵션 복제본을
+	 * 만들 때 이 크기로 calloc 한다.
+	 * 설정자: 컴파일 타임 sizeof. 읽는 자: fio 옵션 파싱 루틴. */
 };
 
 /*
  * [한국어]
- * fio_rados_register - 모듈 로드 시점에 엔진을 fio 코어에 등록.
- * fio_init 속성은 컴파일러/링커가 constructor 로 실행하게 하는 매크로(compiler/compiler.h).
+ * fio_rados_register - fio_init 생성자 — 프로그램 시작 시 엔진을 등록한다.
+ *
+ * @return: 없음.
+ *
+ * 이 함수는 main() 진입 이전(libc 동적 로더가 .init_array 를 실행하는 시점) 에
+ * 자동 호출되어 "rados" 이름의 엔진을 전역 engine_list 에 등록한다. fio_init 속성은
+ * compiler/compiler.h 에서 __attribute__((constructor)) 로 확장되며, 같은 기법을
+ * 쓰는 모든 엔진은 main 시작 전에 register_ioengine 을 완료하므로 load_ioengine 이
+ * "rados" 키워드로 곧바로 이 vtable 을 찾을 수 있다.
+ *
+ * 실행 컨텍스트: 프로세스의 _start → __libc_start_main 의 초기화 단계. 아직 잡
+ * 스레드는 생성되지 않았으며, ld.so 가 단일 스레드로 생성자를 순차 호출한다.
+ *
+ * 호출 체인: ld.so(.init_array) → [이 함수] → register_ioengine() → flist_add_tail
  */
 static void fio_init fio_rados_register(void)
 {
-	register_ioengine(&ioengine);                                           /* [한국어] ioengines.c 의 전역 리스트에 이 엔진을 추가. */
+	register_ioengine(&ioengine);
+	/* [한국어] fio 코어의 engine_list(링크드 리스트)에 이 ioengine vtable 을 등록.
+	 * load_ioengine("rados") 가 이 리스트를 순회해 name == "rados" 를 찾는다. */
 }
 
 /*
  * [한국어]
- * fio_rados_unregister - 모듈 언로드 시 엔진을 목록에서 제거.
- * fio_exit 속성은 destructor 로 실행된다.
+ * fio_rados_unregister - fio_exit 소멸자 — 프로세스 종료 시 엔진 등록 해제.
+ *
+ * @return: 없음.
+ *
+ * fio_exit 속성은 __attribute__((destructor)) 로 확장되어 libc 의 atexit 체인을
+ * 통해 main 종료 후 자동 호출된다. engine_list 에서 이 vtable 을 안전하게 분리해
+ * 이후 접근 시 dangling 을 방지한다.
+ *
+ * 실행 컨텍스트: 모든 잡 스레드가 join 된 후의 단일 스레드. exit() 의 atexit 호출.
+ *
+ * 호출 체인: libc(atexit/.fini_array) → [이 함수] → unregister_ioengine() → flist_del
  */
 static void fio_exit fio_rados_unregister(void)
 {
-	unregister_ioengine(&ioengine);                                         /* [한국어] ioengines.c 전역 리스트에서 제거. */
+	unregister_ioengine(&ioengine);
+	/* [한국어] 전역 engine_list 에서 이 엔트리를 제거 — 이후 load_ioengine("rados")
+	 * 는 NULL 을 반환한다. */
 }

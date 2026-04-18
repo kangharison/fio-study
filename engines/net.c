@@ -2,48 +2,176 @@
  * [한국어 설명] 네트워크 I/O 엔진 구현 (net.c — "net" 및 "netsplice" 두 엔진)
  *
  * === 파일의 역할 ===
- * 이 파일은 fio의 두 개의 I/O 엔진을 동시에 구현한다: (1) "net" — 일반 소켓 I/O
- * (send/recv/sendto/recvfrom/sendmsg/recvmsg)로 TCP/UDP(IPv4·IPv6)/Unix 도메인 소켓/
- * VSOCK(게스트-호스트 VM 통신)을 커버, (2) "netsplice" — splice(2) + 파이프를 이용한
- * 제로카피 전송(FIO_PIPEIO 플래그, 커널 버퍼 간 페이지 이동). 클라이언트/서버 모드를
- * 모두 지원하며, UDP 모드에서는 각 패킷 앞에 udp_seq 헤더를 붙여 수신 측에서 시퀀스
- * 번호·블록 크기·매직 넘버로 순서·무결성을 검증한다. 연결 개방/종료 신호를 위해 UDP
- * 는 udp_close_msg(OPEN/CLOSE 매직)도 주고받는다. 옵션은 독자적인 optgroup
- * (FIO_OPT_G_NETIO)로 등록되며, proto=tcp/udp/unix/tcpv6/udpv6/vsock 및 pingpong,
- * nodelay, window_size, mss, ttl, 인터페이스 바인딩 등 상세 네트워크 튜닝을 제공.
+ * 이 파일은 fio의 두 개의 I/O 엔진을 단일 translation unit에서 동시에 구현한다:
+ *
+ *   (1) "net"      — 일반 소켓 I/O. read 경로는 recv(2)/recvfrom(2),
+ *                     write 경로는 send(2)/sendto(2)를 호출하여 TCP/UDP(IPv4·IPv6)/
+ *                     Unix 도메인 소켓/VSOCK(게스트-호스트 VM 통신)을 모두 커버한다.
+ *                     동기 엔진(FIO_SYNCIO)이라 queue() 콜백 내부에서 blocking
+ *                     send/recv + poll(2) 대기까지 모두 수행한 뒤 FIO_Q_COMPLETED
+ *                     를 즉시 반환하는 1-단계 디스패치 모델이다.
+ *
+ *   (2) "netsplice" — Linux splice(2)+vmsplice(2) 기반 제로카피 변종.
+ *                     소켓↔커널 파이프(pipes[2])↔유저 페이지 사이에서 페이지
+ *                     포인터만 이동해 사용자공간 복사를 회피한다. FIO_PIPEIO 플래그
+ *                     로 fio 코어에 "파이프 기반 엔진"임을 알리며 CONFIG_LINUX_SPLICE
+ *                     로 빌드된 환경에서만 등록된다(BSD/macOS/Windows에선 비활성).
+ *
+ * 두 엔진 모두 클라이언트(initiator) / 서버(acceptor) 모드를 지원한다:
+ *   - listen=1 또는 read 잡(td_read) → 서버: socket+bind+listen 후 accept(2) 대기.
+ *   - 그 외 (write 잡 또는 명시적 hostname 지정) → 클라이언트: socket+connect(2).
+ *   UDP는 connectionless라 listen/accept 단계가 생략되고, sendto/recvfrom으로 매
+ *   호출마다 peer 주소를 명시한다. 또한 UDP 잡은 시작/종료를 애플리케이션 레벨 매직
+ *   메시지(udp_close_msg, FIO_LINK_OPEN/CLOSE)로 핸드쉐이크하여 잡 종료 시점을
+ *   양측이 합의한다.
+ *
+ * UDP 데이터 무결성/순서 검증을 위해 verify=none 잡에서는 매 패킷의 페이로드 끝
+ * sizeof(struct udp_seq) 영역에 (magic, seq, bs) 헤더를 덮어 송신하고 수신 측이
+ * 매칭한다. seq jump가 감지되면 ts.drop_io_u에 손실 카운트를 누적한다. verify가
+ * 데이터 패턴을 직접 검증하는 모드에서는 udp_seq를 끼워넣지 않는다(중복 검증 회피).
+ *
+ * 옵션은 별도 optgroup(FIO_OPT_G_NETIO)으로 등록되며 호스트/포트/프로토콜
+ * (proto=tcp|udp|unix|tcpv6|udpv6|vsock), listen, pingpong, nodelay(TCP_NODELAY),
+ * window_size(SO_RCVBUF/SNDBUF), mss(TCP_MAXSEG), ttl(IP_MULTICAST_TTL),
+ * interface(SO_BINDTODEVICE 의도지만 실제 구현은 IP_MULTICAST_IF) 등 상세
+ * 네트워크 튜닝을 제공한다.
+ *
+ * === ioengine_ops 콜백 매핑 (null.c §1과 같은 양식) ===
+ *   .setup       : fio_netio_setup / fio_netio_setup_splice — fio_file 등록 +
+ *                  netio_data 할당. splice 변종은 pipe(2)로 익명 파이프 추가 생성.
+ *   .init        : fio_netio_init — proto/listen 검증 후 setup_listen|setup_connect.
+ *                  주소 구조체(addr/addr6/addr_un/addr_vm)를 채우고 listen 모드면
+ *                  socket+bind+listen, 클라면 connect 대상 주소만 준비.
+ *   .open_file   : fio_netio_open_file — 실제 accept(2)/connect(2) 수행. UDP면
+ *                  LINK_OPEN 핸드쉐이크까지 한 번 더 주고받음.
+ *   .prep        : fio_netio_prep — UDP 잡의 ddir 방향 검증(데이터그램은 단방향).
+ *   .queue       : fio_netio_queue → __fio_netio_queue → send/recv/splice_*.
+ *                  pingpong=1이면 송신 후 응답 수신(또는 그 역)까지 한 큐에서 처리.
+ *                  반환값: FIO_Q_COMPLETED(부분 전송 포함) / FIO_Q_BUSY(EMSGSIZE 등).
+ *   .commit/.getevents/.event: 미설정 — 동기 엔진이라 ioengines.c 코어가 즉시
+ *                  put_io_u로 정리(FIO_SYNCIO 비트 의미).
+ *   .close_file  : fio_netio_close_file — UDP면 LINK_CLOSE 송신 후 generic_close.
+ *   .terminate   : fio_netio_terminate — 외부 종료 신호 수신 시 SIGTERM 자기송신
+ *                  으로 blocking poll/recv를 깨움(SIGTERM 핸들러는 EINTR 발생).
+ *   .cleanup     : fio_netio_cleanup — listenfd, pipes[], netio_data 모두 회수.
+ *   .flags       : FIO_SYNCIO|DISKLESSIO|UNIDIR|PIPEIO (+ "net" 변종은 BIT_BASED).
+ *                  splice 변종은 위에서 BIT_BASED 제외.
+ *
+ * === TCP 소켓 옵션 풀이 (set_window_size/set_mss + connect/accept 분기) ===
+ *   - SO_REUSEADDR  : TIME_WAIT 상태인 포트 재바인딩 허용. 잡 재시작 즉시 가능케 함.
+ *   - SO_REUSEPORT  : 다중 프로세스/스레드가 같은 포트에 동시 bind — 커널이 부하 분산.
+ *   - SO_RCVBUF/SNDBUF (set_window_size): 수신/송신 큐 한계. 커널이 실제로는 2배로
+ *                     기록(bufsize*2)하여 sk_rmem_alloc 누적과 비교.
+ *   - TCP_NODELAY   : Nagle 알고리즘 비활성화. 작은 쓰기를 즉시 송출(저지연).
+ *   - TCP_MAXSEG    : MSS 강제. MTU 제약 환경 재현 또는 단편화 실험용.
+ *   - IP_MULTICAST_TTL : 멀티캐스트 패킷의 라우터 홉 한계.
+ *   - IP_MULTICAST_IF  : 멀티캐스트 송출에 사용할 출력 인터페이스 선택.
+ *   - IP_ADD_MEMBERSHIP: 수신 측이 멀티캐스트 그룹에 가입(struct ip_mreq).
+ *   - SO_LINGER, SO_KEEPALIVE: 본 엔진은 직접 사용하지 않음(필요 시 sysctl 의존).
+ *
+ * === pingpong / Multicast / iodepth=1 사유 ===
+ *   - pingpong=1: 클라이언트가 데이터를 송신하면 서버가 동일 버퍼를 그대로 회신해
+ *     RTT(왕복지연시간)를 측정. fio_netio_queue가 1차 ddir 실행 후 자동으로 반대
+ *     방향을 한 번 더 호출(td_read+DDIR_READ → DDIR_WRITE 응답, td_write+DDIR_WRITE
+ *     → DDIR_READ 수신).
+ *   - Multicast: hostname이 224.0.0.0/4 범위면 자동으로 IP_ADD_MEMBERSHIP/
+ *     IP_MULTICAST_IF/IP_MULTICAST_TTL 분기로 진입. IPv6 멀티캐스트는 본 구현
+ *     미지원(별도 setsockopt API 필요).
+ *   - iodepth는 fio 옵션상 임의 설정 가능하나, 본 엔진은 동기 엔진이라 queue()
+ *     안에서 모든 I/O가 즉시 완료되므로 사실상 직렬화된다(스트리밍 소켓의 직렬성).
+ *
+ * === short read/write 처리 ===
+ *   send/recv가 요청량보다 적게 처리하면 ret>0 분기에서 io_u->resid에 잔여를
+ *   기록한 뒤 FIO_Q_COMPLETED 반환(fio 코어가 통계에서 부분 전송으로 회계).
+ *   재시도 루프는 send 내부에서 poll_wait(POLLOUT) → 재시도 1회만 수행하며 EINTR/
+ *   EAGAIN은 poll에서 흡수한다. 큰 UDP 데이터그램(EMSGSIZE) 시 BUSY 반환으로
+ *   상위가 bs를 줄여 재시도하도록 유도.
  *
  * === 전체 아키텍처에서의 위치 ===
- * fio_backend 잡 루프: load_ioengine → setup(fio_netio_setup 또는 _setup_splice)
- * → init(fio_netio_init: 소켓 create/bind·listen·accept 또는 connect) → prep
- * (전송 크기 보정) → queue(fio_netio_queue: 송수신, splice 사용 시 pipes[] 중계)
- * → cleanup/close_file/terminate. 이 엔진은 동기 엔진(FIO_SYNCIO)이라 queue()
- * 내부에서 blocking send/recv/poll까지 수행 후 FIO_Q_COMPLETED 반환. 실행 컨텍스트
- * 는 잡 스레드의 사용자 공간. splice 모드는 디스크리스(FIO_DISKLESSIO) + 파이프 기반.
+ * fio_backend 잡 루프 → load_ioengine("net"|"netsplice") → ioengine_ops 콜백 체인:
+ *
+ *   setup → init → open_file → [잡 루프: prep → queue (→ commit no-op)] → close_file
+ *                                                                       → cleanup
+ *
+ *   load_ioengine
+ *       └─ fio_netio_setup     : add_file("net" 가짜) + calloc(netio_data)
+ *   td_io_init
+ *       └─ fio_netio_init      : proto/listen 검증 → setup_listen | setup_connect
+ *                                 ├─ setup_listen: socket(2)+SO_REUSEADDR/PORT+bind(2)
+ *                                 │                +(TCP)listen(2)+(UDP)multicast join
+ *                                 └─ setup_connect: getaddrinfo/inet_pton + addr 채움
+ *   td_io_open_file
+ *       └─ fio_netio_open_file : (server) accept(2)+poll(2) | (client) connect(2)
+ *                                 └─ (UDP) LINK_OPEN/RECV 핸드쉐이크
+ *   잡 루프(get_io_u → prep → queue → put_io_u)
+ *       ├─ fio_netio_prep      : UDP ddir 방향 검증
+ *       └─ fio_netio_queue → __fio_netio_queue
+ *               ├─ DDIR_WRITE: send / sendto / splice_out
+ *               ├─ DDIR_READ : recv / recvfrom / splice_in
+ *               └─ pingpong : 1차 후 반대 ddir 한 번 더
+ *   td_io_close_file
+ *       └─ fio_netio_close_file: send_close(UDP CLOSE) + generic_close_file
+ *   td_io_cleanup
+ *       └─ fio_netio_cleanup   : close(listenfd/pipes) + free(nd)
+ *
+ * 실행 컨텍스트는 잡 스레드의 사용자 공간이며, blocking poll/recv가 일어나는
+ * 동안 외부 SIGTERM 등으로 잡을 깨우는 경로는 fio_netio_terminate가 SIGTERM을
+ * self-send해서 EINTR을 유도하는 방식.
  *
  * === 타 모듈과의 연결 ===
- * - fio.h, optgroup.h, verify.h: 공용 타입/옵션/검증 프레임워크.
- * - <sys/socket.h>, <netinet/in.h>, <arpa/inet.h>, <netdb.h>: POSIX 소켓 API.
- * - <sys/un.h>, <linux/vm_sockets.h>: Unix/VSOCK 주소 구조체.
- * - <poll.h>, <sys/stat.h>: poll(2) 및 Unix 소켓 경로 검증.
- * - splice(2): netsplice 엔진에서 zero-copy.
+ * - fio.h          : thread_data, io_u, ioengine_ops, FIO_Q_*, dprint, td_verror,
+ *                    td_set_runstate, fio_ro_check, generic_close_file, fio_init/exit,
+ *                    register_ioengine/unregister_ioengine, ddir/td_read/write 매크로.
+ * - verify.h       : VERIFY_NONE — UDP 시퀀스 헤더 삽입 분기 조건.
+ * - optgroup.h     : FIO_OPT_C_ENGINE/FIO_OPT_G_NETIO — `fio --enghelp=net` 필터링.
+ * - <sys/socket.h> : socket/bind/listen/accept/connect/send/recv/sendto/recvfrom/
+ *                    setsockopt + SO_xxx / MSG_xxx / SOL_SOCKET 매크로.
+ * - <netinet/in.h> : sockaddr_in/sockaddr_in6/in_addr/in6_addr/IPPROTO_TCP/UDP/IP.
+ * - <netinet/tcp.h>: TCP_NODELAY/TCP_MAXSEG.
+ * - <arpa/inet.h>  : inet_pton/inet_aton/inet_network/htonl/htons/ntohl.
+ * - <netdb.h>      : getaddrinfo/freeaddrinfo/gai_strerror/EAI_xxx/struct addrinfo.
+ * - <sys/un.h>     : sockaddr_un (Unix 도메인).
+ * - <linux/vm_sockets.h> : sockaddr_vm/AF_VSOCK/VMADDR_CID_ANY (옵션).
+ * - <poll.h>       : poll(2)/struct pollfd/POLLIN/POLLOUT.
+ * - <sys/stat.h>   : Unix 소켓 경로 검증/모드 처리(umask).
+ * - <signal.h>     : kill(SIGTERM) (terminate 콜백).
+ * - splice(2)/vmsplice(2) (CONFIG_LINUX_SPLICE) : 제로카피 페이지 이동.
+ *
  * - 공유 상태:
- *   - td->io_ops_data = struct netio_data  (잡 스레드 소유).
- *   - td->eo           = struct netio_options (파싱된 옵션, 불변).
- *   - UDP의 경우 잡 양쪽(서버/클라이언트)이 udp_seq/udp_close_msg를 프로토콜로 공유.
+ *   * td->io_ops_data = struct netio_data  (잡 스레드 소유, 락 불필요).
+ *   * td->eo           = struct netio_options (옵션 파서가 채움, 잡 시작 후 불변).
+ *   * UDP의 경우 잡 양쪽(서버/클라이언트)이 udp_seq/udp_close_msg를 wire 레벨
+ *     프로토콜로 공유 — 매직과 cmd 값을 매칭해 시작/종료/순서를 합의.
  *
  * === 주요 함수/구조체 요약 ===
- * - struct netio_data:    소켓 FD/listen FD/splice 파이프/주소 구조체들/UDP 시퀀스.
- * - struct netio_options: 포트·프로토콜·pingpong·NODELAY·WinSize·MSS·TTL·인터페이스.
- * - struct udp_seq:       UDP 패킷 매직·시퀀스·블록 크기 헤더.
- * - struct udp_close_msg: UDP 링크 OPEN/CLOSE 시그널 패킷.
- * - fio_netio_init():     proto에 따른 socket + bind + listen/accept 또는 connect.
- * - fio_netio_queue():    ddir + pingpong에 따른 send/recv/splice 경로 분기.
- * - fio_netio_send()/recv()/splice_*(): 각 전송 모드별 하위 구현.
- * - str2proto()/str2listen(): 문자열 옵션 파싱 헬퍼.
+ * - struct netio_data    : 잡별 런타임 상태 — listenfd/use_splice/seq_off/pipes[2]/
+ *                          addr/addr6/addr_un/addr_vm/udp_send_seq/udp_recv_seq.
+ * - struct netio_options : 옵션 — port/proto/listen/pingpong/nodelay/ttl/window_size/
+ *                          mss/intfc(인터페이스).
+ * - struct udp_seq       : UDP 페이로드 끝에 덮어쓰는 무결성/순서 검증 헤더.
+ * - struct udp_close_msg : UDP 링크 OPEN/CLOSE 시그널 메시지.
+ * - enum FIO_TYPE_*      : proto 식별 — TCP/UDP/UNIX/TCP_V6/UDP_V6/VSOCK_STREAM.
+ * - enum FIO_LINK_*      : OPEN/CLOSE cmd 및 매직 상수.
+ * - is_udp/is_tcp/is_ipv6/is_vsock : proto 분기 헬퍼.
+ * - set_window_size/set_mss/poll_wait : 공통 setsockopt + poll 헬퍼.
+ * - fio_netio_send/recv/splice_in/splice_out : 저수준 전송/수신.
+ * - __fio_netio_queue/fio_netio_queue : 방향 디스패치 + pingpong 처리.
+ * - fio_netio_init/setup/cleanup : 잡 라이프사이클.
+ * - fio_netio_setup_listen_xxx / setup_connect_xxx : proto별 주소/소켓 준비.
+ * - fio_netio_open_file/close_file/accept/connect/terminate : 연결 관리.
+ * - fio_netio_send_open/udp_recv_open/send_close : UDP 핸드쉐이크.
+ * - str_hostname_cb : hostname= 옵션 파싱 콜백.
+ * - fio_netio_register/unregister : ELF constructor/destructor 진입점.
  *
  * === fio에서의 사용법 ===
- * --ioengine=net, --ioengine=netsplice. proto=tcp|udp|unix|tcpv6|udpv6|vsock,
- * listen=1(서버), hostname=..., port=...
+ * 클라이언트(write 잡):
+ *   fio --name=cli --ioengine=net --proto=tcp --hostname=server --port=8765 \
+ *       --rw=write --bs=64k --size=1g --iodepth=1
+ * 서버(read 잡 또는 listen=1):
+ *   fio --name=srv --ioengine=net --proto=tcp --listen --port=8765 \
+ *       --rw=read --bs=64k --size=1g
+ * UDP pingpong RTT:
+ *   양측 모두 --proto=udp --pingpong, 한쪽은 listen=1.
  */
 
 /*
@@ -52,35 +180,39 @@
  * IO engine that reads/writes to/from sockets.
  *
  */
-#include <stdio.h>            /* [한국어] 로그 포매팅 */
-#include <stdlib.h>           /* [한국어] calloc/free/malloc/atoi */
-#include <unistd.h>           /* [한국어] close/read/write/pipe 등 기본 POSIX */
-#include <signal.h>           /* [한국어] 시그널 처리(서버 모드 중단 대응) */
-#include <errno.h>            /* [한국어] errno 및 에러 코드 */
-#include <netinet/in.h>       /* [한국어] sockaddr_in/sockaddr_in6, IPPROTO_* */
-#include <netinet/tcp.h>      /* [한국어] TCP_NODELAY, TCP_MAXSEG 등 TCP 옵션 */
-#include <arpa/inet.h>        /* [한국어] inet_pton/htons 등 주소 변환 */
-#include <netdb.h>            /* [한국어] getaddrinfo — 호스트명 해석 */
-#include <poll.h>             /* [한국어] poll(2) — 서버 accept 대기 등 */
-#include <sys/stat.h>         /* [한국어] stat — Unix 소켓 경로 검증 */
-#include <sys/socket.h>       /* [한국어] socket/bind/listen/accept/send/recv */
-#include <sys/un.h>           /* [한국어] sockaddr_un — Unix 도메인 소켓 */
+#include <stdio.h>            /* [한국어] log_err/snprintf — 에러 메시지 포매팅에 사용 */
+#include <stdlib.h>           /* [한국어] calloc(netio_data 0초기화)/free(cleanup)/atoi(VSOCK CID 파싱)/strdup(hostname cb) */
+#include <unistd.h>           /* [한국어] close(소켓/파이프 FD 정리)/pipe(2)(splice 변종에서 익명 파이프 생성)/read/write 기본 POSIX */
+#include <signal.h>           /* [한국어] kill(SIGTERM, ...) — fio_netio_terminate가 blocking poll/recv를 EINTR로 깨우기 위해 사용 */
+#include <errno.h>            /* [한국어] errno 전역 — send/recv 실패 시 EMSGSIZE/EAGAIN/EINTR/EOPNOTSUPP 분기에 사용 */
+#include <netinet/in.h>       /* [한국어] sockaddr_in/sockaddr_in6/in_addr/in6_addr/IPPROTO_TCP·UDP·IP 매크로 — IP 레이어 주소 구조체 정의 공급 */
+#include <netinet/tcp.h>      /* [한국어] TCP_NODELAY(Nagle off)/TCP_MAXSEG(MSS 강제) 등 TCP 레벨 setsockopt 상수 공급 */
+#include <arpa/inet.h>        /* [한국어] inet_pton/inet_aton/inet_network/htons/htonl/ntohl — 텍스트↔이진 주소 변환 + 바이트 순서 변환 */
+#include <netdb.h>            /* [한국어] getaddrinfo/freeaddrinfo/gai_strerror/EAI_xxx/struct addrinfo — 호스트명 해석(DNS/sysdb) */
+#include <poll.h>             /* [한국어] poll(2)/struct pollfd/POLLIN/POLLOUT — 동기 엔진의 blocking 대기점에서 fd 이벤트 대기 */
+#include <sys/stat.h>         /* [한국어] umask(소켓 파일 mode 제한 해제) — Unix 도메인 소켓 bind 시 권한 보존을 위해 사용 */
+#include <sys/socket.h>       /* [한국어] socket/bind/listen/accept/connect/send/recv/sendto/recvfrom/setsockopt + SOL_SOCKET/SO_xxx/MSG_xxx/AF_xxx 매크로 공급 */
+#include <sys/un.h>           /* [한국어] sockaddr_un.sun_family/sun_path — Unix 도메인 소켓 주소 표현(파일시스템 경로 기반) */
 
-/* [한국어] VSOCK 지원은 커널 헤더 유무에 따라 조건부.
- * 미지원 빌드에서도 타입/매크로는 자리만 잡아 컴파일을 통과시킨다. */
+/* [한국어] VSOCK(Virtual Socket — VM guest↔host 통신) 지원은 Linux 커널 헤더(linux/vm_sockets.h)
+ * 유무에 따라 조건부 컴파일. CONFIG_VSOCK는 ./configure가 헤더 존재를 확인해 정의한다.
+ * 미지원 빌드에서도 sockaddr_vm 빈 stub 구조체와 AF_VSOCK=-1 매크로를 자리만 잡아두어
+ * 컴파일이 통과되도록 한다(런타임에 socket(AF_VSOCK,...)는 EAFNOSUPPORT로 실패함). */
 #ifdef CONFIG_VSOCK
-#include <linux/vm_sockets.h>
+#include <linux/vm_sockets.h>  /* [한국어] sockaddr_vm/svm_family/svm_cid/svm_port/AF_VSOCK/VMADDR_CID_ANY 공급 */
 #else
 struct sockaddr_vm {
+	/* [한국어] 빈 stub — 미지원 플랫폼에서 netio_data가 멤버를 들고 있어도 OK하도록 함.
+	 * 실제 사용 경로(setup_listen_vsock 등)는 #ifdef CONFIG_VSOCK로 보호되어 무력화. */
 };
 #ifndef AF_VSOCK
-#define AF_VSOCK	-1   /* [한국어] 런타임에 이 값으로 분기되면 에러 처리 */
+#define AF_VSOCK	-1   /* [한국어] 런타임에 socket(-1, ...) 호출이 EAFNOSUPPORT를 반환하도록 — connect_vsock 경로의 자연스러운 차단 */
 #endif
 #endif
 
-#include "../fio.h"
-#include "../verify.h"
-#include "../optgroup.h"
+#include "../fio.h"        /* [한국어] fio 코어 타입/매크로 (thread_data, io_u, ioengine_ops, FIO_Q_*, td_verror, dprint, fio_init/exit 등) */
+#include "../verify.h"     /* [한국어] VERIFY_NONE 매크로 — UDP udp_seq 헤더 삽입 분기 조건(verify가 페이로드를 직접 검증하면 udp_seq 비활성) */
+#include "../optgroup.h"   /* [한국어] FIO_OPT_C_ENGINE/FIO_OPT_G_NETIO — `fio --enghelp=net` 카테고리 분류용 옵션 그룹 ID */
 
 /*
  * [한국어] net 엔진의 잡별 런타임 상태. td->io_ops_data가 가리킴.
@@ -105,10 +237,32 @@ struct netio_data {
 	/* [한국어] splice 경로에서 파일↔소켓 사이 중계로 쓰는 익명 파이프 fd 쌍.
 	 * pipes[0]=read, pipes[1]=write. 설정자: fio_netio_setup_splice의 pipe(). */
 
-	struct sockaddr_in addr;      /* [한국어] IPv4 주소 구조체 — TCP/UDP v4 */
-	struct sockaddr_in6 addr6;    /* [한국어] IPv6 주소 구조체 — TCP/UDP v6 */
-	struct sockaddr_un addr_un;   /* [한국어] Unix 도메인 소켓 경로 주소 */
-	struct sockaddr_vm addr_vm;   /* [한국어] VSOCK 주소(guest-host) */
+	struct sockaddr_in addr;
+	/* [한국어] IPv4 주소 슬롯 — TCP/UDP v4의 connect 목적지 또는 bind/accept 결과.
+	 * 설정자: setup_connect_inet(클라 목적지)/setup_listen_inet(서버 bind 주소)/
+	 *         accept(서버 측 클라 주소 수신).
+	 * 읽는 자: send/recv가 sendto/recvfrom 인자로 사용; udp_close/open 메시지의 to.
+	 * 값 범위: sin_family=AF_INET 고정, sin_port=네트워크 순서, sin_addr=in_addr.
+	 * 동기화: 잡 스레드 전용. */
+
+	struct sockaddr_in6 addr6;
+	/* [한국어] IPv6 주소 슬롯 — TCP/UDP v6 동일 용도.
+	 * 설정자/읽는 자: addr와 동일하지만 is_ipv6(o)일 때 선택.
+	 * 값 범위: sin6_family=AF_INET6, sin6_addr=in6_addr(128bit). 동기화: 잡 전용. */
+
+	struct sockaddr_un addr_un;
+	/* [한국어] Unix 도메인 소켓 주소(파일시스템 경로 sun_path).
+	 * 설정자: setup_connect_unix(클라)/setup_listen_unix(서버, 기존 파일 unlink 후 bind).
+	 * 읽는 자: connect/bind 호출 인자.
+	 * 값 범위: sun_family=AF_UNIX, sun_path는 sizeof 한도 내 경로(보통 108바이트).
+	 * 동기화: 잡 전용. */
+
+	struct sockaddr_vm addr_vm;
+	/* [한국어] VSOCK(guest-host VM) 주소(svm_cid + svm_port).
+	 * 설정자: setup_connect_vsock(host에서 atoi(CID))/setup_listen_vsock(VMADDR_CID_ANY).
+	 * 읽는 자: connect/bind/accept.
+	 * 값 범위: svm_family=AF_VSOCK, svm_cid는 32비트 unsigned (예: 2=호스트).
+	 * 동기화: 잡 전용. CONFIG_VSOCK 미정의 시 빈 stub. */
 
 	uint64_t udp_send_seq;
 	/* [한국어] UDP 송신 시 패킷마다 증가시키는 시퀀스 카운터.
@@ -120,143 +274,267 @@ struct netio_data {
 };
 
 /*
- * [한국어] net 엔진 전용 옵션. 옵션 파서가 채우며 런타임 불변(잡 시작 후).
- * td->eo가 이 구조체를 가리킨다.
+ * [한국어] net 엔진 전용 옵션. 옵션 파서(parse.c)가 잡 파일/CLI 인자 파싱 시 채우며
+ * 잡 시작 후에는 런타임 내내 불변(read-only). td->eo가 이 구조체를 가리키며 옵션
+ * 테이블 options[]의 .off1 오프셋이 이 구조체 멤버를 직접 가리키도록 정의된다.
+ * 잡 스레드 단독 소유 — 동시 접근 없음.
  */
 struct netio_options {
 	struct thread_data *td;
-	/* [한국어] 옵션 파싱 콜백에서 td를 참조하기 위한 역링크.
-	 * 설정자: 엔진 옵션 테이블 정의(offsetof 기반 자동 채움). */
+	/* [한국어] 옵션 파싱 콜백(예: str_hostname_cb)에서 td를 역참조하기 위한 링크.
+	 * 설정자: parse.c가 옵션 구조체 할당 직후 td를 채워줌(엔진별 ioengine_ops.options
+	 *         테이블 등록 경로의 후처리).
+	 * 읽는 자: str_hostname_cb가 o->td->o.filename에 hostname을 저장할 때 사용.
+	 * 값 범위: 유효한 thread_data 포인터(NULL 아님).
+	 * 동기화: 잡 스레드 전용 — 콜백도 동일 스레드에서 호출. */
 
 	unsigned int port;
-	/* [한국어] 접속/리슨 포트 번호(TCP/UDP). VSOCK에선 cid가 port로 재해석될 수 있음. */
+	/* [한국어] 접속/리슨 포트 번호(TCP/UDP). VSOCK에서는 svm_port에 직접 매핑되며
+	 * UNIX 도메인 소켓에선 의미 없음(설정 시 init에서 에러).
+	 * 설정자: parse.c가 옵션 "port=NNN"을 INT로 파싱(min=1 max=65535).
+	 * 읽는 자: setup_listen/setup_connect 경로의 모든 헬퍼 — htons(o->port).
+	 * 값 범위: 1..65535 (well-known 포트 0 거부). 동기화: 불변. */
 
 	unsigned int proto;
-	/* [한국어] 프로토콜 식별(FIO_TYPE_TCP/UDP/UNIX/TCP_V6/UDP_V6/VSOCK).
-	 * 읽는 자: socket 호출의 family/type 결정, 분기 경로. */
+	/* [한국어] 프로토콜 식별 enum (FIO_TYPE_TCP/TCP_V6/UDP/UDP_V6/UNIX/VSOCK_STREAM).
+	 * 설정자: parse.c가 "protocol=tcp" 등 STR을 옵션 테이블의 .posval 매핑으로
+	 *         FIO_TYPE_* 정수로 변환.
+	 * 읽는 자: is_udp/is_tcp/is_ipv6/is_vsock 헬퍼와 모든 socket()/연결 분기.
+	 * 값 범위: FIO_TYPE_TCP(1)..FIO_TYPE_VSOCK_STREAM(6). 동기화: 불변. */
 
 	unsigned int listen;
-	/* [한국어] 1이면 서버(수신) 모드. 0이면 클라이언트(송신). */
+	/* [한국어] 1이면 서버 모드(socket+bind+listen+accept), 0이면 클라이언트 모드(connect).
+	 * 설정자: parse.c가 STR_SET(존재 자체로 1)으로 처리; UDP/UNIX 잡은 init이 td_read에
+	 *         따라 자동 결정해 덮어씀(o->listen = td_read(td)).
+	 * 읽는 자: open_file → accept|connect 분기, set_window_size의 RCVBUF/SNDBUF 분기.
+	 * 값 범위: 0 또는 1. 동기화: init 직후 한 번 갱신될 수 있고 이후 불변. */
 
 	unsigned int pingpong;
-	/* [한국어] 1이면 각 I/O를 송신 후 수신(또는 그 역)으로 왕복 — 순수 RTT 측정에 사용. */
+	/* [한국어] 1이면 매 I/O 후 반대 방향 I/O를 한 번 더 수행 — RTT 측정.
+	 * 설정자: parse.c STR_SET. 읽는 자: fio_netio_queue가 1차 ddir 후 자동 반대 방향
+	 *         호출 여부 판단; set_window_size가 양방향 버퍼 모두 설정 여부 판단.
+	 * 값 범위: 0/1. 동기화: 불변. */
 
 	unsigned int nodelay;
-	/* [한국어] TCP_NODELAY — Nagle 알고리즘 끄기(저지연 필요 시). */
+	/* [한국어] 1이면 TCP_NODELAY를 setsockopt — Nagle 알고리즘 비활성화로 작은
+	 * 메시지를 즉시 전송(저지연 응용 측정).
+	 * 설정자: parse.c BOOL. 읽는 자: connect/accept 직후 setsockopt 분기.
+	 * 값 범위: 0/1. 동기화: 불변. CONFIG_TCP_NODELAY 빌드에서만 노출. */
 
 	unsigned int ttl;
-	/* [한국어] 멀티캐스트 TTL 값(IP_MULTICAST_TTL). */
+	/* [한국어] 멀티캐스트 패킷의 IP TTL(Time-To-Live, 라우터 홉 한계).
+	 * 설정자: parse.c INT(def="1"). 읽는 자: connect 경로에서 멀티캐스트 IPv4면
+	 *         IP_MULTICAST_TTL setsockopt 인자.
+	 * 값 범위: 0..255 (0=같은 호스트만, 1=같은 서브넷, 32=region, 255=전세계).
+	 * 동기화: 불변. */
 
 	unsigned int window_size;
-	/* [한국어] SO_SNDBUF/SO_RCVBUF 크기(바이트). 0이면 커널 기본 사용. */
+	/* [한국어] SO_SNDBUF/SO_RCVBUF로 설정할 소켓 큐 크기(바이트). 0=커널 기본.
+	 * 설정자: parse.c INT. 읽는 자: set_window_size가 listen/pingpong 조합으로
+	 *         RCVBUF만/SNDBUF만/양쪽 결정 후 setsockopt.
+	 * 값 범위: 0..(net.core.rmem_max 이하 권장). 커널이 실제로는 sysctl 한계로 클램프.
+	 * 동기화: 불변. CONFIG_NET_WINDOWSIZE 빌드에서만 노출. */
 
 	unsigned int mss;
-	/* [한국어] TCP_MAXSEG — 최대 세그먼트 크기 강제. */
+	/* [한국어] TCP 최대 세그먼트 크기(TCP_MAXSEG). MTU 제약 환경 재현/단편화 실험용.
+	 * 설정자: parse.c INT. 읽는 자: set_mss가 TCP일 때만 setsockopt 적용.
+	 * 값 범위: 0(미설정) 또는 보통 536..1460. 동기화: 불변. CONFIG_NET_MSS 빌드 한정. */
 
 	char *intfc;
-	/* [한국어] SO_BINDTODEVICE로 소켓을 특정 네트워크 인터페이스에 바인딩할 때의 이름. */
+	/* [한국어] 멀티캐스트 송출/수신에 사용할 인터페이스 IP 텍스트(예: "192.168.1.10").
+	 * 설정자: parse.c STR_STORE(strdup). 읽는 자: connect 멀티캐스트 분기에서
+	 *         IP_MULTICAST_IF, setup_listen_inet에서 IP_ADD_MEMBERSHIP의 imr_interface.
+	 * 값 범위: NULL 또는 점-표기 IPv4 문자열. 옵션 이름이 "interface"인 점 주의.
+	 * 동기화: 불변(잡 시작 후 free되지 않음). */
 };
 
 /*
  * [한국어] UDP 연결 상태 신호 메시지(OPEN/CLOSE).
- * UDP는 연결 없는 프로토콜이므로 스트림 시작/종료를 애플리케이션 레벨 매직으로 알림.
+ * UDP는 연결 없는(connectionless) 프로토콜이므로 스트림의 시작·종료를 애플리케이션
+ * 레벨 매직으로 알려야 한다(TCP의 SYN/FIN과 유사한 역할). 양측이 매직과 cmd를
+ * 매칭해 핸드쉐이크 동기화.
+ *
+ * wire 표현: 8바이트 고정. 모든 정수는 네트워크 바이트 순서(big-endian)로 저장.
+ *   send_open: htonl(MAGIC) + htonl(OPEN), recv는 ntohl로 복원.
+ *   send_close: cpu_to_le32(MAGIC) + cpu_to_le32(CLOSE), is_close_msg는 le32_to_cpu.
+ *   ★ 주의: OPEN과 CLOSE가 엔디언이 다름(역사적/구현 한계). magic/cmd가 양쪽
+ *           엔디언에서 모두 잘못 디코딩되면 일반 데이터로 간주.
  */
 struct udp_close_msg {
 	uint32_t magic;
-	/* [한국어] 식별 매직(FIO_LINK_OPEN_CLOSE_MAGIC). 불일치 시 패킷 무시. */
+	/* [한국어] 식별 매직(FIO_LINK_OPEN_CLOSE_MAGIC = 0x6c696e6b = "link" ASCII).
+	 * 설정자: send_open(htonl)/send_close(cpu_to_le32). 읽는 자: udp_recv_open(ntohl)/
+	 *         is_close_msg(le32_to_cpu).
+	 * 값 범위: 항상 0x6c696e6b. 다른 값이면 무시(다른 송신자/타 프로토콜).
+	 * 동기화: wire 프로토콜 — 잡 인스턴스 간 합의로 의미 부여. */
+
 	uint32_t cmd;
-	/* [한국어] FIO_LINK_OPEN / FIO_LINK_CLOSE. 서버/클라이언트가 rendezvous/shutdown 신호로 사용. */
+	/* [한국어] FIO_LINK_OPEN(0x98) / FIO_LINK_CLOSE(0x89) — 핸드쉐이크 종류.
+	 * 설정자: 위와 같음. 읽는 자: udp_recv_open이 OPEN인지 검증, is_close_msg가
+	 *         CLOSE인지 검증. 값 범위: 두 상수 중 하나(다른 값이면 무시).
+	 * 동기화: wire 프로토콜 매칭. */
 };
 
 /*
- * [한국어] 각 UDP 패킷 앞에 붙이는 애플리케이션 레벨 헤더.
- * 수신 측이 순서/크기/무결성을 자체 검증.
+ * [한국어] 각 UDP 패킷의 페이로드 끝에 덮어쓰는 애플리케이션 레벨 검증 헤더.
+ * 수신 측이 시퀀스 점프(=손실/재정렬)와 블록 크기 일치 여부를 자체 검증한다.
+ *
+ * verify=none(데이터 패턴 검증 비활성) 잡에서만 끼워 넣어진다 — verify가 활성화면
+ * fio 코어가 페이로드 전체를 검증하므로 끝부분에 헤더를 덮는 것이 충돌. wire 표현은
+ * 24바이트(매직+seq+bs 각 8바이트), 모두 little-endian(cpu_to_le64).
  */
 struct udp_seq {
-	uint64_t magic;   /* [한국어] 매직(FIO_UDP_SEQ_MAGIC) */
-	uint64_t seq;     /* [한국어] 송신 측이 단조 증가시키는 시퀀스 번호 */
-	uint64_t bs;      /* [한국어] 본문 블록 크기(바이트) — 수신 검증용 */
+	uint64_t magic;
+	/* [한국어] 매직 상수 FIO_UDP_SEQ_MAGIC(="ceUnqUse" ASCII LE 해석).
+	 * 설정자: store_udp_seq(cpu_to_le64). 읽는 자: verify_udp_seq(le64_to_cpu).
+	 * 값 범위: 0x657375716e556563ULL. 불일치면 검증 스킵.
+	 * 동기화: wire 프로토콜. */
+
+	uint64_t seq;
+	/* [한국어] 송신 측이 단조 증가시키는 시퀀스 번호(0부터 시작).
+	 * 설정자: store_udp_seq가 nd->udp_send_seq++. 읽는 자: verify_udp_seq가
+	 *         nd->udp_recv_seq와 비교, 차이만큼 td->ts.drop_io_u에 누적.
+	 * 값 범위: 0..2^64-1 (단조 증가). 동기화: wire 프로토콜. */
+
+	uint64_t bs;
+	/* [한국어] 본 페이로드 블록 크기(바이트) — 수신/송신 측의 bs 일치 검증용.
+	 * 불일치 시 nd->seq_off=1로 이후 모든 검증 비활성(잡 단위 한 번만 트립).
+	 * 설정자: store_udp_seq=io_u->xfer_buflen. 읽는 자: verify_udp_seq.
+	 * 값 범위: io_u 버퍼 크기와 동일. 동기화: wire 프로토콜. */
 };
 
+/*
+ * [한국어] 네트워크 엔진 내부에서 사용하는 식별 상수 enum.
+ * 두 그룹으로 나뉜다:
+ *   (1) FIO_LINK_*  : udp_close_msg의 magic/cmd 필드에 들어가는 값.
+ *   (2) FIO_UDP_SEQ_MAGIC : udp_seq.magic 필드에 들어가는 값(64비트라 ULL 접미사).
+ *   (3) FIO_TYPE_*  : netio_options.proto의 정수 식별자(parse 시 .posval 매핑 결과).
+ */
 enum {
 	FIO_LINK_CLOSE = 0x89,
-	FIO_LINK_OPEN_CLOSE_MAGIC = 0x6c696e6b,
-	FIO_LINK_OPEN = 0x98,
-	FIO_UDP_SEQ_MAGIC = 0x657375716e556563ULL,
+	/* [한국어] udp_close_msg.cmd가 CLOSE 시그널일 때의 값.
+	 * 설정자: send_close. 읽는 자: is_close_msg. 동기화: wire 매칭. */
 
-	FIO_TYPE_TCP	= 1,
-	FIO_TYPE_UDP	= 2,
-	FIO_TYPE_UNIX	= 3,
-	FIO_TYPE_TCP_V6	= 4,
-	FIO_TYPE_UDP_V6	= 5,
-	FIO_TYPE_VSOCK_STREAM   = 6,
+	FIO_LINK_OPEN_CLOSE_MAGIC = 0x6c696e6b,
+	/* [한국어] udp_close_msg.magic 값(="link" ASCII LE/BE 모두 동일 해석).
+	 * 설정자: send_open/send_close. 읽는 자: udp_recv_open/is_close_msg. */
+
+	FIO_LINK_OPEN = 0x98,
+	/* [한국어] udp_close_msg.cmd가 OPEN(잡 시작 핸드쉐이크) 시그널일 때의 값.
+	 * 설정자: send_open. 읽는 자: udp_recv_open. */
+
+	FIO_UDP_SEQ_MAGIC = 0x657375716e556563ULL,
+	/* [한국어] udp_seq.magic 64비트 값 — 송신 측이 udp_seq 헤더를 끼워 넣었음을
+	 * 표시. 다른 값이면 verify_udp_seq에서 검증 스킵(타 송신자/구버전 호환).
+	 * ULL 접미사는 64비트 리터럴 보장. */
+
+	FIO_TYPE_TCP		= 1,
+	/* [한국어] proto=tcp — IPv4 SOCK_STREAM. 읽는 자: is_tcp(o). */
+
+	FIO_TYPE_UDP		= 2,
+	/* [한국어] proto=udp — IPv4 SOCK_DGRAM. 읽는 자: is_udp(o). */
+
+	FIO_TYPE_UNIX		= 3,
+	/* [한국어] proto=unix — AF_UNIX SOCK_STREAM(filesystem path 기반). */
+
+	FIO_TYPE_TCP_V6		= 4,
+	/* [한국어] proto=tcpv6 — IPv6 SOCK_STREAM. CONFIG_IPV6 빌드에서만 옵션 노출. */
+
+	FIO_TYPE_UDP_V6		= 5,
+	/* [한국어] proto=udpv6 — IPv6 SOCK_DGRAM. CONFIG_IPV6 한정. */
+
+	FIO_TYPE_VSOCK_STREAM	= 6,
+	/* [한국어] proto=vsock — AF_VSOCK SOCK_STREAM (VM guest↔host 통신).
+	 * CONFIG_VSOCK 빌드 환경에서만 실제 socket 호출이 성공. */
 };
 
 /* [한국어] hostname= 옵션 파싱 콜백의 전방 선언. 아래 options[] 테이블에서 .cb로 참조되므로
- * 구현보다 먼저 이름이 필요하다. 실제 구현은 파일 하단(str_hostname_cb 정의)에 있음. */
+ * 구현보다 먼저 이름이 필요하다. 실제 구현은 파일 하단(str_hostname_cb 정의)에 있다.
+ * 콜백은 파서(parse.c)가 옵션 값을 STR_STORE로 처리하기 전에 .cb가 있으면 우선 호출하여
+ * 사용자 정의 처리를 하게 해주는 hook이다. 본 엔진에서는 hostname을 td->o.filename으로
+ * 복제 저장하여 파일 경로처럼 다루기 위해 사용한다. */
 static int str_hostname_cb(void *data, const char *input);
+
 /*
  * [한국어] net/netsplice 엔진의 커맨드라인/잡파일 옵션 테이블.
- *  - fio의 옵션 파서(parse.c)가 이 배열을 순회하며 FIO_OPT_C_ENGINE/FIO_OPT_G_NETIO
- *    카테고리로 등록한다. .off1 은 struct netio_options 내부 필드 오프셋.
- *  - 각 옵션의 type(FIO_OPT_STR_STORE/INT/BOOL/STR/STR_SET)은 파서가 값을 해석하는 방식.
- *  - #ifdef CONFIG_* 로 플랫폼에서 지원 가능한 옵션만 노출된다.
- *  - 테이블은 반드시 .name = NULL 원소로 끝나야 파서가 종료를 인식한다. */
+ *
+ * 공통 규약:
+ *  - 파서: fio의 옵션 파서(parse.c)가 이 배열을 .name 기준으로 선형 탐색.
+ *  - 엔진 등록 시 ioengine_ops.options 포인터로 공유되어 "ioengine=net" 또는
+ *    "ioengine=netsplice" 두 엔진 모두 동일 옵션 셋 사용.
+ *  - .name      : 잡 파일/CLI에서 사용자가 지정하는 키워드.
+ *  - .lname     : long name — `--cmdhelp`/`--enghelp` 출력에 노출되는 가독성 라벨.
+ *  - .type      : 값 파싱 방식 — FIO_OPT_STR_STORE(문자열 strdup),
+ *                 FIO_OPT_INT(정수, minval/maxval 검증), FIO_OPT_BOOL(0/1),
+ *                 FIO_OPT_STR(.posval 매핑으로 enum 정수화),
+ *                 FIO_OPT_STR_SET(존재 자체로 1, 값 불필요).
+ *  - .off1      : offsetof(struct netio_options, member) — 파서가 옵션 값을
+ *                 td->eo + .off1 위치에 직접 기록. 잡 시작 후에는 read-only.
+ *  - .cb        : 사용자 정의 후처리 콜백(예: hostname을 td->o.filename으로 복제).
+ *  - .def       : 기본값 문자열(파싱 후 .off1 위치에 설정됨).
+ *  - .minval/.maxval: INT 타입의 입력 범위 검증.
+ *  - .alias     : 다른 이름으로도 동일 옵션 인식(예: protocol↔proto).
+ *  - .posval[]  : STR 타입의 허용 값 매핑(.ival=문자열, .oval=정수, .help=설명).
+ *  - .category  : FIO_OPT_C_ENGINE — 엔진 옵션 분류.
+ *  - .group     : FIO_OPT_G_NETIO — 네트워크 그룹(--enghelp=net 필터링).
+ *  - #ifdef CONFIG_*: 빌드 시 지원 여부에 따라 옵션 노출 여부 결정.
+ *  - 마지막 항목 .name=NULL : 파서의 종료 센티널(필수).
+ */
 static struct fio_option options[] = {
 	{
-		.name	= "hostname",
-		.lname	= "net engine hostname",
-		.type	= FIO_OPT_STR_STORE,
-		.cb	= str_hostname_cb,
-		.help	= "Hostname for net IO engine",
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_NETIO,
+		.name	= "hostname",                                  /* [한국어] CLI/잡파일 키 — 클라이언트 목적지 호스트 또는 서버 멀티캐스트 그룹 IP */
+		.lname	= "net engine hostname",                       /* [한국어] --cmdhelp 출력 라벨 */
+		.type	= FIO_OPT_STR_STORE,                           /* [한국어] 자유 문자열 저장(strdup); off1 대신 cb로 처리 */
+		.cb	= str_hostname_cb,                             /* [한국어] td->o.filename으로 복제(파일 경로 슬롯 재사용) */
+		.help	= "Hostname for net IO engine",                /* [한국어] --cmdhelp/--enghelp 도움말 */
+		.category = FIO_OPT_C_ENGINE,                          /* [한국어] 엔진 옵션 분류 */
+		.group	= FIO_OPT_G_NETIO,                             /* [한국어] 네트워크 그룹 */
 	},
 	{
-		.name	= "port",
+		.name	= "port",                                      /* [한국어] TCP/UDP/VSOCK 포트 — 양측이 합의한 동일 값 사용 */
 		.lname	= "net engine port",
-		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct netio_options, port),
-		.minval	= 1,
-		.maxval	= 65535,
+		.type	= FIO_OPT_INT,                                 /* [한국어] 정수, minval/maxval 검증 */
+		.off1	= offsetof(struct netio_options, port),        /* [한국어] netio_options.port 위치에 기록 */
+		.minval	= 1,                                           /* [한국어] 0 거부(예약) */
+		.maxval	= 65535,                                       /* [한국어] 16비트 포트 한계 */
 		.help	= "Port to use for TCP or UDP net connections",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
 	},
 	{
-		.name	= "protocol",
+		.name	= "protocol",                                  /* [한국어] proto 옵션 본명 */
 		.lname	= "net engine protocol",
-		.alias	= "proto",
-		.type	= FIO_OPT_STR,
-		.off1	= offsetof(struct netio_options, proto),
+		.alias	= "proto",                                     /* [한국어] 짧은 별칭(잡파일에서 더 흔함) */
+		.type	= FIO_OPT_STR,                                 /* [한국어] .posval 매핑으로 enum 정수화 */
+		.off1	= offsetof(struct netio_options, proto),       /* [한국어] netio_options.proto 위치에 정수 기록 */
 		.help	= "Network protocol to use",
-		.def	= "tcp",
+		.def	= "tcp",                                       /* [한국어] 기본 TCP — 가장 흔한 사용 사례 */
 		.posval = {
-			  { .ival = "tcp",
-			    .oval = FIO_TYPE_TCP,
-			    .help = "Transmission Control Protocol",
+			  { .ival = "tcp",                              /* [한국어] 사용자 입력 문자열 */
+			    .oval = FIO_TYPE_TCP,                       /* [한국어] netio_options.proto에 저장될 정수 */
+			    .help = "Transmission Control Protocol",    /* [한국어] --enghelp 출력 */
 			  },
 #ifdef CONFIG_IPV6
-			  { .ival = "tcpv6",
+			  { .ival = "tcpv6",                            /* [한국어] IPv6 TCP — getaddrinfo가 IPv6 결과만 반환 */
 			    .oval = FIO_TYPE_TCP_V6,
 			    .help = "Transmission Control Protocol V6",
 			  },
 #endif
-			  { .ival = "udp",
+			  { .ival = "udp",                              /* [한국어] UDP v4 — connectionless, sendto/recvfrom */
 			    .oval = FIO_TYPE_UDP,
 			    .help = "User Datagram Protocol",
 			  },
 #ifdef CONFIG_IPV6
-			  { .ival = "udpv6",
+			  { .ival = "udpv6",                            /* [한국어] UDP v6 */
 			    .oval = FIO_TYPE_UDP_V6,
 			    .help = "User Datagram Protocol V6",
 			  },
 #endif
-			  { .ival = "unix",
+			  { .ival = "unix",                             /* [한국어] AF_UNIX 스트림 — 동일 호스트 IPC */
 			    .oval = FIO_TYPE_UNIX,
 			    .help = "UNIX domain socket",
 			  },
-			  { .ival = "vsock",
+			  { .ival = "vsock",                            /* [한국어] AF_VSOCK 스트림 — VM guest↔host */
 			    .oval = FIO_TYPE_VSOCK_STREAM,
 			    .help = "Virtual socket",
 			  },
@@ -266,9 +544,9 @@ static struct fio_option options[] = {
 	},
 #ifdef CONFIG_TCP_NODELAY
 	{
-		.name	= "nodelay",
+		.name	= "nodelay",                                   /* [한국어] TCP_NODELAY = Nagle off */
 		.lname	= "No Delay",
-		.type	= FIO_OPT_BOOL,
+		.type	= FIO_OPT_BOOL,                                /* [한국어] 0(켬)/1(끔=NODELAY 적용) */
 		.off1	= offsetof(struct netio_options, nodelay),
 		.help	= "Use TCP_NODELAY on TCP connections",
 		.category = FIO_OPT_C_ENGINE,
@@ -276,50 +554,50 @@ static struct fio_option options[] = {
 	},
 #endif
 	{
-		.name	= "listen",
+		.name	= "listen",                                    /* [한국어] 서버 모드 표시 */
 		.lname	= "net engine listen",
-		.type	= FIO_OPT_STR_SET,
+		.type	= FIO_OPT_STR_SET,                             /* [한국어] 존재 자체로 1(값 불필요) */
 		.off1	= offsetof(struct netio_options, listen),
 		.help	= "Listen for incoming TCP connections",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
 	},
 	{
-		.name	= "pingpong",
+		.name	= "pingpong",                                  /* [한국어] 매 I/O 후 반대 방향 1회 — RTT 측정 */
 		.lname	= "Ping Pong",
-		.type	= FIO_OPT_STR_SET,
+		.type	= FIO_OPT_STR_SET,                             /* [한국어] 부울 토글 */
 		.off1	= offsetof(struct netio_options, pingpong),
 		.help	= "Ping-pong IO requests",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
 	},
 	{
-		.name	= "interface",
+		.name	= "interface",                                 /* [한국어] 멀티캐스트 송수신 인터페이스 IP(점-표기) */
 		.lname	= "net engine interface",
-		.type	= FIO_OPT_STR_STORE,
+		.type	= FIO_OPT_STR_STORE,                           /* [한국어] strdup(intfc) */
 		.off1	= offsetof(struct netio_options, intfc),
 		.help	= "Network interface to use",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
 	},
 	{
-		.name	= "ttl",
+		.name	= "ttl",                                       /* [한국어] 멀티캐스트 IP_MULTICAST_TTL */
 		.lname	= "net engine multicast ttl",
 		.type	= FIO_OPT_INT,
 		.off1	= offsetof(struct netio_options, ttl),
-		.def    = "1",
-		.minval	= 0,
+		.def    = "1",                                          /* [한국어] 기본 TTL=1 (같은 서브넷만) — 멀티캐스트 안전 기본값 */
+		.minval	= 0,                                            /* [한국어] 0=같은 호스트만(루프백) */
 		.help	= "Time-to-live value for outgoing UDP multicast packets",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
 	},
 #ifdef CONFIG_NET_WINDOWSIZE
 	{
-		.name	= "window_size",
+		.name	= "window_size",                               /* [한국어] SO_RCVBUF/SNDBUF 크기 */
 		.lname	= "Window Size",
 		.type	= FIO_OPT_INT,
 		.off1	= offsetof(struct netio_options, window_size),
-		.minval	= 0,
+		.minval	= 0,                                            /* [한국어] 0=커널 기본 사용 */
 		.help	= "Set socket buffer window size",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
@@ -327,18 +605,18 @@ static struct fio_option options[] = {
 #endif
 #ifdef CONFIG_NET_MSS
 	{
-		.name	= "mss",
+		.name	= "mss",                                       /* [한국어] TCP_MAXSEG */
 		.lname	= "Maximum segment size",
 		.type	= FIO_OPT_INT,
 		.off1	= offsetof(struct netio_options, mss),
-		.minval	= 0,
+		.minval	= 0,                                            /* [한국어] 0=설정 안 함 */
 		.help	= "Set TCP maximum segment size",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_NETIO,
 	},
 #endif
 	{
-		.name	= NULL,
+		.name	= NULL,                                        /* [한국어] 종료 센티널 — parse.c가 .name==NULL을 보면 순회 종료 */
 	},
 };
 
@@ -392,15 +670,28 @@ static inline int is_vsock(struct netio_options *o)
 /*
  * [한국어]
  * set_window_size - 소켓 송/수신 버퍼 크기(SO_SNDBUF/RCVBUF) 설정.
+ *
  * @td: 현재 잡 컨텍스트(에러 보고용 td_verror).
  * @fd: 설정 대상 소켓 FD.
  * @return: 0=성공/미적용, <0=에러.
  *
- * o->window_size 옵션이 설정된 경우에만 실제 setsockopt 수행. listen/pingpong 조합에 따라
- * 수신/송신 양쪽 모두 또는 한쪽만 설정한다(서버는 RCVBUF 중시, 클라는 SNDBUF 중시).
- * 컴파일 타임에 CONFIG_NET_WINDOWSIZE 미지원이면 에러 반환.
+ * 소켓 옵션 스펙(POSIX/Linux):
+ *   - SO_RCVBUF: 수신 큐(커널 skb 누적) 최대 바이트. 커널은 내부 부하 계산용으로 요청값의
+ *     2배를 sk->sk_rcvbuf에 저장하고, sysctl net.core.rmem_max를 상한으로 클램프한다.
+ *     (SO_RCVBUFFORCE는 CAP_NET_ADMIN 필요, 본 엔진 미사용)
+ *   - SO_SNDBUF: 송신 큐 최대 바이트. 마찬가지로 net.core.wmem_max로 클램프.
  *
- * 호출 체인: fio_netio_connect()/fio_netio_setup_listen_inet() → [set_window_size] → setsockopt(2).
+ * 적용 규칙:
+ *   - o->window_size=0이면 커널 기본값 사용(미적용 후 성공 반환).
+ *   - o->listen || o->pingpong 시 RCVBUF 설정(서버는 수신 중심, pingpong은 양방향).
+ *   - !o->listen || o->pingpong 시 SNDBUF 설정(클라는 송신 중심).
+ *   - 한쪽 실패 시 반대쪽은 시도하지 않는다(ret 전파).
+ *
+ * 컴파일 타임에 CONFIG_NET_WINDOWSIZE 미지원이면 EINVAL 반환(옵션 자체가 사용자에게
+ * 노출되지 않지만 엔진 내부 호출 방어).
+ *
+ * 호출 체인: fio_netio_connect()/fio_netio_setup_listen_inet() → [set_window_size]
+ *            → setsockopt(2).
  */
 static int set_window_size(struct thread_data *td, int fd)
 {
@@ -440,12 +731,22 @@ static int set_window_size(struct thread_data *td, int fd)
 /*
  * [한국어]
  * set_mss - TCP 최대 세그먼트 크기(TCP_MAXSEG) 설정.
+ *
  * @td: 에러 보고 대상 잡 컨텍스트.
  * @fd: 대상 TCP 소켓 FD.
  * @return: 0=성공/비적용, <0=에러.
  *
- * o->mss 가 지정되고 프로토콜이 TCP일 때만 TCP_MAXSEG 를 설정한다. 이는 MTU 제약이 있는
- * 경로 튜닝 및 경계 케이스 재현용(fragmentation 실험 등). 호출 체인은 set_window_size 와 동일.
+ * TCP_MAXSEG(level IPPROTO_TCP): TCP 세그먼트 최대 크기를 강제한다. 일반적으로 MSS는
+ * TCP 핸드쉐이크 시 피어 간 MSS 옵션 교환으로 자동 결정(MTU 1500 → MSS 1460 기본)되지만,
+ * 본 옵션은 fio가 의도적으로 작은 값을 설정해 fragmentation/다수 세그먼트화 경로를 재현할
+ * 수 있게 한다. 커널은 IP/TCP 헤더(40바이트) 감산을 고려하므로 0=자동.
+ *
+ * 유효성:
+ *   - o->mss=0 또는 is_tcp 아님 → no-op.
+ *   - TCP면 setsockopt로 값 설정. 커널은 IP MTU 이하로만 허용(EINVAL 가능).
+ *
+ * 호출 체인: fio_netio_connect()/fio_netio_setup_listen_inet() → [set_mss]
+ *            → setsockopt(2, IPPROTO_TCP, TCP_MAXSEG).
  */
 static int set_mss(struct thread_data *td, int fd)
 {
@@ -477,16 +778,24 @@ static int set_mss(struct thread_data *td, int fd)
  *
  * [한국어]
  * poll_wait - fd가 requested events 상태가 될 때까지 블로킹 대기.
+ *
  * @td: 잡 컨텍스트(종료 플래그 td->terminate 체크용).
  * @fd: 대기할 소켓/파이프 FD.
- * @events: 기다릴 이벤트 비트마스크(POLLIN/POLLOUT 등).
- * @return: 1 = 원하는 이벤트 발생, -1 = 에러 혹은 시그널로 중단.
+ * @events: 기다릴 이벤트 비트마스크(POLLIN=수신 가능/POLLOUT=송신 가능/POLLPRI 등).
+ * @return: 1=원하는 이벤트 발생, -1=에러·시그널로 중단 또는 이벤트 불일치.
  *
- * 동기 엔진(FIO_SYNCIO)이므로 fio_netio_send/recv/accept에서 블로킹 대기점으로 사용된다.
- * EINTR은 조용히 루프를 빠져나오고(시그널 재시도 상위에 위임), ret==0(타임아웃 없음, 사실상
- * 발생 불가)은 루프 재시도. td->terminate가 세트되면 즉시 탈출하여 잡 종료에 반응한다.
+ * 동기 엔진(FIO_SYNCIO)이므로 fio_netio_send/recv/accept에서 blocking 대기점으로 사용된다.
+ * poll(2)은 timeout=-1로 무한 대기하며 다음 3개 경로에서 깨어난다:
+ *   1) fd가 요청 이벤트 상태 도달 (ret>0, revents에 마스크 기록).
+ *   2) 시그널 수신(terminate에서 SIGTERM self-send) → ret<0 && errno==EINTR → 루프 탈출.
+ *   3) 에러(EBADF 등) → td_verror 기록 후 -1 반환.
  *
- * 호출 체인: fio_netio_send/recv/accept → [poll_wait] → poll(2).
+ * td->terminate가 설정되면 while 루프의 다음 반복에서 빠져나가 -1 반환하도록 설계(블로킹
+ * 중이라도 SIGTERM이 poll을 깨워 다음 반복에서 terminate를 검사하게 됨). timeout=0(타임아웃
+ * 반환)은 -1 지정 시 이론상 오지 않지만 방어적으로 continue 처리.
+ *
+ * 호출 체인: fio_netio_send(POLLOUT)/fio_netio_recv(POLLIN)/fio_netio_accept(POLLIN)
+ *            → [poll_wait] → poll(2).
  */
 static int poll_wait(struct thread_data *td, int fd, short events)
 {
@@ -541,30 +850,41 @@ static int fio_netio_is_multicast(const char *mcaddr)
 /*
  * [한국어]
  * fio_netio_prep - net 엔진의 I/O 준비 콜백(ioengine_ops.prep).
- * @td: 잡 컨텍스트. @io_u: 곧 queue에 전달될 I/O 유닛.
- * @return: 0=정상, 1=방향 오류.
  *
- * UDP는 수신 서버(listen)가 WRITE를 내거나 송신 클라이언트(!listen)가 READ를 내는 경우를
- * 차단한다(데이터그램은 방향 고정). TCP는 전이중 스트림이므로 별도 검증 없이 통과.
- * 호출 체인: td_io_prep() → [fio_netio_prep].
+ * @td:   잡 컨텍스트(옵션·fio_file 참조용).
+ * @io_u: 곧 td_io_queue()로 넘겨질 I/O 유닛 — ddir/offset/xfer_buflen은 이미 코어가 결정.
+ * @return: 0=정상(queue 진행), 1=방향 오류(잡 중단).
+ *
+ * fio 코어는 get_io_u() 직후 매 io_u마다 엔진의 .prep를 호출해 엔진별 전처리를 허용한다.
+ * 파일시스템 엔진은 여기서 파일 포인터 조정 등을 하지만, 네트워크 엔진은 offset 개념이
+ * 없으므로 UDP의 "잡 방향 ↔ listen 역할" 규약만 검증한다:
+ *   - UDP listen=1 (서버·read 잡) 가 DDIR_WRITE io_u를 받으면 비정상(수신 전용)
+ *   - UDP listen=0 (클라·write 잡) 가 DDIR_READ io_u를 받으면 비정상(송신 전용)
+ * TCP는 양방향 스트림이라 pingpong/혼합 잡에서 양쪽 방향 io_u가 정상이므로 통과.
+ *
+ * 실행 컨텍스트: 잡 스레드 — queue 호출 직전. 실패는 td_verror로 통계에 기록 후 코어가
+ * 잡을 EINVAL 종료하므로 복구 경로는 없다.
+ *
+ * 호출 체인: backend.c 잡 루프 → td_io_prep() → ioengines.c td->io_ops->prep()
+ *            → [fio_netio_prep].
  */
 static int fio_netio_prep(struct thread_data *td, struct io_u *io_u)
 {
-	struct netio_options *o = td->eo;            /* [한국어] 프로토콜/listen 등 옵션 참조. */
+	struct netio_options *o = td->eo;            /* [한국어] 프로토콜/listen 등 옵션 참조(불변). */
 
 	/*
 	 * Make sure we don't see spurious reads to a receiver, and vice versa
 	 */
-	if (is_tcp(o))                               /* [한국어] TCP는 양방향 스트림 — 방향 검사 불필요. */
+	if (is_tcp(o))                               /* [한국어] TCP는 전이중 스트림 — READ/WRITE 모두 허용하므로 조기 return 0. */
 		return 0;
 
 	if ((o->listen && io_u->ddir == DDIR_WRITE) ||
-	    (!o->listen && io_u->ddir == DDIR_READ)) {/* [한국어] 서버=수신, 클라=송신이라는 UDP 규약 위반 감지. */
-		td_verror(td, EINVAL, "bad direction");
+	    (!o->listen && io_u->ddir == DDIR_READ)) {/* [한국어] 서버=수신, 클라=송신이라는 UDP 규약 위반 — 잡 설정 오류로 간주. */
+		td_verror(td, EINVAL, "bad direction"); /* [한국어] td->error=EINVAL 설정 + 통계 기록 — 코어가 잡 종료 판정. */
 		return 1;
 	}
 
-	return 0;
+	return 0;                                    /* [한국어] 방향 규약 일치 — queue 호출 허용. */
 }
 
 #ifdef CONFIG_LINUX_SPLICE
@@ -815,14 +1135,30 @@ static void verify_udp_seq(struct thread_data *td, struct netio_data *nd,
 /*
  * [한국어]
  * fio_netio_send - UDP/TCP/UNIX에 대해 단일 io_u를 송신하는 저수준 루틴.
+ *
  * @td: 잡 컨텍스트. @io_u: 송신 버퍼(xfer_buf/xfer_buflen 사용).
- * @return: 송신 바이트 수(>0) 또는 에러.
+ * @return: 송신 바이트 수(>0) 또는 음수 에러.
  *
- * UDP는 sendto(2)로 저장해둔 peer 주소에 직접 전송하며, verify 미사용 시 udp_seq 헤더를 끼워
- * 넣는다. TCP/UNIX는 send(2)로 전송, 마지막 패킷이 아니면 MSG_MORE로 Nagle 병합 힌트. 송신이
- * 부분/실패이면 POLLOUT poll_wait 후 재시도.
+ * 송신 경로 선택:
+ *   - UDP(v4/v6): sendto(2) — peer 주소를 매 호출마다 지정(connectionless).
+ *     verify=none 잡에서는 store_udp_seq로 버퍼 끝에 udp_seq 헤더 삽입(시퀀스 검증용).
+ *   - TCP/UNIX: send(2) — 이미 연결된 스트림이라 주소 불필요.
  *
- * 호출 체인: __fio_netio_queue(DDIR_WRITE) → [fio_netio_send] → send(2)/sendto(2)/poll(2).
+ * send/sendto 플래그 해설(본 엔진이 사용하는 것):
+ *   - MSG_MORE     : "곧 더 보낼 데이터가 있음" — 커널이 패킷을 즉시 내보내지 않고 축적.
+ *                    Nagle + TCP_CORK와 유사한 효과를 호출별 힌트로 줌. 본 엔진은 마지막
+ *                    패킷이 아니고 pingpong이 아닐 때만 설정(MSG_MORE를 set하면 그 send는
+ *                    flush하지 않고, 다음 send에서 누적본과 함께 전송).
+ *   - 미사용이지만 관련 플래그:
+ *     MSG_NOSIGNAL: SIGPIPE 대신 EPIPE 반환(본 엔진은 SIGPIPE를 무시 설정 가정).
+ *     MSG_DONTWAIT: 비블로킹 힌트 — 본 엔진은 blocking 모드라 불필요.
+ *     MSG_OOB     : out-of-band 데이터(TCP URG) — 본 엔진 미지원.
+ *
+ * 재시도 루프: send가 0/음수를 반환하면 poll_wait(POLLOUT)으로 송신 가능 상태가 될 때까지
+ * 블로킹 대기 후 재시도. poll_wait 실패(종료/에러) 시 루프 탈출.
+ *
+ * 호출 체인: __fio_netio_queue(DDIR_WRITE) → [fio_netio_send]
+ *            → send(2)/sendto(2) + 필요 시 poll_wait → poll(2).
  */
 static int fio_netio_send(struct thread_data *td, struct io_u *io_u)
 {
@@ -899,11 +1235,36 @@ static int is_close_msg(struct io_u *io_u, int len)
 /*
  * [한국어]
  * fio_netio_recv - 단일 io_u 크기만큼 소켓에서 수신.
- * @return: 수신 바이트 수, 0(상대가 CLOSE 표명), 음수(에러).
  *
- * UDP는 listen 측에서 recvfrom으로 peer 주소 캡처(다음 응답 송신용), 그 외는 recv 사용. CLOSE
- * 메시지 수신 시 td->done=1로 잡 종료 신호. MSG_WAITALL 재시도로 짧은 수신을 메꾼다.
- * 호출 체인: __fio_netio_queue(DDIR_READ) → [fio_netio_recv] → recv(2)/recvfrom(2)/poll(2).
+ * @td: 잡 컨텍스트. @io_u: 수신 버퍼(xfer_buf/xfer_buflen 사용).
+ * @return: 수신 바이트 수(>0), 0(상대가 CLOSE 표명 — td->done=1 후), 음수(에러).
+ *
+ * 수신 경로:
+ *   - UDP listen 측: recvfrom으로 peer 주소 캡처(응답 echo에서 sendto 목적지로 사용).
+ *   - UDP client 측: from=NULL (이미 connect 없이 sendto만 할 예정).
+ *   - TCP/UNIX : recv(2) — 연결 단위라 주소 불필요.
+ *
+ * recv/recvfrom 플래그 해설:
+ *   - MSG_WAITALL : 요청 바이트 수가 모두 채워질 때까지 커널 내부에서 반복 수신.
+ *                   본 엔진은 초기 호출에 플래그 없이 사용하다가, 부분 수신 시
+ *                   재시도 루프에서 flags|=MSG_WAITALL로 전환해 커널에 전량 대기 요청.
+ *                   TCP는 메시지 경계가 없어 short receive 이슈를 감추는 가장 안전한 방법.
+ *                   UDP는 데이터그램이라 MSG_WAITALL의 효과가 제한적(큰 영향 없음).
+ *   - MSG_DONTWAIT: 비블로킹. 본 엔진은 blocking 모드라 사용 안 함.
+ *   - MSG_PEEK    : 큐에서 꺼내지 않고 미리보기. 본 엔진 미사용.
+ *   - MSG_TRUNC   : 데이터그램이 버퍼보다 클 때 진짜 길이 반환. UDP만 의미.
+ *
+ * CLOSE 감지: 수신 데이터가 sizeof(udp_close_msg) && 매직/cmd가 CLOSE면 애플리케이션 종료
+ * 신호로 간주하고 td->done=1을 세워 잡 메인 루프 탈출을 유도, 0을 반환.
+ *
+ * 재시도 루프: recv가 0/음수면 poll_wait(POLLIN) 후 재시도(MSG_WAITALL 추가). 시그널/종료
+ * 상황은 poll_wait가 -1 반환으로 전파.
+ *
+ * verify_udp_seq: UDP이고 verify=none이면 수신 직후 udp_seq 검증으로 시퀀스 점프(손실/재
+ * 정렬)를 측정.
+ *
+ * 호출 체인: __fio_netio_queue(DDIR_READ) → [fio_netio_recv]
+ *            → recv(2)/recvfrom(2) + poll_wait → poll(2).
  */
 static int fio_netio_recv(struct thread_data *td, struct io_u *io_u)
 {
@@ -964,105 +1325,152 @@ static int fio_netio_recv(struct thread_data *td, struct io_u *io_u)
 
 /*
  * [한국어]
- * __fio_netio_queue - 내부 방향별 I/O 제출 로직.
- * @td: 잡. @io_u: I/O 유닛. @ddir: 요청 방향(READ/WRITE/SYNC).
- * @return: fio_q_status (COMPLETED/BUSY).
+ * __fio_netio_queue - 방향별(ddir) 저수준 I/O 디스패처.
  *
- * use_splice/UDP/UNIX 조건에 따라 send/recv 또는 splice_in/out 경로로 분기. 부분 전송 시
- * resid 기록(짧은 전송)으로 COMPLETED 반환. EMSGSIZE는 큰 UDP 데이터그램을 줄여서 재시도
- * 하도록 BUSY로 상위에 돌려준다.
+ * @td:   잡 컨텍스트(옵션·netio_data 참조).
+ * @io_u: 전송/수신 대상 I/O 유닛(xfer_buf/xfer_buflen/file->fd 사용).
+ * @ddir: 요청 방향(DDIR_READ / DDIR_WRITE / DDIR_SYNC).
+ * @return: FIO_Q_COMPLETED(전량·부분 전송 성공 또는 에러) / FIO_Q_BUSY(재시도 요청).
  *
- * 호출 체인: fio_netio_queue() → [__fio_netio_queue] → fio_netio_{send,recv,splice_*}().
+ * fio_netio_queue의 1차/2차(pingpong) 방향 모두에서 공용으로 사용되는 내부 dispatcher.
+ * 분기 규칙:
+ *   - use_splice=0(net 엔진)  → 일반 send/recv(TCP/UNIX 스트림) 또는 sendto/recvfrom(UDP).
+ *   - use_splice=1 && TCP      → splice_in/out(TCP 소켓↔커널 파이프 페이지 이동).
+ *   - use_splice=1 && UDP/UNIX → splice가 UDP/UNIX에는 의미 없어 일반 send/recv로 폴백.
+ *
+ * 반환 규약 해석:
+ *   1) ret == xfer_buflen : 전량 전송 성공 → COMPLETED, resid=0.
+ *   2) 0 < ret < xfer_buflen : short transfer — resid에 남은 바이트 기록 후 COMPLETED.
+ *      fio 코어가 부분 전송으로 통계에 반영, 재시도는 발생하지 않음(네트워크 스트림은
+ *      상대 버퍼 상황에 따라 자연스러운 partial 허용).
+ *   3) ret == 0 : 전혀 진전 없음(poll 실패 등) → FIO_Q_BUSY로 코어에 재시도 요청.
+ *   4) ret < 0  : errno 설정된 실패. DDIR_WRITE+EMSGSIZE(UDP 데이터그램 크기 초과)는
+ *                 BUSY로 반환해 상위가 bs를 줄여 재시도하도록 유도. 그 외 errno는
+ *                 io_u->error에 기록 후 COMPLETED(코어가 잡 종료 판정).
+ *
+ * 실행 컨텍스트: 잡 스레드 전용. 내부에서 blocking send/recv/poll이 일어날 수 있음.
+ * 호출 체인: fio_netio_queue() → [__fio_netio_queue] → fio_netio_{send,recv,splice_in,
+ *            splice_out}() → send(2)/recv(2)/sendto(2)/recvfrom(2)/splice(2)/vmsplice(2).
  */
 static enum fio_q_status __fio_netio_queue(struct thread_data *td,
 					   struct io_u *io_u,
 					   enum fio_ddir ddir)
 {
-	struct netio_data *nd = td->io_ops_data;     /* [한국어] splice 사용 여부. */
-	struct netio_options *o = td->eo;            /* [한국어] proto 참조. */
-	int ret;                                     /* [한국어] 저수준 전송량/에러. */
+	struct netio_data *nd = td->io_ops_data;     /* [한국어] use_splice 플래그와 주소/파이프 슬롯 보유. */
+	struct netio_options *o = td->eo;            /* [한국어] proto 참조(is_udp/UNIX 판정용). */
+	int ret;                                     /* [한국어] 저수준 send/recv/splice 반환(음수 에러/0 EOF/양수 바이트). */
 
 	if (ddir == DDIR_WRITE) {
 		if (!nd->use_splice || is_udp(o) ||
-		    o->proto == FIO_TYPE_UNIX)       /* [한국어] splice 미사용이거나 UDP/UNIX면 일반 send. */
+		    o->proto == FIO_TYPE_UNIX)       /* [한국어] net 엔진이거나 UDP/UNIX는 splice 의미 없음 — 일반 송신 경로. */
 			ret = fio_netio_send(td, io_u);
 		else
-			ret = fio_netio_splice_out(td, io_u); /* [한국어] TCP+splice 경로. */
+			ret = fio_netio_splice_out(td, io_u); /* [한국어] netsplice TCP 경로 — io_u→파이프→소켓 2단 이동. */
 	} else if (ddir == DDIR_READ) {
 		if (!nd->use_splice || is_udp(o) ||
 		    o->proto == FIO_TYPE_UNIX)
-			ret = fio_netio_recv(td, io_u);
+			ret = fio_netio_recv(td, io_u); /* [한국어] 일반 수신 경로(recv/recvfrom). */
 		else
-			ret = fio_netio_splice_in(td, io_u);
+			ret = fio_netio_splice_in(td, io_u); /* [한국어] netsplice TCP 경로 — 소켓→파이프→io_u. */
 	} else
-		ret = 0;	/* must be a SYNC */ /* [한국어] 네트워크 엔진에서 SYNC는 no-op. */
+		ret = 0;	/* must be a SYNC */ /* [한국어] 네트워크 엔진은 DDIR_SYNC를 no-op로 처리(TCP은 상대 ACK로 "sync" 의미 없음). */
 
-	if (ret != (int) io_u->xfer_buflen) {        /* [한국어] 요청한 만큼 전송/수신되지 않았다면 후처리. */
-		if (ret > 0) {                       /* [한국어] 부분 처리 — short transfer. */
-			io_u->resid = io_u->xfer_buflen - ret; /* [한국어] 남은 바이트 통계용. */
-			io_u->error = 0;
+	if (ret != (int) io_u->xfer_buflen) {        /* [한국어] 요청한 크기와 다르면 에러/부분/EOF 경로 분기. */
+		if (ret > 0) {                       /* [한국어] 부분 전송(short transfer) — 스트림 소켓에서 자연 발생 가능. */
+			io_u->resid = io_u->xfer_buflen - ret; /* [한국어] 남은 바이트를 resid에 기록 — 코어가 부분 IO로 stat 누적. */
+			io_u->error = 0;             /* [한국어] 에러 아님(short는 성공 변종). */
 			return FIO_Q_COMPLETED;
-		} else if (!ret)                     /* [한국어] 진전 전혀 없음 — 재시도 요청. */
+		} else if (!ret)                     /* [한국어] ret==0: poll 타임아웃/EOF 등 진전 전혀 없음 — 코어 재시도 요청. */
 			return FIO_Q_BUSY;
 		else {
-			int err = errno;             /* [한국어] 저수준에서 설정된 errno 스냅샷. */
+			int err = errno;             /* [한국어] send/recv가 설정한 errno 스냅샷(이후 td_verror가 덮어쓸 수 있음). */
 
-			if (ddir == DDIR_WRITE && err == EMSGSIZE) /* [한국어] UDP 최대 데이터그램 초과 — 축소 후 재시도. */
+			if (ddir == DDIR_WRITE && err == EMSGSIZE) /* [한국어] UDP 최대 데이터그램 크기 초과(IP MTU/64KiB 한계) — bs 축소해 재시도 유도. */
 				return FIO_Q_BUSY;
 
-			io_u->error = err;
+			io_u->error = err;           /* [한국어] 그 외 에러는 io_u에 기록 — 코어가 잡 종료 결정. */
 		}
 	}
 
-	if (io_u->error)                             /* [한국어] 오류가 있으면 상세 기록. */
+	if (io_u->error)                             /* [한국어] 에러가 있는 경우에만 통계 상세 기록("xfer" 라벨). */
 		td_verror(td, io_u->error, "xfer");
 
-	return FIO_Q_COMPLETED;                      /* [한국어] 단일 호출로 완료되는 동기 엔진. */
+	return FIO_Q_COMPLETED;                      /* [한국어] 동기 엔진 — 단일 호출로 완료 보고. 코어가 즉시 put_io_u. */
 }
 
 /*
  * [한국어]
- * fio_netio_queue - net 엔진의 I/O 제출 콜백
+ * fio_netio_queue - net 엔진의 I/O 제출 콜백 진입점(ioengine_ops.queue).
  *
- * 읽기는 recv/recvfrom/splice, 쓰기는 send/sendto/vmsplice로 전송한다.
- * pingpong 모드에서는 쓰기 후 읽기(또는 반대)를 자동으로 수행한다.
+ * @td:   잡 컨텍스트(ts/eo/io_ops_data 등 참조 소유자).
+ * @io_u: 코어가 준비한 I/O 유닛 — ddir/xfer_buf/xfer_buflen/file/offset 필드 사용.
+ * @return: FIO_Q_COMPLETED(성공·부분 전송 포함, 코어가 즉시 put_io_u) /
+ *          FIO_Q_BUSY(진전 없음 — 코어가 잠시 후 재시도) /
+ *          FIO_Q_QUEUED(본 엔진은 동기라 반환하지 않음).
  *
- * 호출 체인: td_io_queue() → [이 함수] → send(2)/recv(2)/splice(2)
+ * 본 엔진은 FIO_SYNCIO 플래그를 단 "동기 엔진"이므로 queue 호출 하나에서 send/recv
+ * 와 필요한 경우 poll 대기까지 모두 수행한 뒤 반환한다. 비동기 엔진과 달리 .commit /
+ * .getevents / .event 콜백은 정의하지 않으며 ioengines.c 코어가 COMPLETED 반환을
+ * 보고 즉시 io_u_sync_complete → put_io_u 경로로 정리한다.
+ *
+ * pingpong 모드는 한 I/O 라운드 안에서 본 방향 완료 뒤 반대 방향을 연속 호출해
+ * RTT(Round-Trip Time)를 단일 queue 호출에 포함시킨다. 이 때문에 실제 측정되는
+ * clat는 "요청 송신 + 응답 수신 + 반대 경로 처리"의 누적이 된다.
+ *
+ * 실행 컨텍스트: 잡 스레드 전용(블로킹 구간 포함).
+ * 호출 체인: backend.c 잡 루프 → td_io_queue() → ioengines.c
+ *            td->io_ops->queue() → [fio_netio_queue] → __fio_netio_queue()
+ *            → send(2)/sendto(2)/recv(2)/recvfrom(2)/splice(2)/vmsplice(2)
+ *            → poll(2)(필요 시 대기).
+ * 에러 경로: io_u->error에 errno 기록 후 COMPLETED 반환(코어가 에러 잡 종료 결정).
  */
 static enum fio_q_status fio_netio_queue(struct thread_data *td,
 					 struct io_u *io_u)
 {
-	struct netio_options *o = td->eo;            /* [한국어] pingpong 여부 확인. */
-	int ret;                                     /* [한국어] 1차 queue 결과. */
+	struct netio_options *o = td->eo;            /* [한국어] pingpong/proto 등 옵션 참조(불변 — init 이후 read-only). */
+	int ret;                                     /* [한국어] 1차 방향 큐잉 결과(fio_q_status 값). */
 
-	fio_ro_check(td, io_u);                      /* [한국어] readonly 잡에서 write io_u 차단 공통 가드. */
+	fio_ro_check(td, io_u);                      /* [한국어] readonly 잡(td->o.read_only)인데 write io_u가 오면 assert — I/O 엔진 공통 가드. */
 
-	ret = __fio_netio_queue(td, io_u, io_u->ddir);/* [한국어] 1차 방향 실행. */
-	if (!o->pingpong || ret != FIO_Q_COMPLETED)  /* [한국어] pingpong 아니거나 실패면 여기서 종료. */
+	ret = __fio_netio_queue(td, io_u, io_u->ddir);/* [한국어] 1차 방향 실행(io_u->ddir이 그대로 — DDIR_READ/WRITE/SYNC). */
+	if (!o->pingpong || ret != FIO_Q_COMPLETED)  /* [한국어] pingpong=0(일반 단방향)이거나 1차가 실패/BUSY면 반대 방향 생략. */
 		return ret;
 
 	/*
 	 * For ping-pong mode, receive or send reply as needed
 	 */
-	if (td_read(td) && io_u->ddir == DDIR_READ)  /* [한국어] 수신 후에는 동일 버퍼를 돌려보냄(에코). */
+	if (td_read(td) && io_u->ddir == DDIR_READ)  /* [한국어] 서버 측(read 잡): 수신 완료 후 동일 버퍼를 클라에 echo(WRITE) — RTT 응답 생성. */
 		ret = __fio_netio_queue(td, io_u, DDIR_WRITE);
-	else if (td_write(td) && io_u->ddir == DDIR_WRITE) /* [한국어] 송신 후에는 응답 수신으로 RTT 측정. */
+	else if (td_write(td) && io_u->ddir == DDIR_WRITE) /* [한국어] 클라 측(write 잡): 송신 완료 후 서버 응답을 수신(READ) — 왕복 시간 포함. */
 		ret = __fio_netio_queue(td, io_u, DDIR_READ);
 
-	return ret;
+	return ret;                                  /* [한국어] 반대 방향 결과를 그대로 반환 — 코어가 stat 누적에 반영. */
 }
 
 /*
  * [한국어]
- * fio_netio_connect - 클라이언트 모드에서 프로토콜별 소켓을 생성하고 서버에 연결.
- * @td: 잡. @f: 해당 연결을 표현할 fio_file(엔진 내부에서 f->fd 채움).
- * @return: 0=성공, 1=실패(에러 보고 후).
+ * fio_netio_connect - 클라이언트 모드에서 프로토콜별 소켓 생성 및 서버 연결.
  *
- * TCP/TCP_V6/UDP/UDP_V6/UNIX/VSOCK 각각에 대해 domain/type을 결정 후 socket(2)을 호출.
- * TCP_NODELAY/window_size/MSS 옵션 반영. UDP는 연결 없이 bind만 하거나 멀티캐스트 멤버십
- * 설정. 그 외(UNIX/TCP/VSOCK)는 connect(2)로 서버 rendezvous.
+ * @td: 잡 컨텍스트(옵션·netio_data·에러 보고 채널).
+ * @f:  이 연결을 대표할 fio_file — 성공 시 f->fd에 유효 소켓 FD 기록.
+ * @return: 0=성공, 1=실패(에러는 td_verror/log_err로 보고됨).
  *
- * 호출 체인: fio_netio_open_file → [fio_netio_connect] → socket/connect/setsockopt.
+ * 동작 단계:
+ *   1) proto → (domain, type) 매핑으로 socket(2) 호출(AF_INET·AF_INET6·AF_UNIX·AF_VSOCK).
+ *   2) TCP인 경우 nodelay 옵션 시 TCP_NODELAY setsockopt(Nagle 알고리즘 비활성화 —
+ *      작은 쓰기를 즉시 패킷화해 저지연 응용 재현).
+ *   3) 모든 타입에 SO_SNDBUF/RCVBUF(window_size) 및 TCP_MAXSEG(mss) 옵션 적용.
+ *   4) UDP 분기:
+ *      - 유니캐스트 UDP   : connect 없이 바로 반환(sendto가 매 패킷마다 주소 지정).
+ *      - 멀티캐스트 UDP v4: IP_MULTICAST_IF(인터페이스 강제) + IP_MULTICAST_TTL(홉 제한)
+ *        설정. IPv6 멀티캐스트는 본 구현 미지원(에러).
+ *   5) TCP/VSOCK/UNIX: connect(2) 호출 — 커널이 3-way handshake(TCP) 또는 서버 accept
+ *      큐에 요청을 넣는다. 실패 시 FD close하고 1 반환.
+ *
+ * 실행 컨텍스트: 잡 스레드, open_file 경로에서 1회. connect(2)는 블로킹이므로 서버가
+ * 없으면 ETIMEDOUT/ECONNREFUSED까지 대기.
+ * 호출 체인: fio_netio_open_file → [fio_netio_connect] → socket(2)/setsockopt(2)/
+ *            connect(2)/IP_MULTICAST_* setsockopt.
  */
 static int fio_netio_connect(struct thread_data *td, struct fio_file *f)
 {
@@ -1192,14 +1600,27 @@ static int fio_netio_connect(struct thread_data *td, struct fio_file *f)
 /*
  * [한국어]
  * fio_netio_accept - 서버 모드에서 listen FD로부터 클라이언트 연결을 수락.
- * @td: 잡. @f: 수락한 연결을 담을 fio_file.
+ *
+ * @td: 잡 컨텍스트(listenfd가 io_ops_data에 있음).
+ * @f:  수락한 연결을 담을 fio_file — 성공 시 f->fd에 피어 소켓 FD 기록.
  * @return: 0=성공, 1=실패.
  *
- * UDP는 accept 없이 listenfd 자체를 f->fd로 사용. TCP/VSOCK/TCPv6는 poll_wait 후 accept(2).
- * TD_SETTING_UP 상태로 잠시 바꿔 런타임 통계에 대기 시간이 섞이지 않도록 하고, 연결 직후
- * reset_all_stats()로 깨끗한 시작점을 만든다.
+ * TCP/VSOCK 흐름:
+ *   1) runstate를 TD_SETTING_UP으로 전환 — 대기 구간이 런타임 통계에서 분리됨.
+ *   2) poll_wait(POLLIN)으로 listenfd에 연결 요청 도착 대기(td->terminate 반응).
+ *   3) accept(2) — 커널이 완성된 연결(3-way handshake 끝난 TCP의 경우)을 accept 큐에서
+ *      꺼내 새 소켓을 할당. 피어 주소 구조체(addr/addr6/addr_vm)에 기록.
+ *   4) nodelay 옵션이면 새 피어 소켓에도 TCP_NODELAY 적용(listenfd가 아닌 피어 소켓에
+ *      소켓 옵션이 상속되므로 재설정 필요).
+ *   5) reset_all_stats(td) — 연결 대기 중 누적된 기간/IOPS 통계 제거.
+ *   6) 원래 runstate 복원.
  *
- * 호출 체인: fio_netio_open_file → [fio_netio_accept] → accept(2)/poll(2).
+ * UDP 흐름: connectionless라 accept 개념 자체가 없어 listenfd를 그대로 f->fd로 복사.
+ * 이후 recvfrom에서 피어 주소를 동적으로 캡처(응답 송신 시 사용).
+ *
+ * 실행 컨텍스트: 잡 스레드, open_file 경로. poll_wait은 무한 블로킹 가능(외부 SIGTERM
+ * 으로 깨어남).
+ * 호출 체인: fio_netio_open_file → [fio_netio_accept] → poll_wait → poll(2) + accept(2).
  */
 static int fio_netio_accept(struct thread_data *td, struct fio_file *f)
 {
@@ -1387,42 +1808,60 @@ static int fio_netio_send_open(struct thread_data *td, struct fio_file *f)
 /*
  * [한국어]
  * fio_netio_open_file - 잡 시작 시 실제 네트워크 연결/바인딩을 수행하는 엔진 콜백.
- * listen 옵션이면 accept, 아니면 connect. UDP의 경우 OPEN 핸드쉐이크까지 수행.
- * @return: 0=성공, 그 외=에러(자동으로 close 호출).
- * 호출 체인: td_io_open_file → [open_file] → accept/connect + UDP OPEN.
+ *
+ * @td: 잡 컨텍스트. @f: 이 연결을 대표할 fio_file(f->fd에 소켓 FD 기록됨).
+ * @return: 0=성공(잡 루프 진입 가능), 그 외=실패(fd=-1, 코어가 잡 중단).
+ *
+ * 코어(filesetup.c)가 잡 루프 시작 전 td_io_open_file()을 통해 호출. 본 엔진에서는
+ * 이 단계에서 비로소 실제 커널 리소스(connected 소켓 또는 accepted 소켓)가 만들어진다.
+ * init 단계에서는 단지 listenfd(서버) 또는 목적지 주소 구조체(클라)까지만 준비했다.
+ *
+ * 동작 흐름:
+ *   1) listen=1 → fio_netio_accept: TCP/VSOCK면 poll+accept, UDP면 listenfd를 그대로 fd로.
+ *   2) listen=0 → fio_netio_connect: socket(2)+setsockopt+connect(2).
+ *   3) UDP 추가 핸드쉐이크:
+ *      - td_write 잡(=클라) → send_open: LINK_OPEN 매직 sendto.
+ *      - td_read 잡(=서버)  → udp_recv_open: recvfrom으로 OPEN 대기, runstate를
+ *        TD_SETTING_UP으로 바꿔 통계에서 대기 시간을 분리한 뒤 복원.
+ *   4) 1~3 중 하나라도 실패하면 close_file로 자동 정리(fd leak 방지).
+ *
+ * 실행 컨텍스트: 잡 스레드. 서버 측은 accept/recvfrom에서 블로킹(외부 SIGTERM이
+ * fio_netio_terminate 경유로 깨움).
+ * 호출 체인: backend.c → td_io_open_file() → filesetup.c get_file_or_default
+ *            → [fio_netio_open_file] → {accept,connect,send_open,udp_recv_open,close_file}.
  */
 static int fio_netio_open_file(struct thread_data *td, struct fio_file *f)
 {
-	int ret;
-	struct netio_options *o = td->eo;
+	int ret;                                     /* [한국어] 하위 accept/connect/OPEN 반환. */
+	struct netio_options *o = td->eo;            /* [한국어] listen/proto 분기 판정용. */
 
-	if (o->listen)                               /* [한국어] 서버 모드 경로. */
+	if (o->listen)                               /* [한국어] 서버 모드 경로(accept 또는 UDP listenfd 재사용). */
 		ret = fio_netio_accept(td, f);
-	else                                         /* [한국어] 클라이언트 모드 경로. */
+	else                                         /* [한국어] 클라이언트 모드 경로(socket+connect). */
 		ret = fio_netio_connect(td, f);
 
-	if (ret) {                                   /* [한국어] 연결 실패 시 fd 무효화 후 반환. */
+	if (ret) {                                   /* [한국어] 연결 실패 시 fd 무효화 후 반환(코어가 잡 중단). */
 		f->fd = -1;
 		return ret;
 	}
 
-	if (is_udp(o)) {                             /* [한국어] UDP OPEN 핸드쉐이크 처리. */
-		if (td_write(td))                    /* [한국어] 송신 잡이면 OPEN 보냄. */
+	if (is_udp(o)) {                             /* [한국어] UDP는 connectionless라 애플리케이션 레벨 OPEN 핸드쉐이크 필요. */
+		if (td_write(td))                    /* [한국어] 송신 잡(클라이언트)이면 먼저 OPEN 메시지 송신. */
 			ret = fio_netio_send_open(td, f);
-		else {                               /* [한국어] 수신 잡이면 OPEN 수신 대기 — runstate 변경 구간. */
-			int state;
+		else {                               /* [한국어] 수신 잡(서버)이면 OPEN 대기 — runstate 분리로 통계 왜곡 방지. */
+			int state;                   /* [한국어] 원래 runstate 백업. */
 
-			state = td->runstate;
-			td_set_runstate(td, TD_SETTING_UP);
-			ret = fio_netio_udp_recv_open(td, f);
-			td_set_runstate(td, state);
+			state = td->runstate;        /* [한국어] 현재 상태 보존(TD_RUNNING 등). */
+			td_set_runstate(td, TD_SETTING_UP); /* [한국어] 대기 시간은 "설정 구간" 통계로 분리. */
+			ret = fio_netio_udp_recv_open(td, f); /* [한국어] OPEN 수신 시 td->start 시각 고정. */
+			td_set_runstate(td, state);  /* [한국어] 원 상태 복원. */
 		}
 	}
 
-	if (ret)                                     /* [한국어] 실패 시 자동 정리. */
+	if (ret)                                     /* [한국어] 어느 단계라도 실패 → 소켓 자동 정리(fd leak 방지). */
 		fio_netio_close_file(td, f);
 
-	return ret;
+	return ret;                                  /* [한국어] 0/에러 전파 — 0이면 잡 루프 진입 승인. */
 }
 
 /*
@@ -1647,8 +2086,31 @@ static int fio_netio_setup_listen_unix(struct thread_data *td, const char *path)
 /*
  * [한국어]
  * fio_netio_setup_listen_inet - IPv4/IPv6 TCP·UDP 서버 소켓 생성 및 bind.
- * SO_REUSEADDR/SO_REUSEPORT로 빠른 재시작 지원, 멀티캐스트(UDP v4)면 그룹 조인까지 수행.
- * 호출 체인: fio_netio_setup_listen → [setup_listen_inet].
+ *
+ * @td: 잡 컨텍스트(nd에 listenfd 기록).
+ * @port: 바인딩할 포트(호스트 엔디언 — 내부에서 htons로 네트워크 엔디언 변환).
+ * @return: 0=성공, 1=실패.
+ *
+ * 수행 순서:
+ *   1) proto에서 (domain, type) 결정(TCP SOCK_STREAM / UDP SOCK_DGRAM, IPv4/IPv6).
+ *   2) socket(2) — 서버 소켓 생성.
+ *   3) SO_REUSEADDR — TIME_WAIT 상태 포트 재사용(잡 재시작 시 bind 거부 방지).
+ *   4) SO_REUSEPORT(지원 시) — 다중 프로세스/스레드 동일 포트 bind 허용(커널이 accept/
+ *      datagram을 해시 기반으로 분산 — fio numjobs와 결합 시 로드 밸런싱).
+ *   5) set_window_size / set_mss — 사용자 지정 SO_RCVBUF/SO_SNDBUF/TCP_MAXSEG 적용.
+ *   6) filename이 설정된 경우 반드시 멀티캐스트 주소(224.0.0.0/4)여야 하며:
+ *      a) IP_ADD_MEMBERSHIP — 커널에 IGMPv2/v3 join 요청 전송(해당 그룹 멀티캐스트 수신).
+ *      b) imr_interface = o->intfc 있으면 해당 IP 인터페이스 / 없으면 INADDR_ANY(전 인터페이스).
+ *   7) 바인딩 주소 결정:
+ *      - IPv4: sin_addr = 멀티캐스트 그룹이면 그 주소, 아니면 INADDR_ANY(모든 인터페이스).
+ *      - IPv6: in6addr_any 고정(멀티캐스트 IPv6은 본 구현 미지원).
+ *   8) bind(2) — 주소/포트를 소켓에 할당.
+ *
+ * 주의: 본 함수는 listen(2)을 호출하지 않음 — 상위 fio_netio_setup_listen이 TCP인 경우에만
+ * listen(fd, 10)으로 accept 큐를 활성화한다. UDP는 연결 없이 bind만으로 수신 준비 완료.
+ *
+ * 호출 체인: fio_netio_setup_listen → [setup_listen_inet] → socket/bind/setsockopt +
+ *            IP_ADD_MEMBERSHIP(멀티캐스트).
  */
 static int fio_netio_setup_listen_inet(struct thread_data *td, short port)
 {
@@ -1779,35 +2241,35 @@ static int fio_netio_setup_listen_vsock(struct thread_data *td, short port, int 
 	int fd, opt;
 	socklen_t len;
 
-	fd = socket(AF_VSOCK, type, 0);              /* [한국어] VSOCK 소켓. */
-	if (fd < 0) {
+	fd = socket(AF_VSOCK, type, 0);              /* [한국어] AF_VSOCK 소켓 생성 — Linux transport(virtio-vsock/vhost-vsock)로 hypervisor↔guest 통신. */
+	if (fd < 0) {                                /* [한국어] EAFNOSUPPORT 등 — 커널 모듈 미로드 또는 권한 문제. */
 		td_verror(td, errno, "socket");
 		return 1;
 	}
 
 	opt = 1;
 	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (void *) &opt, sizeof(opt)) < 0) {
-		td_verror(td, errno, "setsockopt"); /* [한국어] 재바인딩 허용. */
-		close(fd);
+		td_verror(td, errno, "setsockopt"); /* [한국어] 재바인딩 허용(이전 잡의 소켓이 TIME_WAIT 상태인 경우 대비). */
+		close(fd);                           /* [한국어] 실패 시 FD leak 방지. */
 		return 1;
 	}
 
-	len = sizeof(*addr);
+	len = sizeof(*addr);                         /* [한국어] bind에 전달할 주소 길이. */
 
-	nd->addr_vm.svm_family = AF_VSOCK;
-	nd->addr_vm.svm_cid = VMADDR_CID_ANY;        /* [한국어] 어떤 CID에서 오는 연결이든 허용. */
-	nd->addr_vm.svm_port = port;
+	nd->addr_vm.svm_family = AF_VSOCK;           /* [한국어] family 고정 — bind/accept가 family 매칭 검사. */
+	nd->addr_vm.svm_cid = VMADDR_CID_ANY;        /* [한국어] 어떤 CID(Context ID)에서 오는 연결이든 허용. CID=0(hypervisor)/2(host)/3+(guest) 전부 수락. */
+	nd->addr_vm.svm_port = port;                 /* [한국어] VSOCK 포트(네트워크 바이트 순서 변환 불필요 — 커널이 호스트 엔디언 사용). */
 
-	if (bind(fd, (struct sockaddr *) addr, len) < 0) {
+	if (bind(fd, (struct sockaddr *) addr, len) < 0) { /* [한국어] VSOCK transport에 (CID_ANY, port) 바인딩. */
 		td_verror(td, errno, "bind");
 		close(fd);
 		return 1;
 	}
 
-	nd->listenfd = fd;
+	nd->listenfd = fd;                           /* [한국어] 바인딩된 소켓을 listenfd로 보존 — 이후 listen/accept 대상. */
 	return 0;
 #else
-	td_verror(td, -EINVAL, "vsock not supported");
+	td_verror(td, -EINVAL, "vsock not supported"); /* [한국어] CONFIG_VSOCK 미지원 빌드 — linux/vm_sockets.h 부재. */
 	return -1;
 #endif
 }
@@ -1820,219 +2282,378 @@ static int fio_netio_setup_listen_vsock(struct thread_data *td, short port, int 
  */
 static int fio_netio_setup_listen(struct thread_data *td)
 {
-	struct netio_data *nd = td->io_ops_data;
-	struct netio_options *o = td->eo;
-	int ret;
+	struct netio_data *nd = td->io_ops_data;     /* [한국어] listenfd 저장 대상. */
+	struct netio_options *o = td->eo;            /* [한국어] proto/port 참조. */
+	int ret;                                     /* [한국어] 하위 setup_listen_* 반환 코드. */
 
-	if (is_udp(o) || is_tcp(o))                  /* [한국어] IPv4/6 TCP/UDP. */
+	if (is_udp(o) || is_tcp(o))                  /* [한국어] IPv4/IPv6 TCP·UDP — inet 공통 경로(SO_REUSEADDR/PORT+bind+멀티캐스트 처리). */
 		ret = fio_netio_setup_listen_inet(td, o->port);
-	else if (is_vsock(o))                        /* [한국어] VSOCK은 STREAM. */
+	else if (is_vsock(o))                        /* [한국어] VSOCK 스트림 — STREAM type 전달(DGRAM은 본 엔진 미사용). */
 		ret = fio_netio_setup_listen_vsock(td, o->port, SOCK_STREAM);
-	else                                         /* [한국어] Unix 도메인. */
+	else                                         /* [한국어] Unix 도메인 — filename이 소켓 파일 경로. */
 		ret = fio_netio_setup_listen_unix(td, td->o.filename);
 
-	if (ret)
+	if (ret)                                     /* [한국어] 프로토콜별 bind 실패 시 그대로 전파. */
 		return ret;
-	if (is_udp(o))                               /* [한국어] UDP는 listen 단계 생략. */
+	if (is_udp(o))                               /* [한국어] UDP는 connectionless — listen(2)/accept(2) 단계 생략. */
 		return 0;
 
-	if (listen(nd->listenfd, 10) < 0) {          /* [한국어] 백로그 10 — 대기 중 미완료 연결 큐 한계. */
+	if (listen(nd->listenfd, 10) < 0) {          /* [한국어] TCP listen(2) — backlog=10 (3-way handshake 완료 후 accept 대기 큐 한계). 실제 한계는 min(10, net.core.somaxconn). fio 테스트 규모에서는 충분. SYN queue(SYN-ACK 대기)는 net.ipv4.tcp_max_syn_backlog로 별도 관리. */
 		td_verror(td, errno, "listen");
-		nd->listenfd = -1;
+		nd->listenfd = -1;                   /* [한국어] 실패 표시 — cleanup이 close(-1)를 건너뛰도록. */
 		return 1;
 	}
 
-	return 0;
+	return 0;                                    /* [한국어] listen 완료 — 이후 open_file에서 accept로 진입. */
 }
 
 /*
  * [한국어]
- * fio_netio_init - net 엔진 초기화 콜백
+ * fio_netio_init - net/netsplice 엔진의 init 콜백(ioengine_ops.init).
  *
- * listen 모드이면 소켓을 생성하고 bind/listen하여 클라이언트 연결을 대기하고,
- * 그렇지 않으면 connect 주소를 설정한다. 프로토콜별(TCP/UDP/Unix/VSOCK)로
- * 적절한 소켓 생성 및 주소 구조체 초기화를 수행한다.
+ * @td:     잡 컨텍스트(옵션/runstate 접근).
+ * @return: 0=성공(다음 단계 open_file 진입 가능), 1=실패(잡 중단).
  *
- * 호출 체인: td_io_init() → [이 함수] → socket(2)/bind(2)/listen(2)
+ * 잡 시작 시 ioengines.c가 td_io_init()을 통해 호출하며, 이 시점에 setup 단계는
+ * 이미 완료된 상태(netio_data 할당, fio_file 등록 완료). 본 함수는 다음을 수행:
+ *   1) Windows 플랫폼이면 WSAStartup로 Winsock 2.2 DLL을 프로세스 당 1회 로드.
+ *   2) td_random 방지 — 네트워크 소켓은 오프셋 개념이 없어 "랜덤 I/O"가 무의미.
+ *   3) 프로토콜별 port 필수성 검증(UNIX는 포트 무관, VSOCK/TCP/UDP는 필수).
+ *   4) 서브잡 번호만큼 port에 오프셋 추가 — numjobs>1 잡이 겹치지 않도록.
+ *   5) TCP/VSOCK가 아닌 경우(UDP/UNIX): listen은 TCP만 허용, td_rw 금지,
+ *      UNIX는 filename 필수, 그리고 listen을 td_read(td)로 자동 결정.
+ *   6) listen이면 setup_listen(서버 경로), 아니면 setup_connect(클라 경로) 호출.
+ *
+ * 실행 컨텍스트: 잡 스레드, 단 1회. 실패 시 잡은 즉시 중단되고 cleanup으로 진입.
+ * 호출 체인: td_io_init() → [fio_netio_init] → fio_netio_setup_listen |
+ *                                                  fio_netio_setup_connect.
  */
 static int fio_netio_init(struct thread_data *td)
 {
-	struct netio_options *o = td->eo;
-	int ret;
+	struct netio_options *o = td->eo;            /* [한국어] 파싱된 엔진 옵션(proto/port/listen/...) */
+	int ret;                                     /* [한국어] 하위 setup_* 반환 코드 */
 
 #ifdef WIN32
-	WSADATA wsd;                                 /* [한국어] Winsock 2.2 초기화(DLL 로드). */
-	WSAStartup(MAKEWORD(2,2), &wsd);
+	WSADATA wsd;                                 /* [한국어] Winsock 2.2 초기화 결과 — DLL 버전/기능 집합 저장. */
+	WSAStartup(MAKEWORD(2,2), &wsd);             /* [한국어] Windows 소켓 서브시스템 로드 — 반드시 socket(2) 이전에 호출 */
 #endif
 
-	if (td_random(td)) {                         /* [한국어] 네트워크는 순차 I/O만 유효(오프셋 개념 없음). */
+	if (td_random(td)) {                         /* [한국어] rw=randread/randwrite 잡 거부 — 네트워크 스트림은 offset 없음 */
 		log_err("fio: network IO can't be random\n");
 		return 1;
 	}
 
-	if (o->proto == FIO_TYPE_UNIX && o->port) {  /* [한국어] UNIX 도메인은 포트 개념 없음. */
+	if (o->proto == FIO_TYPE_UNIX && o->port) {  /* [한국어] UNIX 도메인 소켓은 파일시스템 경로 기반 — port= 옵션 의미 없음 */
 		log_err("fio: network IO port not valid with unix socket\n");
 		return 1;
-	} else if (is_vsock(o) && !o->port) {        /* [한국어] VSOCK은 포트 필수. */
+	} else if (is_vsock(o) && !o->port) {        /* [한국어] VSOCK은 svm_port 필수 — 0 포트는 예약 */
 		log_err("fio: network IO requires port for vsock\n");
 		return 1;
-	} else if (o->proto != FIO_TYPE_UNIX && !o->port) { /* [한국어] TCP/UDP도 포트 필수. */
+	} else if (o->proto != FIO_TYPE_UNIX && !o->port) { /* [한국어] TCP/UDP도 port 필수(well-known 0 불가) */
 		log_err("fio: network IO requires port for tcp or udp\n");
 		return 1;
 	}
 
-	o->port += td->subjob_number;                /* [한국어] 서브잡 번호별로 포트 오프셋(다수 잡 분산용). */
+	o->port += td->subjob_number;                /* [한국어] numjobs>1 서브잡 포트 자동 분산(subjob_number=0..n-1) */
 
-	if (!is_tcp(o) && !is_vsock(o)) {            /* [한국어] UDP/UNIX만 해당되는 제약 검증 블록. */
+	if (!is_tcp(o) && !is_vsock(o)) {            /* [한국어] UDP/UNIX 전용 추가 제약 — 이 블록 안에서 listen/방향 규약 결정 */
 		if (o->listen) {
-			log_err("fio: listen only valid for TCP proto IO\n"); /* [한국어] listen= 옵션 오용. */
+			log_err("fio: listen only valid for TCP proto IO\n"); /* [한국어] UDP/UNIX에서는 listen= 명시적 설정 금지(자동 결정) */
 			return 1;
 		}
-		if (td_rw(td)) {                     /* [한국어] 데이터그램/UNIX는 읽기 또는 쓰기 중 하나만. */
+		if (td_rw(td)) {                     /* [한국어] rw=readwrite 잡 금지 — 데이터그램은 양방향 잡 규약 없음 */
 			log_err("fio: datagram network connections must be"
 				   " read OR write\n");
 			return 1;
 		}
 		if (o->proto == FIO_TYPE_UNIX && !td->o.filename) {
-			log_err("fio: UNIX sockets need host/filename\n"); /* [한국어] Unix 소켓 경로 필수. */
+			log_err("fio: UNIX sockets need host/filename\n"); /* [한국어] Unix 소켓은 filename= 또는 hostname=으로 경로 필수 */
 			return 1;
 		}
-		o->listen = td_read(td);             /* [한국어] 읽기면 서버, 쓰기면 클라이언트로 자동 지정. */
+		o->listen = td_read(td);             /* [한국어] read 잡=서버(listen=1), write 잡=클라(listen=0) 자동 매핑 */
 	}
 
 	if (o->listen)
-		ret = fio_netio_setup_listen(td);    /* [한국어] 서버 경로. */
+		ret = fio_netio_setup_listen(td);    /* [한국어] 서버 경로 — socket+bind+(TCP)listen */
 	else
-		ret = fio_netio_setup_connect(td);   /* [한국어] 클라이언트 경로. */
+		ret = fio_netio_setup_connect(td);   /* [한국어] 클라이언트 경로 — getaddrinfo+주소 구조체 채움(socket/connect는 open_file에서) */
 
-	return ret;
+	return ret;                                  /* [한국어] 0/1 전파 — 1이면 잡 중단 */
 }
 
 /*
  * [한국어]
- * fio_netio_cleanup - 엔진 종료 시 자원 반환(ioengine_ops.cleanup).
- * listenfd/파이프 FD를 닫고 netio_data 할당 해제. td->io_ops_data는 잡 스레드 전용이라 락 불필요.
- * 호출 체인: td_io_cleanup() → [fio_netio_cleanup].
+ * fio_netio_cleanup - ioengine_ops.cleanup 콜백. 엔진 종료 시 자원 반환.
+ *
+ * @td: 잡 컨텍스트(io_ops_data 접근).
+ *
+ * 잡 종료 시 ioengines.c가 td_io_cleanup으로 호출. init/setup에서 할당한 모든
+ * 자원(서버 소켓 listenfd, splice 파이프 쌍, netio_data 자체)을 해제한다.
+ * 클라이언트 소켓(f->fd)은 close_file에서 이미 generic_close_file로 닫혔으므로
+ * 여기서는 건드리지 않는다. nd==NULL 가드로 setup 실패 경로에서도 안전하게 호출.
+ *
+ * 실행 컨텍스트: 잡 스레드, 단 1회. 잡 스레드 전용 데이터라 락 불필요.
+ * 호출 체인: td_io_cleanup() → [fio_netio_cleanup] → close(2)/free(3).
  */
 static void fio_netio_cleanup(struct thread_data *td)
 {
-	struct netio_data *nd = td->io_ops_data;
+	struct netio_data *nd = td->io_ops_data;     /* [한국어] 잡별 상태 포인터 — NULL 가능(setup 실패). */
 
 	if (nd) {
-		if (nd->listenfd != -1)              /* [한국어] 서버 소켓 정리. */
+		if (nd->listenfd != -1)              /* [한국어] 서버 소켓이 있으면 닫음(accept 완료 후에도 listenfd는 별도로 유지되었음). */
 			close(nd->listenfd);
-		if (nd->pipes[0] != -1)              /* [한국어] splice 파이프 읽기쪽. */
+		if (nd->pipes[0] != -1)              /* [한국어] splice 변종의 읽기 파이프(커널 버퍼 소유) 해제. */
 			close(nd->pipes[0]);
-		if (nd->pipes[1] != -1)              /* [한국어] splice 파이프 쓰기쪽. */
+		if (nd->pipes[1] != -1)              /* [한국어] splice 변종의 쓰기 파이프 해제. */
 			close(nd->pipes[1]);
 
-		free(nd);                            /* [한국어] 구조체 자체 해제. */
+		free(nd);                            /* [한국어] 구조체 본체(calloc) 해제. */
 	}
 }
 
 /*
  * [한국어]
- * fio_netio_setup - 엔진 setup 콜백(init 이전에 호출). fio_file 등록 및 netio_data 할당.
- * 파일명이 제공되지 않으면 가상 이름 "net"으로 파일을 하나 추가해 fio의 I/O 경로와 호환시킴.
- * 호출 체인: load_ioengine → [fio_netio_setup] → add_file.
+ * fio_netio_setup - 엔진 setup 콜백(ioengine_ops.setup).
+ *
+ * @td: 잡 컨텍스트(files/io_ops_data 초기화 대상).
+ * @return: 0=성공(init 진행 허용), 그 외=실패(잡 중단).
+ *
+ * 코어(ioengines.c)가 load_ioengine으로 엔진을 td->io_ops에 연결한 직후 init 이전에
+ * 한 번 호출한다. 본 엔진에서는 두 가지를 처리한다:
+ *   1) 가상 파일 등록: 네트워크 엔진은 실제 파일시스템 파일이 없지만 fio의 I/O 경로가
+ *      모두 fio_file 단위로 설계되어 있어, 사용자가 filename=을 지정하지 않아도 "net"이
+ *      라는 더미 이름으로 add_file을 호출해 files_index/nr_files/open_files를 채운다.
+ *      이는 생성된 더미 fio_file이 이후 open_file/queue/close_file의 f 파라미터로
+ *      전달되어 f->fd에 진짜 소켓 FD가 들어가는 구조이기 때문이다.
+ *   2) netio_data(잡별 런타임 상태) 할당: calloc으로 0 초기화 후 FD 슬롯 -1 초기값.
+ *      재호출 안전(netsplice의 fio_netio_setup_splice가 본 함수를 감싼 뒤 pipe(2)로
+ *      파이프를 추가 생성).
+ *
+ * 실행 컨텍스트: 잡 스레드, init 이전 단 1회.
+ * 호출 체인: ioengines.c td_io_init 초기 단계 → td->io_ops->setup()
+ *            → [fio_netio_setup] → add_file() + calloc(3).
  */
 static int fio_netio_setup(struct thread_data *td)
 {
-	struct netio_data *nd;
+	struct netio_data *nd;                       /* [한국어] 할당할 netio_data 임시 포인터. */
 
-	if (!td->files_index) {                      /* [한국어] 아직 파일이 등록되지 않았다면 가상 파일 추가. */
-		add_file(td, td->o.filename ?: "net", 0, 0);
-		td->o.nr_files = td->o.nr_files ?: 1;
-		td->o.open_files++;
+	if (!td->files_index) {                      /* [한국어] 아직 파일이 등록되지 않았다면(filename= 미지정 & nr_files=0) 가상 파일 추가. */
+		add_file(td, td->o.filename ?: "net", 0, 0); /* [한국어] filename이 있으면 그 값을 파일명으로, 없으면 "net" 상수 — 로깅/표시용. */
+		td->o.nr_files = td->o.nr_files ?: 1; /* [한국어] 최소 1개 파일 보장. */
+		td->o.open_files++;                  /* [한국어] 열려 있는 파일 수 카운트 증가(잡 통계 meta). */
 	}
 
-	if (!td->io_ops_data) {                      /* [한국어] 첫 호출에서만 netio_data 할당. */
-		nd = calloc(1, sizeof(*nd));
-		nd->listenfd = -1;                   /* [한국어] 초기 무효값. */
-		nd->pipes[0] = nd->pipes[1] = -1;    /* [한국어] 파이프 아직 미생성. */
-		td->io_ops_data = nd;
+	if (!td->io_ops_data) {                      /* [한국어] 중복 호출 시(예: setup_splice가 본 함수 호출 후 추가 작업) 재할당 방지. */
+		nd = calloc(1, sizeof(*nd));         /* [한국어] 모든 필드 0 초기화 — 카운터/플래그의 안전한 기본값. */
+		nd->listenfd = -1;                   /* [한국어] 초기 무효 FD — cleanup 시 close(-1) 방지. */
+		nd->pipes[0] = nd->pipes[1] = -1;    /* [한국어] 파이프 미생성 상태 표시(netsplice만 나중에 채움). */
+		td->io_ops_data = nd;                /* [한국어] 코어 스트럭에 endpoint 연결 — 이후 모든 콜백이 td->io_ops_data로 접근. */
 	}
 
-	return 0;
+	return 0;                                    /* [한국어] 성공 — init 단계 진행 허용. */
 }
 
 /*
  * [한국어]
- * fio_netio_terminate - 외부 종료 요청 시 현재 잡 프로세스에 SIGTERM 송신.
- * 블로킹 poll/recv 중인 잡을 깨우기 위한 용도. 호출 체인: 종료 핸들러 → [terminate] → kill(2).
+ * fio_netio_terminate - 외부 종료 요청 수신 시 잡 프로세스에 SIGTERM self-send.
+ *
+ * @td: 잡 컨텍스트(.pid가 잡 프로세스/스레드 식별자).
+ *
+ * fio 코어는 사용자 Ctrl-C, runtime 만료, 타 잡 에러 등으로 terminate_threads()를
+ * 호출할 때 각 엔진의 .terminate 콜백을 시도한다. 본 동기 엔진은 queue 내부에서
+ * blocking send/recv/poll에 갇혀 있을 수 있어, 단순히 td->terminate=1을 설정하는
+ * 것만으로는 즉시 반응하지 못한다. 따라서 kill(2)로 SIGTERM을 자기 자신에게 전송해
+ * blocking syscall이 EINTR로 풀려나오도록 강제한다. poll_wait / fio_netio_send /
+ * fio_netio_recv 는 EINTR을 감지하면 td->terminate 를 재검사해 루프를 빠져나간다.
+ *
+ * 실행 컨텍스트: 다른 스레드(시그널/모니터 스레드) 또는 같은 잡 스레드에서 호출 가능.
+ * kill(2)은 async-signal-safe 하므로 동시성 안전.
+ * 호출 체인: backend.c terminate_threads() → td->io_ops->terminate()
+ *            → [fio_netio_terminate] → kill(SIGTERM).
  */
 static void fio_netio_terminate(struct thread_data *td)
 {
-	kill(td->pid, SIGTERM);                      /* [한국어] 잡 프로세스/스레드에 종료 시그널. */
+	kill(td->pid, SIGTERM);                      /* [한국어] 잡 프로세스/스레드에 SIGTERM — blocking syscall을 EINTR로 깨움(POSIX 기본 핸들러=종료지만 fio가 사전에 핸들러 설치). */
 }
 
 #ifdef CONFIG_LINUX_SPLICE
 /*
  * [한국어]
- * fio_netio_setup_splice - netsplice 엔진 전용 setup(공통 setup + 파이프 생성).
- * pipe(2)로 익명 파이프를 만들어 splice/vmsplice 경로 활성화.
- * 호출 체인: load_ioengine(netsplice) → [setup_splice] → fio_netio_setup + pipe(2).
+ * fio_netio_setup_splice - netsplice 엔진 전용 setup 콜백.
+ *
+ * @td: 잡 컨텍스트.
+ * @return: 0=성공, 1=실패(잡 중단).
+ *
+ * netsplice 엔진에만 사용되는 .setup 콜백. 공통 fio_netio_setup()을 먼저 호출해
+ * fio_file 등록과 netio_data 할당을 마친 뒤, pipe(2)로 익명 파이프를 한 쌍 더 만들어
+ * 두 가지 제로카피 경로에 사용한다:
+ *   - splice(2) 경로 : 소켓↔파이프 페이지 이동(커널이 페이지 참조만 옮김, copy X).
+ *   - vmsplice(2) 경로: 유저 버퍼(io_u->xfer_buf)↔파이프 사이 페이지 매핑(GIFT 옵션
+ *                         으로 페이지 소유권을 커널에 넘기면 copy 완전 회피).
+ * 완성된 경로: READ = 소켓 →splice→ 파이프 →vmsplice→ 유저 버퍼.
+ *              WRITE = 유저 버퍼 →vmsplice→ 파이프 →splice→ 소켓.
+ *
+ * nd->use_splice=1로 설정하면 __fio_netio_queue가 TCP 경로에 한해 splice 변종을
+ * 선택한다(UDP/UNIX는 여전히 send/recv로 폴백 — splice는 스트림 소켓에서만 유용).
+ *
+ * CONFIG_LINUX_SPLICE가 정의되지 않은 플랫폼(BSD/macOS/Windows)에서는 아예 이 함수도
+ * 존재하지 않고 엔진 자체도 등록되지 않는다(파일 하단 register 생성자의 #ifdef 분기).
+ *
+ * 실행 컨텍스트: 잡 스레드, init 이전 1회.
+ * 호출 체인: ioengines.c td_io_init → ioengine_splice.setup → [setup_splice]
+ *            → fio_netio_setup() + pipe(2).
  */
 static int fio_netio_setup_splice(struct thread_data *td)
 {
-	struct netio_data *nd;
+	struct netio_data *nd;                       /* [한국어] 공통 setup에서 할당한 구조체 포인터. */
 
-	fio_netio_setup(td);                         /* [한국어] 공통 setup 먼저 수행. */
+	fio_netio_setup(td);                         /* [한국어] 공통 setup 먼저 수행(파일 등록 + calloc + FD 슬롯 -1 초기화). */
 
-	nd = td->io_ops_data;
+	nd = td->io_ops_data;                        /* [한국어] calloc 결과 — 이 시점엔 non-NULL 보장(setup이 성공했으면). */
 	if (nd) {
-		if (pipe(nd->pipes) < 0)             /* [한국어] read/write 파이프 쌍 생성. */
+		if (pipe(nd->pipes) < 0)             /* [한국어] 커널 익명 파이프 한 쌍 생성(pipes[0]=read, pipes[1]=write) — splice/vmsplice 중계 버퍼. */
 			return 1;
 
-		nd->use_splice = 1;                  /* [한국어] queue 분기에서 splice 경로 선택. */
+		nd->use_splice = 1;                  /* [한국어] queue 분기에서 splice_in/out 경로를 선택하도록 마킹. */
 		return 0;
 	}
 
-	return 1;
+	return 1;                                    /* [한국어] 공통 setup이 calloc 실패한 이례적 경로. */
 }
 
 /*
- * [한국어] netsplice 엔진 등록 메타(splice 기반 제로카피 엔진).
- *  - flags에 FIO_PIPEIO(파이프 중계), FIO_DISKLESSIO(디스크 없음) 포함.
+ * [한국어] netsplice 엔진 등록 메타(splice 기반 제로카피 엔진) — ioengine_ops vtable.
+ * fio 코어(ioengines.c)가 load_ioengine("netsplice") 시 이 구조체를 engine_list
+ * 에서 찾아 td->io_ops로 링크하고, 이후 잡 수명 동안 각 .xxx 콜백을 호출한다.
+ *
+ * CONFIG_LINUX_SPLICE 빌드에서만 등록된다(constructor 내부 #ifdef). 플래그에
+ * FIO_PIPEIO가 포함되어 fio 코어가 "파이프 중계 엔진"임을 인지하고 해당 최적화
+ * 경로(예: 파이프 기반 통계 처리)를 활성화한다. BIT_BASED 비트는 netsplice에는
+ * 부여하지 않음(bs= 단위가 "byte"만 허용 — splice 페이지 단위 요구).
  */
 static struct ioengine_ops ioengine_splice = {
 	.name			= "netsplice",
+	/* [한국어] 엔진 식별 문자열. 잡 파일의 `ioengine=netsplice`와 매칭.
+	 * 설정자: 이 초기화. 읽는 자: load_ioengine strcmp. 불변. */
+
 	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] ioengine ABI 버전. check_engine_ops가 불일치 시 로드 거부.
+	 * 설정자: 이 초기화. 읽는 자: register_ioengine. 불변. */
+
 	.prep			= fio_netio_prep,
+	/* [한국어] io_u를 queue 전에 준비(UDP ddir 방향 검증).
+	 * 반환: 0=정상, 1=잡 중단. 동기화: 잡 스레드 전용. */
+
 	.queue			= fio_netio_queue,
+	/* [한국어] io_u 제출 — 동기 엔진이라 내부에서 splice 완료까지 블로킹.
+	 * 반환: FIO_Q_COMPLETED/BUSY. 동기화: 잡 스레드 전용. */
+
 	.setup			= fio_netio_setup_splice,
+	/* [한국어] fio_file 등록 + netio_data calloc + pipe(2) 생성으로 splice 경로 활성.
+	 * 반환: 0=성공, 1=실패(잡 중단). 동기화: 잡 스레드 전용, init 전 1회. */
+
 	.init			= fio_netio_init,
+	/* [한국어] proto/listen/port 검증 후 setup_listen|setup_connect 디스패치.
+	 * 반환: 0=성공, 1=실패. 동기화: 잡 스레드 전용, 1회. */
+
 	.cleanup		= fio_netio_cleanup,
+	/* [한국어] listenfd/pipes[0]/[1]/netio_data 해제. init/setup과 대칭.
+	 * 동기화: 잡 스레드 전용, 1회. */
+
 	.open_file		= fio_netio_open_file,
+	/* [한국어] accept(2) 또는 connect(2) + UDP면 LINK_OPEN 핸드쉐이크.
+	 * 반환: 0=성공, 음수=실패(코어가 정리). */
+
 	.close_file		= fio_netio_close_file,
+	/* [한국어] UDP면 LINK_CLOSE 송신 후 generic_close_file(fd 정리).
+	 * 반환: 0=성공. */
+
 	.terminate		= fio_netio_terminate,
+	/* [한국어] 외부 종료 신호에 대응해 kill(SIGTERM)로 자신을 깨움 — blocking
+	 * poll/recv를 EINTR로 빠져나오게 함. 동기화: 임의 시그널 스레드에서 호출 가능
+	 * 하지만 kill(2)은 async-signal-safe. */
+
 	.options		= options,
+	/* [한국어] net/netsplice 공유 옵션 테이블 포인터. parse.c가 읽음. 불변. */
+
 	.option_struct_size	= sizeof(struct netio_options),
+	/* [한국어] td->eo에 할당할 옵션 구조체 크기. parse.c가 이 값으로 malloc. 불변. */
+
 	.flags			= FIO_SYNCIO | FIO_DISKLESSIO | FIO_UNIDIR |
 				  FIO_PIPEIO,
+	/* [한국어] 엔진 특성 플래그.
+	 *   FIO_SYNCIO    — 동기 엔진. queue 호출이 즉시 완료(실제로 내부 blocking 포함).
+	 *                    코어가 commit/getevents/event를 호출하지 않음.
+	 *   FIO_DISKLESSIO — 실제 파일/블록 디바이스 필요 없음. 코어가 파일 크기/존재
+	 *                    검증 건너뜀. netsplice는 "가짜 net 파일"만 등록.
+	 *   FIO_UNIDIR    — 잡을 read 또는 write 한 방향만 허용 (rw 불가).
+	 *                    UDP가 단방향 데이터그램인 점을 반영.
+	 *   FIO_PIPEIO    — 파이프 중계 엔진임을 공지 — splice/vmsplice의 파이프 의존성.
+	 * 미설정 비트 의미:
+	 *   FIO_RAWIO/NOEXTEND/MEMALIGN: 블록 디바이스 특성 — 네트워크 소켓에 무관.
+	 *   FIO_BIT_BASED: 비트 단위 크기 표기 — splice는 페이지 단위 제약이라 제외.
+	 *   FIO_ASYNCIO_*: 비동기 계약 — 본 엔진은 동기이므로 N/A. */
 };
 #endif
 
 /*
- * [한국어] 일반 "net" 엔진 등록 메타(send/recv 기반).
- *  - FIO_SYNCIO: 동기 I/O, FIO_DISKLESSIO: 디스크 의존 없음, FIO_UNIDIR: 한 방향 잡 지원,
- *    FIO_PIPEIO: 파이프 유사 성격, FIO_BIT_BASED: 비트 단위 크기 표기 허용.
+ * [한국어] 일반 "net" 엔진 등록 메타(send/recv 기반) — ioengine_ops vtable.
+ * splice 변종과 동일한 콜백 체인을 사용하되 .setup만 fio_netio_setup(파이프 생성 생략)
+ * 이며, flags에 FIO_BIT_BASED가 추가되어 bs=단위로 "8b"(비트) 같은 표기가 허용된다
+ * (유선 프로토콜 테스트에서 비트 단위 크기를 쓰는 경우 대비).
  */
 static struct ioengine_ops ioengine_rw = {
 	.name			= "net",
+	/* [한국어] 엔진 식별자. 잡파일 `ioengine=net`과 매칭. 불변. */
+
 	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] ABI 버전 가드. 불변. */
+
 	.prep			= fio_netio_prep,
+	/* [한국어] UDP ddir 방향 검증(listen=1과 WRITE, !listen과 READ 충돌 체크).
+	 * 반환: 0=정상, 1=잡 중단. */
+
 	.queue			= fio_netio_queue,
+	/* [한국어] io_u 제출. pingpong 시 1차 후 반대 방향 한 번 더.
+	 * 반환: FIO_Q_COMPLETED(부분 전송 포함), FIO_Q_BUSY(EMSGSIZE/전혀 진전 없음). */
+
 	.setup			= fio_netio_setup,
+	/* [한국어] fio_file 등록("net" 가짜) + netio_data calloc. init보다 먼저.
+	 * 반환: 0=성공. */
+
 	.init			= fio_netio_init,
+	/* [한국어] proto/listen/port 검증 후 setup_listen|setup_connect. 반환: 0/1. */
+
 	.cleanup		= fio_netio_cleanup,
+	/* [한국어] 잡 종료 시 소켓/구조체 해제. init/setup과 대칭. */
+
 	.open_file		= fio_netio_open_file,
+	/* [한국어] accept|connect + UDP LINK_OPEN 핸드쉐이크. */
+
 	.close_file		= fio_netio_close_file,
+	/* [한국어] UDP LINK_CLOSE + generic_close_file. */
+
 	.terminate		= fio_netio_terminate,
+	/* [한국어] SIGTERM self-send로 blocking poll 깨우기. */
+
 	.options		= options,
+	/* [한국어] 동일한 옵션 테이블을 netsplice와 공유. 불변. */
+
 	.option_struct_size	= sizeof(struct netio_options),
+	/* [한국어] td->eo 구조체 크기. 불변. */
+
 	.flags			= FIO_SYNCIO | FIO_DISKLESSIO | FIO_UNIDIR |
 				  FIO_PIPEIO | FIO_BIT_BASED,
+	/* [한국어] 엔진 특성 플래그.
+	 *   FIO_SYNCIO     — 동기 I/O. queue 완료 즉시 put_io_u.
+	 *   FIO_DISKLESSIO — 디스크 의존 없음.
+	 *   FIO_UNIDIR     — 한 방향 잡만 허용(UDP/UNIX에서 강제됨).
+	 *   FIO_PIPEIO     — 네트워크/파이프 성격 공지(일부 코어 분기 영향).
+	 *   FIO_BIT_BASED  — bs="8b" 같은 비트 단위 크기 표기 허용(네트워크 프로토콜
+	 *                    테스트의 비트 단위 측정을 위함).
+	 * 미설정 비트:
+	 *   FIO_RAWIO/MEMALIGN/NOEXTEND: 블록 디바이스 전용 — 무관.
+	 *   FIO_ASYNCIO_* : 비동기 계약 아님. */
 };
 
 /*
@@ -2057,27 +2678,49 @@ static int str_hostname_cb(void *data, const char *input)
 
 /*
  * [한국어]
- * fio_netio_register - 모듈 로드(init 생성자) 시 net/netsplice 엔진을 fio 코어에 등록.
- * fio_init 속성으로 인해 라이브러리/바이너리 로드 시 자동 호출.
- * 호출 체인: ELF constructor → [fio_netio_register] → register_ioengine().
+ * fio_netio_register - 빌트인 엔진 등록 생성자.
+ *
+ * @return: 없음.
+ *
+ * `fio_init` 속성(= GCC __attribute__((constructor)))에 의해 ELF .init_array 섹션
+ * 에 등록되어, libc 동적 로더(ld.so)가 main() 진입 전에 자동으로 호출한다.
+ * register_ioengine()은 flist_add_tail로 전역 engine_list(ioengines.c)에 링크하여,
+ * 이후 load_ioengine("net"|"netsplice") 호출 시 strcmp 매칭이 가능해진다.
+ *
+ * netsplice는 CONFIG_LINUX_SPLICE가 정의된 빌드에서만 등록된다 — splice(2)는 Linux
+ * 전용 syscall이라 BSD/macOS/Windows에서는 조건부 컴파일로 제외.
+ *
+ * 실행 컨텍스트: 프로세스 메인 스레드, main() 진입 전, 단 1회.
+ * 호출 체인: ELF loader(.init_array) → [fio_netio_register] → register_ioengine()
+ *                                                             → flist_add_tail().
  */
 static void fio_init fio_netio_register(void)
 {
-	register_ioengine(&ioengine_rw);             /* [한국어] 일반 "net" 엔진 등록. */
+	register_ioengine(&ioengine_rw);             /* [한국어] "net" 엔진을 전역 engine_list에 링크 — load_ioengine("net") 매칭 가능. */
 #ifdef CONFIG_LINUX_SPLICE
-	register_ioengine(&ioengine_splice);         /* [한국어] "netsplice" 엔진 등록(리눅스만). */
+	register_ioengine(&ioengine_splice);         /* [한국어] "netsplice" 엔진 등록 — Linux splice/vmsplice 빌드에서만 */
 #endif
 }
 
 /*
  * [한국어]
- * fio_netio_unregister - 모듈 언로드(exit 소멸자) 시 엔진 등록 해제.
- * 호출 체인: ELF destructor → [fio_netio_unregister] → unregister_ioengine().
+ * fio_netio_unregister - 빌트인 엔진 등록 해제 소멸자.
+ *
+ * @return: 없음.
+ *
+ * `fio_exit`(= __attribute__((destructor))) 속성에 의해 .fini_array 섹션에 등록되어
+ * main() 복귀(또는 atexit 체인) 후 자동 호출. 정적 바이너리에서는 동작상 불필요하나
+ * .so 빌드의 dlclose 대비 안전 장치 역할을 하며, 재적재(드물게 반복 dlopen)에도
+ * engine_list에 중복 엔트리가 남지 않도록 flist_del_init으로 노드를 해제한다.
+ *
+ * 실행 컨텍스트: 프로세스 종료 직전 메인 스레드, 단 1회.
+ * 호출 체인: ELF .fini_array / atexit → [fio_netio_unregister] → unregister_ioengine()
+ *                                                               → flist_del_init().
  */
 static void fio_exit fio_netio_unregister(void)
 {
-	unregister_ioengine(&ioengine_rw);
+	unregister_ioengine(&ioengine_rw);           /* [한국어] "net" 엔진 링크 해제. */
 #ifdef CONFIG_LINUX_SPLICE
-	unregister_ioengine(&ioengine_splice);
+	unregister_ioengine(&ioengine_splice);       /* [한국어] "netsplice" 엔진 해제(Linux 빌드만). */
 #endif
 }

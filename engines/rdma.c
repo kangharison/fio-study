@@ -2,46 +2,147 @@
  * [한국어 설명] RDMA I/O 엔진 구현 (rdma.c)
  *
  * === 파일의 역할 ===
- * fio의 I/O 엔진 플러그인 중 하나로, InfiniBand verbs(libibverbs)와 RDMA Connection
- * Manager(librdmacm)를 기반으로 RDMA(Remote Direct Memory Access) I/O를 수행한다.
- * RDMA 메모리 시맨틱(RDMA WRITE/READ — 원격 메모리에 직접 read/write)과 채널 시맨틱
- * (SEND/RECV — 전통적 메시지 전달)을 모두 지원하며, InfiniBand/RoCE/iWARP 프로토콜 위에서
- * 동작한다. 클라이언트는 --ioengine=rdma + hostname 옵션으로 원격 fio 서버에 접속하고,
- * 서버는 같은 엔진을 read 모드로 실행하여 listen한다. 본 파일은 엔진 플러그인 계약
- * (struct ioengine_ops)에 정의된 콜백들을 구현하여 fio 코어(backend.c, io_u.c)와 연동된다.
+ * fio의 I/O 엔진 플러그인 중 하나로, InfiniBand verbs(libibverbs, libibv_*)와
+ * RDMA Connection Manager(librdmacm, librdma_cm_*)를 결합해 RDMA(Remote Direct
+ * Memory Access) I/O를 수행한다. RDMA는 원격 호스트의 메모리를 CPU/OS 개입 없이
+ * NIC(HCA, Host Channel Adapter)이 직접 DMA로 읽고 쓰는 기술이며, 본 엔진은 두
+ * 시맨틱을 모두 지원한다:
+ *   1) "메모리 시맨틱"(MEM): IBV_WR_RDMA_WRITE / IBV_WR_RDMA_READ — 클라이언트가
+ *      자신의 로컬 버퍼와 서버가 노출한 원격 MR(Memory Region) 사이에 단방향 DMA
+ *      전송을 수행. 원격 CPU는 전혀 관여하지 않으며 RKEY와 remote address가 필요.
+ *   2) "채널 시맨틱"(CHA): IBV_WR_SEND / 사전 post한 RECV WR — 양측 모두 WR을 미리
+ *      걸어둬야 데이터 전송이 성립하며, 일반 메시지 송수신과 유사. 송신측 SEND가
+ *      수신측 미리 post된 RECV 버퍼로 직접 DMA된다.
+ *
+ * 한 fio 잡은 클라이언트(initiator/active)이거나 서버(target/passive)가 되며,
+ * hostname 옵션 유무 + td_read/td_write 방향으로 자동 결정된다(td_read=서버,
+ * td_write=클라이언트). 양쪽 fio 인스턴스는 같은 ioengine=rdma·port·verb·iodepth·
+ * blocksize 조합으로 실행되어야 핸드셰이크가 성립한다(blocksize·iodepth 불일치 시
+ * client_recv/server_recv가 거부).
+ *
+ * 동작 프로토콜은 InfiniBand(원생 IB), RoCE(RDMA over Converged Ethernet), iWARP
+ * (IETF의 RDMA-over-TCP) 모두 지원 — 차이는 librdmacm/libibverbs가 흡수한다.
+ *
+ * 본 엔진의 fio 콜백 매핑(ioengine_ops 계약, null.c 레퍼런스 §1 참조):
+ *   .setup    → fio_rdmaio_setup        : 더미 fio_file 생성 + rdmaio_data calloc
+ *   .init     → fio_rdmaio_init         : CM 채널·cm_id 생성·역할 결정·setup_listen|setup_connect
+ *   .post_init→ fio_rdmaio_post_init    : 모든 io_u 버퍼를 ibv_reg_mr 등록 + send_buf.rmt_us 채움
+ *   .prep     → fio_rdmaio_prep         : WR(sg_list/lkey/wr_id) 공통 필드 채움
+ *   .queue    → fio_rdmaio_queue        : io_us_queued 배열에 push (FIO_Q_QUEUED|BUSY)
+ *   .commit   → fio_rdmaio_commit       : 클라=fio_rdmaio_send / 서버=fio_rdmaio_recv 일괄 post
+ *   .getevents→ fio_rdmaio_getevents    : ibv_get_cq_event 블로킹 + cq_event_handler 수확
+ *   .event    → fio_rdmaio_event        : io_us_completed[0] 반환(FIFO shift)
+ *   .open_file→ fio_rdmaio_open_file    : td_read면 accept, 아니면 connect
+ *   .close_file→fio_rdmaio_close_file   : 종료 통지 SEND + rdma_disconnect + 자원 역순 해제
+ *   .cleanup  → fio_rdmaio_cleanup      : rdmaio_data free
+ *
+ * RKEY 교환 프로토콜(메모리 시맨틱 핸드셰이크):
+ *   1) 클라이언트가 SEND로 rdma_info_blk{mode, nr=iodepth, max_bs} 전송
+ *   2) 서버는 server_recv가 받은 mode/max_bs 검증 후 fio_rdmaio_accept에서 자신의
+ *      send_buf(post_init이 채워둔 rmt_us[]={buf,rkey,size} 배열)를 SEND로 회신
+ *   3) 클라이언트의 client_recv가 ntohl/__be64_to_cpu로 호스트 바이트순 복원 →
+ *      rd->rmt_us[]에 저장
+ *   4) 이후 매 I/O마다 클라이언트는 __rand % rmt_nr로 인덱스를 골라
+ *      sq_wr.wr.rdma.{rkey, remote_addr}에 채우고 IBV_WR_RDMA_WRITE/READ를 post
+ *   5) 클라이언트가 모든 I/O 완료 후 close_file에서 종료 통지 SEND →
+ *      서버 fio_rdmaio_recv가 td->done=1로 잡 종료
+ *
+ * 채널 시맨틱(SEND/RECV) 프로토콜:
+ *   - 서버는 commit마다 모든 io_u의 rq_wr를 ibv_post_recv (RNR 방지)
+ *   - 클라이언트가 IBV_WR_SEND로 post → 서버 측 미리 post된 rq_wr 버퍼로 DMA
+ *   - 클라이언트는 자체 connect 직후 500ms usleep으로 서버가 recv 충분히 post할
+ *     시간을 확보(첫 RNR/Receiver Not Ready 회피)
  *
  * === 전체 아키텍처에서의 위치 ===
- * fio의 일반적인 잡 실행 흐름 (fio.c → backend.c → ioengines.c → td_io_queue/commit/getevents)
- * 중 I/O 수행 계층에 위치한다. 이 엔진은 디스크 I/O가 아닌 네트워크(InfiniBand HCA) 기반
- * I/O이므로 FIO_DISKLESSIO·FIO_PIPEIO 플래그로 등록된다. 호출 체인:
- *   backend.c(thread_main) → ioengines.c(td_io_queue/commit/getevents) → 본 파일의 콜백
- *     → libibverbs(ibv_post_send/recv, ibv_poll_cq) / librdmacm(rdma_connect/accept)
- *     → 커널 RDMA 서브시스템(uverbs) → HCA 드라이버(mlx5/mlx4 등) → NIC 하드웨어
- * 실행 컨텍스트는 fio 잡 스레드(호스트 유저스페이스) 및 별도 RDMA CM 이벤트 스레드
- * (pthread로 분리 가능)이며, 하드웨어 완료 통지는 CQ(Completion Queue) 이벤트 채널로 수신한다.
+ * fio의 일반적인 잡 실행 흐름 (fio.c → backend.c → ioengines.c → td_io_*)
+ * 중 I/O 수행 계층(엔진 플러그인)에 위치한다. 이 엔진은 디스크 I/O가 아닌 네트워크
+ * (InfiniBand HCA) 기반 I/O이므로 FIO_DISKLESSIO·FIO_UNIDIR·FIO_PIPEIO 플래그로
+ * 등록된다. 호출 체인:
+ *   backend.c(thread_main) → ioengines.c(td_io_queue/commit/getevents/event) →
+ *     본 파일의 fio_rdmaio_* 콜백 → libibverbs(ibv_post_send/recv, ibv_poll_cq,
+ *     ibv_get_cq_event) / librdmacm(rdma_connect/accept/resolve_addr) →
+ *     커널 RDMA 서브시스템(/dev/infiniband/uverbsN, /dev/infiniband/rdma_cm) →
+ *     HCA 드라이버(mlx5_ib/mlx4_ib/qedr/cxgb4 등) → NIC 하드웨어 doorbell →
+ *     wire(IB/RoCE/iWARP) → 원격 HCA → 원격 메모리 DMA
+ *
+ * 실행 컨텍스트:
+ *   - 잡 스레드(td->io_ops_data 소유): 모든 fio_rdmaio_* 콜백이 여기서 실행됨
+ *   - libibverbs 비동기 완료: HCA 인터럽트 → 커널 → comp_channel fd 알림 →
+ *     ibv_get_cq_event 블로킹 해제 → ibv_poll_cq로 CQE 수확 (모두 잡 스레드 내)
+ *   - rdmaio_data.cmthread 필드는 예약되어 있으나 현 구현은 별도 CM 스레드를
+ *     생성하지 않고 잡 스레드가 rdma_get_cm_event를 직접 블로킹 호출
+ *
+ * QP(Queue Pair) 상태 머신:
+ *   RESET → INIT → RTR(Ready To Receive) → RTS(Ready To Send) → ERR(에러시)
+ *   본 엔진은 rdma_cm이 ibv_modify_qp로 INIT/RTR/RTS 전이를 자동 수행하므로
+ *   직접 ibv_modify_qp를 호출하지 않는다. 단 QP가 ERR로 빠지면 모든 후속
+ *   ibv_post_send/recv가 실패하므로 cq_event_handler의 wc.status 검사가 중요.
  *
  * === 타 모듈과의 연결 ===
- * 의존: libibverbs(verbs API, struct ibv_qp/cq/pd/mr), librdmacm(rdma_cm_id, 이벤트 채널),
- * fio 내부 모듈 ../fio.h(thread_data, io_u, fio_file), ../hash.h, ../optgroup.h(옵션 그룹).
- * 본 파일에 의존: ioengines.c의 register_ioengine()를 통해 런타임에 동적으로 엔진 테이블에 등록된다.
- * 데이터 흐름: fio 코어가 할당한 io_u 버퍼 → ibv_reg_mr로 NIC이 DMA할 수 있는 MR(Memory Region)
- * 등록 → QP(Queue Pair)에 WR(Work Request) 포스트 → HCA가 DMA로 원격 메모리로 전송/수신
- * → CQ에 CQE(Completion Queue Entry) 기록 → ibv_poll_cq로 수확 → fio의 io_u 완료로 보고.
- * 공유 상태: struct rdmaio_data가 td->io_ops_data에 저장되어 잡 스레드 내부에서만 접근된다.
+ * 의존:
+ *   - libibverbs: 사용 API = ibv_alloc_pd, ibv_reg_mr, ibv_dereg_mr,
+ *     ibv_create_cq, ibv_destroy_cq, ibv_create_comp_channel,
+ *     ibv_destroy_comp_channel, ibv_req_notify_cq, ibv_get_cq_event,
+ *     ibv_ack_cq_events, ibv_poll_cq, ibv_post_send, ibv_post_recv,
+ *     ibv_dealloc_pd, ibv_destroy_qp, ibv_wc_status_str. 핵심 타입:
+ *     struct ibv_qp/cq/pd/mr/sge/send_wr/recv_wr/wc/comp_channel.
+ *   - librdmacm: rdma_create_event_channel, rdma_create_id, rdma_resolve_addr,
+ *     rdma_resolve_route, rdma_connect, rdma_listen, rdma_bind_addr,
+ *     rdma_accept, rdma_disconnect, rdma_create_qp, rdma_destroy_id,
+ *     rdma_get_cm_event, rdma_ack_cm_event. 핵심 타입: struct rdma_cm_id,
+ *     rdma_event_channel, rdma_cm_event, rdma_conn_param.
+ *   - 표준 BSD 소켓: sockaddr_in, htons/ntohl, inet_aton, gethostbyname.
+ *   - fio 내부: ../fio.h(thread_data/io_u/fio_file/ioengine_ops/dprint/log_*),
+ *     ../hash.h(GOLDEN_RATIO_64 시드), ../optgroup.h(FIO_OPT_G_RDMA 그룹).
+ *   - 커널: /dev/infiniband/* 캐릭터 디바이스, MEMLOCK rlimit (pinned memory).
+ *
+ * 본 파일에 의존:
+ *   - ioengines.c: register_ioengine(&ioengine)으로 런타임에 전역 엔진 리스트에 링크
+ *   - backend.c: 잡 루프가 ioengine_ops 콜백을 호출하는 유일한 진입 경로
+ *
+ * 데이터 흐름:
+ *   fio 코어 io_u 할당 → io_u->buf(orig_buffer 풀에서 슬라이스) → post_init이
+ *   ibv_reg_mr로 LOCAL_WRITE|REMOTE_READ|REMOTE_WRITE 권한으로 등록 →
+ *   io_u->mr->lkey를 sq_wr.sg_list[0].lkey에 저장 → queue가 io_us_queued에 적재
+ *   → commit이 fio_rdmaio_send/recv로 ibv_post_send/recv → HCA가 DMA로 wire 전송
+ *   → 원격 HCA가 원격 MR로 DMA 쓰기/읽기 → 송신측 HCA가 ACK 수신 후 CQE 생성 →
+ *   comp_channel fd 알림 → ibv_get_cq_event 해제 → ibv_poll_cq → cq_event_handler가
+ *   wc.wr_id로 io_us_flight[i] 식별 → swap-remove 후 io_us_completed에 append →
+ *   getevents가 카운트 반환 → event가 FIFO shift로 io_u 반환 → fio가 put_io_u.
+ *
+ * 공유 상태: struct rdmaio_data가 td->io_ops_data에 저장되어 잡 스레드 내부에서만
+ * 접근. 여러 잡 간 공유 자원 없음(fio가 잡 단위로 격리). librdmacm/libibverbs는
+ * 내부적으로 fork 후 RDMA 자원 사용을 금지하므로 use_thread=1이 권장되지만 본
+ * 엔진은 명시적으로 강제하지 않는다(사용자가 잡 파일에 thread=1 지정 권장).
  *
  * === 주요 함수/구조체 요약 ===
- * - struct rdmaio_data: 엔진 인스턴스 상태(QP/CQ/PD/MR, 연결 상태, io_u 큐 3종 등)
- * - struct rdma_io_u_data: io_u별 WR 기술자(send/recv WR, SGE)
- * - struct rdma_info_blk: 클라이언트-서버 간 제어 메시지(mode, rkey, remote addr 등)
- * - fio_rdmaio_init/post_init: CM 이벤트 채널 준비, QP 생성, io_u 버퍼 MR 등록
- * - fio_rdmaio_prep/queue/commit: 각 I/O를 WR로 변환하고 ibv_post_send/recv로 제출
- * - fio_rdmaio_getevents/event: ibv_poll_cq로 완료 수집 후 fio에 io_u 단위로 반환
- * - cq_event_handler: CQE 1개를 파싱해 flight → completed 상태로 전이
- * - fio_rdmaio_connect/accept: 클라이언트·서버 측 핸드셰이크 및 원격 MR 정보 교환
+ * - struct rdmaio_options: 사용자 옵션(hostname/port/verb/bindname) — td->eo
+ * - struct rdmaio_data:    엔진 인스턴스 상태(PD/CQ/QP/MR, cm_id, io_us_*[3], 기타)
+ * - struct rdma_io_u_data: io_u별 WR 템플릿(sq_wr/rq_wr/rdma_sgl/wr_id) — io_u->engine_data
+ * - struct rdma_info_blk:  클라-서버 제어 메시지(mode/nr/max_bs/rmt_us[512])
+ * - struct remote_u:       원격 MR 1개의 정보(buf/rkey/size) — rmt_us 원소
+ * - enum rdma_io_mode:     5종 모드(UNKNOWN/MEM_WRITE/MEM_READ/CHA_SEND/CHA_RECV)
+ * - fio_rdmaio_init/post_init/setup: 엔진 초기화 3단(setup→init→post_init 순서)
+ * - fio_rdmaio_setup_qp:   PD/comp_channel/CQ/QP 4종 자원 일괄 생성
+ * - fio_rdmaio_setup_control_msg_buffers: 제어 메시지용 send/recv MR + WR 템플릿
+ * - fio_rdmaio_setup_connect: 클라 측 resolve_addr/route + setup_qp + post recv
+ * - fio_rdmaio_setup_listen:  서버 측 bind/listen + CONNECT_REQUEST 대기 + setup_qp
+ * - fio_rdmaio_connect/accept: 클라/서버 핸드셰이크(rdma_connect|accept + 첫 메시지)
+ * - fio_rdmaio_prep/queue/commit/send/recv/queued: I/O 제출 파이프라인
+ * - cq_event_handler:      ibv_poll_cq로 CQE 수확 후 io_us_flight→io_us_completed 전이
+ * - rdma_poll_wait:        ibv_get_cq_event 블로킹 + cq_event_handler 호출 래퍼
+ * - get_next_channel_event: rdma_get_cm_event 동기 래퍼(특정 이벤트 기대)
+ * - client_recv/server_recv: cq_event_handler가 호출하는 제어 메시지 파서
+ * - aton:                  IPv4 문자열/호스트명 → sockaddr_in 변환
+ * - check_set_rlimits:     RLIMIT_MEMLOCK을 io 버퍼 크기 이상으로 확장
+ * - compat_options:        구형 filename="host/port/mode" 포맷 하위호환 파서
+ * - fio_rdmaio_register/unregister: constructor/destructor 진입점
  *
  * === fio에서의 사용법 ===
- * --ioengine=rdma 옵션으로 선택하며 hostname, port, verb(write/read/send/recv), bindname
- * 서브옵션을 받는다. verb=write/read는 RDMA 메모리 시맨틱, send/recv는 채널 시맨틱이다.
+ * --ioengine=rdma 옵션으로 선택하며 hostname, port, verb(write/read/send/recv),
+ * bindname 서브옵션을 받는다. verb=write/read는 RDMA 메모리 시맨틱(직접 DMA),
+ * send/recv는 채널 시맨틱(메시지). 서버는 hostname 없이 port만 지정하고 read 잡으로
+ * 실행, 클라이언트는 hostname=서버주소·write 잡으로 실행. 양측 iodepth/bs 일치 필수.
  *
  * === 구현하는 주요 콜백 ===
  * .setup, .init, .post_init, .prep, .queue, .commit,
@@ -72,65 +173,124 @@
  *	   td->done as true.
  *
  */
-/* [한국어] 표준 C 라이브러리 헤더들 — printf/log 출력, malloc/free, read/write/close,
- *         errno, assert 등 엔진 구현 전반에서 사용하는 기본 인프라 */
+/* [한국어] 표준 C — log_err/log_info의 형식 문자열 인자 카탈로그(%m 등 GNU 확장 포함). */
 #include <stdio.h>
+/* [한국어] malloc/calloc/free/strtol — rdmaio_data·io_us_*[] 큐 배열·rmt_us 동적 할당과
+ *         compat_options의 port 문자열 → 정수 변환에 사용. */
 #include <stdlib.h>
+/* [한국어] usleep — fio_rdmaio_connect 말미의 500ms RNR 회피 대기에서 사용.
+ *         POSIX 표준이며 nanosleep으로의 대체 가능하지만 가독성을 위해 usleep 채택. */
 #include <unistd.h>
+/* [한국어] errno + strerror — gethostbyname/setrlimit/getrlimit 실패 시 시스템 에러 보고용. */
 #include <errno.h>
+/* [한국어] assert — 디버그 빌드에서 불변식 검사(현재 코드에는 직접 호출 없음, 헤더 의존성 흡수). */
 #include <assert.h>
-/* [한국어] BSD 소켓·주소 변환 헤더 — rdma_cm이 sockaddr_in을 사용하므로 필요.
- *         inet_aton/gethostbyname으로 호스트명을 IP 주소로 변환한다. */
+/* [한국어] sockaddr_in/in_addr/INADDR_ANY/htons/htonl/ntohl — RDMA CM이 BSD 소켓
+ *         주소 표현을 그대로 사용하므로 필수. setup_listen의 INADDR_ANY 바인딩과
+ *         port 변환에 사용. */
 #include <netinet/in.h>
+/* [한국어] inet_aton — "x.x.x.x" 점 표기 IPv4 → struct in_addr 변환(aton 함수 내부). */
 #include <arpa/inet.h>
+/* [한국어] gethostbyname/struct hostent — DNS A 레코드 조회. inet_aton 실패 시 폴백. */
 #include <netdb.h>
-/* [한국어] poll() 시스템 콜 선언 — 이벤트 채널 대기에서 사용 가능(현 파일에서는
- *         rdma_get_cm_event 블로킹 호출로 처리하지만, CM 이벤트 소켓 폴링 맥락으로 포함) */
+/* [한국어] poll(2) 시스템 콜 — 현 구현은 rdma_get_cm_event(블로킹)로 CM 이벤트를 받지만,
+ *         미래 확장(non-blocking + poll 멀티플렉싱) 대비 헤더 포함. comp_channel은
+ *         ibv_get_cq_event가 내부에서 read(2)를 사용하므로 poll은 직접 호출 안 함. */
 #include <poll.h>
-/* [한국어] 소켓/시간/리소스 한계 — setrlimit(RLIMIT_MEMLOCK)로 pinning 가능 메모리
- *         한계를 조정하기 위해 sys/resource.h 필요 (check_set_rlimits 참조) */
+/* [한국어] POSIX 기본 타입(off_t/pid_t 등) — 다른 헤더가 간접 의존. */
 #include <sys/types.h>
+/* [한국어] socket(2) 관련 상수(AF_INET/SOCK_STREAM 등) — sockaddr_storage가 정의됨. */
 #include <sys/socket.h>
+/* [한국어] struct timeval — rdma_resolve_addr/route 타임아웃 인자(현 코드는 ms 직접 전달
+ *         하지만 헤더 의존성 흡수). */
 #include <sys/time.h>
+/* [한국어] getrlimit/setrlimit/RLIMIT_MEMLOCK/struct rlimit — check_set_rlimits에서
+ *         pinned memory 한계 확장에 사용. ibv_reg_mr이 페이지 pin이므로 MEMLOCK
+ *         초과 시 ENOMEM 실패. */
 #include <sys/resource.h>
 
-/* [한국어] 현재 파일에서는 pthread_t 선언에만 쓰이지만, 향후 CM 이벤트 처리 스레드를
- *         분리할 수 있도록 포함한다 (rdmaio_data::cmthread 필드 참조) */
+/* [한국어] pthread_t 타입 선언 — rdmaio_data.cmthread 필드 정의에 필요. 현 구현은
+ *         pthread_create를 호출하지 않으므로 -lpthread 링크는 불필요(타입만 사용). */
 #include <pthread.h>
-/* [한국어] PRIx64/PRId64 등 고정폭 정수 포맷 매크로 — dprint/log_err에서 사용 */
+/* [한국어] PRIx64/PRId64 — 64비트 정수의 플랫폼 독립 포맷 지정자. dprint/log_err에서
+ *         remote_addr/wr_id 출력에 사용 (long vs long long 호환). */
 #include <inttypes.h>
 
-/* [한국어] fio 코어 헤더 — struct thread_data, io_u, fio_file, ioengine_ops 정의 제공 */
+/* [한국어] fio 코어 헤더 — struct thread_data, io_u, fio_file, ioengine_ops 정의 제공.
+ *         FIO_Q_QUEUED/BUSY/COMPLETED, dprint(FD_IO,...), log_err/log_info, td_verror,
+ *         fio_ro_check, fio_fill_issue_time, fio_gettime, td_set_runstate, add_file,
+ *         init_rand_seed, td_io_u, io_u_queued, io_u_mark_submit, register_ioengine,
+ *         unregister_ioengine, fio_init/fio_exit constructor/destructor 매크로,
+ *         FIO_DISKLESSIO/UNIDIR/PIPEIO/ASYNCIO_SETS_ISSUE_TIME 플래그, FIO_IOOPS_VERSION
+ *         등 거의 모든 식별자 진입점. */
 #include "../fio.h"
-/* [한국어] __rand 등 해시/난수 유틸 — 원격 MR 인덱스 무작위 선택(rand_state)에서 사용 */
+/* [한국어] __rand/frand_state/GOLDEN_RATIO_64 — fio의 빠른 난수(LCG) 유틸. WRITE/READ
+ *         시 rmt_us 인덱스를 무작위 선택해 부하 분산에 사용. cryptographic 강도 불필요. */
 #include "../hash.h"
-/* [한국어] FIO_OPT_G_RDMA 옵션 그룹 상수 정의 — 서브옵션을 'RDMA engine' 그룹으로 묶기 위함 */
+/* [한국어] FIO_OPT_G_RDMA — 옵션 그룹 enum 상수. `fio --enghelp=rdma` 등 사용자 도구가
+ *         RDMA 전용 옵션만 필터링해 표시할 수 있도록 분류 태그 역할. */
 #include "../optgroup.h"
 
-/* [한국어] RDMA Connection Manager API — rdma_create_id/connect/accept/bind_addr 등 제공.
- *         InfiniBand 수준의 주소 해석 및 QP 생성을 TCP 유사한 시맨틱으로 감싼다. */
+/* [한국어] RDMA Connection Manager API — rdma_create_event_channel/rdma_create_id/
+ *         rdma_resolve_addr/rdma_resolve_route/rdma_connect/rdma_listen/rdma_bind_addr/
+ *         rdma_accept/rdma_disconnect/rdma_create_qp/rdma_destroy_id/rdma_get_cm_event/
+ *         rdma_ack_cm_event 진입점과 enum rdma_cm_event_type, struct rdma_cm_id/event/
+ *         conn_param 정의 제공. InfiniBand 수준의 IB SA(Subnet Administrator) 라우트
+ *         해석을 TCP 유사 sockaddr 추상화로 감싸 사용 편의성을 높인다. 내부적으로
+ *         libibverbs(rdma_cma.h가 verbs.h를 transitively include)를 함께 가져오므로
+ *         별도 ibv_*.h 명시 include 불필요. */
 #include <rdma/rdma_cma.h>
 
-/* [한국어] 이 엔진이 지원하는 최대 io_depth 상한. send/recv WR의 wr_id가 이 값일 때는
- *         "제어 메시지용 특수 WR"로 해석되므로(예: wc.wr_id == FIO_RDMA_MAX_IO_DEPTH),
- *         일반 io_u의 wr_id(0..iodepth-1)와 구분되는 센티널로도 쓰인다. */
+/* [한국어] 이 엔진이 지원하는 최대 io_depth 상한 (512).
+ *         두 가지 용도:
+ *         (1) send_buf.rmt_us[FIO_RDMA_MAX_IO_DEPTH] 정적 배열의 크기 — 서버가
+ *             클라이언트에게 알릴 수 있는 최대 원격 MR 개수. 실제 사용량은
+ *             td->o.iodepth만큼이지만 컴파일 타임 상한이 필요해 512로 못 박음.
+ *         (2) "제어 메시지 전용 wr_id 센티널" — rd->rq_wr.wr_id와 rd->sq_wr.wr_id에
+ *             이 값을 부여해 cq_event_handler가 일반 io_u(wr_id=0..iodepth-1)와
+ *             제어 메시지를 구분. iodepth가 512를 넘으면 충돌 위험이 있으므로
+ *             간접적으로 iodepth 상한 강제. */
 #define FIO_RDMA_MAX_IO_DEPTH    512
 
 /*
- * [한국어] RDMA 동작 모드 열거형.
- * - FIO_RDMA_UNKNOWN: 초기화 전 미정 상태 (0으로 초기화되므로 기본값 방어용).
- * - FIO_RDMA_MEM_WRITE: 클라이언트가 RDMA WRITE로 서버의 원격 메모리에 직접 쓰기.
- * - FIO_RDMA_MEM_READ:  클라이언트가 RDMA READ로 서버의 원격 메모리를 직접 읽기.
- * - FIO_RDMA_CHA_SEND:  채널 시맨틱 송신(IBV_WR_SEND). 서버 측 post_recv 버퍼로 복사.
- * - FIO_RDMA_CHA_RECV:  채널 시맨틱 수신. 서버가 클라이언트의 SEND를 받는 쪽.
- * 설정 경로: rdmaio_options.verb(사용자 입력) → fio_rdmaio_init에서 rdmaio_data.rdma_protocol로 전파.
+ * [한국어] RDMA 동작 모드 열거형. 사용자 옵션(--verb)에서 받아 rd->rdma_protocol로 전파되며,
+ * prep/queue/commit/getevents의 분기 결정 키. enum 값 순서는 외부 의존이 있는 경우
+ * 호환성에 유의할 것(현 코드는 자체 사용만 하므로 순서 변경은 가능).
+ *
+ * 설정 경로: rdmaio_options.verb(사용자 입력) → fio_rdmaio_init이 rd->rdma_protocol에 복사 →
+ * 서버는 server_recv가 클라이언트 메시지 수신 후 자신의 rdma_protocol을 클라에 맞춰 덮어씀
+ * (CHA_SEND→CHA_RECV 자동 전환).
  */
 enum rdma_io_mode {
 	FIO_RDMA_UNKNOWN = 0,
+	/* [한국어] 초기화 전 미정 상태(0으로 초기화되므로 기본값 방어용 sentinel).
+	 * 설정자: enum 정의 시 명시. 읽는 자: 사용자 옵션 미입력 시 prep/send default 분기에서 unknown 로그.
+	 * 값 범위: 0 고정. 동기화: 불변 enum 상수. */
+
 	FIO_RDMA_MEM_WRITE,
+	/* [한국어] 클라이언트가 RDMA WRITE(IBV_WR_RDMA_WRITE)로 서버의 원격 MR에 직접 쓰기.
+	 * 설정자: 사용자 --verb=write. 읽는 자: prep/send에서 sq_wr.opcode 결정, getevents에서 IBV_WC_RDMA_WRITE 기대.
+	 * 값 범위: 1. 의미: 단방향 송신, 서버 CPU 무개입(원격 메모리 직접 DMA).
+	 * 동기화: 잡 수명 동안 불변. */
+
 	FIO_RDMA_MEM_READ,
+	/* [한국어] 클라이언트가 RDMA READ(IBV_WR_RDMA_READ)로 서버의 원격 MR을 직접 읽기.
+	 * 설정자: --verb=read. 읽는 자: prep/send에서 opcode 결정.
+	 * 값 범위: 2. 의미: 단방향 수신, 서버 CPU 무개입.
+	 * 동기화: 잡 수명 동안 불변. */
+
 	FIO_RDMA_CHA_SEND,
+	/* [한국어] 채널 시맨틱 송신(IBV_WR_SEND). 서버 측이 미리 post_recv한 버퍼로 데이터가 DMA됨.
+	 * 설정자: --verb=send (클라이언트만 직접 지정 가능). 읽는 자: prep/send에서 opcode=IBV_WR_SEND.
+	 * 값 범위: 3. 의미: 양방향 메시지 — 서버가 RECV WR을 미리 post해야 RNR 회피.
+	 * 동기화: 잡 수명 동안 불변. */
+
 	FIO_RDMA_CHA_RECV
+	/* [한국어] 채널 시맨틱 수신. 서버가 클라이언트의 SEND를 받는 쪽.
+	 * 설정자: 클라이언트가 send 모드면 server_recv가 자동으로 RECV로 전환.
+	 * 읽는 자: commit이 fio_rdmaio_recv 경로로 분기, prep이 rq_wr 채움.
+	 * 값 범위: 4. 의미: 모든 io_u의 rq_wr를 사전 post해 클라 SEND를 수신.
+	 * 동기화: 잡 수명 동안 불변(server_recv가 1회 설정). */
 };
 
 /* [한국어] RDMA 엔진 전용 옵션 구조체 — fio 옵션 파서가 사용자로부터 받은 값을 담는다.
@@ -195,65 +355,111 @@ static int str_hostname_cb(void *data, const char *input)
 }
 
 /*
- * [한국어] 엔진 옵션 테이블 — fio가 --enghelp rdma 또는 잡 파일 파싱 시 이 배열을 순회한다.
- * 각 엔트리는 { .name, .type, .off1(옵션 구조체 내 오프셋), .cb, .help, .group } 형태.
- * 마지막은 .name=NULL 종단자. FIO_OPT_STR_STORE는 문자열 복제, FIO_OPT_INT는 정수, FIO_OPT_STR은 열거형.
+ * [한국어] 엔진 옵션 테이블 — fio가 --enghelp=rdma 또는 잡 파일 파싱 시 이 배열을 순회한다.
+ *
+ * 공통 규약(모든 엔트리에 적용):
+ *   .name        : 잡 파일/CLI에서 쓰는 짧은 키(예: hostname=192.168.1.1).
+ *   .lname       : `fio --enghelp` 출력에 표시되는 긴 이름.
+ *   .type        : 파서 타입.
+ *                  - FIO_OPT_STR_STORE: 사용자 문자열을 strdup하여 .off1 오프셋에 저장.
+ *                  - FIO_OPT_INT      : 10진/16진 정수 파싱, .minval/.maxval 검증.
+ *                  - FIO_OPT_STR      : .posval[] 매핑으로 enum 정수 결정.
+ *   .off1        : offsetof(struct rdmaio_options, <field>) — 결과를 저장할 오프셋.
+ *                  .cb 가 있으면 .off1 대신 콜백이 직접 td 내부 저장 위치를 결정.
+ *   .cb          : 사용자 입력 후처리 콜백(.off1 대신 사용 가능).
+ *   .def         : 사용자 미지정 시 기본값(문자열로 표현; 파서가 .type에 맞게 변환).
+ *   .help        : `--enghelp=rdma` 도움말 텍스트.
+ *   .category    : FIO_OPT_C_ENGINE — 엔진 옵션 분류.
+ *   .group       : FIO_OPT_G_RDMA   — RDMA 그룹(다른 엔진과 그룹 분리).
+ *   .alias       : 별칭(레거시 호환).
+ *   .posval      : .type=FIO_OPT_STR일 때 사용. {ival(문자열), oval(enum 값), help}.
+ *   .minval/.maxval : .type=FIO_OPT_INT일 때 유효 범위.
+ *
+ * 마지막 엔트리는 .name=NULL 종단자(parse.c가 옵션 순회 종료 신호로 사용).
+ * 옵션 인스턴스는 td->eo(옵션 객체)에 저장되며, 인스턴스 크기는 ioengine.option_struct_size.
  */
 static struct fio_option options[] = {
 	{
-		.name	= "hostname",              /* [한국어] 원격 서버 호스트명/IP */
-		.lname	= "rdma engine hostname",  /* [한국어] 긴 이름(도움말에 표시) */
-		.type	= FIO_OPT_STR_STORE,       /* [한국어] 문자열로 저장하는 옵션 */
-		.cb	= str_hostname_cb,         /* [한국어] filename에도 반영하기 위한 콜백 */
+		.name	= "hostname",
+		/* [한국어] 잡 파일/CLI 키. 예: `hostname=10.0.0.1` 또는 호스트명.
+		 * 사용 위치: parse.c가 매칭, str_hostname_cb 호출. */
+		.lname	= "rdma engine hostname",
+		/* [한국어] --enghelp 출력용 긴 이름. 사용자에게 의미 명확화. */
+		.type	= FIO_OPT_STR_STORE,
+		/* [한국어] 문자열 strdup 저장 타입. 파서가 입력을 strdup해 콜백 또는 .off1로 전달. */
+		.cb	= str_hostname_cb,
+		/* [한국어] hostname은 td->o.filename에도 반영해야 하므로 콜백으로 직접 처리(.off1 미사용).
+		 * 콜백이 NULL이면 .off1로만 저장. 본 옵션은 .off1 부재 = 콜백 단독 처리. */
 		.help	= "Hostname for RDMA IO engine",
-		.category = FIO_OPT_C_ENGINE,      /* [한국어] 카테고리: 엔진 옵션 */
-		.group	= FIO_OPT_G_RDMA,          /* [한국어] 그룹: RDMA */
+		/* [한국어] 도움말 텍스트. fio --enghelp=rdma 출력에 노출. */
+		.category = FIO_OPT_C_ENGINE,
+		/* [한국어] 카테고리: 엔진 옵션. 카테고리는 옵션 분류의 1차 기준. */
+		.group	= FIO_OPT_G_RDMA,
+		/* [한국어] 그룹: RDMA. 카테고리 내 2차 분류로, --enghelp 그룹별 출력에 사용. */
 	},
 	{
 		.name	= "bindname",
+		/* [한국어] 로컬 RDMA 장치/주소 바인딩(멀티 HCA 환경에서 송신 인터페이스 선택). */
 		.lname	= "rdma engine bindname",
 		.type	= FIO_OPT_STR_STORE,
-		.off1	= offsetof(struct rdmaio_options, bindname), /* [한국어] 옵션 구조체 오프셋으로 직접 저장 */
+		.off1	= offsetof(struct rdmaio_options, bindname),
+		/* [한국어] 옵션 구조체 내 char *bindname 오프셋. 파서가 strdup 결과를 직접 저장. */
 		.help	= "Bind for RDMA IO engine",
-		.def    = "",                      /* [한국어] 기본값: 빈 문자열 = 바인딩 없음 */
+		.def    = "",
+		/* [한국어] 기본값: 빈 문자열 = 바인딩 없음(자동 인터페이스 선택, INADDR_ANY). */
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_RDMA,
 	},
 	{
 		.name	= "port",
+		/* [한국어] RDMA CM 연결 포트 — TCP 포트와 의미 동일(librdmacm이 흡수). */
 		.lname	= "rdma engine port",
 		.type	= FIO_OPT_INT,
+		/* [한국어] 정수 파싱. 음수/범위 초과 시 파서가 에러 반환. */
 		.off1	= offsetof(struct rdmaio_options, port),
-		.minval	= 1,                       /* [한국어] TCP 유효 포트 범위 최소 */
-		.maxval	= 65535,                   /* [한국어] 16비트 포트 상한 */
+		/* [한국어] unsigned int port 오프셋. */
+		.minval	= 1,
+		/* [한국어] TCP/RDMA-CM 유효 포트 최솟값(0은 "임의 할당" 의미라 명시 입력 금지). */
+		.maxval	= 65535,
+		/* [한국어] 16비트 포트 상한. */
 		.help	= "Port to use for RDMA connections",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_RDMA,
 	},
 	{
 		.name	= "verb",
+		/* [한국어] RDMA 동작 모드 선택 — 메모리 시맨틱(write/read) vs 채널 시맨틱(send/recv). */
 		.lname	= "RDMA engine verb",
-		.alias	= "proto",                 /* [한국어] proto로도 입력 허용 (하위호환) */
-		.type	= FIO_OPT_STR,             /* [한국어] 열거형 문자열 → posval 매핑 */
+		.alias	= "proto",
+		/* [한국어] 별칭(--proto=write 등). 구버전 잡 파일 호환을 위해 제공. */
+		.type	= FIO_OPT_STR,
+		/* [한국어] 열거형 문자열 → enum 정수 매핑. .posval[] 검색으로 oval 결정. */
 		.off1	= offsetof(struct rdmaio_options, verb),
+		/* [한국어] enum rdma_io_mode verb 오프셋. 파서가 매칭된 oval을 저장. */
 		.help	= "RDMA engine verb",
-		.def	= "write",                 /* [한국어] 기본 동작은 RDMA WRITE */
+		.def	= "write",
+		/* [한국어] 기본 동작: RDMA WRITE(가장 일반적인 단방향 DMA 쓰기 시나리오). */
 		.posval = {
-			  /* [한국어] 각 posval은 문자열 입력 → enum 값 매핑을 정의 */
+			  /* [한국어] posval 배열 — {ival(문자열 키), oval(매칭 시 저장값), help}.
+			   * fio 파서가 strcmp(input, ival) 일치 시 oval을 .off1 위치에 기록. */
 			  { .ival = "write",
 			    .oval = FIO_RDMA_MEM_WRITE,
+			    /* [한국어] 클라가 IBV_WR_RDMA_WRITE로 서버 메모리에 직접 쓰기. */
 			    .help = "Memory Write",
 			  },
 			  { .ival = "read",
 			    .oval = FIO_RDMA_MEM_READ,
+			    /* [한국어] 클라가 IBV_WR_RDMA_READ로 서버 메모리를 직접 읽기. */
 			    .help = "Memory Read",
 			  },
 			  { .ival = "send",
 			    .oval = FIO_RDMA_CHA_SEND,
+			    /* [한국어] 채널 SEND — 서버 측 사전 post된 RECV 버퍼로 메시지 전송. */
 			    .help = "Posted Send",
 			  },
 			  { .ival = "recv",
 			    .oval = FIO_RDMA_CHA_RECV,
+			    /* [한국어] 채널 RECV — 클라 SEND 수신용 (서버 측 자동 설정). */
 			    .help = "Posted Receive",
 			  },
 		},
@@ -261,7 +467,8 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_RDMA,
 	},
 	{
-		.name	= NULL,                    /* [한국어] 옵션 배열 종단자 */
+		.name	= NULL,
+		/* [한국어] 옵션 배열 종단자. parse.c의 for 루프가 .name==NULL을 보고 순회 종료. */
 	},
 };
 
@@ -1185,27 +1392,31 @@ static int fio_rdmaio_send(struct thread_data *td, struct io_u **io_us,
 	long index;
 	struct rdma_io_u_data *r_io_u_d;
 
-	r_io_u_d = NULL;
+	r_io_u_d = NULL;  /* [한국어] 루프 진입 전 초기화 — switch default 후 미설정 방지 */
 
 	for (i = 0; i < nr; i++) {
 		/* RDMA_WRITE or RDMA_READ */
+		/* [한국어] 모드별 WR 필드 채움 분기. WRITE/READ는 rmt_us 인덱스 선택 + opcode/rkey/remote_addr/length,
+		 *          SEND는 opcode/send_flags만 갱신(prep에서 sg_list/length 이미 설정). */
 		switch (rd->rdma_protocol) {
 		case FIO_RDMA_MEM_WRITE:
 			/* compose work request */
-			r_io_u_d = io_us[i]->engine_data;
-			/* [한국어] 원격 MR 인덱스를 난수로 선택(부하 분산) */
+			r_io_u_d = io_us[i]->engine_data;  /* [한국어] io_u에 매달린 WR 템플릿 추출 */
+			/* [한국어] 원격 MR 인덱스를 난수로 선택(rmt_nr개 중 하나 — 부하 분산).
+			 * __rand는 frand_state 기반의 빠른 LCG. 분포 편향이 약간 있어도 부하 분산용으로는 충분. */
 			index = __rand(&rd->rand_state) % rd->rmt_nr;
-			r_io_u_d->sq_wr.opcode = IBV_WR_RDMA_WRITE;
-			r_io_u_d->sq_wr.wr.rdma.rkey = rd->rmt_us[index].rkey;
+			r_io_u_d->sq_wr.opcode = IBV_WR_RDMA_WRITE;  /* [한국어] WR 종류: 원격 메모리 직접 쓰기 */
+			r_io_u_d->sq_wr.wr.rdma.rkey = rd->rmt_us[index].rkey;  /* [한국어] HCA가 권한 검증할 RKEY */
 			r_io_u_d->sq_wr.wr.rdma.remote_addr = \
-				rd->rmt_us[index].buf;
+				rd->rmt_us[index].buf;                /* [한국어] 원격 가상 주소(서버 측 VA) */
+			/* [한국어] 매 I/O마다 실제 전송 길이 갱신(io_u->buflen이 잡 옵션에 따라 가변). */
 			r_io_u_d->sq_wr.sg_list->length = io_us[i]->buflen;
 			break;
 		case FIO_RDMA_MEM_READ:
 			/* compose work request */
 			r_io_u_d = io_us[i]->engine_data;
-			index = __rand(&rd->rand_state) % rd->rmt_nr;
-			r_io_u_d->sq_wr.opcode = IBV_WR_RDMA_READ;
+			index = __rand(&rd->rand_state) % rd->rmt_nr;  /* [한국어] WRITE와 동일한 무작위 선택 */
+			r_io_u_d->sq_wr.opcode = IBV_WR_RDMA_READ;     /* [한국어] WR 종류: 원격 메모리 직접 읽기 */
 			r_io_u_d->sq_wr.wr.rdma.rkey = rd->rmt_us[index].rkey;
 			r_io_u_d->sq_wr.wr.rdma.remote_addr = \
 				rd->rmt_us[index].buf;
@@ -1213,22 +1424,25 @@ static int fio_rdmaio_send(struct thread_data *td, struct io_u **io_us,
 			break;
 		case FIO_RDMA_CHA_SEND:
 			r_io_u_d = io_us[i]->engine_data;
-			r_io_u_d->sq_wr.opcode = IBV_WR_SEND;
-			r_io_u_d->sq_wr.send_flags = IBV_SEND_SIGNALED;
+			r_io_u_d->sq_wr.opcode = IBV_WR_SEND;          /* [한국어] WR 종류: 채널 SEND(메시지) */
+			r_io_u_d->sq_wr.send_flags = IBV_SEND_SIGNALED; /* [한국어] 완료 시 CQE 생성 요청 */
 			break;
 		default:
+			/* [한국어] 알 수 없는 모드 — fio_rdmaio_init이 거부했어야 할 경로 */
 			log_err("fio: unknown rdma protocol - %d\n",
 				rd->rdma_protocol);
 			break;
 		}
 
-		/* [한국어] 실제 WR 게시 — 커널 RDMA 드라이버 경유 HCA doorbell ring */
+		/* [한국어] 실제 WR 게시 — 커널 RDMA 드라이버를 경유해 HCA doorbell을 울려 비동기 제출.
+		 * bad_wr은 실패한 WR의 첫 포인터를 반환받는 out 파라미터(현재 코드는 검사하지 않음).
+		 * 성공 시 즉시 반환 — 완료는 CQ로 별도 비동기 통지. */
 		if (ibv_post_send(rd->qp, &r_io_u_d->sq_wr, &bad_wr) != 0) {
 			log_err("fio: ibv_post_send fail: %m\n");
 			return -1;
 		}
 
-		dprint_io_u(io_us[i], "fio_rdmaio_send");
+		dprint_io_u(io_us[i], "fio_rdmaio_send");  /* [한국어] FD_IO 디버그 로그 */
 	}
 
 	/* wait for completion
@@ -1433,22 +1647,31 @@ static int fio_rdmaio_commit(struct thread_data *td)
 static int fio_rdmaio_connect(struct thread_data *td, struct fio_file *f)
 {
 	struct rdmaio_data *rd = td->io_ops_data;
-	struct rdma_conn_param conn_param;
-	struct ibv_send_wr *bad_wr;
+	struct rdma_conn_param conn_param;     /* [한국어] RC QP 연결 파라미터(IB CM REQ에 포함) */
+	struct ibv_send_wr *bad_wr;            /* [한국어] ibv_post_send 실패 시 거부 WR */
 
-	/* [한국어] 연결 파라미터 초기화(RC QP 설정) */
+	/* [한국어] 연결 파라미터 초기화(RC QP 설정).
+	 * conn_param의 모든 필드는 IB CM(Connection Management)의 REQ/REP 메시지에 직접 매핑된다. */
 	memset(&conn_param, 0, sizeof(conn_param));
-	conn_param.responder_resources = 1;  /* [한국어] RDMA READ/atomic 동시 수행 가능 수 */
+	conn_param.responder_resources = 1;
+	/* [한국어] 자신이 응답할 수 있는 동시 RDMA READ/atomic 수(IB 스펙: max_dest_rd_atomic).
+	 * 1 = 동시 1개의 RDMA READ만 처리 가능(자원 절약, 성능과 trade-off). */
 	conn_param.initiator_depth = 1;
-	conn_param.retry_count = 10;          /* [한국어] 연결 재시도 횟수 */
+	/* [한국어] 자신이 송신할 수 있는 동시 RDMA READ/atomic 수(max_rd_atomic).
+	 * 1 = 한 번에 1개의 outstanding READ만 발사(RDMA WRITE는 영향 없음). */
+	conn_param.retry_count = 10;
+	/* [한국어] 패킷 timeout 시 RC QP가 재전송할 횟수(7=무한 아님, 0..7 범위 — IB 스펙).
+	 * 10은 잘못된 값(7 초과)이지만 librdmacm이 7로 클램프하므로 실제 동작에 문제 없음(원본 그대로). */
 
-	/* [한국어] CM connect 요청 — 서버의 accept로 완료 */
+	/* [한국어] CM connect 요청 — 비동기 시작. 완료는 RDMA_CM_EVENT_ESTABLISHED 이벤트로 통지.
+	 * 내부적으로 IB CM REQ 패킷을 wire로 전송(InfiniBand) 또는 TCP 연결 후 RDMA REQ(iWARP). */
 	if (rdma_connect(rd->cm_id, &conn_param) != 0) {
 		log_err("fio: rdma_connect fail: %m\n");
 		return 1;
 	}
 
-	/* [한국어] ESTABLISHED 이벤트 대기 */
+	/* [한국어] ESTABLISHED 이벤트 동기 대기 — 서버가 rdma_accept로 응답하면 발생.
+	 * 거절되면 RDMA_CM_EVENT_REJECTED, 시간 초과면 UNREACHABLE 등이 와서 get_next_channel_event가 실패. */
 	if (get_next_channel_event
 	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_ESTABLISHED\n");
@@ -1456,21 +1679,25 @@ static int fio_rdmaio_connect(struct thread_data *td, struct fio_file *f)
 	}
 
 	/* send task request */
-	/* [한국어] 제어 메시지에 모드와 iodepth를 담아 서버로 전송 */
-	rd->send_buf.mode = htonl(rd->rdma_protocol);
-	rd->send_buf.nr = htonl(td->o.iodepth);
+	/* [한국어] 제어 메시지(rdma_info_blk)에 모드와 iodepth를 담아 서버로 전송.
+	 * send_buf의 다른 필드(max_bs, rmt_us)는 post_init에서 이미 채워짐. */
+	rd->send_buf.mode = htonl(rd->rdma_protocol);  /* [한국어] 클라가 원하는 모드 통보 */
+	rd->send_buf.nr = htonl(td->o.iodepth);          /* [한국어] iodepth 통보(서버 recv 버퍼 수 결정 참고) */
 
+	/* [한국어] 제어 메시지 송신 — sq_wr는 setup_control_msg_buffers에서 IBV_WR_SEND로 셋업됨.
+	 * RC QP는 ESTABLISHED 상태가 아니면 post_send 실패하므로 위 ESTABLISHED 대기가 선행. */
 	if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
 		log_err("fio: ibv_post_send fail: %m\n");
 		return 1;
 	}
 
-	/* [한국어] SEND 완료 대기 */
+	/* [한국어] SEND 완료 대기 — wire로 패킷이 나갔는지 확인(서버는 자기 큐에 도착) */
 	if (rdma_poll_wait(td, IBV_WC_SEND) < 0)
 		return 1;
 
 	/* wait for remote MR info from server side */
-	/* [한국어] 서버로부터 원격 MR 정보 수신 대기 */
+	/* [한국어] 서버로부터 원격 MR 정보 수신 대기 — setup_connect의 ibv_post_recv가 미리 걸어둔
+	 * rd->rq_wr에 서버의 SEND가 도착. cq_event_handler가 client_recv를 호출해 rmt_us[]에 전개. */
 	if (rdma_poll_wait(td, IBV_WC_RECV) < 0)
 		return 1;
 
@@ -1482,7 +1709,9 @@ static int fio_rdmaio_connect(struct thread_data *td, struct fio_file *f)
 	 * This may lead to RNR error. Here, SEND side pauses for a while
 	 * during which RECV side commits sufficient recv buffers.
 	 */
-	/* [한국어] 500ms 대기 — 서버(RECV측)가 recv 버퍼 post를 충분히 끝내도록 유예 */
+	/* [한국어] 500ms 대기 — 채널 시맨틱(SEND/RECV)에서 RNR(Receiver Not Ready) 회피용.
+	 * 서버 측이 모든 io_u의 rq_wr를 사전 post 완료할 시간을 보장.
+	 * 메모리 시맨틱(WRITE/READ)에서는 굳이 필요 없으나 코드 단순화를 위해 일괄 적용. */
 	usleep(500000);
 
 	return 0;
@@ -1502,21 +1731,24 @@ static int fio_rdmaio_connect(struct thread_data *td, struct fio_file *f)
 static int fio_rdmaio_accept(struct thread_data *td, struct fio_file *f)
 {
 	struct rdmaio_data *rd = td->io_ops_data;
-	struct rdma_conn_param conn_param;
+	struct rdma_conn_param conn_param;     /* [한국어] RC QP accept 파라미터 */
 	struct ibv_send_wr *bad_wr;
 	int ret = 0;
 
 	/* rdma_accept() - then wait for accept success */
+	/* [한국어] 연결 수락 파라미터 초기화 — connect와 같은 의미의 필드. */
 	memset(&conn_param, 0, sizeof(conn_param));
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
+	conn_param.responder_resources = 1;  /* [한국어] 동시 응답 가능 RDMA READ 수 */
+	conn_param.initiator_depth = 1;       /* [한국어] 동시 송신 가능 RDMA READ 수 */
 
-	/* [한국어] 자식 cm_id(CONNECT_REQUEST에서 받은)에 대해 accept */
+	/* [한국어] 자식 cm_id(setup_listen이 CONNECT_REQUEST에서 받은)에 대해 accept.
+	 * 이는 IB CM REP 패킷을 클라에게 보내고 QP를 RTS 상태로 전이시킨다(librdmacm 내부). */
 	if (rdma_accept(rd->child_cm_id, &conn_param) != 0) {
 		log_err("fio: rdma_accept: %m\n");
 		return 1;
 	}
 
+	/* [한국어] 클라가 RTU(Ready To Use) 응답하면 ESTABLISHED 이벤트 도착. */
 	if (get_next_channel_event
 	    (td, rd->cm_channel, RDMA_CM_EVENT_ESTABLISHED) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_ESTABLISHED\n");
@@ -1524,19 +1756,23 @@ static int fio_rdmaio_accept(struct thread_data *td, struct fio_file *f)
 	}
 
 	/* wait for request */
-	/* [한국어] 클라이언트의 첫 제어 메시지 수신 */
+	/* [한국어] 클라이언트의 첫 제어 메시지(rdma_info_blk{mode,nr}) 수신.
+	 * setup_listen의 ibv_post_recv가 rd->rq_wr를 미리 post해둔 상태라 도착하면 즉시 CQE 발생.
+	 * cq_event_handler가 server_recv를 호출해 rd->rdma_protocol 결정. */
 	ret = rdma_poll_wait(td, IBV_WC_RECV) < 0;
 
-	/* [한국어] 원격 MR 정보 포함한 회신 전송 (send_buf는 post_init에서 채워짐) */
+	/* [한국어] 원격 MR 정보 포함한 회신 전송 (send_buf는 post_init에서 채워둔 그대로).
+	 * 클라이언트의 client_recv가 이를 받아 rmt_us[]에 전개 → 이후 RDMA WRITE/READ 가능. */
 	if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
 		log_err("fio: ibv_post_send fail: %m\n");
 		return 1;
 	}
 
+	/* [한국어] SEND 완료 대기 — 회신 패킷이 wire로 나갔는지 확인 후 반환. */
 	if (rdma_poll_wait(td, IBV_WC_SEND) < 0)
 		return 1;
 
-	return ret;
+	return ret;  /* [한국어] 위 첫 RECV 대기 결과(0=성공, 1=실패) 전파 */
 }
 
 /*
@@ -1552,10 +1788,12 @@ static int fio_rdmaio_accept(struct thread_data *td, struct fio_file *f)
  */
 static int fio_rdmaio_open_file(struct thread_data *td, struct fio_file *f)
 {
+	/* [한국어] td_read(td) — 잡이 read 방향이면 서버 역할(accept).
+	 * write/trim 등은 클라이언트 역할(connect). 본 엔진은 td_rw를 init에서 거부하므로 두 경로뿐. */
 	if (td_read(td))
-		return fio_rdmaio_accept(td, f);
+		return fio_rdmaio_accept(td, f);   /* [한국어] 서버: rdma_accept + 첫 메시지 왕복 */
 	else
-		return fio_rdmaio_connect(td, f);
+		return fio_rdmaio_connect(td, f);  /* [한국어] 클라: rdma_connect + 첫 메시지 왕복 */
 }
 
 /*
@@ -1573,7 +1811,7 @@ static int fio_rdmaio_open_file(struct thread_data *td, struct fio_file *f)
 static int fio_rdmaio_close_file(struct thread_data *td, struct fio_file *f)
 {
 	struct rdmaio_data *rd = td->io_ops_data;
-	struct ibv_send_wr *bad_wr;
+	struct ibv_send_wr *bad_wr;  /* [한국어] ibv_post_send 실패 시 첫 거부 WR 포인터 (현 코드 미검사) */
 
 	/* unregister rdma buffer */
 
@@ -1581,50 +1819,59 @@ static int fio_rdmaio_close_file(struct thread_data *td, struct fio_file *f)
 	 * Client sends notification to the server side
 	 */
 	/* refer to: http://linux.die.net/man/7/rdma_cm */
-	/* [한국어] 클라이언트 && MEM 모드면 종료 통지 제어 메시지 전송 */
+	/* [한국어] 클라이언트 + MEM 모드(WRITE/READ)에서만 명시적 종료 통지 SEND.
+	 * MEM 모드는 서버 CPU가 데이터 전송에 무개입이라 클라가 끝났음을 알릴 방법이 SEND뿐.
+	 * 채널 시맨틱(CHA_SEND/RECV)은 데이터 자체가 SEND/RECV이므로 큐 고갈로 자연스럽게 종료됨. */
 	if ((rd->is_client == 1) && ((rd->rdma_protocol == FIO_RDMA_MEM_WRITE)
 				     || (rd->rdma_protocol ==
 					 FIO_RDMA_MEM_READ))) {
+		/* [한국어] rd->sq_wr는 setup_control_msg_buffers에서 IBV_WR_SEND로 셋업된 제어 메시지 WR.
+		 * wr_id=FIO_RDMA_MAX_IO_DEPTH 센티널이라 cq_event_handler가 io_u 추적에서 제외. */
 		if (ibv_post_send(rd->qp, &rd->sq_wr, &bad_wr) != 0) {
 			log_err("fio: ibv_post_send fail: %m\n");
 			return 1;
 		}
 
 		dprint(FD_IO, "fio: close information sent success\n");
-		rdma_poll_wait(td, IBV_WC_SEND);  /* [한국어] 전송 완료 대기 */
+		rdma_poll_wait(td, IBV_WC_SEND);  /* [한국어] SEND 완료 CQE 대기 — 패킷이 wire로 나갔는지 확인 */
 	}
 
-	/* [한국어] 역할별 CM disconnect — 서버는 자식 id 기준 */
+	/* [한국어] 역할별 CM disconnect — RDMA CM에 RC QP의 정상 종료를 알림.
+	 * 서버는 child_cm_id(accept로 파생된 자식 id)에 대해 disconnect.
+	 * cm_id(listen용)는 destroy_id에서 정리. */
 	if (rd->is_client == 1)
 		rdma_disconnect(rd->cm_id);
 	else {
 		rdma_disconnect(rd->child_cm_id);
 #if 0
-		rdma_disconnect(rd->cm_id);
+		rdma_disconnect(rd->cm_id);  /* [한국어] listen id 분리 disconnect는 보통 불필요 */
 #endif
 	}
 
 #if 0
-	/* [한국어] DISCONNECTED 이벤트 대기는 선택 — 현재는 비활성 */
+	/* [한국어] DISCONNECTED 이벤트 대기는 선택 — 현재는 비활성.
+	 * 활성화하면 양측 disconnect 완료까지 동기화 가능하지만 현 구현은 fire-and-forget. */
 	if (get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_DISCONNECTED) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_DISCONNECTED\n");
 		return 1;
 	}
 #endif
 
-	/* [한국어] 리소스 역순 해제: CQ → QP → cm_id → comp_channel → PD */
-	ibv_destroy_cq(rd->cq);
-	ibv_destroy_qp(rd->qp);
+	/* [한국어] 리소스 역순 해제: 생성 역순(PD<-QP<-CQ<-comp_channel<-cm_id 순으로 만들었으니
+	 * 해제는 그 역순). 단, 본 코드의 해제 순서는 CQ→QP→id→channel→PD로 일부가 어긋난다.
+	 * libibverbs는 의존성 검증을 일부만 하므로 작동하지만 엄밀한 순서는 QP→CQ→PD가 맞다(원본 그대로). */
+	ibv_destroy_cq(rd->cq);   /* [한국어] CQ 파괴 */
+	ibv_destroy_qp(rd->qp);   /* [한국어] QP 파괴(내부 send/recv 큐 자원 회수) */
 
 	if (rd->is_client == 1)
-		rdma_destroy_id(rd->cm_id);
+		rdma_destroy_id(rd->cm_id);  /* [한국어] 클라는 cm_id만 */
 	else {
-		rdma_destroy_id(rd->child_cm_id);
-		rdma_destroy_id(rd->cm_id);
+		rdma_destroy_id(rd->child_cm_id);  /* [한국어] 서버는 자식 id 우선 */
+		rdma_destroy_id(rd->cm_id);          /* [한국어] 그다음 listen id */
 	}
 
-	ibv_destroy_comp_channel(rd->channel);
-	ibv_dealloc_pd(rd->pd);
+	ibv_destroy_comp_channel(rd->channel);  /* [한국어] CQ 알림 fd 채널 close */
+	ibv_dealloc_pd(rd->pd);                  /* [한국어] PD 해제 — 마지막 자원 */
 
 	return 0;
 }
@@ -1644,17 +1891,22 @@ static int fio_rdmaio_close_file(struct thread_data *td, struct fio_file *f)
 static int aton(struct thread_data *td, const char *host,
 		     struct sockaddr_in *addr)
 {
-	/* [한국어] 문자 IP가 아니면 DNS 폴백 */
+	/* [한국어] inet_aton 시도 — 입력이 "x.x.x.x" 형식이면 1 반환하며 addr->sin_addr 채움.
+	 * 0 반환 시 형식 오류 → 호스트명일 가능성 → DNS 폴백 */
 	if (inet_aton(host, &addr->sin_addr) != 1) {
 		struct hostent *hent;
 
+		/* [한국어] DNS 조회(/etc/hosts + DNS 서버). thread-safe 아님(getaddrinfo 권장)
+		 * 이지만 본 엔진은 잡 init에서 1회 호출이라 실용상 문제 없음. */
 		hent = gethostbyname(host);
 		if (!hent) {
+			/* [한국어] td_verror — fio 코어에 errno 보고(통계/잡 종료 사유에 기록) */
 			td_verror(td, errno, "gethostbyname");
 			return 1;
 		}
 
-		/* [한국어] IPv4 A 레코드의 첫 4바이트를 복사 */
+		/* [한국어] IPv4 A 레코드의 첫 4바이트를 sin_addr.s_addr에 복사.
+		 * h_addr은 hent->h_addr_list[0]의 매크로. AAAA(IPv6) 미지원. */
 		memcpy(&addr->sin_addr, hent->h_addr, 4);
 	}
 	return 0;
@@ -1678,30 +1930,33 @@ static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
 {
 	struct rdmaio_data *rd = td->io_ops_data;
 	struct rdmaio_options *o = td->eo;
-	struct sockaddr_storage addrb;
-	struct ibv_recv_wr *bad_wr;
+	struct sockaddr_storage addrb;        /* [한국어] bindname용 로컬 주소 (sockaddr_in을 담는 큰 컨테이너) */
+	struct ibv_recv_wr *bad_wr;            /* [한국어] post_recv 실패 시 거부 WR */
 	int err;
 
-	/* [한국어] 원격 주소 구조체 채움 */
+	/* [한국어] 원격 주소 구조체 채움 — IPv4 전용. */
 	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_port = htons(port);
+	rd->addr.sin_port = htons(port);  /* [한국어] 호스트 포트 → 네트워크 바이트순 */
 
+	/* [한국어] 호스트명 또는 IP 문자열 → sin_addr 변환(DNS 폴백 포함) */
 	err = aton(td, host, &rd->addr);
 	if (err)
 		return err;
 
 	/* resolve route */
-	/* [한국어] 로컬 바인딩 주소 있으면 dual-address resolve */
+	/* [한국어] 로컬 바인딩 주소 지정 시 dual-address resolve(특정 인터페이스에서 송신).
+	 * 멀티 HCA/멀티 포트 환경에서 RDMA 트래픽이 어느 포트로 나갈지 결정. */
 	if (o->bindname && strlen(o->bindname)) {
 		addrb.ss_family = AF_INET;
 		err = aton(td, o->bindname, (struct sockaddr_in *)&addrb);
 		if (err)
 			return err;
+		/* [한국어] rdma_resolve_addr — src+dst 동시 지정. timeout 2000ms. */
 		err = rdma_resolve_addr(rd->cm_id, (struct sockaddr *)&addrb,
 					(struct sockaddr *)&rd->addr, 2000);
 
 	} else {
-		/* [한국어] 자동 로컬 선택 */
+		/* [한국어] 자동 로컬 선택 — 커널 라우팅 테이블에 따라 출력 인터페이스 결정 */
 		err = rdma_resolve_addr(rd->cm_id, NULL,
 					(struct sockaddr *)&rd->addr, 2000);
 	}
@@ -1711,7 +1966,8 @@ static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
 		return 1;
 	}
 
-	/* [한국어] ADDR_RESOLVED 이벤트 대기 */
+	/* [한국어] ADDR_RESOLVED 이벤트 대기 — librdmacm이 GID/MAC 해석 완료 통지.
+	 * 실패 시 ADDR_ERROR 이벤트가 와서 get_next_channel_event가 거부. */
 	err = get_next_channel_event(td, rd->cm_channel, RDMA_CM_EVENT_ADDR_RESOLVED);
 	if (err != 0) {
 		log_err("fio: get_next_channel_event: %d\n", err);
@@ -1719,7 +1975,8 @@ static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
 	}
 
 	/* resolve route */
-	/* [한국어] 라우트 해석(InfiniBand path record 조회) */
+	/* [한국어] 라우트 해석 — InfiniBand의 경우 SA(Subnet Administrator)에 PathRecord 질의,
+	 * RoCE/iWARP는 일반 IP 라우팅 사용. timeout 2000ms. */
 	err = rdma_resolve_route(rd->cm_id, 2000);
 	if (err != 0) {
 		log_err("fio: rdma_resolve_route: %d\n", err);
@@ -1733,14 +1990,17 @@ static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
 	}
 
 	/* create qp and buffer */
+	/* [한국어] PD/comp_channel/CQ/QP 생성 — 이제 cm_id->verbs가 유효해 가능 */
 	if (fio_rdmaio_setup_qp(td) != 0)
 		return 1;
 
+	/* [한국어] 제어 메시지용 send_buf/recv_buf MR 등록 + WR 템플릿 셋업 */
 	if (fio_rdmaio_setup_control_msg_buffers(td) != 0)
 		return 1;
 
 	/* post recv buf */
-	/* [한국어] 서버 응답을 받을 수 있도록 recv WR을 미리 post */
+	/* [한국어] 서버 응답을 받을 수 있도록 recv WR을 미리 post.
+	 * 이렇게 하지 않으면 서버가 SEND한 첫 메시지에서 RNR(Receiver Not Ready) 발생. */
 	err = ibv_post_recv(rd->qp, &rd->rq_wr, &bad_wr);
 	if (err != 0) {
 		log_err("fio: ibv_post_recv fail: %d\n", err);
@@ -1767,27 +2027,33 @@ static int fio_rdmaio_setup_listen(struct thread_data *td, short port)
 	struct rdmaio_data *rd = td->io_ops_data;
 	struct rdmaio_options *o = td->eo;
 	struct ibv_recv_wr *bad_wr;
-	int state = td->runstate;  /* [한국어] 이전 runstate 보존(복원용) */
+	int state = td->runstate;  /* [한국어] 이전 runstate 보존(setup 종료 후 복원용) */
 
-	/* [한국어] setup 중임을 fio 코어에 알림 — 통계에서 setup 시간 제외 */
+	/* [한국어] setup 중임을 fio 코어에 알림 — TD_SETTING_UP 상태에선 ETA/통계 누적이 일시 중단되어
+	 * 서버가 클라이언트 connect를 기다리는 시간이 잡 통계에 왜곡으로 잡히지 않음. */
 	td_set_runstate(td, TD_SETTING_UP);
 
 	rd->addr.sin_family = AF_INET;
 	rd->addr.sin_port = htons(port);
 
-	/* [한국어] bindname 없으면 INADDR_ANY(모든 인터페이스), 있으면 첫 바이트값 사용(레거시 동작) */
+	/* [한국어] bindname 처리:
+	 *   - 미지정/빈 문자열: INADDR_ANY(0.0.0.0) — 모든 로컬 인터페이스에서 수신
+	 *   - 지정된 경우: htonl(*o->bindname) — 레거시 동작(문자열의 첫 바이트만 IP로 사용,
+	 *     실용성은 거의 없음 — 원본 버그성 코드. 정상이라면 inet_aton/aton을 사용했어야 함). */
 	if (!o->bindname || !strlen(o->bindname))
 		rd->addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	else
 		rd->addr.sin_addr.s_addr = htonl(*o->bindname);
 
 	/* rdma_listen */
+	/* [한국어] CM id를 로컬 주소+포트에 바인드. RDMA_PS_TCP라 두 호스트가 동시 동일 포트 가능. */
 	if (rdma_bind_addr(rd->cm_id, (struct sockaddr *)&rd->addr) != 0) {
 		log_err("fio: rdma_bind_addr fail: %m\n");
 		return 1;
 	}
 
-	/* [한국어] backlog=3 — 대기 큐 길이(소량의 동시 접속 허용) */
+	/* [한국어] listen 시작. backlog=3 — 보류 중 connect 요청 큐 길이(TCP listen과 의미 동일).
+	 * fio rdma 시나리오는 보통 단일 클라 1:1이라 3이면 충분. */
 	if (rdma_listen(rd->cm_id, 3) != 0) {
 		log_err("fio: rdma_listen fail: %m\n");
 		return 1;
@@ -1796,26 +2062,31 @@ static int fio_rdmaio_setup_listen(struct thread_data *td, short port)
 	log_info("fio: waiting for connection\n");
 
 	/* wait for CONNECT_REQUEST */
-	/* [한국어] 클라이언트의 connect 대기. 수신 시 child_cm_id 저장(get_next_channel_event 내부) */
+	/* [한국어] 클라이언트의 connect 대기 — 도착 시 RDMA_CM_EVENT_CONNECT_REQUEST 발생.
+	 * get_next_channel_event 내부에서 event->id를 rd->child_cm_id에 저장(이후 accept 대상). */
 	if (get_next_channel_event
 	    (td, rd->cm_channel, RDMA_CM_EVENT_CONNECT_REQUEST) != 0) {
 		log_err("fio: wait for RDMA_CM_EVENT_CONNECT_REQUEST\n");
 		return 1;
 	}
 
+	/* [한국어] 자식 cm_id 기준으로 PD/CQ/QP 생성 (서버 분기는 setup_qp 내부에서 처리) */
 	if (fio_rdmaio_setup_qp(td) != 0)
 		return 1;
 
+	/* [한국어] 제어 메시지 버퍼 MR + WR 셋업 */
 	if (fio_rdmaio_setup_control_msg_buffers(td) != 0)
 		return 1;
 
 	/* post recv buf */
+	/* [한국어] 클라이언트의 첫 제어 메시지를 받을 수 있도록 RECV WR 사전 post.
+	 * accept 후 ESTABLISHED 직후 첫 SEND가 도착하므로 미리 준비 필수. */
 	if (ibv_post_recv(rd->qp, &rd->rq_wr, &bad_wr) != 0) {
 		log_err("fio: ibv_post_recv fail: %m\n");
 		return 1;
 	}
 
-	/* [한국어] 이전 runstate 복원 */
+	/* [한국어] 이전 runstate 복원(보통 TD_INITIALIZED) — fio 코어가 다음 단계(post_init 등) 진행 */
 	td_set_runstate(td, state);
 	return 0;
 }
@@ -1891,32 +2162,35 @@ static int compat_options(struct thread_data *td)
 	char *modep, *portp;
 	char *filename = td->o.filename;
 
-	/* [한국어] filename이 없으면 파싱할 것도 없음 */
+	/* [한국어] filename이 없으면 파싱할 것도 없음 — 새 옵션 모드(--hostname/--port/--verb) 사용. */
 	if (!filename)
 		return 0;
 
-	/* [한국어] 첫 '/' 위치 탐색 — port 구분자 */
+	/* [한국어] 첫 '/' 위치 탐색 — host와 port 구분자.
+	 * 없으면 filename이 그냥 호스트명이라 가정하고 파싱 종료. */
 	portp = strchr(filename, '/');
 	if (portp == NULL)
 		return 0;
 
-	/* [한국어] '/'를 널로 잘라 host 부분을 filename이 가리키도록 유지 */
+	/* [한국어] '/'를 NUL로 치환해 filename이 host 문자열만 가리키게 자르기.
+	 * portp는 한 칸 전진해 port 문자열의 시작. */
 	*portp = '\0';
 	portp++;
 
-	/* [한국어] port 문자열을 10진수로 변환 */
+	/* [한국어] port 문자열 → 10진수 정수. strtol 실패 시 0 반환. */
 	o->port = strtol(portp, NULL, 10);
 	if (!o->port || o->port > 65535)
-		goto bad_host;
+		goto bad_host;  /* [한국어] 0/범위 초과면 오류 */
 
-	/* [한국어] 두 번째 '/' — mode 구분자(선택) */
+	/* [한국어] 두 번째 '/' — mode 구분자(선택). 없으면 mode 기본값 사용. */
 	modep = strchr(portp, '/');
 	if (modep != NULL) {
-		*modep = '\0';
-		modep++;
+		*modep = '\0';   /* [한국어] port 문자열의 끝을 NUL로 자름 */
+		modep++;          /* [한국어] mode 문자열 시작 */
 	}
 
-	/* [한국어] mode 문자열을 enum으로 매핑 */
+	/* [한국어] mode 문자열 → enum 매핑. strncmp(strlen(modep))로 prefix 매칭(레거시 관용).
+	 * 대소문자 양쪽 허용. 새 verb=recv는 레거시 모드에서 불필요(서버 자동 전환). */
 	if (modep) {
 		if (!strncmp("rdma_write", modep, strlen(modep)) ||
 		    !strncmp("RDMA_WRITE", modep, strlen(modep)))
@@ -1928,7 +2202,7 @@ static int compat_options(struct thread_data *td)
 			 !strncmp("SEND", modep, strlen(modep)))
 			o->verb = FIO_RDMA_CHA_SEND;
 		else
-			goto bad_host;
+			goto bad_host;  /* [한국어] 알 수 없는 모드 문자열 */
 	} else
 		o->verb = FIO_RDMA_MEM_WRITE;  /* [한국어] mode 생략 시 기본 WRITE */
 
@@ -1936,6 +2210,7 @@ static int compat_options(struct thread_data *td)
 	return 0;
 
 bad_host:
+	/* [한국어] 단일 에러 라벨로 모든 형식 오류 처리. td->o.filename은 이미 잘린 상태일 수 있음. */
 	log_err("fio: bad rdma host/port/protocol: %s\n", td->o.filename);
 	return 1;
 }
@@ -1954,62 +2229,70 @@ bad_host:
  */
 static int fio_rdmaio_init(struct thread_data *td)
 {
-	struct rdmaio_data *rd = td->io_ops_data;
-	struct rdmaio_options *o = td->eo;
+	struct rdmaio_data *rd = td->io_ops_data;  /* [한국어] setup이 만든 엔진 상태 포인터 */
+	struct rdmaio_options *o = td->eo;          /* [한국어] 옵션 객체(td->eo는 사용자 입력 결과) */
 	int ret;
 
-	/* [한국어] RDMA 엔진 제약: 한 연결은 단일 방향(read OR write)만 허용 */
+	/* [한국어] RDMA 엔진 제약: 한 연결은 단일 방향(read XOR write)만 허용.
+	 * td_rw(td)는 RW 잡(혼합) 검출 매크로. RDMA QP는 양방향이 가능하지만 본 엔진의
+	 * 핸드셰이크 프로토콜이 단일 방향만 지원(서버=read, 클라=write). */
 	if (td_rw(td)) {
 		log_err("fio: rdma connections must be read OR write\n");
 		return 1;
 	}
-	/* [한국어] 랜덤 I/O는 RDMA 네트워크 엔진에서 의미 없음 — 서버는 순차적으로 MR을 수신 */
+	/* [한국어] 랜덤 I/O는 RDMA 네트워크 엔진에서 의미 없음 — 서버는 순차적으로 MR을 수신.
+	 * FIO_PIPEIO 플래그가 이를 코어 측에서도 강제하지만 명시적 검사로 사용자 안내. */
 	if (td_random(td)) {
 		log_err("fio: RDMA network IO can't be random\n");
 		return 1;
 	}
 
-	/* [한국어] 레거시 filename 포맷 파싱(있으면) */
+	/* [한국어] 구버전 filename="host/port/mode" 포맷 호환 파싱(설정 시 o->port/verb 채움) */
 	if (compat_options(td))
 		return 1;
 
-	/* [한국어] port는 필수 */
+	/* [한국어] port는 필수 — 서버 listen / 클라 connect 양쪽 모두 필요 */
 	if (!o->port) {
 		log_err("fio: no port has been specified which is required "
 			"for the rdma engine\n");
 		return 1;
 	}
 
-	/* [한국어] MEMLOCK 한계 확장(ibv_reg_mr 대비) */
+	/* [한국어] MEMLOCK rlimit 확장 — ibv_reg_mr이 페이지를 pin하므로 io 버퍼 총량보다
+	 * MEMLOCK이 작으면 ENOMEM. soft를 hard까지 끌어올려 시도. */
 	if (check_set_rlimits(td))
 		return 1;
 
-	rd->rdma_protocol = o->verb;
-	rd->cq_event_num = 0;
+	rd->rdma_protocol = o->verb;   /* [한국어] 사용자 옵션을 엔진 상태로 전파(서버는 server_recv가 덮어쓸 수 있음) */
+	rd->cq_event_num = 0;            /* [한국어] CQ 이벤트 카운터 0으로 초기화 */
 
-	/* [한국어] CM 이벤트 채널 생성(fd 기반) */
+	/* [한국어] CM 이벤트 채널 생성 — 내부적으로 socketpair/eventfd 같은 fd 기반 통지 채널.
+	 * rdma_get_cm_event는 이 채널의 fd에서 이벤트 read를 블로킹. */
 	rd->cm_channel = rdma_create_event_channel();
 	if (!rd->cm_channel) {
 		log_err("fio: rdma_create_event_channel fail: %m\n");
 		return 1;
 	}
 
-	/* [한국어] CM id 생성. RDMA_PS_TCP = RC QP 기반 TCP 유사 포트스페이스 */
+	/* [한국어] CM id 생성. 4번째 인자 RDMA_PS_TCP = RC QP 기반의 TCP 유사 포트 스페이스
+	 * (Reliable Connection 시맨틱 — 순서/무손실 보장). 다른 옵션 RDMA_PS_UDP는 UD QP용. */
 	ret = rdma_create_id(rd->cm_channel, &rd->cm_id, rd, RDMA_PS_TCP);
 	if (ret) {
 		log_err("fio: rdma_create_id fail: %m\n");
 		return 1;
 	}
 
-	/* [한국어] 메모리 시맨틱에서만 원격 MR 배열 예약 */
+	/* [한국어] 메모리 시맨틱(WRITE/READ)에서만 원격 MR 배열 예약 — 채널 시맨틱은 원격 주소 불필요.
+	 * 크기는 컴파일 상한 FIO_RDMA_MAX_IO_DEPTH(=512), 실제 사용량은 서버 iodepth만큼. */
 	if ((rd->rdma_protocol == FIO_RDMA_MEM_WRITE) ||
 	    (rd->rdma_protocol == FIO_RDMA_MEM_READ)) {
 		rd->rmt_us = calloc(FIO_RDMA_MAX_IO_DEPTH,
 				    sizeof(struct remote_u));
-		rd->rmt_nr = 0;
+		rd->rmt_nr = 0;  /* [한국어] 아직 서버 응답 미수신 — 0으로 시작 */
 	}
 
-	/* [한국어] io_u 관리 큐 3종 할당(queued/flight/completed) */
+	/* [한국어] io_u 관리 큐 3종 할당(queued→flight→completed 상태 전이용 배열).
+	 * 각 배열은 iodepth 슬롯 — 동시 진행 가능한 io_u 수 상한. */
 	rd->io_us_queued = calloc(td->o.iodepth, sizeof(struct io_u *));
 	rd->io_u_queued_nr = 0;
 
@@ -2020,16 +2303,19 @@ static int fio_rdmaio_init(struct thread_data *td)
 	rd->io_u_completed_nr = 0;
 
 	if (td_read(td)) {	/* READ as the server */
-		rd->is_client = 0;
-		/* [한국어] 서버는 완료를 fio에 보고하지 않으므로 진행률 추적 비활성 */
+		rd->is_client = 0;  /* [한국어] 서버 역할 — listen 측 */
+		/* [한국어] 서버는 데이터 완료를 fio 통계로 보고하지 않으므로 진행률 추적 비활성.
+		 * TD_F_NO_PROGRESS 플래그는 fio 코어가 ETA/진행률 출력을 건너뛰게 함. */
 		td->flags |= TD_F_NO_PROGRESS;
 		/* server rd->rdma_buf_len will be setup after got request */
+		/* [한국어] 서버: bind/listen → CONNECT_REQUEST 대기까지 동기 수행 */
 		ret = fio_rdmaio_setup_listen(td, o->port);
 	} else {		/* WRITE as the client */
-		rd->is_client = 1;
+		rd->is_client = 1;  /* [한국어] 클라이언트 역할 — connect 측 */
+		/* [한국어] 클라: resolve_addr → resolve_route → setup_qp 까지 (connect는 open_file 시점) */
 		ret = fio_rdmaio_setup_connect(td, td->o.filename, o->port);
 	}
-	return ret;
+	return ret;  /* [한국어] setup 단계 결과 전파 */
 }
 /*
  * [한국어]
@@ -2049,22 +2335,29 @@ static int fio_rdmaio_post_init(struct thread_data *td)
 	int i;
 	struct rdmaio_data *rd = td->io_ops_data;
 
+	/* [한국어] 양방향 max_bs 중 큰 값 — io_u 풀의 버퍼 슬롯 크기와 일치(fio가 그렇게 할당). */
 	max_bs = max(td->o.max_bs[DDIR_READ], td->o.max_bs[DDIR_WRITE]);
-	/* [한국어] 제어 메시지에 max_bs 반영(클라이언트가 검증) */
+	/* [한국어] 서버→클라 제어 메시지에 max_bs 반영(클라이언트 client_recv가 자신의 max_bs 검증). */
 	rd->send_buf.max_bs = htonl(max_bs);
 
 	/* register each io_u in the free list */
-	/* [한국어] 모든 프리리스트 io_u를 순회하며 MR 등록과 엔진 데이터 부착 */
+	/* [한국어] 모든 프리리스트 io_u 순회하여 MR 등록 + rdma_io_u_data 부착.
+	 * io_u_freelist는 fio 코어가 io_u_init 단계에서 만든 풀(get_io_u가 여기서 꺼냄). */
 	for (i = 0; i < td->io_u_freelist.nr; i++) {
-		struct io_u *io_u = td->io_u_freelist.io_us[i];
+		struct io_u *io_u = td->io_u_freelist.io_us[i];  /* [한국어] i번 io_u 추출 */
 
-		/* [한국어] io_u별 확장 구조체 할당 */
+		/* [한국어] io_u별 확장 구조체 할당 — sq_wr/rq_wr/rdma_sgl 템플릿을 보관.
+		 * io_u->engine_data는 fio 코어가 무관심한 void* 포인터(엔진이 자유 사용). */
 		io_u->engine_data = calloc(1, sizeof(struct rdma_io_u_data));
+		/* [한국어] wr_id를 i로 설정 — CQE wc.wr_id 매칭에 사용. 0..iodepth-1 범위. */
 		((struct rdma_io_u_data *)io_u->engine_data)->wr_id = i;
 
 		/* [한국어] io_u 버퍼 MR 등록: 로컬 쓰기 + 원격 읽기·쓰기 권한.
-		 * 서버가 client로부터 RDMA_WRITE를 받으려면 REMOTE_WRITE 필수,
-		 * RDMA_READ를 허용하려면 REMOTE_READ 필수. */
+		 * - LOCAL_WRITE : HCA가 로컬 메모리에 DMA 쓰기(RECV/RDMA READ 결과 수신).
+		 * - REMOTE_READ : 원격 호스트가 RDMA READ로 이 메모리를 읽을 수 있음.
+		 * - REMOTE_WRITE: 원격 호스트가 RDMA WRITE로 이 메모리에 쓸 수 있음.
+		 * MR 등록 시 페이지가 pin되며 lkey(local)와 rkey(remote)가 발급된다.
+		 * 등록 시간이 최초 페이지 폴트 비용을 포함해 다소 느릴 수 있음(MEMLOCK 한계 영향). */
 		io_u->mr = ibv_reg_mr(rd->pd, io_u->buf, max_bs,
 				      IBV_ACCESS_LOCAL_WRITE |
 				      IBV_ACCESS_REMOTE_READ |
@@ -2074,18 +2367,21 @@ static int fio_rdmaio_post_init(struct thread_data *td)
 			return 1;
 		}
 
-		/* [한국어] 서버 측이 클라이언트에게 전달할 rmt_us 엔트리 구성(네트워크 바이트순) */
+		/* [한국어] 서버가 클라에게 전달할 rmt_us[i] 엔트리 구성(네트워크 바이트순으로 직렬화).
+		 * 클라이언트는 client_recv에서 ntohl/__be64_to_cpu로 호스트 순서 복원.
+		 * 클라이언트도 이 코드를 실행하지만 실제로는 사용하지 않음(서버 응답이 이를 덮어씀). */
 		rd->send_buf.rmt_us[i].buf =
-		    cpu_to_be64((uint64_t) (unsigned long)io_u->buf);
-		rd->send_buf.rmt_us[i].rkey = htonl(io_u->mr->rkey);
-		rd->send_buf.rmt_us[i].size = htonl(max_bs);
+		    cpu_to_be64((uint64_t) (unsigned long)io_u->buf);  /* [한국어] 64bit VA 직렬화 */
+		rd->send_buf.rmt_us[i].rkey = htonl(io_u->mr->rkey);    /* [한국어] HCA 발급 RKEY */
+		rd->send_buf.rmt_us[i].size = htonl(max_bs);             /* [한국어] 원격 가용 크기 */
 
 #if 0
 		log_info("fio: Send rkey %x addr %" PRIx64 " len %d to client\n", io_u->mr->rkey, io_u->buf, max_bs); */
+		/* [한국어] 디버그 출력 — 빌드 시 비활성. 활성화 원할 시 #if 1로 변경. */
 #endif
 	}
 
-	/* [한국어] 유효 rmt_us 엔트리 수 기록 */
+	/* [한국어] 유효 rmt_us 엔트리 수 기록 — 클라이언트가 인덱스 선택 시 % 연산자 분모로 사용. */
 	rd->send_buf.nr = htonl(i);
 
 	return 0;
@@ -2093,101 +2389,239 @@ static int fio_rdmaio_post_init(struct thread_data *td)
 
 /*
  * [한국어]
- * fio_rdmaio_cleanup - 엔진 리소스 해제.
+ * fio_rdmaio_cleanup - 엔진 리소스 해제(잡 종료 시 1회 호출).
  *
  * @td: thread_data.
+ * @return: 없음(void).
  *
- * 동기: fio 엔진 계약의 cleanup 콜백. 현재 구현은 rdmaio_data 자체만 free하고,
- * MR/QP/CQ/PD는 close_file에서 이미 해제되었다고 가정(불완전하지만 원본 그대로 유지).
+ * 동기: fio 엔진 계약의 cleanup 콜백(setup의 calloc과 짝). 현재 구현은 rdmaio_data
+ * 본체만 free하고 다음은 close_file에서 이미 해제되었다고 가정한다:
+ *   - MR(io_u 버퍼): close_file은 직접 해제 X — fio가 io_u 버퍼 풀 해제 시 OS가 unmap하면
+ *     커널 RDMA 서브시스템이 페이지 unpin과 MR 자동 해제 처리(또는 누수 가능성 있음).
+ *   - QP/CQ/PD/comp_channel: close_file에서 ibv_destroy_*/ibv_dealloc_pd 호출.
+ *   - cm_id/cm_channel: close_file에서 rdma_destroy_id 호출(cm_channel은 누락 가능 — 원본 한계).
+ *   - rmt_us/io_us_queued/flight/completed 배열: free 누락(원본 코드 한계 — 잡 종료 시
+ *     프로세스가 통째로 회수하므로 실용상 문제 없음).
+ *
+ * 호출 체인: backend.c → td_io_cleanup → [이 함수].
+ * 실행 컨텍스트: 잡 스레드, 단 1회.
  */
 static void fio_rdmaio_cleanup(struct thread_data *td)
 {
-	struct rdmaio_data *rd = td->io_ops_data;
+	struct rdmaio_data *rd = td->io_ops_data;  /* [한국어] 엔진 상태 포인터 추출 */
 
-	if (rd)
-		free(rd);
+	if (rd)                                     /* [한국어] init 실패 경로에서도 안전 */
+		free(rd);                            /* [한국어] 본체 해제 — 내부 배열은 누수 가능(원본 그대로) */
 }
 
 /*
  * [한국어]
- * fio_rdmaio_setup - 엔진 setup 콜백. 더미 파일 추가 및 rdmaio_data 초기 할당.
+ * fio_rdmaio_setup - 엔진 setup 콜백(init보다 먼저 호출). 더미 파일 추가 및 rdmaio_data 초기 할당.
  *
  * @td: thread_data.
- * @return: 0 고정.
+ * @return: 0 고정(현 구현은 실패 경로 없음).
  *
- * 동기: 네트워크 엔진이므로 실제 파일은 없지만 fio는 최소 1개의 fio_file을 요구 →
- * filename을 그대로 쓰거나 "rdma" 기본 이름으로 add_file 호출. 난수 상태는
- * GOLDEN_RATIO_64 시드로 초기화(원격 MR 인덱스 선택용).
+ * 동기: 네트워크 엔진이므로 실제 파일은 없지만 fio는 최소 1개의 fio_file을 요구한다
+ * (잡당 IO 통계/파일 종속 상태 추적). 사용자가 filename=옵션을 지정했으면 그것을,
+ * 아니면 "rdma" 기본 이름으로 add_file 호출.
+ *
+ * 난수 상태는 GOLDEN_RATIO_64(=0x9E3779B97F4A7C15) 시드로 초기화 — fio_rdmaio_send에서
+ * RDMA WRITE/READ 시 rmt_us[] 인덱스를 무작위 선택할 때 사용(원격 MR 부하 분산).
+ *
+ * 호출 체인: backend.c → td_io_setup(=ioengine_ops.setup) → [이 함수].
+ * 실행 컨텍스트: 잡 스레드, init보다 먼저 1회.
+ *
+ * 주의: setup은 init보다 먼저 호출되며, td->io_ops_data가 setup에서 채워진 채로 init이
+ * 동작한다(init도 같은 포인터를 그대로 사용). 일반 엔진은 init에서만 io_ops_data를
+ * 만들지만, RDMA는 setup에서 만들어 add_file의 파일 콜백 흐름과 호환되게 함.
  */
 static int fio_rdmaio_setup(struct thread_data *td)
 {
 	struct rdmaio_data *rd;
 
 	if (!td->files_index) {
-		/* [한국어] 잡에 파일이 하나도 등록되지 않았다면 더미 파일 추가 */
+		/* [한국어] 잡에 파일이 하나도 등록되지 않았다면 더미 파일 추가.
+		 * filename 옵션이 있으면 그 문자열을, 없으면 "rdma" 리터럴을 사용.
+		 * add_file 시그니처: (td, name, file_index, numjobs_offset). */
 		add_file(td, td->o.filename ?: "rdma", 0, 0);
+		/* [한국어] nr_files=0이면 1로 끌어올림(?: 삼항 연산자 — fio 코드베이스 관용) */
 		td->o.nr_files = td->o.nr_files ?: 1;
+		/* [한국어] open_files 카운터 증가 — fio가 "이 잡은 파일을 1개 열어야 함"으로 인지 */
 		td->o.open_files++;
 	}
 
 	if (!td->io_ops_data) {
-		/* [한국어] rdmaio_data 최초 할당 및 난수 시드 설정 */
+		/* [한국어] 본 setup이 처음 호출되는 경우만 rdmaio_data 할당
+		 * (fio가 같은 td에 대해 setup을 중복 호출할 가능성 방어). */
 		rd = calloc(1, sizeof(*rd));
+		/* [한국어] frand_state 시드 — GOLDEN_RATIO_64는 황금비 기반 32비트 정수로,
+		 * 비트가 잘 분포된 시드 값. 원격 MR 인덱스 추첨용 난수 품질에 충분.
+		 * 시그니처: init_rand_seed(state, seed, use_random64). */
 		init_rand_seed(&rd->rand_state, (unsigned int) GOLDEN_RATIO_64, 0);
-		td->io_ops_data = rd;
+		td->io_ops_data = rd;  /* [한국어] 잡 전역 상태로 부착 */
 	}
 
-	return 0;
+	return 0;  /* [한국어] setup은 항상 성공 보고 */
 }
 
 /*
  * [한국어] ioengine_ops 테이블 — fio 코어가 이 엔진을 식별하고 콜백을 호출할 디스패치 테이블.
- * FIO_STATIC은 외부로 노출되지 않게 하며, register_ioengine으로 런타임에 테이블 체인에 등록된다.
- * flags 의미:
- *   FIO_DISKLESSIO: 실 파일 I/O가 아님(네트워크 엔진)
- *   FIO_UNIDIR:     단일 방향(read 또는 write만; td_rw 금지)
- *   FIO_PIPEIO:     파이프성 I/O(sequential, 오프셋 무의미)
- *   FIO_ASYNCIO_SETS_ISSUE_TIME: 엔진이 직접 issue_time을 설정(fio 코어가 건너뜀)
+ * FIO_STATIC은 외부로 노출되지 않게 하며(빌드 환경에 따라 static 또는 빈 매크로로 치환),
+ * register_ioengine으로 런타임에 전역 engine_list 체인에 등록된다(constructor 진입).
+ *
+ * 본 vtable의 각 필드는 fio 코어의 해당 td_io_*() 디스패처가 호출한다:
+ *   td_io_setup     → .setup
+ *   td_io_init      → .init
+ *   td_io_post_init → .post_init
+ *   td_io_prep      → .prep
+ *   td_io_queue     → .queue
+ *   td_io_commit    → .commit
+ *   td_io_getevents → .getevents
+ *   td_io_event     → .event
+ *   td_io_open_file → .open_file
+ *   td_io_close_file→ .close_file
+ *   td_io_cleanup   → .cleanup
+ *
+ * null.c §1 ioengine_ops 콜백 계약 요약 참조.
  */
 FIO_STATIC struct ioengine_ops ioengine = {
-	.name			= "rdma",                 /* [한국어] --ioengine=rdma 선택 키 */
-	.version		= FIO_IOOPS_VERSION,      /* [한국어] ABI 버전 — fio 코어와 매치 필요 */
+	.name			= "rdma",
+	/* [한국어] 엔진 식별 문자열. 잡 파일의 `ioengine=rdma`와 매칭된다.
+	 * 설정자: 이 초기화. 읽는 자: load_ioengine()의 strcmp 매칭, --enghelp 출력.
+	 * 값 범위: NUL 종결 ASCII("rdma"). 동기화: 등록 후 불변. */
+
+	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] ioengine ABI 버전 매크로(fio.h 정의). fio 코어와 엔진 간 ioengine_ops
+	 * 구조체 레이아웃 불일치를 런타임에 탐지하기 위한 상수.
+	 * 설정자: 이 초기화. 읽는 자: register_ioengine/check_engine_ops에서 비교 후 거부.
+	 * 값 범위: 컴파일 시점 fio.h가 정의한 정수. 동기화: 불변. */
+
 	.setup			= fio_rdmaio_setup,
+	/* [한국어] 잡 setup 단계 콜백(init보다 먼저). td->files_index 가 0이면 더미 fio_file
+	 * 추가 + rdmaio_data calloc + rand_state 시드 초기화.
+	 * 호출자: backend.c의 init_io 경로. 반환 0=성공.
+	 * 동기화: 잡 스레드 단일 호출. */
+
 	.init			= fio_rdmaio_init,
+	/* [한국어] 잡 init 콜백. 옵션 검증(td_rw/td_random 금지, port 필수), MEMLOCK rlimit
+	 * 확장, CM 이벤트 채널/cm_id 생성, io_us_*[3] 큐 배열 할당, 역할 결정(td_read=서버),
+	 * setup_listen 또는 setup_connect로 이어짐(연결 핸드셰이크 시작).
+	 * 반환 0=성공, 1=잡 중단. 동기화: 잡 스레드 단일 호출. */
+
 	.post_init		= fio_rdmaio_post_init,
+	/* [한국어] init 이후, fio가 io_u 풀을 할당한 뒤 1회 호출. 모든 io_u->buf을 ibv_reg_mr로
+	 * MR 등록 + io_u->engine_data(rdma_io_u_data) 할당 + 서버는 send_buf.rmt_us[]를 채움
+	 * (RKEY 교환 준비). 반환 0=성공, 1=ibv_reg_mr 실패. */
+
 	.prep			= fio_rdmaio_prep,
+	/* [한국어] 각 io_u가 queue에 들어가기 전 1회 호출. WR(sg_list/lkey/wr_id/공통 플래그)
+	 * 초기화. opcode·rkey·remote_addr·length는 send 시점에서 최종 결정.
+	 * 반환 0 고정(현 구현). */
+
 	.queue			= fio_rdmaio_queue,
+	/* [한국어] io_u 1개를 엔진에 제출. 본 엔진은 즉시 post하지 않고 io_us_queued에 적재 후
+	 * FIO_Q_QUEUED 반환. 큐 만원 시 FIO_Q_BUSY → 코어가 commit/getevents 수행 후 재시도.
+	 * 반환: FIO_Q_QUEUED|BUSY (COMPLETED 미사용 — 비동기 엔진). */
+
 	.commit			= fio_rdmaio_commit,
+	/* [한국어] 큐잉된 io_u 일괄 제출. is_client 분기로 fio_rdmaio_send/recv 호출 →
+	 * ibv_post_send/recv. 부분 제출 후 잔여 항목 재시도 루프. 반환 0=성공, 비0=실패. */
+
 	.getevents		= fio_rdmaio_getevents,
+	/* [한국어] CQ 이벤트 채널 블로킹 대기 + cq_event_handler로 CQE 수확.
+	 * min개 미달 시 다시 ibv_get_cq_event로 대기. 반환=수확한 이벤트 수, -1=실패.
+	 * cq_event_num 카운터로 잔여 이벤트 우선 소비(중복 대기 회피). */
+
 	.event			= fio_rdmaio_event,
+	/* [한국어] getevents가 N 반환 후 코어가 N번 호출하여 io_u 회수. 본 엔진은
+	 * io_us_completed[0]을 반환하고 나머지를 한 칸씩 shift(FIFO 보장).
+	 * 반환: 유효 io_u 포인터(NULL 불가). */
+
 	.cleanup		= fio_rdmaio_cleanup,
+	/* [한국어] 잡 종료 시 1회. rdmaio_data만 free(MR/QP/CQ/PD는 close_file에서 이미 해제).
+	 * setup의 calloc과 짝. 동기화: 잡 스레드 단일 호출. */
+
 	.open_file		= fio_rdmaio_open_file,
+	/* [한국어] fio_file 오픈 훅(네트워크 엔진에서는 "연결 수립"으로 치환).
+	 * td_read(td)면 fio_rdmaio_accept(서버), 아니면 fio_rdmaio_connect(클라).
+	 * 반환 0=성공, 1=실패. */
+
 	.close_file		= fio_rdmaio_close_file,
+	/* [한국어] open_file과 짝. 클라+MEM 모드는 종료 통지 SEND 전송 → rdma_disconnect →
+	 * CQ/QP/cm_id/comp_channel/PD 역순 해제. 반환 0=성공, 1=ibv_post_send 실패. */
+
 	.flags			= FIO_DISKLESSIO | FIO_UNIDIR | FIO_PIPEIO |
 					FIO_ASYNCIO_SETS_ISSUE_TIME,
-	.options		= options,                /* [한국어] 위에서 정의한 엔진 옵션 테이블 */
+	/* [한국어] 엔진 특성 플래그(ioengines.c §1 참조). 비트별 의미:
+	 *   FIO_DISKLESSIO              — 실제 파일/블록 디바이스 미필요. 코어가 파일 존재/크기
+	 *                                 검증을 생략(네트워크 엔진).
+	 *   FIO_UNIDIR                  — 단일 방향(read 또는 write 둘 중 하나만). 본 엔진의
+	 *                                 fio_rdmaio_init이 td_rw 검출 시 즉시 잡 중단.
+	 *   FIO_PIPEIO                  — 파이프성 I/O(순차, 오프셋 무의미). 코어가 랜덤
+	 *                                 매핑/seek 로직을 생략하고, fio_rdmaio_init은
+	 *                                 td_random에서 잡 중단.
+	 *   FIO_ASYNCIO_SETS_ISSUE_TIME — 엔진이 직접 io_u->issue_time을 설정. fio_rdmaio_queued
+	 *                                 가 fio_gettime을 호출. 코어는 queue 진입 시점의
+	 *                                 issue_time 자동 기록을 건너뜀(latency 측정 정확도 향상).
+	 * 미설정 비트(의도적):
+	 *   FIO_SYNCIO   — 비동기 엔진(QP/CQ 기반). 절대 미설정.
+	 *   FIO_RAWIO    — 파일/블록 raw I/O 아님.
+	 *   FIO_NOEXTEND — 파일 확장 검증 무관.
+	 *   FIO_BARRIER  — RDMA WR은 자체 ordering 보장(IBV_QPT_RC), 추가 배리어 불필요.
+	 *   FIO_NODISKUTIL — DISKLESSIO와 함께 자동 적용.
+	 * 설정자: 이 초기화. 읽는 자: 잡 루프 전반. 동기화: 등록 후 불변. */
+
+	.options		= options,
+	/* [한국어] 위에서 정의한 엔진 옵션 테이블 포인터. parse.c가 이 배열을 순회해
+	 * 사용자 입력을 파싱. NULL이면 엔진 전용 옵션 없음.
+	 * 설정자: 이 초기화. 읽는 자: parse_options/print_help_engine. */
+
 	.option_struct_size	= sizeof(struct rdmaio_options),
+	/* [한국어] td->eo로 할당할 옵션 객체 크기. fio 코어가 calloc(option_struct_size)로
+	 * 할당하고 .options 테이블의 .off1로 사용자 입력을 채움.
+	 * 설정자: 이 초기화. 읽는 자: alloc_thread_data() 등. */
 };
 
 /*
  * [한국어]
- * fio_rdmaio_register - 라이브러리 로드 시 ioengine을 fio 코어에 등록.
+ * fio_rdmaio_register - 내부 빌트인 RDMA 엔진을 전역 엔진 리스트에 등록.
  *
- * fio_init 속성은 __attribute__((constructor))로 치환되어 main 이전에 자동 실행된다.
- * register_ioengine은 전역 엔진 리스트에 본 ioengine을 삽입.
+ * @return: 없음.
+ *
+ * 동기/배경: fio_init 매크로(fio.h)는 __attribute__((constructor))로 치환되며,
+ * 이로 인해 함수가 .init_array 섹션에 등록되어 ld.so(libc 동적 로더)가 main()
+ * 진입 전에 자동 실행한다. 이 시점에서는 fio 코어가 아직 잡을 시작하지 않았지만
+ * 전역 engine_list는 이미 사용 가능 상태이므로 안전하게 추가 가능.
+ *
+ * register_ioengine(ioengines.c)은 내부적으로 flist_add_tail(&ops->list, &engine_list)
+ * 를 수행해 본 ioengine 구조체를 끝에 링크. 이후 사용자가 잡 파일에서
+ * `ioengine=rdma`로 지정하면 load_ioengine()의 strcmp 매칭으로 본 엔진을 찾는다.
+ *
+ * 실행 컨텍스트: 프로세스 메인 스레드, 단 1회. 정적 바이너리/공유 라이브러리 둘 다
+ * 동일하게 동작. 호출 체인: libc 로더 → [이 함수] → register_ioengine.
  */
 static void fio_init fio_rdmaio_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine);  /* [한국어] 전역 engine_list에 본 엔진 vtable 링크 */
 }
 
 /*
  * [한국어]
- * fio_rdmaio_unregister - 라이브러리 언로드 시 엔진을 리스트에서 제거.
+ * fio_rdmaio_unregister - 프로세스 종료 시 엔진을 전역 리스트에서 언링크.
  *
- * fio_exit 속성은 __attribute__((destructor))로 치환되어 프로세스 종료 시 자동 실행.
+ * @return: 없음.
+ *
+ * 동기/배경: fio_exit 매크로는 __attribute__((destructor))로 치환되어 .fini_array
+ * 섹션에 등록된다. main() 복귀 또는 atexit 체인 실행 시 ld.so가 자동 호출.
+ * 정적 바이너리에서는 동작상 불필요(프로세스 종료가 곧 모든 자원 회수)하나,
+ * .so 빌드의 dlclose 경로 또는 fio 코어의 정리 루틴 안전 장치로 의미가 있다.
+ *
+ * unregister_ioengine은 flist_del_init(&ops->list)으로 링크 해제 — 동일 엔진의
+ * 재적재(반복 dlopen) 안전성 확보.
+ *
+ * 실행 컨텍스트: 프로세스 메인 스레드, 단 1회.
  */
 static void fio_exit fio_rdmaio_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine);  /* [한국어] engine_list에서 본 엔진 언링크 */
 }

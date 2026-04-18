@@ -1,15 +1,24 @@
 /*
- * [한국어 설명] xNVMe 기반 NVMe I/O 엔진 구현 (xnvme.c)
+ * [한국어 설명] xNVMe 기반 교차 백엔드 NVMe I/O 엔진 구현 (xnvme.c)
  *
  * === 파일의 역할 ===
- * 이 파일은 fio I/O 엔진 플러그인 중 "xnvme" 엔진의 전체 구현을 담는다. xNVMe는
- * 다양한 NVMe 접근 백엔드(Linux 커널 NVMe 드라이버, io_uring, io_uring_cmd, libaio,
- * SPDK user-space 드라이버, FreeBSD NVMe, POSIX, VFIO 등)를 단일 C API로 추상화한
- * 라이브러리이다. 이 엔진은 libxnvme C API를 사용하여 NVMe 네임스페이스에 대한
- * Read/Write 를 비동기로 제출·수확(submit/reap)하며, Zoned Namespace(ZNS) 관리,
- * Flexible Data Placement(FDP) Reclaim Unit Handle, NVMe Protection Information(PI)
- * 생성·검증까지 지원한다. 즉, 하나의 fio --ioengine=xnvme 로 "어떤 NVMe 접근 경로를
- *쓸지"를 런타임 옵션(--xnvme_async, --xnvme_sync, --xnvme_be 등)으로 고르게 한다.
+ * 이 파일은 fio I/O 엔진 플러그인 중 "xnvme" 엔진의 전체 구현을 담는다. xNVMe
+ * (github.com/OpenMPDK/xNVMe)는 다양한 NVMe 접근 백엔드 — Linux 커널 NVMe 블록
+ * 드라이버, io_uring(일반 블록 SQE), io_uring_cmd(NVMe passthru SQE), libaio,
+ * SPDK user-space NVMe 드라이버(UIO/VFIO 기반 폴 모드), FreeBSD NVMe, POSIX
+ * pread/pwrite, VFIO, thrpool(스레드풀 에뮬레이션), nil(더미) 등을 단일 C API
+ * 로 추상화한 라이브러리이다. 이 엔진은 libxnvme C API를 사용하여 NVMe
+ * 네임스페이스에 대한 Read/Write 를 비동기로 제출·수확(submit/reap)하며, Zoned
+ * Namespace(ZNS) 관리(Report Zones / Zone Mgmt Send RESET), Flexible Data
+ * Placement(FDP) Reclaim Unit Handle Status 조회, NVMe Protection Information
+ * (PI, Type1/2/3, 16B/64B GUARD) 생성·검증, Application Tag/Reference Tag
+ * 관리, 확장 LBA(데이터+PI 결합) 지원, 분리 메타데이터 버퍼 경로까지 제공한다.
+ * 즉, 하나의 `fio --ioengine=xnvme` 로 "어떤 NVMe 접근 경로를 쓸지"를 런타임
+ * 옵션(--xnvme_async=io_uring_cmd, --xnvme_sync=nvme, --xnvme_be=spdk 등)으로
+ * 선택하게 한다. 유사 엔진인 engines/nvme.c(io_uring_cmd 전용)나
+ * engines/sg.c(SCSI generic ioctl), engines/io_uring.c(io_uring 전용)와 기능이
+ * 일부 중첩되지만, 이 엔진의 고유 가치는 "하나의 코드 경로로 6~7종의 백엔드를
+ * 스위치"하여 성능/기능 비교 및 이식성을 얻는 점이다.
  *
  * === 전체 아키텍처에서의 위치 ===
  * fio 호출 체인에서 이 파일의 콜백들은 backend.c → ioengines.c 가 관리하는
@@ -18,43 +27,82 @@
  *     → td_io_init() → .init = xnvme_fioe_init()       (잡 시작 시 1회)
  *     → td_io_open_file() → .open_file = xnvme_fioe_open()
  *     → get_io_u() → .io_u_init = xnvme_fioe_io_u_init()
- *     → td_io_queue() → .queue = xnvme_fioe_queue()    (I/O 제출)
+ *     → td_io_queue() → .queue = xnvme_fioe_queue()    (I/O 제출, 비동기)
+ *     → td_io_commit() → (엔진이 commit 콜백 없음 — queue 가 즉시 커밋)
  *     → td_io_getevents() → .getevents = xnvme_fioe_getevents() (완료 수확)
  *     → .event = xnvme_fioe_event()                    (개별 완료 추출)
  *     → td_io_close_file() → .close_file = xnvme_fioe_close()
  *     → .cleanup = xnvme_fioe_cleanup()                (잡 종료 시 1회)
- * 실행 컨텍스트는 항상 호스트 유저스페이스의 fio 잡 스레드이며, 옵션
- * --thread=1 이 강제되어 동일 프로세스 내 스레드 모델로만 동작한다 (멀티프로세스
- * fork 모델 금지: libxnvme 전역 상태 공유 때문).
+ * ZBD/FDP 경로는 엔진 init 이전에도 호출될 수 있으므로(.get_zoned_model,
+ * .report_zones, .reset_wp, .fdp_fetch_ruhs, .get_max_open_zones,
+ * .get_file_size) 각 콜백이 "io_ops_data 있으면 재사용 / 없으면 임시
+ * xnvme_dev_open/close" 양쪽 경로를 모두 지원한다. 실행 컨텍스트는 항상 호스트
+ * 유저스페이스의 fio 잡 스레드이며, 옵션 --thread=1 이 강제되어 동일 프로세스
+ * 내 스레드 모델로만 동작한다 (멀티프로세스 fork 모델 금지: libxnvme 의
+ * 백엔드 레지스트리·PCI enumeration·SPDK EAL 상태가 전역이라 fork 후 공유
+ * 불가). 실제 I/O 시스템 콜은 선택된 백엔드가 결정 — 예: io_uring_cmd 는
+ * io_uring_enter(2) + IORING_OP_URING_CMD + NVMe_URING_CMD_IO, libaio 는
+ * io_submit(2)/io_getevents(2), SPDK 는 유저스페이스 폴링(시스템 콜 0회).
  *
  * === 타 모듈과의 연결 ===
  * - 상위(호출자): fio 코어(ioengines.c, backend.c, io_u.c, zbd.c, dataplacement.c).
  *   io_u 하나가 들어오면 xnvme_fioe_queue() 에서 xNVMe 명령 컨텍스트(xnvme_cmd_ctx)
- *   로 변환 후 xnvme_queue_*/xnvme_cmd_pass*() 로 제출한다.
- * - 하위(피호출자): libxnvme API (xnvme_dev_open, xnvme_queue_init/poke/term,
- *   xnvme_cmd_pass/passv, xnvme_buf_alloc/free, xnvme_znd_report_from_dev,
- *   xnvme_znd_mgmt_send, xnvme_nvm_mgmt_recv, xnvme_pi_ctx_init/generate/verify).
- *   libxnvme 는 내부에서 선택된 백엔드(io_uring, SPDK 등)의 시스템 콜/ioctl 을 수행.
+ *   로 변환 후 xnvme_queue_*/xnvme_cmd_pass*() 로 제출한다. zbd.c 는
+ *   get_zoned_model/report_zones/reset_wp 를 호출해 "Zoned Block Device" 추상을
+ *   구현하며, dataplacement.c 는 fdp_fetch_ruhs 로 RUH(Reclaim Unit Handle) 리스트를
+ *   얻어 FDP dtype/dspec 을 설정한다.
+ * - 하위(피호출자): libxnvme API — 장치 관리(xnvme_dev_open/close/get_geo/get_ssw/
+ *   get_nsid/get_ns_css), 큐(xnvme_queue_init/term/poke/put_cmd_ctx/get_cmd_ctx/
+ *   set_cb), 버퍼(xnvme_buf_alloc/free, xnvme_buf_virt_free), NVM 명령
+ *   (xnvme_cmd_pass/passv, xnvme_cmd_ctx_from_dev, xnvme_cmd_ctx_cpl_status,
+ *   xnvme_cmd_ctx_pr), ZNS(xnvme_znd_report_from_dev, xnvme_znd_mgmt_send,
+ *   xnvme_znd_dev_get_lbafe), FDP(xnvme_nvm_mgmt_recv), PI(xnvme_pi_ctx_init,
+ *   xnvme_pi_generate, xnvme_pi_verify, xnvme_pi_size). libxnvme 는 내부에서
+ *   선택된 백엔드의 시스템 콜/ioctl(NVME_IOCTL_IO_CMD, io_uring_enter,
+ *   SPDK NVMe doorbell write 등)을 수행한다.
  * - 공유 자료구조: struct thread_data 의 io_ops_data 필드에 struct xnvme_fioe_data
- *   포인터를 저장한다. io_u 는 mmap_data 에 xd 포인터를, engine_data 에
- *   struct xnvme_fioe_request 를 연결한다(완료 콜백에서 io_u 를 복원하기 위한 근거).
- * - 데이터 흐름: fio io_u (offset, buflen, buf) → 이 엔진이 LBA/NLB 로 변환 →
- *   xnvme_cmd_ctx.nvm 필드 채움 → libxnvme 로 제출 → 커널/디바이스 → 완료 콜백
- *   cb_pool() 에서 xd->iocq[] 로 적재 → getevents() 가 리턴 → fio 가 event() 로
- *   개별 io_u 회수 → put_io_u() 로 반환.
+ *   포인터를 저장한다. io_u 는 mmap_data 에 xd 포인터를(cb_pool 역참조용),
+ *   engine_data 에 struct xnvme_fioe_request 포인터를(PI 컨텍스트/메타 버퍼 보관)
+ *   연결한다. 완료 콜백 cb_pool 의 cb_arg 에는 io_u 자체 포인터가 저장되어,
+ *   xnvme_queue_poke 가 완료 항목별로 cb_pool(ctx, io_u) 를 호출하면
+ *   io_u->mmap_data 에서 xd 를, io_u->engine_data 에서 fio_req 를 복원한다.
+ * - 데이터 흐름: fio io_u (offset, buflen, xfer_buf, ddir) → 이 엔진이 LBA(SLBA)
+ *   /NLB(Number of Logical Blocks) 로 변환(2의 거듭제곱 LBA 는 >>ssw, 확장 LBA
+ *   는 /lba_nbytes) → xnvme_cmd_ctx.cmd.nvm 필드(opcode, nsid, slba, nlb,
+ *   prinfo, ilbrt, lbat, lbatm) 채움 → PI 필요 시 xnvme_pi_generate 로 데이터
+ *   +메타 버퍼에 GUARD/REFTAG/APPTAG 삽입 → libxnvme 로 제출 → 백엔드가 커널/
+ *   디바이스로 전달 → 완료 시 libxnvme 내부 완료 큐에 적재 → xnvme_queue_poke
+ *   가 꺼내 cb_pool 호출 → cb_pool 이 cpl.status 검사/READ 시 PI verify/
+ *   xd->iocq[] 로 적재 → getevents() 가 라운드로빈으로 여러 파일을 poke 후
+ *   min 도달 시 반환 → fio 가 event(idx) 로 개별 io_u 회수 → put_io_u() 로 반환.
  *
  * === 주요 함수/구조체 요약 ===
- * - xnvme_fioe_init()     : 잡 스레드 시작 시 xd 할당, 파일별 _dev_open() 호출.
- * - xnvme_fioe_cleanup()  : xd 해제, 파일별 _dev_close() 호출.
+ * - xnvme_fioe_init()     : 잡 스레드 시작 시 xd 할당(flexible array + iocq +
+ *                            옵션별 iovec/md_iovec 풀), --thread=1 강제, 파일별
+ *                            _dev_open() 호출.
+ * - xnvme_fioe_cleanup()  : xd 와 iocq/iovec/md_iovec 해제, 파일별 _dev_close()
+ *                            호출 (g_serialize 직렬화).
  * - xnvme_fioe_queue()    : io_u → NVMe Read/Write 명령 변환 후 비동기 제출.
- * - xnvme_fioe_getevents(): xNVMe 큐를 poke 하여 완료를 수확, xd->iocq 에 채움.
- * - cb_pool()             : xNVMe 큐의 명령 완료 콜백. 상태 검사/PI 검증/iocq 적재.
- * - xnvme_fioe_report_zones()/reset_wp(): ZNS 존 리포트/리셋 (zbd.c 연동).
- * - xnvme_fioe_fetch_ruhs(): FDP Reclaim Unit Handle Status 조회 (dataplacement.c).
- * - struct xnvme_fioe_fwrap : fio_file 1개당 xNVMe 장치 핸들/큐/지오메트리 래퍼.
- * - struct xnvme_fioe_data  : 잡당 런타임 상태 (iocq, 파일 배열, iovec 풀).
+ *                            FIO_Q_QUEUED/BUSY/COMPLETED 반환. PI/FDP 필드 세팅.
+ * - xnvme_fioe_getevents(): 여러 파일의 xNVMe 큐를 라운드로빈으로 poke 하여 완료를
+ *                            수확, xd->iocq 에 채움. min 도달 시 반환.
+ * - cb_pool()             : xNVMe 큐의 명령 완료 콜백. cpl.status 검사 / PI 검증
+ *                            (READ 시) / iocq 적재 / cmd_ctx 반환.
+ * - xnvme_fioe_report_zones()/reset_wp(): ZNS Report Zones 로그 변환 / Zone Mgmt
+ *                            Send RESET (zbd.c 연동).
+ * - xnvme_fioe_fetch_ruhs(): NVMe IO Management Receive 로 FDP RUHS 로그 조회
+ *                            (dataplacement.c 연동).
+ * - xnvme_fioe_get_zoned_model/get_max_open_zones/get_file_size: init 이전 경로
+ *                            (자체 open/close) + init 이후 경로 공존.
+ * - xnvme_opts_from_fioe(): fio 옵션 → xnvme_opts 변환 공통 헬퍼.
+ * - _dev_open()/_dev_close(): 파일 단위 xNVMe 장치·큐 초기화·종료.
+ * - struct xnvme_fioe_fwrap : fio_file 1개당 xNVMe 장치 핸들/큐/지오메트리 래퍼
+ *                              (64B 캐시라인 정렬 STATIC_ASSERT).
+ * - struct xnvme_fioe_data  : 잡당 런타임 상태 (iocq, files[] flexible array,
+ *                              iovec/md_iovec 풀, 라운드로빈 커서).
  * - struct xnvme_fioe_request : io_u 당 PI 컨텍스트/메타데이터 버퍼.
- * - struct xnvme_fioe_options : --xnvme_* 커맨드라인 옵션 값의 저장소.
+ * - struct xnvme_fioe_options : --xnvme_* 커맨드라인 옵션 값의 저장소
+ *                                (td->eo 로 접근).
  */
 
 /*
@@ -71,21 +119,38 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-/* [한국어] calloc/free/abs 등 표준 메모리·수치 유틸. xd/iocq/iovec 동적 할당에 사용. */
+/* [한국어] calloc/free/abs/usleep(구현자에 따라) 등 표준 메모리·수치·유틸.
+ * xd/iocq/iovec/md_iovec/fio_req 동적 할당 및 cb_pool/queue 에서 abs(err) 로
+ * libxnvme 의 음수 에러코드를 양수 errno 로 변환하는 데 사용. */
 #include <stdlib.h>
-/* [한국어] assert() 매크로. 디버그 빌드에서 내부 불변식(event 인덱스 범위 등) 검증. */
+/* [한국어] assert() 매크로. 디버그 빌드에서 내부 불변식(event 인덱스 범위,
+ * fwrap->dev/geo NULL 여부, 미지원 ddir 도달 금지)을 검증. NDEBUG 빌드에서는
+ * 컴파일 시 제거되므로 성능 크리티컬 경로에도 안전하게 배치. */
 #include <assert.h>
-/* [한국어] xNVMe 공개 헤더. xnvme_dev/queue/cmd_ctx/znd/pi 등 모든 타입·함수 선언. */
+/* [한국어] xNVMe 공개 헤더. xnvme_dev/queue/cmd_ctx/znd/pi 등 모든 타입·함수
+ * 선언을 한 파일에서 제공. libxnvme.so 와의 링크는 configure 단계의
+ * CONFIG_LIBXNVME 매크로/Makefile 로 제어됨. 이 헤더는 백엔드별 내부 구현을
+ * 노출하지 않고 불투명 포인터(xnvme_dev*, xnvme_queue*)만 제공한다. */
 #include <libxnvme.h>
-/* [한국어] fio 코어: thread_data, fio_file, io_u, DDIR_*, FIO_Q_* 등 엔진 계약 정의. */
+/* [한국어] fio 코어 헤더: thread_data, fio_file, io_u, DDIR_*, FIO_Q_*,
+ * fio_ro_check, fio_file_* 등 엔진 계약 정의. register_ioengine/
+ * unregister_ioengine 함수 프로토타입과 fio_init/fio_exit 매크로도 제공. */
 #include "fio.h"
-/* [한국어] VERIFY_NONE 등 verify 모드 상수 — 확장 LBA + PI 충돌 검사에 사용. */
+/* [한국어] VERIFY_NONE/VERIFY_MD5 등 verify 모드 상수 — 확장 LBA + PI +
+ * verify 조합 충돌 검사(_verify_options)에 사용. fio 의 end-to-end 검증 경로와
+ * NVMe PI 의 end-to-end 보호가 서로 "데이터 바디"를 덮어쓰려 해서 배타 관계. */
 #include "verify.h"
-/* [한국어] zbd_zone/zbd_zoned_model/ZBD_ZONE_COND_* 등 존 블록 디바이스 추상 타입. */
+/* [한국어] zbd_zone/zbd_zoned_model/ZBD_ZONE_COND_*/ZBD_ZONE_TYPE_SWR/ZBD_HOST_MANAGED
+ * 등 존 블록 디바이스 추상 타입. NVMe ZNS 의 zs/zt 코드를 이 공용 타입으로 매핑하여
+ * zbd.c 가 백엔드 독립적으로 존 상태를 다루게 한다. */
 #include "zbd_types.h"
-/* [한국어] fio_ruhs_info — FDP Reclaim Unit Handle Status 전달 구조체. */
+/* [한국어] fio_ruhs_info — FDP Reclaim Unit Handle Status 전달 구조체
+ * (nr_ruhs, plis[]). dataplacement.c 가 잡 시작 시 이 콜백으로 RUH 목록을
+ * 수집해서 WRITE 명령의 dtype/dspec 필드를 라운드로빈 할당한다. */
 #include "dataplacement.h"
-/* [한국어] FIO_OPT_G_XNVME 옵션 그룹 식별자 정의. --enghelp 분류에 사용. */
+/* [한국어] FIO_OPT_G_XNVME 옵션 그룹 식별자 정의. `fio --enghelp=xnvme` 로 이
+ * 엔진 전용 옵션만 필터링 출력하는 분류 태그로 사용. FIO_OPT_C_ENGINE 은
+ * 엔진 카테고리(최상위), FIO_OPT_G_XNVME 는 이 엔진 서브그룹. */
 #include "optgroup.h"
 
 /*
@@ -257,42 +322,130 @@ struct xnvme_fioe_request {
 
 /*
  * [한국어] --xnvme_* 커맨드라인 옵션을 매핑할 구조체.
- * fio 의 fio_option.off1 이 이 구조체의 필드 오프셋을 가리켜, 파서가 값을 저장한다.
- * td->eo 로 접근.
+ * fio 의 fio_option.off1 이 이 구조체의 필드 오프셋을 가리켜, 옵션 파서가 값을
+ * 저장한다. thread_data 의 eo(engine options) 필드에 연결되며 이 엔진의 모든
+ * 콜백에서 td->eo 로 접근한다. 라이프사이클: 파서가 init 이전에 채우고,
+ * cleanup 이후까지 유지(문자열 포인터 포함). 필드 순서는 ABI 가 아니므로
+ * 재배치 가능하지만 padding 은 반드시 선두여야 한다.
  */
 struct xnvme_fioe_options {
 	void *padding;
-	/* [한국어] fio 옵션 프레임워크가 요구하는 선두 패딩(옵션 파서 호환성). */
+	/* [한국어] fio 옵션 프레임워크가 요구하는 선두 패딩(옵션 파서 호환성).
+	 * 설정자: 없음(파서가 건드리지 않음).
+	 * 읽는 자: 없음.
+	 * 값 범위: 항상 NULL.
+	 * 동기화: 불변. fio 옵션 파서의 포인터 정렬·구버전 호환 관례 충족용. */
+
 	unsigned int hipri;
-	/* [한국어] --hipri : polled completion(고우선순위) 사용 여부. io_uring poll_io 매핑. */
+	/* [한국어] --hipri : polled completion(고우선순위) 사용 여부.
+	 * 설정자: 옵션 파서가 FIO_OPT_STR_SET 로 0/1 저장.
+	 * 읽는 자: xnvme_opts_from_fioe 가 opts.poll_io 에 매핑.
+	 * 값 범위: 0(비활성)/1(활성). io_uring 백엔드에서 IORING_SETUP_IOPOLL 활성.
+	 * 동기화: init 이전 설정, 이후 read-only. */
+
 	unsigned int sqpoll_thread;
-	/* [한국어] --sqthread_poll : io_uring 커널 SQ 폴링 스레드 사용 여부. */
+	/* [한국어] --sqthread_poll : io_uring 커널 SQ 폴링 스레드 사용 여부.
+	 * 설정자: 옵션 파서.
+	 * 읽는 자: xnvme_opts_from_fioe 가 opts.poll_sq 에 매핑.
+	 * 값 범위: 0/1. 1 이면 IORING_SETUP_SQPOLL 로 커널이 SQ 를 폴링(도어벨
+	 *          쓰기 절감, CPU 한 개 커널 스레드 점유).
+	 * 동기화: init 이전 설정, 이후 read-only. */
+
 	unsigned int xnvme_dev_nsid;
-	/* [한국어] --xnvme_dev_nsid : user-space NVMe 드라이버에서 선택할 NSID. */
+	/* [한국어] --xnvme_dev_nsid : user-space NVMe 드라이버(SPDK 등)에서 선택할
+	 *         Namespace Identifier. 커널 백엔드(/dev/nvme0n1)에서는 장치 이름으로
+	 *         NSID 가 이미 결정되어 불필요, SPDK 는 컨트롤러 당 여러 NS 중
+	 *         선택해야 하므로 필요.
+	 * 설정자: 옵션 파서(FIO_OPT_INT).
+	 * 읽는 자: xnvme_opts_from_fioe → opts.nsid.
+	 * 값 범위: 0=미지정(백엔드 기본), 1..N=유효 NSID. */
+
 	unsigned int xnvme_iovec;
-	/* [한국어] --xnvme_iovec : 벡터드 I/O(xnvme_cmd_passv) 경로 강제. */
+	/* [한국어] --xnvme_iovec : 벡터드 I/O(xnvme_cmd_passv) 경로 강제.
+	 * 설정자: 옵션 파서(FIO_OPT_STR_SET).
+	 * 읽는 자: xnvme_fioe_queue 에서 분기(passv vs pass), init 에서 iovec 풀 할당 조건.
+	 * 값 범위: 0(단일 버퍼)/1(iovec). 1 이면 iodepth 크기의 iovec 배열 할당. */
+
 	unsigned int md_per_io_size;
-	/* [한국어] --md_per_io_size : io_u 당 별도 메타데이터 버퍼 크기(바이트). */
+	/* [한국어] --md_per_io_size : io_u 당 별도 메타데이터 버퍼 크기(바이트).
+	 *         확장 LBA 가 아닌 분리 메타 경로에서 사용.
+	 * 설정자: 옵션 파서(FIO_OPT_INT).
+	 * 읽는 자: io_u_init 에서 xnvme_buf_alloc 크기, _verify_options 에서 최소값 검증.
+	 * 값 범위: 0=미사용, >0=바이트 수. 일반적으로 lba_count * lba_md_size 이상. */
+
 	unsigned int pi_act;
-	/* [한국어] --pi_act : PI 액션 비트(1=컨트롤러가 PI 삽입/제거, 0=호스트 처리). */
+	/* [한국어] --pi_act : PI Action 비트. NVMe 스펙 PRINFO bit3 에 매핑.
+	 *         1 = 컨트롤러가 PI 삽입(WRITE)/제거(READ), 호스트는 데이터만 다룸.
+	 *         0 = 호스트가 PI 생성/검증 (xnvme_pi_generate/verify 사용).
+	 * 설정자: 옵션 파서(FIO_OPT_BOOL, 기본 1).
+	 * 읽는 자: queue 에서 pi_ctx_init/generate 호출 조건, cb_pool 에서 verify 조건.
+	 * 값 범위: 0/1. */
+
 	unsigned int apptag;
-	/* [한국어] --apptag : PI 의 Application Tag 필드 값. */
+	/* [한국어] --apptag : PI 의 Application Tag 필드 값(16비트).
+	 *         PI Type1/2/3 모두에서 의미 있으며, NVMe 가 쓰기 시 저장/읽기 시 반환.
+	 * 설정자: 옵션 파서(FIO_OPT_INT, 기본 0x1234).
+	 * 읽는 자: queue 에서 ctx->cmd.nvm.lbat 필드에 복사, pi_ctx_init 에 전달.
+	 * 값 범위: 0x0000..0xFFFF. */
+
 	unsigned int apptag_mask;
-	/* [한국어] --apptag_mask : Application Tag 체크용 마스크. */
+	/* [한국어] --apptag_mask : Application Tag 체크용 마스크(16비트).
+	 *         컨트롤러가 비교 시 mask 비트 1 인 위치만 확인.
+	 * 설정자: 옵션 파서(FIO_OPT_INT, 기본 0xffff=전체 체크).
+	 * 읽는 자: queue 에서 ctx->cmd.nvm.lbatm, pi_ctx_init.
+	 * 값 범위: 0x0000..0xFFFF. */
+
 	unsigned int prchk;
-	/* [한국어] --pi_chk 콜백이 채우는 플래그 (GUARD/REFTAG/APPTAG 체크 비트 OR). */
+	/* [한국어] --pi_chk 콜백(str_pi_chk_cb)이 파싱하여 채우는 플래그 비트 OR.
+	 *         GUARD/REFTAG/APPTAG 체크 중 활성화할 것들.
+	 * 설정자: str_pi_chk_cb 가 XNVME_PI_FLAGS_*_CHECK 비트 조합으로 설정.
+	 * 읽는 자: queue 에서 ctx->cmd.nvm.prinfo 하위 비트, pi_ctx_init 플래그.
+	 * 값 범위: 0..(GUARD|REFTAG|APPTAG). off1 없이 .cb 로만 채워짐. */
+
 	char *xnvme_be;
-	/* [한국어] --xnvme_be : 백엔드 선택 문자열 "spdk"/"linux"/"fbsd". */
+	/* [한국어] --xnvme_be : 백엔드 선택 문자열 (예: "spdk", "linux", "fbsd").
+	 *         libxnvme 가 이 문자열로 xnvme_be_* 구조체 레지스트리에서 선택.
+	 * 설정자: 옵션 파서(FIO_OPT_STR_STORE) — strdup 한 포인터.
+	 * 읽는 자: xnvme_opts_from_fioe → opts.be.
+	 * 값 범위: NULL(기본 자동선택) 또는 등록된 백엔드 이름. */
+
 	char *xnvme_mem;
-	/* [한국어] --xnvme_mem : DMA 메모리 할당자 선택 문자열. */
+	/* [한국어] --xnvme_mem : DMA 메모리 할당자 선택 문자열 ("hugepage", "posix", ...).
+	 *         백엔드별로 지원되는 할당자가 다르며, SPDK 는 DPDK hugepage 기본.
+	 * 설정자: 옵션 파서.
+	 * 읽는 자: xnvme_opts_from_fioe → opts.mem.
+	 * 값 범위: NULL 또는 지원 이름. */
+
 	char *xnvme_async;
-	/* [한국어] --xnvme_async : 비동기 인터페이스 선택 (io_uring, io_uring_cmd, libaio, ...). */
+	/* [한국어] --xnvme_async : 비동기 인터페이스 선택
+	 *         (emu/thrpool/io_uring/io_uring_cmd/libaio/posix/vfio/nil).
+	 *         io_uring_cmd 가 NVMe passthru(SQE opcode IORING_OP_URING_CMD) 로 NVMe
+	 *         명령을 커널 블록 계층 우회하여 전송. nil 은 실제 I/O 없이 즉시 완료.
+	 * 설정자: 옵션 파서.
+	 * 읽는 자: xnvme_opts_from_fioe → opts.async.
+	 * 값 범위: NULL(기본) 또는 지원 이름. */
+
 	char *xnvme_sync;
-	/* [한국어] --xnvme_sync : 동기 인터페이스 선택 (nvme, psync, block). */
+	/* [한국어] --xnvme_sync : 동기 인터페이스 선택 (nvme/psync/block).
+	 *         이 엔진 자체는 비동기 제출이지만, 백엔드에 따라 내부에서 동기
+	 *         경로가 필요한 경우(admin 명령, 초기화 질의) 사용.
+	 * 설정자: 옵션 파서.
+	 * 읽는 자: xnvme_opts_from_fioe → opts.sync.
+	 * 값 범위: NULL 또는 지원 이름. */
+
 	char *xnvme_admin;
-	/* [한국어] --xnvme_admin : admin 명령 인터페이스 선택 (nvme, block). */
+	/* [한국어] --xnvme_admin : admin 명령 인터페이스 선택 (nvme/block).
+	 *         Identify/Log Page 등 admin 큐 명령을 어느 채널로 보낼지.
+	 * 설정자: 옵션 파서.
+	 * 읽는 자: xnvme_opts_from_fioe → opts.admin.
+	 * 값 범위: NULL 또는 지원 이름. */
+
 	char *xnvme_dev_subnqn;
-	/* [한국어] --xnvme_dev_subnqn : NVMe-oF Fabrics subsystem NQN. */
+	/* [한국어] --xnvme_dev_subnqn : NVMe-oF(Over Fabrics) subsystem NQN
+	 *         (예: nqn.2014-08.org.nvmexpress:uuid:...). Fabrics 연결 시 필요.
+	 * 설정자: 옵션 파서.
+	 * 읽는 자: xnvme_opts_from_fioe → opts.subnqn.
+	 * 값 범위: NULL(로컬 PCIe) 또는 유효 NQN 문자열. */
 };
 
 /*
@@ -328,46 +481,59 @@ static int str_pi_chk_cb(void *data, const char *str)
 
 /*
  * [한국어] xnvme 엔진이 노출하는 커맨드라인/잡파일 옵션 테이블.
- * 마지막 원소 .name = NULL 로 종결. FIO_OPT_C_ENGINE/FIO_OPT_G_XNVME 그룹에 속한다.
+ * 마지막 원소 .name = NULL 로 종결(fio 옵션 파서가 이 센티넬로 배열 끝 인식).
+ * 모든 옵션이 FIO_OPT_C_ENGINE(엔진 카테고리) + FIO_OPT_G_XNVME(xnvme 서브그룹)
+ * 에 속한다. `fio --enghelp=xnvme` 로 출력 필터링 가능.
+ *
+ * 각 엔트리 공통 필드 규약:
+ *  .name       : 커맨드라인/잡파일에서 쓰는 옵션 이름 (--<name>=<val>).
+ *  .lname      : long name — --help 설명 출력에 표시되는 사람이 읽는 이름.
+ *  .type       : FIO_OPT_STR_SET(부울 플래그)/STR_STORE(문자열)/INT(정수)/BOOL.
+ *  .off1       : offsetof(struct xnvme_fioe_options, <field>) — 파서가 저장할 위치.
+ *  .def        : 기본값(문자열). NULL = 기본 없음.
+ *  .help       : 한 줄 설명.
+ *  .cb         : 사용자 정의 파서 콜백(필요 시). off1 대신 사용 가능.
+ *  .category   : 최상위 카테고리. FIO_OPT_C_ENGINE=엔진 옵션 분류.
+ *  .group      : 서브그룹. FIO_OPT_G_XNVME=xnvme 전용.
  */
 static struct fio_option options[] = {
 	{
-		/* [한국어] --hipri : polled completion(io_uring polled) 사용. */
-		.name = "hipri",
-		.lname = "High Priority",
-		.type = FIO_OPT_STR_SET,
-		.off1 = offsetof(struct xnvme_fioe_options, hipri),
-		.help = "Use polled IO completions",
-		.category = FIO_OPT_C_ENGINE,
-		.group = FIO_OPT_G_XNVME,
+		/* [한국어] --hipri : polled completion(io_uring polled 등) 사용 플래그. */
+		.name = "hipri",                                          /* [한국어] 옵션 이름. */
+		.lname = "High Priority",                                 /* [한국어] 설명용 long name. */
+		.type = FIO_OPT_STR_SET,                                  /* [한국어] 존재만으로 1 설정(값 불필요). */
+		.off1 = offsetof(struct xnvme_fioe_options, hipri),       /* [한국어] hipri 필드 오프셋. */
+		.help = "Use polled IO completions",                      /* [한국어] --help 설명. */
+		.category = FIO_OPT_C_ENGINE,                              /* [한국어] 엔진 카테고리. */
+		.group = FIO_OPT_G_XNVME,                                 /* [한국어] xnvme 서브그룹. */
 	},
 	{
 		/* [한국어] --sqthread_poll : io_uring SQ 폴링 커널 스레드 활성화. */
-		.name = "sqthread_poll",
-		.lname = "Kernel SQ thread polling",
-		.type = FIO_OPT_STR_SET,
-		.off1 = offsetof(struct xnvme_fioe_options, sqpoll_thread),
-		.help = "Offload submission/completion to kernel thread",
+		.name = "sqthread_poll",                                  /* [한국어] 옵션 이름. */
+		.lname = "Kernel SQ thread polling",                       /* [한국어] long name. */
+		.type = FIO_OPT_STR_SET,                                  /* [한국어] 부울 플래그. */
+		.off1 = offsetof(struct xnvme_fioe_options, sqpoll_thread), /* [한국어] sqpoll_thread 필드. */
+		.help = "Offload submission/completion to kernel thread",  /* [한국어] 설명: CPU 1개 전용. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --xnvme_be : 백엔드 문자열. libxnvme 가 동적 선택. */
-		.name = "xnvme_be",
-		.lname = "xNVMe Backend",
-		.type = FIO_OPT_STR_STORE,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_be),
-		.help = "Select xNVMe backend [spdk,linux,fbsd]",
+		/* [한국어] --xnvme_be : 백엔드 문자열. libxnvme 가 런타임에 동적 선택. */
+		.name = "xnvme_be",                                       /* [한국어] 옵션 이름. */
+		.lname = "xNVMe Backend",                                 /* [한국어] long name. */
+		.type = FIO_OPT_STR_STORE,                                /* [한국어] 문자열 저장(strdup). */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_be),    /* [한국어] xnvme_be 필드. */
+		.help = "Select xNVMe backend [spdk,linux,fbsd]",         /* [한국어] 지원 값 힌트. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --xnvme_mem : DMA 메모리 할당자 선택. */
+		/* [한국어] --xnvme_mem : DMA 메모리 할당자 선택 (hugepage/posix 등). */
 		.name = "xnvme_mem",
 		.lname = "xNVMe Memory Backend",
-		.type = FIO_OPT_STR_STORE,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_mem),
-		.help = "Select xNVMe memory backend",
+		.type = FIO_OPT_STR_STORE,                                /* [한국어] 문자열 저장. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_mem),   /* [한국어] xnvme_mem 필드. */
+		.help = "Select xNVMe memory backend",                    /* [한국어] 백엔드 의존. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
@@ -375,10 +541,11 @@ static struct fio_option options[] = {
 		/* [한국어] --xnvme_async : 비동기 인터페이스 (io_uring/io_uring_cmd/libaio/...). */
 		.name = "xnvme_async",
 		.lname = "xNVMe Asynchronous command-interface",
-		.type = FIO_OPT_STR_STORE,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_async),
+		.type = FIO_OPT_STR_STORE,                                /* [한국어] 문자열. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_async), /* [한국어] xnvme_async 필드. */
 		.help = "Select xNVMe async. interface: "
 			"[emu,thrpool,io_uring,io_uring_cmd,libaio,posix,vfio,nil]",
+		/* [한국어] 8종 지원 값. io_uring_cmd=NVMe passthru, nil=더미(성능 상한 측정). */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
@@ -386,9 +553,9 @@ static struct fio_option options[] = {
 		/* [한국어] --xnvme_sync : 동기 인터페이스 (nvme/psync/block). */
 		.name = "xnvme_sync",
 		.lname = "xNVMe Synchronous. command-interface",
-		.type = FIO_OPT_STR_STORE,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_sync),
-		.help = "Select xNVMe sync. interface: [nvme,psync,block]",
+		.type = FIO_OPT_STR_STORE,                                /* [한국어] 문자열. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_sync),  /* [한국어] xnvme_sync 필드. */
+		.help = "Select xNVMe sync. interface: [nvme,psync,block]", /* [한국어] 지원 값. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
@@ -396,9 +563,9 @@ static struct fio_option options[] = {
 		/* [한국어] --xnvme_admin : admin 명령 전송 채널 선택. */
 		.name = "xnvme_admin",
 		.lname = "xNVMe Admin command-interface",
-		.type = FIO_OPT_STR_STORE,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_admin),
-		.help = "Select xNVMe admin. cmd-interface: [nvme,block]",
+		.type = FIO_OPT_STR_STORE,                                /* [한국어] 문자열. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_admin), /* [한국어] xnvme_admin 필드. */
+		.help = "Select xNVMe admin. cmd-interface: [nvme,block]", /* [한국어] admin 채널. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
@@ -406,8 +573,8 @@ static struct fio_option options[] = {
 		/* [한국어] --xnvme_dev_nsid : user-space 드라이버용 NSID 명시. */
 		.name = "xnvme_dev_nsid",
 		.lname = "xNVMe Namespace-Identifier, for user-space NVMe driver",
-		.type = FIO_OPT_INT,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_dev_nsid),
+		.type = FIO_OPT_INT,                                      /* [한국어] 정수. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_dev_nsid), /* [한국어] 필드. */
 		.help = "xNVMe Namespace-Identifier, for user-space NVMe driver",
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
@@ -416,40 +583,40 @@ static struct fio_option options[] = {
 		/* [한국어] --xnvme_dev_subnqn : NVMe-oF Fabrics subsystem NQN. */
 		.name = "xnvme_dev_subnqn",
 		.lname = "Subsystem nqn for Fabrics",
-		.type = FIO_OPT_STR_STORE,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_dev_subnqn),
-		.help = "Subsystem NQN for Fabrics",
+		.type = FIO_OPT_STR_STORE,                                /* [한국어] 문자열. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_dev_subnqn), /* [한국어] 필드. */
+		.help = "Subsystem NQN for Fabrics",                      /* [한국어] Fabrics 연결용. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --xnvme_iovec : 벡터드 I/O 경로 강제. */
+		/* [한국어] --xnvme_iovec : 벡터드 I/O 경로(xnvme_cmd_passv) 강제. */
 		.name = "xnvme_iovec",
 		.lname = "Vectored IOs",
-		.type = FIO_OPT_STR_SET,
-		.off1 = offsetof(struct xnvme_fioe_options, xnvme_iovec),
-		.help = "Send vectored IOs",
+		.type = FIO_OPT_STR_SET,                                  /* [한국어] 부울 플래그. */
+		.off1 = offsetof(struct xnvme_fioe_options, xnvme_iovec), /* [한국어] 필드. */
+		.help = "Send vectored IOs",                              /* [한국어] iovec 사용. */
 		.category = FIO_OPT_C_ENGINE,
 		.group = FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --md_per_io_size : I/O 당 별도 메타데이터 버퍼 크기. */
+		/* [한국어] --md_per_io_size : I/O 당 별도 메타데이터 버퍼 크기(바이트). */
 		.name	= "md_per_io_size",
 		.lname	= "Separate Metadata Buffer Size per I/O",
-		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct xnvme_fioe_options, md_per_io_size),
-		.def	= "0",
+		.type	= FIO_OPT_INT,                                    /* [한국어] 정수 바이트. */
+		.off1	= offsetof(struct xnvme_fioe_options, md_per_io_size), /* [한국어] 필드. */
+		.def	= "0",                                            /* [한국어] 기본=0(미사용). */
 		.help	= "Size of separate metadata buffer per I/O (Default: 0)",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --pi_act : PI 삽입/제거를 컨트롤러가 수행할지. */
+		/* [한국어] --pi_act : PI 삽입/제거를 컨트롤러가 수행할지 여부. */
 		.name	= "pi_act",
 		.lname	= "Protection Information Action",
-		.type	= FIO_OPT_BOOL,
-		.off1	= offsetof(struct xnvme_fioe_options, pi_act),
-		.def	= "1",
+		.type	= FIO_OPT_BOOL,                                   /* [한국어] 0/1. */
+		.off1	= offsetof(struct xnvme_fioe_options, pi_act),    /* [한국어] 필드. */
+		.def	= "1",                                            /* [한국어] 기본=1(컨트롤러). */
 		.help	= "Protection Information Action bit (pi_act=1 or pi_act=0)",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_XNVME,
@@ -458,38 +625,38 @@ static struct fio_option options[] = {
 		/* [한국어] --pi_chk : PI 체크 대상 문자열. str_pi_chk_cb 로 파싱. */
 		.name	= "pi_chk",
 		.lname	= "Protection Information Check",
-		.type	= FIO_OPT_STR_STORE,
-		.def	= NULL,
+		.type	= FIO_OPT_STR_STORE,                              /* [한국어] 문자열 저장. */
+		.def	= NULL,                                           /* [한국어] 기본 없음. */
 		.help	= "Control of Protection Information Checking (pi_chk=GUARD,REFTAG,APPTAG)",
-		.cb	= str_pi_chk_cb,
+		.cb	= str_pi_chk_cb,                                  /* [한국어] 사용자 파서(off1 없음). */
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --apptag : PI Application Tag. */
+		/* [한국어] --apptag : PI Application Tag 16비트 값. */
 		.name	= "apptag",
 		.lname	= "Application Tag used in Protection Information",
-		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct xnvme_fioe_options, apptag),
-		.def	= "0x1234",
+		.type	= FIO_OPT_INT,                                    /* [한국어] 정수. */
+		.off1	= offsetof(struct xnvme_fioe_options, apptag),    /* [한국어] 필드. */
+		.def	= "0x1234",                                       /* [한국어] 기본값 리터럴. */
 		.help	= "Application Tag used in Protection Information field (Default: 0x1234)",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_XNVME,
 	},
 	{
-		/* [한국어] --apptag_mask : Application Tag 체크 마스크. */
+		/* [한국어] --apptag_mask : Application Tag 체크 마스크 16비트. */
 		.name	= "apptag_mask",
 		.lname	= "Application Tag Mask",
-		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct xnvme_fioe_options, apptag_mask),
-		.def	= "0xffff",
+		.type	= FIO_OPT_INT,                                    /* [한국어] 정수. */
+		.off1	= offsetof(struct xnvme_fioe_options, apptag_mask), /* [한국어] 필드. */
+		.def	= "0xffff",                                       /* [한국어] 기본=전체 체크. */
 		.help	= "Application Tag Mask used with Application Tag (Default: 0xffff)",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_XNVME,
 	},
 
 	{
-		/* [한국어] 옵션 배열 종결 마커 — fio 옵션 파서 관례. */
+		/* [한국어] 옵션 배열 종결 마커 — fio 옵션 파서가 .name==NULL 감지. */
 		.name = NULL,
 	},
 };
@@ -2030,68 +2197,176 @@ exit:
 }
 
 /*
- * [한국어] 이 엔진이 fio 에 등록하는 콜백 테이블.
- * 플래그 의미:
- *  - FIO_DISKLESSIO : 실제 파일 시스템 파일이 아닌 장치/URI 도 허용.
- *  - FIO_NODISKUTIL : diskutil 통계 수집 비활성 (xNVMe 가 직접 장치 관리).
- *  - FIO_NOEXTEND   : 파일 자동 확장 금지 (블록 디바이스 크기 고정).
- *  - FIO_MEMALIGN   : 버퍼 정렬 요구 (DMA 요건).
- *  - FIO_RAWIO      : raw I/O 엔진 (페이지 캐시 우회).
+ * [한국어] 이 엔진이 fio 에 등록하는 콜백 테이블(ioengine_ops vtable).
+ * fio 코어(ioengines.c)는 struct ioengine_ops 포인터를 engine_list 에 연결해두고
+ * `--ioengine=xnvme` 요청 시 이 테이블을 찾아 td_io_* 디스패처에서 각 콜백을 호출.
+ * 필드별 계약은 아래 §4 주석 참조.
+ *
+ * flags 비트 의미 (ioengine_ops.flags 비트마스크):
+ *  - FIO_DISKLESSIO : 실제 파일시스템 파일이 아닌 장치/URI 도 허용. fio 코어가
+ *                     파일 크기/생성 등 POSIX 가정을 완화.
+ *  - FIO_NODISKUTIL : diskutil 통계(/proc/diskstats) 수집 비활성 — xNVMe 가
+ *                     직접 장치를 관리해서 fio 의 OS 통계가 부정확할 수 있음.
+ *  - FIO_NOEXTEND   : 파일 자동 확장 금지 (블록/NVMe 디바이스는 크기 고정).
+ *  - FIO_MEMALIGN   : 버퍼 정렬 요구 (DMA 요건 — 페이지 또는 LBA 정렬).
+ *  - FIO_RAWIO      : raw I/O 엔진 (커널 페이지 캐시 우회, O_DIRECT 와 유사 의미).
+ * 미설정 비트: FIO_SYNCIO(아님 — 비동기 계약), FIO_PIPEIO(아님), FIO_NOIO(아님),
+ *              FIO_ASYNCIO_SYNC_TRIM(이 엔진은 TRIM 미지원), FIO_FAKEIO(아님).
  */
 FIO_STATIC struct ioengine_ops ioengine = {
 	.name = "xnvme",
+	/* [한국어] 엔진 식별자. `--ioengine=xnvme` 매칭.
+	 * 설정자: 초기화 리터럴.
+	 * 읽는 자: ioengines.c::find_ioengine(name) 이 engine_list 순회하며 strcmp. */
+
 	.version = FIO_IOOPS_VERSION,
+	/* [한국어] 엔진 ABI 버전. fio 코어와 불일치 시 로드 거부.
+	 * 설정자: 빌드 시 fio.h 매크로.
+	 * 읽는 자: register_ioengine() 이 검사. */
+
 	.options = options,
+	/* [한국어] 위에 정의한 옵션 테이블 포인터.
+	 * 설정자: 리터럴.
+	 * 읽는 자: fio 옵션 파서가 init 이전에 순회해 td->eo 에 값 저장. */
+
 	.option_struct_size = sizeof(struct xnvme_fioe_options),
+	/* [한국어] 옵션 구조체 크기(td->eo 버퍼 할당 크기).
+	 * 설정자: sizeof.
+	 * 읽는 자: fio 코어가 td->eo = calloc(1, option_struct_size) 로 할당. */
+
 	.flags = FIO_DISKLESSIO | FIO_NODISKUTIL | FIO_NOEXTEND | FIO_MEMALIGN | FIO_RAWIO,
+	/* [한국어] 위 주석 참조. fio 코어가 엔진의 특성을 파악해 파일 처리/통계 수집/
+	 * 버퍼 정렬 정책을 조정. 설정자: 리터럴. 읽는 자: ioengines.c, backend.c,
+	 * io_u.c 의 다양한 조건문. */
 
 	.cleanup = xnvme_fioe_cleanup,
+	/* [한국어] 잡 종료 시 1회 호출되는 엔진 정리 콜백. xd/iocq/iovec 해제, 파일
+	 * 장치 닫기. 설정자: 리터럴. 읽는 자: backend.c::close_ioengine. */
+
 	.init = xnvme_fioe_init,
+	/* [한국어] 잡 시작 시 1회 호출되는 초기화 콜백. --thread=1 강제, xd 할당,
+	 * 파일별 _dev_open. 반환 0=성공, 1=실패(잡 중단). 설정자: 리터럴.
+	 * 읽는 자: backend.c::td_io_init. */
 
 	.iomem_free = xnvme_fioe_iomem_free,
+	/* [한국어] DMA 버퍼 해제 콜백. iomem_alloc 과 대응. 설정자: 리터럴.
+	 * 읽는 자: io_u.c::free_io_mem. */
+
 	.iomem_alloc = xnvme_fioe_iomem_alloc,
+	/* [한국어] DMA 가능한 I/O 버퍼 할당 콜백 — fio 의 총 버퍼(orig_buffer) 할당.
+	 * 백엔드(SPDK/hugepage)에 맞는 특수 메모리 필요해서 이 콜백 존재.
+	 * 설정자: 리터럴. 읽는 자: io_u.c::init_io_u_buffers. */
 
 	.io_u_free = xnvme_fioe_io_u_free,
+	/* [한국어] io_u 당 엔진 상태 해제 콜백. 설정자: 리터럴.
+	 * 읽는 자: io_u.c::__free_io_u. */
+
 	.io_u_init = xnvme_fioe_io_u_init,
+	/* [한국어] io_u 1개당 엔진 전용 상태(xnvme_fioe_request) 할당·연결 콜백.
+	 * 설정자: 리터럴. 읽는 자: io_u.c::init_io_u (get_io_u 전 사전 초기화). */
 
 	.event = xnvme_fioe_event,
+	/* [한국어] 완료 큐에서 인덱스로 io_u 반환. getevents 가 반환한 N 만큼 호출.
+	 * 설정자: 리터럴. 읽는 자: backend.c::io_u_queued_complete 루프. */
+
 	.getevents = xnvme_fioe_getevents,
+	/* [한국어] 완료 수확 — xNVMe 큐 poke 하여 cb_pool 호출 유도, iocq 에 적재.
+	 * 반환값 = 수확된 완료 수. 설정자: 리터럴. 읽는 자: td_io_getevents. */
+
 	.queue = xnvme_fioe_queue,
+	/* [한국어] io_u → NVMe 명령 변환·제출. 반환값 계약:
+	 *   FIO_Q_QUEUED    : 제출 성공, 완료는 getevents 경유.
+	 *   FIO_Q_BUSY      : 일시 혼잡 — fio 가 재시도.
+	 *   FIO_Q_COMPLETED : 즉시 완료(성공/실패 io_u->error 로 구분).
+	 * 설정자: 리터럴. 읽는 자: td_io_queue. */
 
 	.close_file = xnvme_fioe_close,
+	/* [한국어] 파일 close 콜백. 실제 dev_close 는 cleanup 일괄 처리, 여기서는
+	 * nopen 감소만. 설정자: 리터럴. 읽는 자: td_io_close_file. */
+
 	.open_file = xnvme_fioe_open,
+	/* [한국어] 파일 open 콜백. _dev_open 은 이미 init 에서 수행 — 슬롯 매핑
+	 * 검증과 nopen 증가만. 설정자: 리터럴. 읽는 자: td_io_open_file. */
+
 	.get_file_size = xnvme_fioe_get_file_size,
+	/* [한국어] 장치 총 크기 조회 콜백(geo->tbytes). init 이전 경로용 자체 open/
+	 * close. 설정자: 리터럴. 읽는 자: filesetup.c::get_file_sizes. */
 
 	.invalidate = xnvme_fioe_invalidate,
+	/* [한국어] 페이지 캐시 무효화 콜백. 대부분 xNVMe 백엔드는 direct 이므로 no-op.
+	 * 설정자: 리터럴. 읽는 자: filesetup.c 의 invalidate 경로. */
+
 	.get_max_open_zones = xnvme_fioe_get_max_open_zones,
+	/* [한국어] ZNS Maximum Open Resources 조회 (zbd.c 요청). 설정자: 리터럴.
+	 * 읽는 자: zbd.c::zbd_get_max_open_zones. */
+
 	.get_zoned_model = xnvme_fioe_get_zoned_model,
+	/* [한국어] 장치가 ZBD_NONE/HOST_MANAGED/HOST_AWARE 중 어느 모델인지 분류.
+	 * 설정자: 리터럴. 읽는 자: zbd.c::zbd_get_zoned_model. */
+
 	.report_zones = xnvme_fioe_report_zones,
+	/* [한국어] NVMe Report Zones → fio zbd_zone[] 변환. 설정자: 리터럴.
+	 * 읽는 자: zbd.c::zbd_report_zones. */
+
 	.reset_wp = xnvme_fioe_reset_wp,
+	/* [한국어] Zone Mgmt Send RESET 으로 write pointer 초기화. 설정자: 리터럴.
+	 * 읽는 자: zbd.c::zbd_reset_range. */
 
 	.fdp_fetch_ruhs = xnvme_fioe_fetch_ruhs,
+	/* [한국어] FDP Reclaim Unit Handle Status 조회. 설정자: 리터럴.
+	 * 읽는 자: dataplacement.c::fdp_init. */
 };
 
 /*
  * [한국어]
- * fio_xnvme_register - 공유 라이브러리 로드 시 자동 호출되는 생성자.
+ * fio_xnvme_register - 공유 라이브러리 로드 시 자동 호출되는 생성자(constructor).
  *
- * fio_init 은 __attribute__((constructor)) 매크로로, 프로세스 시작/.so 로딩 시
- * 이 함수를 실행하여 ioengine 을 fio 코어의 엔진 레지스트리에 등록한다.
+ * @void: 파라미터 없음.
+ * @return: 없음.
+ *
+ * fio_init 은 fio.h 가 제공하는 매크로로 __attribute__((constructor)) 를 풀어
+ * 정의된다. GCC 의 이 속성은 함수를 .init_array 섹션에 등록하여, ld.so 동적
+ * 로더(또는 정적 링크 시 _start)가 main() 호출 전에 순회하며 실행한다. 따라서
+ * 이 엔진이 fio 바이너리에 정적 링크되든 외부 .so 로 dlopen 되든, 적재 시점에
+ * 자동으로 엔진 레지스트리에 자신을 등록하게 된다.
+ *
+ * 실행 컨텍스트: 메인 스레드, main() 이전(정적 링크) 또는 dlopen 콜러 스레드
+ * (동적 링크). 시그널 핸들러 문맥이 아님 — async-signal-safety 제약 없음.
+ *
+ * 호출 체인:
+ *   ld.so / dlopen → .init_array 순회 → fio_xnvme_register → register_ioengine.
  */
 static void fio_init fio_xnvme_register(void)
 {
-	/* [한국어] ioengines.c 의 등록 API — 이후 --ioengine=xnvme 로 선택 가능. */
+	/* [한국어] ioengines.c 의 등록 API — flist_add_tail 로 전역 engine_list 에
+	 * ioengine 포인터 추가. 이후 find_ioengine("xnvme") 가 성공하여
+	 * --ioengine=xnvme 로 선택 가능해진다. 중복 등록은 register_ioengine 내부
+	 * 에서 경고 후 무시. */
 	register_ioengine(&ioengine);
 }
 
 /*
  * [한국어]
- * fio_xnvme_unregister - 프로세스 종료/.so 언로드 시 호출되는 소멸자.
+ * fio_xnvme_unregister - 프로세스 종료/.so 언로드 시 호출되는 소멸자(destructor).
  *
- * fio_exit 은 __attribute__((destructor)) 매크로. 엔진을 레지스트리에서 제거한다.
+ * @void: 파라미터 없음.
+ * @return: 없음.
+ *
+ * fio_exit 매크로는 __attribute__((destructor)) 로 풀린다. GCC 의 이 속성은
+ * 함수를 .fini_array 섹션에 등록하여, exit(3) / main() return 후 atexit 체인의
+ * 일부로 실행된다. dlclose(3) 를 통한 .so 언로드 시에도 호출된다.
+ *
+ * 실행 컨텍스트: 메인 스레드 종료 경로. 이미 잡 스레드들은 join 되었고 fio
+ * 코어의 대부분 리소스가 정리된 이후. 시그널 핸들러 문맥 아님.
+ *
+ * 호출 체인:
+ *   exit() / dlclose() → .fini_array 역순 순회 → fio_xnvme_unregister →
+ *   unregister_ioengine.
  */
 static void fio_exit fio_xnvme_unregister(void)
 {
-	/* [한국어] 등록 해제 — 중복 등록 방지 및 깨끗한 종료. */
+	/* [한국어] 등록 해제 — flist_del_init 로 engine_list 에서 제거. 중복 언로드
+	 * (dlclose 후 재 dlopen 같은 시나리오)에서 깨끗한 상태 유지를 위해 쌍으로
+	 * 존재. 이후 find_ioengine("xnvme") 이 NULL 반환. */
 	unregister_ioengine(&ioengine);
 }

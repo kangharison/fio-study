@@ -18,36 +18,215 @@
  * [한국어 설명] DDN IME(Infinite Memory Engine) 버스트 버퍼 I/O 엔진 묶음 (ime.c)
  *
  * === 파일의 역할 ===
- * DDN의 버스트 버퍼 플랫폼 IME에 접근하기 위한 세 가지 fio I/O 엔진을 하나의 TU에서
- * 함께 구현한다: ime_psync(요청 단위 동기 호출), ime_psyncv(iovec 누적 후 단일 동기
- * preadv/pwritev), ime_aio(다수 요청을 비동기로 제출/수확). IME 네이티브 라이브러리의
- * ime_native_* 심볼을 직접 링크하여 사용하며, 각 엔진은 fio의 queue/commit/getevents/
- * event 계약을 IME API 특성에 맞게 다르게 채운다.
+ * DDN(DataDirect Networks)의 분산 버스트 버퍼/캐시 플랫폼 "Infinite Memory Engine(IME)"
+ * 을 fio가 직접 두드리도록 해주는 세 가지 I/O 엔진을 하나의 translation unit에서
+ * 함께 구현한다. 세 엔진은 동일한 IME 네이티브 라이브러리(libim_client)를 공유하지만,
+ * fio 코어가 요구하는 ioengine_ops 콜백 계약을 각각 다른 방식으로 채워서 "동기 vs
+ * iovec 일괄 vs 진짜 비동기" 세 가지 사용 패턴을 노출한다.
+ *
+ *   1) ime_psync   — 가장 단순한 동기 엔진. queue() 콜백 안에서 ime_native_pread/
+ *                    pwrite/fsync를 직접 호출하고 즉시 FIO_Q_COMPLETED를 반환한다.
+ *                    iodepth>1 의미가 없고, ime_data 구조체도 사용하지 않는다.
+ *                    fio가 보낸 io_u 1개 = IME 호출 1회 = 결과 반환 1회.
+ *   2) ime_psyncv  — iovec 누적 동기 엔진. fio가 iodepth_batch 옵션으로 io_u를 묶어
+ *                    submit하면, queue()는 iovec 슬롯에 쌓아두고 FIO_Q_QUEUED만
+ *                    반환한다. 이후 commit()이 호출되면 누적된 iovec을 ime_native_
+ *                    preadv/pwritev 한 번의 호출로 IME에 보낸다(scatter/gather I/O).
+ *                    호출 자체는 동기이지만 fio API는 비동기 인터페이스를 사용한다.
+ *                    한 배치는 단일 fd/단일 방향/연속 오프셋이어야 한다.
+ *   3) ime_aio     — 진정한 비동기 엔진. ime_native_aio_read/aio_write로 여러 요청을
+ *                    동시에 IME에 던지고, IME 라이브러리의 내부 스레드가 완료 콜백
+ *                    fio_ime_aio_complete_cb()를 호출하면 status/cond_signal로
+ *                    잡 스레드를 깨운다. 한 요청 안에서도 인접한 io_u는 iovec 배열의
+ *                    연속 슬롯으로 묶어 vector AIO로 효율화한다(can_append 경로).
+ *
+ * 세 엔진 모두 IME만의 경로 규약("im://path" 또는 DEFAULT_IME_FILE_PREFIX 접두)을
+ * 처리하기 위해 generic_open_file 대신 자체 fio_ime_open_file을 둔다. POSIX stat 도
+ * 사용할 수 없으므로 fio_ime_get_file_size 가 ime_native_stat 으로 메타데이터를 얻고,
+ * fio 코어가 stat 단계를 건너뛰도록 fio_ime_setup이 real_file_size=0으로 일시 표식한다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * --ioengine=ime_psync / ime_psyncv / ime_aio 로 선택되는 세 플러그인이 모두 하나의
- * fio_init 생성자 경로(fio_ime_*_register)에서 등록된다. 실행 흐름은 backend.c →
- * td_io_init → fio_ime_*_setup → fio_ime_*_open_file → I/O 루프. ime_psync는 매번 바로
- * 완료를 반환하지만, ime_psyncv는 iodepth_batch만큼 iovec을 쌓은 뒤 commit에서
- * ime_native_preadv/pwritev를 호출한다. ime_aio는 여러 리퀘스트 큐를 병렬로 운용한다.
- * 실행 컨텍스트는 fio 잡 스레드 1개이며, aio 완료 대기는 pthread_mutex/cond로 동기화한다.
+ *   사용자가 --ioengine=ime_psync | ime_psyncv | ime_aio 중 하나를 선택하면
+ *   load_ioengine(ioengines.c) 이 본 파일이 fio_init 생성자 경로(fio_ime_register)에서
+ *   global engine_list 에 등록해 둔 ioengine_prw / ioengine_pvrw / ioengine_aio 중
+ *   해당 ioengine_ops 를 잡 스레드의 td->io_ops 로 바인딩한다.
+ *
+ *   잡 라이프사이클(엔진별 콜백 호출 순서, backend.c 의 잡 루프 기준):
+ *
+ *     fio_backend
+ *       └→ thread_main (잡 스레드 1개)
+ *            ├→ td_io_init     ─→ ops->setup     = fio_ime_setup     (real_file_size=0)
+ *            │                ─→ ops->init      = fio_ime_engine_init / _psyncv_init / _aio_init
+ *            │                                     (ime_native_init + ime_data 할당 + cond/mutex 초기화)
+ *            ├→ td_io_open_file─→ ops->open_file = fio_ime_open_file (TRIM 거부, ime_native_open)
+ *            ├→ 본 루프
+ *            │    ├→ td_io_queue   ─→ ops->queue
+ *            │    │                     · psync : ime_native_pread/pwrite/fsync 동기 호출
+ *            │    │                     · psyncv: iovec 적재 (FIO_Q_QUEUED 또는 BUSY)
+ *            │    │                     · aio   : iovec 적재 (FIO_Q_QUEUED 또는 BUSY)
+ *            │    ├→ td_io_commit ─→ ops->commit   (psync 미사용)
+ *            │    │                     · psyncv: ime_native_preadv/pwritev 단일 호출
+ *            │    │                     · aio   : ime_native_aio_read/write 루프 제출
+ *            │    ├→ td_io_getevents ─→ ops->getevents
+ *            │    │                     · psyncv: 동기 commit 결과를 event_io_us 로 복사
+ *            │    │                     · aio   : status==IN_PROGRESS면 cond_wait
+ *            │    └→ ops->event(idx) ─→ event_io_us[idx]
+ *            ├→ td_io_close_file─→ ops->close_file = fio_ime_close_file (ime_native_close)
+ *            └→ ops->cleanup    ─→ fio_ime_engine_finalize / _psyncv_clean / _aio_clean
+ *
+ *   실행 컨텍스트:
+ *     - 모든 fio 콜백은 잡 스레드(use_thread=0이면 별도 프로세스의 main, =1이면 pthread)에서 실행.
+ *     - ime_aio 의 fio_ime_aio_complete_cb 만 IME 라이브러리 내부 스레드에서 비동기 호출됨
+ *       → status_mutex / cond_endio 로 잡 스레드와 동기화.
+ *     - fio_ime_is_initialized 전역 플래그는 잡 스레드 생성 이전(라이브러리 한번 init/finalize
+ *       원칙) 에 결정되므로 별도 락 없이 사용. use_thread=1 모드에서는 여러 잡이 같은
+ *       프로세스의 IME 라이브러리 인스턴스를 공유한다.
  *
  * === 타 모듈과의 연결 ===
- * 상단: fio 코어의 ioengine 플러그인 경로(ioengines.c)에서 호출된다.
- * 하단: libim_client(ime_native_init/finalize/pread/pwrite/preadv/pwritev/aio_read/
- *       aio_write/aio_wait/open/close/lstat/unlink)를 호출한다.
- * 데이터 흐름: io_u->xfer_buf ↔ ime_native_* ↔ IME 클라이언트 라이브러리 ↔ 버스트 버퍼.
- * 공유 상태: 각 엔진의 ime_data 구조체(iovecs, completed events, aio request lists)는
- * td->io_ops_data에 저장되어 잡 스레드 단독 소유이나, aio 완료 콜백은 IME 라이브러리의
- * 내부 스레드에서 호출되므로 pthread_mutex로 보호된다.
+ *   상단(fio core):
+ *     - ioengines.c 의 td_io_* 디스패처가 본 파일의 콜백을 호출.
+ *     - fio.h 가 공급하는 thread_data, io_u, fio_file, ioengine_ops, FIO_Q_*,
+ *       td_verror, fio_ro_check, register_ioengine, dprint, log_err, td_read/td_write/
+ *       td_trim, for_each_file, FIO_VERROR_SIZE 등을 사용.
+ *   하단(IME SDK = libim_client):
+ *     - 초기화/종료    : ime_native_init() / ime_native_finalize()
+ *     - 메타데이터     : ime_native_stat() (POSIX stat 호환 buf 반환)
+ *     - 파일 핸들     : ime_native_open(path, flags, mode) / ime_native_close(fd) /
+ *                       ime_native_ftruncate(fd, size)
+ *     - 동기 I/O      : ime_native_pread/pwrite(fd, buf, len, off) /
+ *                       ime_native_preadv/pwritev(fd, iov, iovcnt, off) /
+ *                       ime_native_fsync(fd)
+ *     - 비동기 I/O    : ime_native_aio_read(struct ime_aiocb *) /
+ *                       ime_native_aio_write(struct ime_aiocb *)
+ *                       (완료는 iocb->complete_cb로 콜백 통지)
+ *     - 경로 규약     : DEFAULT_IME_FILE_PREFIX(보통 "ime://")가 ime_native.h에서 제공.
+ *                       모든 IME API는 prefix 가 붙은 경로를 요구.
+ *   하단(libc): unlink(2)는 IME가 POSIX FUSE 마운트로도 노출되는 경우를 가정해 직접 호출.
+ *
+ *   데이터 흐름:
+ *     fio io_u (xfer_buf, xfer_buflen, offset, ddir)
+ *        │
+ *        ├─[psync]→ ime_native_p{read,write,fsync} ──┐
+ *        ├─[psyncv]→ iovec[head] 슬롯 적재 ──→ commit 시 ime_native_p{readv,writev}
+ *        └─[aio]   → ime_aiocb (fd/offset/iov/iovcnt) 적재 ──→ commit 시
+ *                    ime_native_aio_{read,write} ──→ IME 라이브러리 ──┐
+ *                                                                       ▼
+ *                                                            ┌──────────────────┐
+ *                                                            │ DDN IME 클라이언트 │
+ *                                                            │  (RDMA/TCP RPC)   │
+ *                                                            └────────┬─────────┘
+ *                                                                       ▼
+ *                                                ┌────────────────────────────────────┐
+ *                                                │ IME 분산 버스트 버퍼 노드(메모리·NVMe)│
+ *                                                │   ─ NVMe SSD를 backing store로 사용 │
+ *                                                │   ─ HDD 기반 PFS 앞단의 캐시 계층    │
+ *                                                └────────────────────────────────────┘
+ *
+ *   공유 상태:
+ *     - struct ime_data*  : td->io_ops_data 에 저장. psyncv/aio가 사용. 잡 스레드 단독 소유.
+ *     - struct imeaio_req::status : aio 완료 콜백(라이브러리 스레드) ↔ getevents(잡 스레드)
+ *                                    경계. status_mutex + cond_endio 페어로 보호.
+ *     - fio_ime_is_initialized : 프로세스 전역 플래그. ime_native_init이 한 번이라도
+ *                                 성공했는지 추적. 잡 스레드 생성 이전 단계에서만 변경.
  *
  * === 주요 함수/구조체 요약 ===
- * - fio_ime_psync_queue(): ime_native_pread/pwrite 직접 호출 후 FIO_Q_COMPLETED 반환.
- * - fio_ime_psyncv_{queue,commit,getevents,event}(): iovec 누적 + 단일 preadv/pwritev.
- * - fio_ime_aio_{queue,commit,getevents,event}(): ime_native_aio_read/write 다중 제출.
- * - fio_ime_aio_complete_cb(): IME 콜백에서 완료 카운트 증가 + cond_signal.
- * - struct imesio_req / imeaio_req: iovec 누적 요청 기술자.
- * - 공통 open_file/close_file/get_file_size/unlink_file: ime_native 파일 관리 래핑.
+ *   [공통 파일/메타]
+ *     - fio_set_ime_filename()    : 사용자 경로에 DEFAULT_IME_FILE_PREFIX 부착(thread-local 버퍼).
+ *     - fio_ime_get_file_size()   : ime_native_stat 으로 real_file_size 채움.
+ *     - fio_ime_open_file()       : TRIM 거부, ime_native_open + 필요 시 ftruncate.
+ *     - fio_ime_close_file()      : ime_native_close, fd=-1 무효화.
+ *     - fio_ime_unlink_file()     : POSIX unlink (IME가 FUSE 마운트 노출 가정).
+ *     - fio_ime_setup()           : real_file_size=0 으로 fio가 stat 호출하지 않도록 유도.
+ *     - fio_ime_engine_init()     : ime_native_init() + 임시 real_file_size 채움.
+ *     - fio_ime_engine_finalize() : fork 모드에서만 ime_native_finalize().
+ *     - fio_ime_event()           : event_io_us[event] 반환 (psyncv/aio 공용).
+ *
+ *   [ime_psync 동기 경로]
+ *     - fio_ime_psync_queue()     : ime_native_pread/pwrite/fsync 즉시 호출.
+ *     - fio_ime_psync_end()       : 반환값 → io_u->error/resid 환산, FIO_Q_COMPLETED 반환.
+ *
+ *   [ime_psyncv iovec 누적 + 단일 preadv/pwritev]
+ *     - fio_ime_psyncv_can_queue(): 빈 큐 또는 동일 fd/ddir/연속 오프셋 + 미수확 이벤트 0.
+ *     - fio_ime_psyncv_enqueue()  : iovec 슬롯에 (xfer_buf, xfer_buflen) 기록.
+ *     - fio_ime_psyncv_queue()    : 누적 후 FIO_Q_QUEUED, 만원이면 FIO_Q_BUSY.
+ *     - fio_ime_psyncv_commit()   : ime_native_preadv/pwritev 단일 호출.
+ *     - fio_ime_psyncv_end()      : 반환 바이트를 batch 안의 io_u 들에 순차 분배.
+ *     - fio_ime_psyncv_getevents(): io_us → event_io_us 복사 + queue 리셋.
+ *     - fio_ime_psyncv_init/clean(): ime_data + sioreq + iovecs + io_us 할당/해제.
+ *
+ *   [ime_aio 진짜 비동기 경로]
+ *     - fio_ime_aio_complete_cb() : IME 라이브러리 콜백. status 갱신 + cond_signal.
+ *     - fio_ime_aio_can_append()  : head!=0 + 동일 fd/ddir/연속 오프셋이면 기존 iocb 확장.
+ *     - fio_ime_aio_enqueue()     : append 또는 새 iocb 채움 (complete_cb/user_context 포함).
+ *     - fio_ime_aio_queue()       : 큐 채움. 만원이면 FIO_Q_BUSY.
+ *     - fio_ime_aio_commit()      : ime_native_aio_read/write 루프 제출.
+ *     - fio_ime_aio_getevents()   : status!=IN_PROGRESS이면 io_u 복원, 아니면 cond_wait.
+ *     - fio_ime_aio_init/clean()  : aioreqs + cond/mutex iodepth개 초기화/파괴.
+ *
+ *   [구조체]
+ *     - struct imesio_req : psyncv 1배치당 단일 (fd/ddir/offset).
+ *     - struct imeaio_req : aio 요청 1개 (iocb + status + cond/mutex + ddir).
+ *     - struct ime_data   : psyncv/aio 공통 링 큐 컨테이너 (iovecs/io_us/queued/events/
+ *                            depth/head/tail/cur_commit/last_offset/last_req).
+ *
+ *   [엔진 등록]
+ *     - ioengine_prw / ioengine_pvrw / ioengine_aio : 세 ioengine_ops vtable.
+ *     - fio_ime_register()    : fio_init constructor. 세 vtable 모두 등록.
+ *     - fio_ime_unregister()  : fio_exit destructor. 등록 해제 + 지연된 finalize.
+ *
+ * === DDN IME 도메인 메모 ===
+ *   - IME 는 HDD 기반 PFS(Lustre, GPFS, Spectrum Scale 등) "앞에 끼워넣는" 분산
+ *     캐시·버스트 버퍼 계층이다. 실제 capacity는 분산된 IME 서버 노드의 RAM + NVMe SSD.
+ *   - HPC 잡이 체크포인트나 burst write를 IME 에 빠르게 토하면, IME가 백그라운드로
+ *     PFS 에 flush/migrate 한다(write-behind). 읽기는 prefetch.
+ *   - 클라이언트 라이브러리(libim_client)는 자체 RPC(보통 RDMA/IB 또는 TCP)로 IME
+ *     서버와 통신. POSIX 시스템콜을 거치지 않는다.
+ *   - 경로 네임스페이스: "ime://path/to/file" 또는 DEFAULT_IME_FILE_PREFIX("ime:/")
+ *     로 시작. ime_native_open()은 이 prefix 가 붙은 경로만 인식.
+ *   - TRIM/discard 미지원(블록 디바이스 추상화가 없는 객체-스타일 캐시).
+ *
+ * === 빌드 게이트 (CONFIG_IME) ===
+ *   본 파일은 configure 스크립트가 IME SDK(ime_native.h + libim_client) 설치를
+ *   감지했을 때에만 컴파일된다. 검사 흐름:
+ *     1) `./configure` 실행 시 `cat_output=yes`로 ime_native.h 테스트 컴파일 시도.
+ *     2) 성공 시 configure 가 `config-host.mak` 에 `CONFIG_IME=y` 기록 + 소스
+ *        `output_sym "CONFIG_IME"` 로 `config-host.h` 에 `#define CONFIG_IME` 심벌 생성.
+ *     3) Makefile 의 `ifdef CONFIG_IME` 블록이 `engines/ime.o` 를 `SOURCE` 에 append,
+ *        `-lim_client` 를 `ENGINE_LDLIBS` 에 추가.
+ *     4) options.c 의 `#ifdef CONFIG_IME` 블록이 --ioengine 의 possible values 에
+ *        ime_psync/ime_psyncv/ime_aio 3개를 help 텍스트와 함께 노출.
+ *   본 파일 자체에는 `#ifdef CONFIG_IME` 같은 내부 가드가 없다 — 파일 전체가
+ *   configure 단계에서 "컴파일 대상에 포함시킬지/말지" 결정되기 때문이다. 따라서
+ *   ime_native.h 가 항상 존재한다고 가정해도 안전하고, NULL-빌드 대응 stub 도 필요 없다.
+ *
+ * === IMESDK 매크로/에러 코드 관례 ===
+ *   - ime_native_open/close/pread/pwrite/preadv/pwritev/fsync/ftruncate/stat 은 모두
+ *     POSIX 스타일 반환값을 사용한다: 성공 >= 0, 실패 -1 with errno 설정.
+ *     따라서 본 파일에서 `if (ret == -1)` / `if (ret < 0)` 분기 + `errno` 기록이 정석.
+ *   - ime_native_aio_read/write 는 비동기 — 반환값은 "제출 성공 0 / 제출 실패 < 0" 로
+ *     처리한다(본 파일 fio_ime_aio_commit 참조). 실제 전송 바이트나 완료 상태는
+ *     ime_aiocb::complete_cb 로 전달.
+ *   - ime_native.h 자체는 DEFAULT_IME_FILE_PREFIX 외의 매크로 상수를 본 파일에서
+ *     직접 사용하지 않으며, 에러 코드도 표준 errno(EIO/EINVAL/ENOMEM 등) 로 매핑된다.
+ *   - AIO 완료 콜백 시그니처: `void (*ime_complete_cb_t)(struct ime_aiocb *aiocb,
+ *     int err, ssize_t bytes);` — err==0 성공/err!=0 에러, bytes = 성공 시 전송량.
+ *     IMESDK 헤더에서 typedef im_client_cb_t 로 공급되며, 본 파일은 함수 포인터
+ *     형식(&fio_ime_aio_complete_cb) 로 직접 iocb->complete_cb 에 대입한다.
+ *
+ * === VERIFY / TRIM ddir 처리 ===
+ *   - DDIR_READ/WRITE  : 본 파일의 주된 경로. 세 엔진이 각자 방식으로 처리.
+ *   - DDIR_SYNC        : ime_native_fsync(fd) 로 즉시 처리. queue() 안에서 동기 실행
+ *                        후 FIO_Q_COMPLETED 반환. psyncv/aio 에서도 배치를 거치지 않고
+ *                        바이패스.
+ *   - DDIR_TRIM        : IME 미지원. fio_ime_open_file 에서 td_trim(td) 검사로 잡
+ *                        시작 단계에 EINVAL 거부. 우회: IME 는 객체-스타일 캐시이며
+ *                        블록 디바이스 추상화가 없어 discard 개념 자체가 부재.
+ *   - VERIFY           : fio 코어가 DDIR_READ 로 재발행하므로 IME 엔진 관점에선 읽기.
+ *                        단, open_file 에서 td_write(td)==true 이면 O_RDWR 로 열어 두어
+ *                        write → verify read-back 가능.
+ *   - DDIR_DATASYNC    : 본 파일은 DDIR_SYNC 만 처리 — DDIR_DATASYNC 진입 시 "wrong ddir"
+ *                        으로 EINVAL. 필요하면 ime_native_fdatasync (SDK 제공 시) 추가 가능.
+ *   - DDIR_SYNC_FILE_RANGE : 미지원.
  */
 
 /*
@@ -72,13 +251,41 @@
  * one.
  */
 
-#include <stdio.h>       /* [한국어] snprintf/log_err 포맷 I/O를 위해 포함 - dprint 등 fio 로깅에서 내부적으로 사용. */
-#include <stdlib.h>      /* [한국어] malloc/calloc/free 동적 메모리 관리 - ime_data, iovecs, io_us 배열 할당에 사용. */
-#include <errno.h>       /* [한국어] 시스템 호출(unlink, ime_native_*)이 실패 시 전역 errno를 읽어 td_verror에 전달하기 위해 필요. */
-#include <linux/limits.h>/* [한국어] PATH_MAX 상수 제공 - fio_set_ime_filename()이 thread-local 경로 버퍼 크기로 사용. */
-#include <ime_native.h>  /* [한국어] DDN IME 네이티브 클라이언트 API 헤더 - ime_native_init/pread/pwrite/preadv/pwritev/aio_read/aio_write/stat/open/close/ftruncate/fsync와 struct ime_aiocb, DEFAULT_IME_FILE_PREFIX 제공. */
+#include <stdio.h>       /* [한국어] snprintf() 사용. fio_set_ime_filename()이 PATH_MAX 버퍼에 prefix+원본 경로를 안전 합성할 때 호출. NULL 종료와 길이 초과 검출(반환 >= PATH_MAX)을 위해 표준 stdio가 필요하다. */
+#include <stdlib.h>      /* [한국어] malloc/calloc/free 동적 메모리 관리. struct ime_data, aioreqs[], iovecs[], io_us[] 배열, 단일 sioreq 객체 모두 동적 할당된다. calloc(1, sizeof(*ime_d))는 head/tail/queued/events/cur_commit/last_offset 등 모든 카운터를 0 으로 일괄 초기화하는 코드량 절감 트릭. */
+#include <errno.h>       /* [한국어] errno 전역 변수 노출. ime_native_*() / unlink(2)가 실패하면 errno에 부가 정보가 들어가며, td_verror(td, errno, "tag") 로 잡 컨텍스트에 기록한다. EAGAIN/EINVAL/ENOMEM 등 ABI 매크로도 같이 따라옴. */
+#include <linux/limits.h>/* [한국어] PATH_MAX 상수(보통 4096) 제공. fio_set_ime_filename()이 thread-local 정적 버퍼 크기로 사용. <limits.h>가 아닌 리눅스 전용 헤더를 쓰는 이유는 일부 환경에서 <limits.h>가 PATH_MAX 를 정의하지 않을 수 있기 때문(POSIX는 PATH_MAX 정의를 강제하지 않는다). */
+#include <ime_native.h>  /* [한국어] DDN IME 네이티브 클라이언트 SDK(libim_client) 헤더.
+                          *   공급 심볼:
+                          *     - ime_native_init() / ime_native_finalize()         : 라이브러리 라이프사이클
+                          *     - ime_native_stat(path, struct stat*)               : 메타데이터 조회(POSIX stat 호환 buf)
+                          *     - ime_native_open(path, flags, mode) / _close(fd)   : 파일 핸들
+                          *     - ime_native_ftruncate(fd, size)                    : 파일 크기 조정
+                          *     - ime_native_pread/pwrite(fd, buf, len, off)        : 동기 단일 버퍼 I/O
+                          *     - ime_native_preadv/pwritev(fd, iov, cnt, off)      : 동기 scatter/gather I/O
+                          *     - ime_native_aio_read/aio_write(struct ime_aiocb*)  : 비동기 I/O 제출
+                          *     - ime_native_fsync(fd)                              : 캐시 플러시
+                          *     - struct ime_aiocb { fd, file_offset, iov, iovcnt,
+                          *                          flags, complete_cb, user_context } : AIO 제어 블록
+                          *     - DEFAULT_IME_FILE_PREFIX                           : 경로 prefix(보통 "ime:/")
+                          *   링크 시 -lim_client(또는 빌드 시스템이 결정한 라이브러리)가 필요. */
 
-#include "../fio.h"      /* [한국어] fio 코어 API - struct thread_data, struct io_u, struct fio_file, ioengine_ops, dprint, td_verror, fio_ro_check, register_ioengine 등. */
+#include "../fio.h"      /* [한국어] fio 코어 공용 헤더.
+                          *   본 파일이 사용하는 주요 심볼:
+                          *     타입       : struct thread_data, struct io_u, struct fio_file, struct ioengine_ops,
+                          *                   enum fio_ddir(DDIR_READ/DDIR_WRITE/DDIR_SYNC), enum fio_q_status,
+                          *                   struct timespec.
+                          *     반환 매크로: FIO_Q_COMPLETED, FIO_Q_QUEUED, FIO_Q_BUSY (io_u 큐잉 결과 코드).
+                          *     플래그     : FIO_SYNCIO, FIO_DISKLESSIO, FIO_IOOPS_VERSION, FIO_VERROR_SIZE.
+                          *     판별 매크로: td_read(td), td_write(td), td_trim(td) — 잡의 작업 방향 검사.
+                          *     반복 매크로: for_each_file(td, f, i).
+                          *     로그/에러 : dprint(FD_FILE/FD_IO, ...), log_err(...), td_verror(td, errno, "tag"),
+                          *                   io_u_log_error(td, io_u).
+                          *     보조      : fio_ro_check(td, io_u) — read-only 잡에서 쓰기 시도 잡아냄.
+                          *     상태/통계  : io_u_mark_submit(td, n) — 제출된 io_u 수 누적(stat.c).
+                          *     등록 매크로: fio_init / fio_exit (생성자/소멸자 속성), register_ioengine(),
+                          *                   unregister_ioengine().
+                          *     기타     : read_only(전역 read-only 모드), fio_unused(매개변수 미사용 표식). */
 
 
 /**************************************************************
@@ -87,14 +294,32 @@
  **************************************************************/
 
 /* define constants for async IOs */
-/* [한국어] imeaio_req->status에 "아직 진행 중"임을 표시하는 sentinel 값.
- *   - 설정자: fio_ime_aio_enqueue()가 새 요청을 만들 때.
- *   - 읽는 자: fio_ime_aio_getevents()가 완료 여부 판정 시, 그리고 완료 콜백이 덮어씀.
- *   - 값 범위: 음수(-1) 하나만 이 의미로 사용. 0 이상은 전송 바이트 수로 해석됨. */
+/* [한국어] imeaio_req->status 의 3-state 머신을 구현하는 두 sentinel.
+ *
+ *   ssize_t status 의 의미 :
+ *     -1 (FIO_IME_IN_PROGRESS) : enqueue 직후, 아직 완료 콜백 없음.
+ *     -2 (FIO_IME_REQ_ERROR)   : 라이브러리가 err!=0 보고했거나 ime_native_aio_*()
+ *                                 자체가 음수 반환(=제출 실패).
+ *      0 .. SSIZE_MAX          : 완료 콜백이 전달한 실제 전송 바이트 수.
+ *                                 (요청 총 바이트가 부분 전송된 경우에도 유효한 양수.)
+ *
+ *   왜 ssize_t 음수 영역을 sentinel 로 쓰는가:
+ *     IME aio 콜백은 성공 시 bytes>=0 만 전달하므로 음수 영역이 자유롭다.
+ *     "완료/미완료/에러" 3상태를 단일 워드로 표현해서 mutex 보호 하에 원자적
+ *     기록·판독이 가능하다. 추가 bool/플래그 없이 lock-step 으로 갱신된다. */
+/* [한국어] FIO_IME_IN_PROGRESS — "아직 진행 중" sentinel.
+ *   - 설정자: fio_ime_aio_enqueue() 가 새 요청을 만들 때 초기값.
+ *   - 읽는 자: fio_ime_aio_getevents() 루프가 status 비교, == IN_PROGRESS 면 대기.
+ *   - 변환: 완료 콜백이 덮어쓴다(>=0 또는 REQ_ERROR).
+ *   - 값 범위: 음수 -1 단일값. */
 #define FIO_IME_IN_PROGRESS -1
-/* [한국어] imeaio_req->status에 "IME 라이브러리가 에러를 돌려줬다"를 표시하는 sentinel.
- *   - 설정자: 완료 콜백 fio_ime_aio_complete_cb()가 err!=0일 때, 또는 commit에서 제출 실패 시.
- *   - 읽는 자: getevents 루프가 io_u->error = EIO로 매핑. */
+/* [한국어] FIO_IME_REQ_ERROR — "에러 발생" sentinel.
+ *   - 설정자: (a) 완료 콜백 fio_ime_aio_complete_cb()가 err!=0 인 경우.
+ *              (b) fio_ime_aio_commit() 가 ime_native_aio_*() 음수 반환을 받았을 때
+ *                   콜백 없이 직접 마킹.
+ *   - 읽는 자: fio_ime_aio_getevents() 가 이 값을 보면 해당 요청에 묶인 모든
+ *              io_u 의 ->error = EIO 로 매핑. (구체적 errno 보존 없이 EIO 단일화.)
+ *   - 값 범위: 음수 -2 단일값. */
 #define FIO_IME_REQ_ERROR   -2
 
 /* This flag is used when some jobs were created using threads. In that
@@ -103,13 +328,32 @@
    in the destructor (see fio_ime_unregister), only when the flag
    fio_ime_is_initialized is true (which means at least one thread has
    initialized IME). */
-/* [한국어] IME 라이브러리가 최소 한 스레드에 의해 초기화되었는지 여부의 전역 플래그.
- *   - 설정자: fio_ime_engine_init()이 ime_native_init() 성공 후 true로 설정.
- *   - 해제자: 프로세스 모드 finalize(fio_ime_engine_finalize) 또는 스레드 모드에서
- *     전체 언로드 시 fio_ime_unregister()에서 해제.
- *   - 값 범위: true/false. 스레드 모드에서는 여러 잡이 공유하지만, fio 초기화 순서상
- *     잡 스레드 생성 이전에 init이 호출되면 경쟁 없음(경고 로그만 출력).
- *   - 동기화: 잡 스레드 생성 전/후 순서 보장에 의존하며 별도 락 없음. */
+/* [한국어] fio_ime_is_initialized — IME 라이브러리가 "이 프로세스에서 한 번이라도"
+ *          ime_native_init() 으로 초기화되었는지 추적하는 프로세스 전역 bool.
+ *
+ *   왜 필요한가 (use_thread vs fork 모드 구분):
+ *     - use_thread=0 (fork 모드, 기본): 잡마다 별도 프로세스. 각 프로세스가 자기
+ *       IME 인스턴스를 가지므로 cleanup(fio_ime_engine_finalize)에서 즉시
+ *       ime_native_finalize() 호출 안전.
+ *     - use_thread=1 (pthread 모드): 모든 잡이 단일 프로세스의 단일 IME 인스턴스를
+ *       공유. 한 잡이 cleanup 에서 finalize 하면 다른 잡이 망가진다. 따라서
+ *       cleanup 은 finalize 를 건너뛰고, 프로세스 종료 시 fio_exit destructor
+ *       (fio_ime_unregister) 가 이 플래그를 보고 한 번만 finalize 한다.
+ *
+ *   설정자:
+ *     - fio_ime_engine_init() 이 ime_native_init() 직후 true 로 설정.
+ *   해제자:
+ *     - fio_ime_engine_finalize() (fork 모드 cleanup) 가 finalize 후 false.
+ *     - fio_ime_unregister() (.fini_array) 가 thread 모드에서 마지막 finalize 후 암묵적.
+ *
+ *   값 범위: true / false.
+ *
+ *   동기화:
+ *     - fio 의 잡 초기화 순서는 "메인 스레드가 모든 잡 워커를 spawn 하기 전 init/setup"
+ *       이므로 잡 스레드 생성 이전에 첫 init() 가 발생할 수 있다. 정상 시나리오에서는
+ *       잡 워커 spawn 이전 단계에서만 변경되어 별도 atomic/lock 없이 동작.
+ *     - 만일 잡 스레드 생성 후 init 이 호출되는 비정상 패턴이면 fio_ime_engine_init()
+ *       가 log_err 경고만 출력하고 진행한다(데이터 경쟁 가능성 인정). */
 static bool fio_ime_is_initialized = false;
 
 /* [한국어] IME 동기 I/O 요청 구조체 (ime_psync/ime_psyncv 엔진용)
@@ -195,83 +439,148 @@ struct imeaio_req {
 };
 
 /* This structure will be used for 2 engines: ime_psyncv and ime_aio */
-/* [한국어] ime_psyncv와 ime_aio가 공유하는 엔진별 상태 컨테이너. td->io_ops_data에 저장되어
- *          잡 스레드 생명주기 동안 유지된다. ime_psync는 단순 동기 엔진이라 이 구조체를 쓰지 않음. */
+/* [한국어] struct ime_data — ime_psyncv 와 ime_aio 가 공유하는 엔진별 상태 컨테이너.
+ *
+ *   생명주기:
+ *     - 생성: fio_ime_psyncv_init() 또는 fio_ime_aio_init() 에서 calloc(1, ...).
+ *     - 소유: td->io_ops_data 에 저장되어 잡 스레드 단독 소유. 다른 잡과 공유되지 않음.
+ *     - 파괴: fio_ime_psyncv_clean() 또는 fio_ime_aio_clean() 에서 free.
+ *
+ *   ime_psync 는 commit/getevents 단계가 없는 단순 동기 엔진이므로 이 구조체를 쓰지 않는다.
+ *   (td->io_ops_data 가 NULL 인 채로 동작.)
+ *
+ *   링 큐 의미론:
+ *     - aioreqs[depth] / iovecs[depth] / io_us[2*depth] 가 모두 같은 head/tail 인덱스를
+ *       공유하는 "병행 링". head 는 enqueue 가 쓰는 다음 슬롯, tail 은 getevents 가
+ *       소비할 다음 슬롯.
+ *     - psyncv 는 사실상 링이 아니라 "한 배치 단일 윈도우"로 동작 — getevents 후
+ *       fio_ime_queue_reset() 이 head/tail/cur_commit/queued/events 를 모두 0 으로 리셋.
+ *     - aio 는 진짜 링. head 가 wrap-around 하면(=다시 0) can_append 가 false 를 돌려
+ *       기존 iocb->iov 의 배열 연속성이 깨지지 않게 새 요청을 시작한다. */
 struct ime_data {
 	union {
 		struct imeaio_req 	*aioreqs;
-		/* [한국어] ime_aio: iodepth 크기의 요청 배열(링 버퍼).
-		 * 설정자: fio_ime_aio_init()이 malloc, cond/mutex init.
-		 * 해제자: fio_ime_aio_clean()이 destroy 후 free.
-		 * 접근 인덱스: head(enqueue), tail(pop/getevents), cur_commit(commit). */
+		/* [한국어] ime_aio 전용 — iodepth 크기의 요청 객체 배열.
+		 * 설정자: fio_ime_aio_init() 이 malloc 한 뒤 각 슬롯의 cond/mutex 를 init.
+		 * 읽는 자: enqueue (head), commit (cur_commit), getevents (tail) 인덱스로 접근.
+		 * 해제자: fio_ime_aio_clean() 이 cond/mutex destroy 후 free.
+		 * 인덱싱: 세 인덱스가 모두 [0..depth) 범위에서 순환.
+		 * 동기화: 한 슬롯의 status 필드만 라이브러리 콜백 스레드와 공유(슬롯 내부의
+		 *          status_mutex/cond_endio 로 보호). 배열 자체의 head/tail/cur_commit
+		 *          은 잡 스레드 단독 갱신이라 락 불필요. */
 		struct imesio_req	*sioreq;
-		/* [한국어] ime_psyncv: 단일 배치 요청 기술자(하나만 사용).
-		 * psyncv는 하나의 preadv/pwritev 호출로 모든 iovec을 커밋하므로 요청 객체도 1개. */
+		/* [한국어] ime_psyncv 전용 — 단일 배치 요청 기술자(요청 1개만 사용).
+		 * psyncv 는 한 commit 당 단 1회의 ime_native_preadv/pwritev 호출에 모든 iovec 을
+		 * 묶어 보내므로 "현재 배치가 어떤 fd/ddir/offset 에 대한 것인지"를 기억하는 객체도 1개면 충분.
+		 * 설정자: fio_ime_psyncv_init() 이 malloc, enqueue()가 큐 비었을 때 fd/ddir/offset 채움.
+		 * 읽는 자: can_queue() 가 새 io_u 와 fd/ddir 비교, commit() 이 preadv/pwritev 인자로 사용.
+		 * 해제자: fio_ime_psyncv_clean() 이 free. */
 		/* [한국어 원주석] array of aio requests / pointer to the only syncio request
-		 * 두 엔진이 메모리를 공유하기 위해 union - 엔진 선택 시점에 한쪽만 유효. */
+		 * 두 엔진이 같은 메모리 슬롯을 공유하기 위해 union 사용 — 엔진 선택은
+		 * 컴파일 시 결정되므로 같은 잡 안에서 두 멤버가 동시에 의미를 갖는 일은 없다. */
 	};
 	struct iovec 	*iovecs;
-	/* [한국어] 제출 대기 중인 scatter/gather 버퍼 배열(크기=iodepth).
-	 * 설정자: init()이 malloc, enqueue()가 io_u의 xfer_buf/xfer_buflen을 기록.
-	 * 읽는 자: psyncv commit은 ime_native_preadv/pwritev에 전달, aio는 iocb->iov로 가리킴.
-	 * 인덱스: head 위치에 append, iocb는 배열의 연속 구간을 iov로 묶어 참조. */
+	/* [한국어] iodepth 크기의 scatter/gather 버퍼 배열.
+	 * 각 iovec 의 (iov_base, iov_len) 슬롯에 enqueue 시점의 (io_u->xfer_buf, xfer_buflen) 을 기록.
+	 * 설정자: init() 가 malloc, psyncv_enqueue()/aio_enqueue() 가 head 위치에 기록.
+	 * 읽는 자:
+	 *   - psyncv commit  : ime_native_preadv/pwritev 의 iovec 인자로 통째 전달.
+	 *   - aio enqueue    : iocb->iov 가 iovecs[head] 를 가리키게 하여 요청별로 연속 슬롯
+	 *                      구간을 묶음(iovcnt 만큼). 따라서 head 가 0 으로 wrap 되면
+	 *                      iocb 가 가리키는 연속 구간이 깨지므로 can_append 가 false 반환.
+	 * 인덱싱: head (enqueue) 위치에 추가. tail (getevents) 위치는 io_us 와 동기.
+	 * 해제자: clean() 이 free.
+	 * 동기화: 잡 스레드 전용. */
 	/* [한국어 원주석] array of queued iovecs */
 
 	struct io_u 	**io_us;
-	/* [한국어] iovec과 1:1 대응되는 io_u 포인터 배열(크기=2*iodepth로 할당되어 앞 iodepth는
-	 *          "queued" 용, 뒤 iodepth는 event_io_us 용으로 분할).
-	 * 설정자: enqueue()가 head 위치에 io_u 저장.
-	 * 읽는 자: getevents()가 완료 순서대로 event_io_us에 복사, psyncv_end가 io_u->error/resid 기록. */
+	/* [한국어] iovec 과 1:1 대응되는 io_u 포인터 배열.
+	 * 할당 크기는 2 * iodepth — 앞쪽 iodepth 는 "queued" 슬롯, 뒤쪽 iodepth 는 event_io_us 슬롯.
+	 *   (단일 malloc 으로 두 영역을 합쳐 free 도 한 번이면 끝나는 작은 최적화.)
+	 * 설정자: enqueue() 가 io_us[head] = io_u.
+	 * 읽는 자: getevents() 가 io_us[tail] 을 꺼내 event_io_us[events++] 로 복사.
+	 *           psyncv_end()/aio_getevents() 가 io_u->error / io_u->resid 를 기록.
+	 * 해제자: clean() 이 free. (event_io_us 는 같은 할당의 후반부이므로 별도 free 금지.) */
 	/* [한국어 원주석] array of queued io_u pointers */
 
 	struct io_u 	**event_io_us;
-	/* [한국어] get_events가 fio에 반환할 완료 io_u들의 임시 배열(io_us 뒤쪽 iodepth 구간).
-	 * 설정자: getevents() 루프가 채움.
-	 * 읽는 자: fio_ime_event(td, event_idx)가 event_io_us[event_idx]를 fio에 반환. */
+	/* [한국어] fio_ime_event(td, idx) 가 fio 코어에 반환할 완료 io_u 배열.
+	 * 위치: io_us 의 뒤쪽 iodepth 구간(io_us + td->o.iodepth) 을 가리키는 별칭 포인터.
+	 * 설정자: getevents() 루프가 idx 위치에 채움.
+	 * 읽는 자: fio_ime_event(td, event_idx) → event_io_us[event_idx]. */
 	/* [한국어 원주석] array of the events retrieved after get_events */
 
 	unsigned int 	queued;
-	/* [한국어] 현재 큐에 적재된(iovec으로 등록된) io_u 개수.
-	 * 설정자: fio_ime_queue_incr()가 증가, fio_ime_queue_red()가 감소, queue_reset()이 0으로.
-	 * 읽는 자: queue()가 depth와 비교해 FIO_Q_BUSY 결정, commit()이 제출량 결정. */
+	/* [한국어] 현재 큐에 적재된(iovec 슬롯에 기록된) io_u 총 개수.
+	 *           "아직 commit 안 된 것 + 이미 commit 됐지만 수확 안 된 것" 모두 포함.
+	 * 설정자: queue_incr()=+1, queue_red()=-1, queue_reset()=0.
+	 * 읽는 자:
+	 *   - queue()   가 queued==depth 비교해 FIO_Q_BUSY 결정.
+	 *   - commit()  이 (queued - events) 로 미커밋 요청 수 계산.
+	 *   - psyncv commit 이 events = queued 로 일괄 승격.
+	 * 값 범위: 0 .. depth. */
 	/* [한국어 원주석] iovecs/io_us in the queue */
 
 	unsigned int 	events;
-	/* [한국어] "커밋은 되었으나 아직 get_events로 수확되지 않은" io_u 개수.
-	 * 설정자: commit()이 queue_commit()으로 증가, getevents가 queue_red/reset으로 감소.
-	 * 의미: psyncv에서는 events>0이면 get_events 전까지 새 queue 금지(can_queue 검사). */
+	/* [한국어] "이미 IME 에 commit 했지만 아직 fio 가 getevents 로 가져가지 않은" io_u 수.
+	 * 설정자:
+	 *   - psyncv commit() : events = queued (배치를 통째로 발사).
+	 *   - aio queue_commit() : iovcnt 만큼 누적 증가.
+	 *   - getevents()/queue_red()/queue_reset() 이 감소.
+	 * 의미:
+	 *   - psyncv 는 events>0 이면 새 배치 시작 금지(can_queue 검사 — 한 번에 한 배치만).
+	 *   - aio 는 events 와 (queued-events) 두 영역이 링에 공존(in-flight + 대기).
+	 * 값 범위: 0 .. queued (≤ depth). */
 	/* [한국어 원주석] number of committed iovecs/io_us */
 
 	/* variables used to implement a "ring" queue */
 	unsigned int depth;
-	/* [한국어] 링 버퍼 용량 = td->o.iodepth. init()에서 설정되고 이후 불변. */
+	/* [한국어] 링 버퍼 용량 = td->o.iodepth.
+	 * 설정자: init() 1회. 이후 불변(읽기 전용). */
 	/* [한국어 원주석] max entries in the queue */
 
 	unsigned int head;
-	/* [한국어] 다음 enqueue 위치(write index). queue_incr에서 (head+1)%depth로 전진.
-	 *          aio에서 can_append의 첫 조건이 head!=0 - 배열 경계에서는 새 요청을 만들도록 강제. */
+	/* [한국어] 다음 enqueue 가 쓸 슬롯 인덱스(write pointer).
+	 * 설정자: queue_incr() = (head+1) % depth, queue_reset() = 0.
+	 * 읽는 자:
+	 *   - psyncv/aio enqueue()  : iovecs[head] / io_us[head] 슬롯 위치 결정.
+	 *   - aio can_append()      : head==0 이면 링이 막 wrap 되어 iov 연속성이 깨졌으므로
+	 *                              새 요청을 강제(false 반환). */
 	/* [한국어 원주석] index used to append */
 
 	unsigned int tail;
-	/* [한국어] 다음 pop 위치(read index). getevents가 완료된 iovec을 소비하면서 전진. */
+	/* [한국어] 다음 pop 이 읽을 슬롯 인덱스(read pointer).
+	 * 설정자: queue_red() = (tail+1) % depth, queue_reset() = 0.
+	 * 읽는 자: aio_getevents() 가 aioreqs[tail] / io_us[tail] 위치에서 완료 수확. */
 	/* [한국어 원주석] index used to pop */
 
 	unsigned int cur_commit;
-	/* [한국어] 아직 commit되지 않은 첫 요청의 인덱스(aio 전용). queue_commit에서 iovcnt만큼 전진.
-	 *          (queued - events) > 0이면 커밋할 요청이 남아 있음. */
+	/* [한국어] 다음 commit 이 제출할 첫 요청의 인덱스(aio 전용).
+	 * 설정자: queue_commit() = (cur_commit + iovcnt) % depth, queue_reset() = 0.
+	 * 읽는 자: aio_commit() 의 while 루프가 (queued - events) > 0 인 동안 cur_commit
+	 *          위치에서 요청을 꺼내 ime_native_aio_read/write 호출. */
 	/* [한국어 원주석] index of the first uncommitted req */
 
 	/* offset used by the last iovec (used to check if the iovecs can be appended)*/
 	unsigned long long	last_offset;
-	/* [한국어] 가장 최근 enqueue된 iovec의 "끝 오프셋"(offset + xfer_buflen).
-	 * 사용 목적: 새 io_u가 이 위치와 정확히 인접해야만 배치에 append 가능(연속 I/O 조건).
-	 * 설정자: psyncv_enqueue/aio_enqueue가 매번 갱신. */
+	/* [한국어] 가장 최근 enqueue 된 iovec 의 끝 오프셋 = (offset + xfer_buflen).
+	 *          새 io_u 의 시작 오프셋이 이 값과 정확히 일치해야 배치에 append 가능.
+	 *          (= 파일상 연속 I/O 조건. 비연속이면 새 요청을 시작해야 한다.)
+	 * 설정자: psyncv_enqueue/aio_enqueue 가 매번 새 끝 오프셋으로 갱신.
+	 * 읽는 자:
+	 *   - psyncv can_queue()  : last_offset == io_u->offset 검사.
+	 *   - aio can_append()    : last_offset == io_u->offset 검사.
+	 * 값 범위: 0 .. 파일 크기 상한.
+	 * 동기화: 잡 스레드 전용. */
 
 	/* The variables below are used for aio only */
 	struct imeaio_req	*last_req;
-	/* [한국어] aio 전용: 현재 "확장 가능한" 마지막 요청(동일 fd/ddir/연속 오프셋의 배치).
-	 * 설정자: enqueue에서 새 요청을 만들 때 자신을 가리키도록 갱신.
-	 * 읽는 자: can_append()와 enqueue 내부에서 iovcnt 증가. */
+	/* [한국어] aio 전용 — 현재 "확장 가능한 마지막 요청" 포인터.
+	 *          새 io_u 가 동일 fd/ddir/연속 오프셋이면 last_req->iocb.iovcnt 만 증가시켜
+	 *          하나의 ime_native_aio_*() 호출로 묶는다(vector AIO 효과).
+	 * 설정자: aio_enqueue() 가 새 요청을 만들 때 last_req = ioreq.
+	 *          (append 경로에서는 갱신하지 않음 — 같은 요청 계속 확장.)
+	 * 읽는 자: can_append() 가 last_req->ddir / iocb.fd 비교. */
 	/* [한국어 원주석] last request awaiting committing */
 };
 
@@ -663,11 +972,26 @@ static void fio_ime_engine_finalize(struct thread_data *td)
  * [한국어]
  * fio_ime_psync_end - ime_native_p{read,write}/fsync 결과를 io_u에 반영하고 완료 상태 반환.
  *
- * @ret: 시스템 호출 반환값(성공 시 바이트 수, 부분 전송 시 작은 수, 실패 시 -1).
+ * @td:     잡 스레드 컨텍스트(td_verror/io_u_log_error 대상).
+ * @io_u:   방금 처리된 io_u — 성공/실패 상태를 기록할 대상.
+ * @ret:    시스템 호출 반환값(성공 시 바이트 수, 부분 전송 시 작은 수, 실패 시 -1).
  * @return: 항상 FIO_Q_COMPLETED (psync는 동기 엔진).
  *
  * 부분 전송(short I/O)은 io_u->resid에 미전송 바이트를 기록하고 error=0으로 둔다.
  * 완전 실패는 io_u->error에 errno를 기록하고 td_verror로 fio에 보고.
+ *
+ * 원본 출처: engines/sync.c 의 fio_io_end() 와 동일 로직. IME 가 POSIX read/write 와
+ * 유사한 "반환값 = 전송 바이트 또는 -1" 규약을 따르므로 그대로 재사용. 향후 sync.c 의
+ * fio_io_end 변경 시 여기도 맞춰야 한다.
+ *
+ * 실행 컨텍스트: 잡 스레드 동기. 호출 체인:
+ *   backend → td_io_queue → fio_ime_psync_queue → ime_native_p{read,write,fsync} →
+ *     [이 함수] → FIO_Q_COMPLETED.
+ *
+ * 반환 규약 재확인:
+ *   - ret == xfer_buflen : 완전 성공. resid/error 손대지 않음.
+ *   - 0 <= ret < xfer_buflen : 부분 전송. resid=xfer_buflen-ret, error=0.
+ *   - ret == -1 : 실패. io_u->error = errno, td_verror("xfer").
  */
 static int fio_ime_psync_end(struct thread_data *td, struct io_u *io_u, ssize_t ret)
 {
@@ -707,12 +1031,15 @@ static enum fio_q_status fio_ime_psync_queue(struct thread_data *td,
 	fio_ro_check(td, io_u);            /* [한국어] read-only 잡이면 쓰기 시도를 assert로 잡음 - 방어적 점검. */
 
 	if (io_u->ddir == DDIR_READ)
-		ret = ime_native_pread(f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);    /* [한국어] IME pread - 주어진 오프셋에서 xfer_buflen 바이트 읽기. */
+		ret = ime_native_pread(f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);    /* [한국어] IME pread - 주어진 오프셋에서 xfer_buflen 바이트 읽기. VERIFY 도 이 경로 사용. */
 	else if (io_u->ddir == DDIR_WRITE)
 		ret = ime_native_pwrite(f->fd, io_u->xfer_buf, io_u->xfer_buflen, io_u->offset);   /* [한국어] IME pwrite - 주어진 오프셋에 쓰기. */
 	else if (io_u->ddir == DDIR_SYNC)
-		ret = ime_native_fsync(f->fd);                                                      /* [한국어] IME fsync - 캐시 플러시. */
+		ret = ime_native_fsync(f->fd);                                                      /* [한국어] IME fsync - 캐시 플러시. 실패 시 -1 반환 → end() 에서 errno 로 매핑. */
 	else {
+		/* [한국어] DDIR_TRIM/DDIR_DATASYNC 등 미지원 방향.
+		 *   ret 을 xfer_buflen 으로 위장해서 "resid 계산 = 0" 으로 만들고, io_u->error
+		 *   를 EINVAL 로 기록 — 이후 end() 가 if (io_u->error) 분기를 타서 td_verror 보고. */
 		ret = io_u->xfer_buflen;                                                            /* [한국어] 알 수 없는 방향 - ret을 "전체 전송"으로 세팅해서 resid 0이 되도록. */
 		io_u->error = EINVAL;                                                               /* [한국어] 그러나 에러 플래그는 명시. */
 	}
@@ -801,25 +1128,28 @@ static enum fio_q_status fio_ime_psyncv_queue(struct thread_data *td,
 	if (ime_d->queued == ime_d->depth)         /* [한국어] 큐가 가득 - fio에 커밋/수확을 먼저 하라고 요청. */
 		return FIO_Q_BUSY;
 
-	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {  /* [한국어] 일반 read/write 경로. */
+	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {  /* [한국어] 일반 read/write 경로 — VERIFY 도 코어가 DDIR_READ 로 디스패치하므로 이 분기 사용. */
 		if (!fio_ime_psyncv_can_queue(ime_d, io_u))              /* [한국어] 연속성/동일 fd/동일 방향/미수확 이벤트 없음 확인. */
 			return FIO_Q_BUSY;                                     /* [한국어] 배치 불가 - fio가 먼저 commit. */
 
 		dprint(FD_IO, "queue: ddir=%d at %u commit=%u queued=%u events=%u\n",
 			io_u->ddir, ime_d->head, ime_d->cur_commit,
-			ime_d->queued, ime_d->events);                        /* [한국어] 큐 상태 디버그. */
+			ime_d->queued, ime_d->events);                        /* [한국어] 큐 상태 디버그 - FD_IO 채널로 현재 head/cur_commit/queued/events 찍어 배치 진행 추적. */
 		fio_ime_psyncv_enqueue(ime_d, io_u);                     /* [한국어] iovec 슬롯에 기록 + head 전진. */
 		return FIO_Q_QUEUED;                                      /* [한국어] 비동기 성공 - 완료는 getevents에서. */
 	} else if (io_u->ddir == DDIR_SYNC) {                       /* [한국어] fsync는 배치 대상이 아니므로 즉시 실행. */
 		if (ime_native_fsync(io_u->file->fd) < 0) {              /* [한국어] IME fsync - 버스트 버퍼 캐시 플러시. */
 			io_u->error = errno;                                   /* [한국어] 실패 시 errno 기록. */
-			td_verror(td, io_u->error, "fsync");
+			td_verror(td, io_u->error, "fsync");                  /* [한국어] "fsync" 태그로 잡에 치명 에러 등록 - 이후 td 상태가 오류로 전이. */
 		}
 		return FIO_Q_COMPLETED;                                   /* [한국어] 동기 완료. */
 	} else {
+		/* [한국어] DDIR_TRIM/DDIR_DATASYNC/DDIR_SYNC_FILE_RANGE 등 IME 미지원 방향.
+		 *   DDIR_TRIM 은 fio_ime_open_file 에서 잡 시작 시 이미 거부되지만, 방어적으로
+		 *   여기서도 EINVAL 보고한다. (버그나 옵션 파서 변경으로 도달 가능.) */
 		io_u->error = EINVAL;                                     /* [한국어] TRIM 등 미지원 방향. */
-		td_verror(td, io_u->error, "wrong ddir");
-		return FIO_Q_COMPLETED;
+		td_verror(td, io_u->error, "wrong ddir");                /* [한국어] "wrong ddir" 태그로 잡에 에러 기록. */
+		return FIO_Q_COMPLETED;                                   /* [한국어] COMPLETED 로 돌려야 fio 코어가 io_u 를 다시 큐에 넣지 않고 에러 처리한다. */
 	}
 }
 
@@ -842,17 +1172,20 @@ static int fio_ime_psyncv_end(struct thread_data *td, ssize_t bytes)
 	unsigned int i;
 	int err = errno;   /* [한국어] 후속 로깅이 errno를 덮기 전에 보존. */
 
-	for (i = 0; i < ime_d->queued; i++) {  /* [한국어] 배치에 포함된 모든 io_u 순회. */
-		io_u = ime_d->io_us[i];
+	for (i = 0; i < ime_d->queued; i++) {  /* [한국어] 배치에 포함된 모든 io_u 순회. iovec 순서 = io_us 순서이므로 순차 소진 가능. */
+		io_u = ime_d->io_us[i];            /* [한국어] i 번째 슬롯의 io_u 포인터 꺼냄. */
 
 		if (bytes == -1)                     /* [한국어] 전체 실패 - 모든 io_u에 같은 errno 기록. */
-			io_u->error = err;
+			io_u->error = err;                /* [한국어] 루프 시작 전 스냅샷한 errno 를 모든 io_u 에 전파. */
 		else {
+			/* [한국어] 부분/전체 성공 경로.
+			 *   preadv/pwritev 는 iovec 배열을 "왼쪽부터 순차로" 채우므로,
+			 *   bytes 를 iovec 사이즈 순서대로 소진하면서 각 io_u 에 개별 resid 계산. */
 			unsigned int this_io;              /* [한국어] 이 io_u에 할당된 전송량. */
 
 			this_io = bytes;                   /* [한국어] 남은 bytes를 가용 상한으로. */
 			if (this_io > io_u->xfer_buflen)  /* [한국어] io_u 한도를 넘지 않도록 clamp. */
-				this_io = io_u->xfer_buflen;
+				this_io = io_u->xfer_buflen;    /* [한국어] 이 io_u 가 요청한 만큼만 가져가고 나머지는 다음 io_u 로 이월. */
 
 			io_u->resid = io_u->xfer_buflen - this_io;  /* [한국어] 미전송 바이트. */
 			io_u->error = 0;                             /* [한국어] 부분 성공 - 에러 아님. */
@@ -1103,10 +1436,10 @@ static enum fio_q_status fio_ime_aio_queue(struct thread_data *td,
 		io_u->ddir, ime_d->head, ime_d->cur_commit,
 		ime_d->queued, ime_d->events);
 
-	if (ime_d->queued == ime_d->depth)                   /* [한국어] 링 용량 초과 차단. */
+	if (ime_d->queued == ime_d->depth)                   /* [한국어] 링 용량 초과 차단. fio 코어가 FIO_Q_BUSY 를 받으면 commit+getevents 를 돌린 뒤 재시도. */
 		return FIO_Q_BUSY;
 
-	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {
+	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) {  /* [한국어] VERIFY 는 DDIR_READ 로 디스패치되므로 이 분기 활용. TRIM 은 이 분기로 진입 불가(open_file 에서 사전 거부). */
 		if (!fio_ime_aio_can_queue(ime_d, io_u))          /* [한국어] 확장 훅 - 현재는 항상 true. */
 			return FIO_Q_BUSY;
 
@@ -1114,14 +1447,16 @@ static enum fio_q_status fio_ime_aio_queue(struct thread_data *td,
 		return FIO_Q_QUEUED;                              /* [한국어] 비동기 - 완료는 getevents에서. */
 	} else if (io_u->ddir == DDIR_SYNC) {
 		if (ime_native_fsync(io_u->file->fd) < 0) {       /* [한국어] fsync는 배치 대상 아니므로 즉시 동기 수행. */
-			io_u->error = errno;
-			td_verror(td, io_u->error, "fsync");
+			io_u->error = errno;                            /* [한국어] 실패 시 errno 스냅샷하여 io_u 에 보존. */
+			td_verror(td, io_u->error, "fsync");           /* [한국어] "fsync" 태그로 잡에 치명 에러 기록. */
 		}
-		return FIO_Q_COMPLETED;
+		return FIO_Q_COMPLETED;                           /* [한국어] SYNC 는 한 번의 syscall 로 끝나므로 즉시 완료 반환. */
 	} else {
+		/* [한국어] DDIR_TRIM/DDIR_DATASYNC/SYNC_FILE_RANGE 등 미지원 방향 방어 경로.
+		 *   TRIM 은 open_file 에서 td_trim(td) 검사로 이미 거부됐지만 방어적 처리. */
 		io_u->error = EINVAL;                             /* [한국어] 미지원 방향. */
-		td_verror(td, io_u->error, "wrong ddir");
-		return FIO_Q_COMPLETED;
+		td_verror(td, io_u->error, "wrong ddir");        /* [한국어] "wrong ddir" 태그 잡에 에러 등록. */
+		return FIO_Q_COMPLETED;                           /* [한국어] COMPLETED 반환 - fio 코어는 io_u->error 를 확인해 에러 처리. */
 	}
 }
 
@@ -1184,15 +1519,18 @@ static int fio_ime_aio_getevents(struct thread_data *td, unsigned int min,
 	unsigned int count;       /* [한국어] 요청 내 iovec 순회 인덱스. */
 	ssize_t bytes;            /* [한국어] 요청이 전송한 총 바이트 - 각 io_u에 분배. */
 
-	while (ime_d->events) {  /* [한국어] 커밋되었으나 수확 안 된 것이 남아 있는 동안. */
+	while (ime_d->events) {  /* [한국어] 커밋되었으나 수확 안 된 것이 남아 있는 동안. events==0 이면 반환. */
 		ioreq = &ime_d->aioreqs[ime_d->tail];  /* [한국어] tail 위치의 요청. */
 
 		/* Break if we already got events, and if we will
 		   exceed max if we append the next events */
+		/* [한국어] aio 에서 한 요청은 iovcnt 개의 io_u 를 품을 수 있으므로, 이 요청을
+		 *   통째로 수확하면 events+iovcnt 가 되어 fio 코어가 요구한 max 를 넘을 수 있다.
+		 *   이미 events>0 으로 부분 결과가 있다면 다음 라운드로 미루는 것이 안전. */
 		if (events && events + ioreq->iocb.iovcnt > max)  /* [한국어] 이미 일부 반환했고 이 요청을 추가하면 max 초과 - 중단. */
 			break;
 
-		if (ioreq->status != FIO_IME_IN_PROGRESS) {       /* [한국어] 이미 완료된 요청(성공 바이트 수 또는 REQ_ERROR). */
+		if (ioreq->status != FIO_IME_IN_PROGRESS) {       /* [한국어] 이미 완료된 요청(성공 바이트 수 또는 REQ_ERROR). IN_PROGRESS 가 아니면 콜백이 이미 status 를 덮어썼다는 뜻. */
 
 			bytes = ioreq->status;                         /* [한국어] 총 전송 바이트(또는 에러 sentinel). */
 			for (count = 0; count < ioreq->iocb.iovcnt; count++) {  /* [한국어] 이 요청에 묶인 iovec 수만큼 io_u 처리. */
@@ -1290,85 +1628,286 @@ static void fio_ime_aio_clean(struct thread_data *td)
 
 /* The FIO_DISKLESSIO flag used for these engines is necessary to prevent
    FIO from using POSIX calls. See fio_ime_open_file for more details. */
-/* [한국어] FIO_DISKLESSIO는 "fio 코어가 POSIX 파일 계열 호출을 스스로 하지 않도록" 막는 플래그.
- *          IME 경로는 POSIX 네임스페이스에 있지 않을 수 있으므로 stat/open/close를 모두
- *          엔진이 인수해야 한다. FIO_SYNCIO는 잡 러너에게 "이 엔진은 동기 방식"임을 알려
- *          iodepth>1에서도 getevents를 기본 경로로 쓰지 않도록 한다(psyncv는 commit이 동기이므로 포함). */
+/* [한국어] 본 파일이 노출하는 세 ioengine_ops 의 공통 규약 메모.
+ *
+ *   ┌── 공통 .flags 비트 풀이 ───────────────────────────────────────────────────┐
+ *   │ FIO_DISKLESSIO  (모든 IME 엔진)
+ *   │   - "디스크 기반 가정 금지" 플래그. fio 코어가 POSIX open/stat/close 등을
+ *   │     스스로 호출하지 않도록 막는다. IME 경로(im://...)는 일반 POSIX
+ *   │     네임스페이스에 보장되지 않으므로 모든 파일 핸들 관련 호출을 엔진이
+ *   │     인수해야 한다(fio_ime_open_file/close_file/get_file_size/unlink_file).
+ *   │     또한 size 계산/레이아웃 단계에서 디스크 사용량 보고(NODISKUTIL)와
+ *   │     별개로 파일이 디스크 블록을 점유한다는 가정도 비활성화한다.
+ *   │
+ *   │ FIO_SYNCIO     (ime_psync, ime_psyncv 만)
+ *   │   - "이 엔진은 동기적으로 큐잉/완료한다" 힌트. fio 러너가 issue 시간을
+ *   │     queue() 진입 시점에 자동 기록하고, getevents 루프를 단순화한다.
+ *   │     ime_psync 는 queue() 안에서 ime_native_pread/pwrite 를 끝내고 즉시
+ *   │     FIO_Q_COMPLETED 반환. ime_psyncv 는 queue() 시점은 비동기지만
+ *   │     commit() 의 ime_native_preadv/pwritev 호출이 동기이므로 SYNCIO.
+ *   │   - ime_aio 는 진정한 비동기이므로 이 비트를 켜지 않는다(미설정 의미:
+ *   │     코어가 issue 시점을 commit() 호출 시점으로 기록하고, getevents 루프
+ *   │     동기화는 엔진의 cond_wait 에 위임).
+ *   │
+ *   │ 미설정 비트 의미(세 엔진 공통):
+ *   │   FIO_RAWIO    : 블록 디바이스 raw 접근 아님.
+ *   │   FIO_NOEXTEND : 잡 중 파일 확장 허용 (fio_ime_open_file 이 ftruncate 사용).
+ *   │   FIO_PIPEIO   : 파이프 I/O 아님.
+ *   │   FIO_BARRIER  : 배리어 의미론 별도 추적 안 함.
+ *   │   FIO_UNIDIR   : 양방향 R/W 모두 가능.
+ *   │   FIO_NODISKUTIL : 디스크 사용량 통계 비활성화 안 함(IME가 backing NVMe 사용).
+ *   │   FIO_ASYNCIO_SYNC_TRIM/SYNCFS : TRIM/syncfs 동기 폴백 없음(IME TRIM 미지원).
+ *   │   FIO_ASYNCIO_SETS_ISSUE_TIME : 엔진이 issue 시간을 따로 기록하지 않음.
+ *   └─────────────────────────────────────────────────────────────────────────────┘
+ *
+ *   ┌── 공통 ioengine_ops 필드 규약 ─────────────────────────────────────────────┐
+ *   │ .name           : --ioengine=<NAME> 으로 선택될 식별자. load_ioengine() 의
+ *   │                    strcmp 매칭 키.
+ *   │ .version        : FIO_IOOPS_VERSION (현재 fio 빌드의 ABI 버전). 불일치 시
+ *   │                    check_engine_ops() 가 로드 거부.
+ *   │ .setup          : td_io_setup 시점, init 직전. 본 엔진들은 모두
+ *   │                    fio_ime_setup 으로 real_file_size=0 만 표시(IME 라이브러리
+ *   │                    init 을 fork 이후로 미루기 위함).
+ *   │ .init/.cleanup  : 잡당 1회. ime_native_init/finalize 와 ime_data 라이프.
+ *   │ .queue          : io_u 1개 제출. 반환 FIO_Q_COMPLETED|QUEUED|BUSY.
+ *   │ .commit         : queue 가 누적한 배치를 실제 IME 에 발사. ime_psync 는
+ *   │                    필요 없어 NULL(코어가 commit 단계 건너뜀).
+ *   │ .getevents      : 완료 수확. 반환 = 완료된 io_u 수.
+ *   │ .event          : getevents 가 보고한 idx 번째 io_u 반환(event_io_us[idx]).
+ *   │ .open_file      : ime_native_open 으로 fd 획득. TRIM 거부.
+ *   │ .close_file     : ime_native_close.
+ *   │ .get_file_size  : ime_native_stat 으로 real_file_size 채움.
+ *   │ .unlink_file    : POSIX unlink (IME가 FUSE 마운트로도 노출되는 경우 지원).
+ *   └─────────────────────────────────────────────────────────────────────────────┘
+ */
 
-/* [한국어] ime_psync 엔진 op 테이블 - 단순 동기 pread/pwrite/fsync. commit/getevents 없음. */
+/* [한국어] ioengine_prw — "ime_psync" 동기 엔진 vtable.
+ *          단순 ime_native_pread/pwrite/fsync 직접 호출. commit/getevents 미사용.
+ *          ime_data 도 사용하지 않음(td->io_ops_data == NULL). iodepth>1 의미 없음. */
 static struct ioengine_ops ioengine_prw = {
-	.name		= "ime_psync",                    /* [한국어] --ioengine=ime_psync 로 선택되는 엔진 이름. */
-	.version	= FIO_IOOPS_VERSION,              /* [한국어] 엔진 ABI 버전 매칭용. 불일치 시 fio 로드 거부. */
-	.setup		= fio_ime_setup,                  /* [한국어] real_file_size=0으로 세팅하여 init을 늦춤. */
-	.init		= fio_ime_engine_init,            /* [한국어] ime_native_init 호출. */
-	.cleanup	= fio_ime_engine_finalize,        /* [한국어] fork 모드에서 ime_native_finalize. */
-	.queue		= fio_ime_psync_queue,            /* [한국어] 동기 pread/pwrite/fsync 직접 호출. */
-	.open_file	= fio_ime_open_file,              /* [한국어] IME prefix 붙여 ime_native_open. */
-	.close_file	= fio_ime_close_file,             /* [한국어] ime_native_close. */
-	.get_file_size	= fio_ime_get_file_size,      /* [한국어] ime_native_stat. */
-	.unlink_file  	= fio_ime_unlink_file,         /* [한국어] POSIX unlink(IME도 POSIX 네임스페이스 노출). */
-	.flags	    	= FIO_SYNCIO | FIO_DISKLESSIO, /* [한국어] 동기 + POSIX 우회. */
+	.name		= "ime_psync",
+	/* [한국어] --ioengine=ime_psync 식별자. load_ioengine() 의 strcmp 매칭 키.
+	 *          fio 명령줄/잡 파일에서 이 이름으로 선택된다. */
+
+	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] fio 빌드의 ioengine ABI 버전. 불일치 시 check_engine_ops() 가 로드 거부.
+	 *          본 파일이 외부 .so 가 아닌 in-tree 엔진이라 사실상 항상 일치. */
+
+	.setup		= fio_ime_setup,
+	/* [한국어] td_io_setup 콜백. real_file_size=0 으로 채워 fio 코어가 stat 단계에서
+	 *          POSIX stat 을 쓰지 못하도록 함. 실제 크기는 open_file 에서 채워짐. */
+
+	.init		= fio_ime_engine_init,
+	/* [한국어] td_io_init 콜백. ime_native_init() 호출 + real_file_size 임시 채움.
+	 *          fork 모드에서 잡 스레드(=프로세스) 생성 직후, IME 라이브러리 첫 사용 전. */
+
+	.cleanup	= fio_ime_engine_finalize,
+	/* [한국어] 잡 종료 시 콜백. fork 모드에서만 ime_native_finalize() 즉시 호출.
+	 *          thread 모드에서는 다른 잡이 IME 사용 중일 수 있어 finalize 보류. */
+
+	.queue		= fio_ime_psync_queue,
+	/* [한국어] io_u 1개 동기 처리. ime_native_pread/pwrite/fsync 직접 호출.
+	 *          항상 FIO_Q_COMPLETED 반환 — commit/getevents 단계 우회.
+	 *          DDIR_TRIM 등은 EINVAL 로 처리. */
+
+	.open_file	= fio_ime_open_file,
+	/* [한국어] IME 경로 prefix 부여 + ime_native_open(). TRIM 잡 거부.
+	 *          generic_file_open 을 IME API 로 재구현한 것. */
+
+	.close_file	= fio_ime_close_file,
+	/* [한국어] ime_native_close() + f->fd = -1 무효화. */
+
+	.get_file_size	= fio_ime_get_file_size,
+	/* [한국어] ime_native_stat() 으로 real_file_size 채움. */
+
+	.unlink_file  	= fio_ime_unlink_file,
+	/* [한국어] POSIX unlink() 사용. IME 가 FUSE 마운트로도 노출되어
+	 *          OS 레이어에서 디렉토리 엔트리 제거 가능함을 전제. */
+
+	.flags	    	= FIO_SYNCIO | FIO_DISKLESSIO,
+	/* [한국어] FIO_SYNCIO  : queue() 가 즉시 완료(FIO_Q_COMPLETED) — 코어가 issue
+	 *                        시간을 queue 시점에 자동 기록.
+	 *          FIO_DISKLESSIO : POSIX open/stat 등 코어 호출 금지(엔진이 인수). */
 };
 
-/* [한국어] ime_psyncv 엔진 op 테이블 - iovec 누적 + 단일 preadv/pwritev. */
+/* [한국어] ioengine_pvrw — "ime_psyncv" iovec 누적 동기 엔진 vtable.
+ *          fio API 는 비동기지만(queue→commit→getevents 분리), 실제 IME 호출
+ *          (ime_native_preadv/pwritev) 은 commit() 안에서 동기 실행. */
 static struct ioengine_ops ioengine_pvrw = {
-	.name		= "ime_psyncv",                   /* [한국어] --ioengine=ime_psyncv. */
+	.name		= "ime_psyncv",
+	/* [한국어] --ioengine=ime_psyncv 식별자. */
+
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] ABI 버전 가드. */
+
 	.setup		= fio_ime_setup,
-	.init		= fio_ime_psyncv_init,            /* [한국어] 상태 구조체 + iovec 배열 할당. */
-	.cleanup	= fio_ime_psyncv_clean,           /* [한국어] 할당 자원 해제. */
-	.queue		= fio_ime_psyncv_queue,           /* [한국어] iovec에 누적(FIO_Q_QUEUED 반환). */
-	.commit		= fio_ime_psyncv_commit,          /* [한국어] preadv/pwritev 단일 호출로 배치 플러시. */
-	.getevents	= fio_ime_psyncv_getevents,       /* [한국어] io_us → event_io_us 복사 + 큐 리셋. */
-	.event		= fio_ime_event,                  /* [한국어] event_io_us[event] 반환. */
+	/* [한국어] real_file_size=0 표식. ime_psync 와 공유. */
+
+	.init		= fio_ime_psyncv_init,
+	/* [한국어] fio_ime_engine_init() + ime_data + sioreq + iovecs[depth] +
+	 *          io_us[2*depth] 할당. event_io_us = io_us + depth. */
+
+	.cleanup	= fio_ime_psyncv_clean,
+	/* [한국어] init 의 모든 free + fio_ime_engine_finalize. */
+
+	.queue		= fio_ime_psyncv_queue,
+	/* [한국어] iovec 슬롯에 io_u 적재. 동일 fd/ddir/연속 오프셋 검사 후
+	 *          FIO_Q_QUEUED. 큐 만원 또는 위반이면 FIO_Q_BUSY. fsync/오류는 즉시 COMPLETED. */
+
+	.commit		= fio_ime_psyncv_commit,
+	/* [한국어] 누적 iovec 을 단일 ime_native_preadv/pwritev 로 IME 에 동기 전송.
+	 *          commit 반환 시점에 모든 전송 끝남. events = queued 로 일괄 승격. */
+
+	.getevents	= fio_ime_psyncv_getevents,
+	/* [한국어] commit 이 이미 끝낸 io_us 를 event_io_us 로 단순 복사. 큐 리셋.
+	 *          반환 = 복사한 이벤트 수(=커밋된 iovec 수). */
+
+	.event		= fio_ime_event,
+	/* [한국어] event_io_us[event] 반환. ime_aio 와 공유 구현. */
+
 	.open_file	= fio_ime_open_file,
 	.close_file	= fio_ime_close_file,
 	.get_file_size	= fio_ime_get_file_size,
 	.unlink_file  	= fio_ime_unlink_file,
-	.flags	    	= FIO_SYNCIO | FIO_DISKLESSIO, /* [한국어] commit이 동기이므로 SYNCIO 유지. */
+	/* [한국어] ime_psync 와 동일 — 모든 IME 엔진이 같은 파일 관리 콜백 공유. */
+
+	.flags	    	= FIO_SYNCIO | FIO_DISKLESSIO,
+	/* [한국어] FIO_SYNCIO : commit 의 ime_native_preadv/pwritev 가 동기 호출.
+	 *                       getevents 가 cond_wait 등의 비동기 동기화를 하지 않음.
+	 *          FIO_DISKLESSIO : POSIX 파일 호출 금지. */
 };
 
-/* [한국어] ime_aio 엔진 op 테이블 - 진짜 비동기 ime_native_aio_{read,write}. */
+/* [한국어] ioengine_aio — "ime_aio" 진정한 비동기 엔진 vtable.
+ *          ime_native_aio_{read,write} 로 다중 in-flight 운용.
+ *          완료는 IME 라이브러리 콜백 → status_mutex/cond_endio 로 동기화. */
 static struct ioengine_ops ioengine_aio = {
-	.name		= "ime_aio",                      /* [한국어] --ioengine=ime_aio. */
+	.name		= "ime_aio",
+	/* [한국어] --ioengine=ime_aio 식별자. */
+
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] ABI 버전 가드. */
+
 	.setup		= fio_ime_setup,
-	.init		= fio_ime_aio_init,               /* [한국어] 요청 배열 + cond/mutex 초기화. */
-	.cleanup	= fio_ime_aio_clean,              /* [한국어] destroy + free. */
-	.queue		= fio_ime_aio_queue,              /* [한국어] 배치에 누적, 필요 시 새 요청 생성. */
-	.commit		= fio_ime_aio_commit,             /* [한국어] aio_read/write 제출 루프. */
-	.getevents	= fio_ime_aio_getevents,          /* [한국어] 콜백 대기 + 완료 iovec → io_u 변환. */
+	/* [한국어] real_file_size=0 표식. */
+
+	.init		= fio_ime_aio_init,
+	/* [한국어] fio_ime_engine_init() + ime_data + aioreqs[depth] + iovecs[depth] +
+	 *          io_us[2*depth] 할당 + 각 aioreq 의 cond/mutex pthread_init. */
+
+	.cleanup	= fio_ime_aio_clean,
+	/* [한국어] 각 aioreq 의 cond/mutex destroy + 모든 free + finalize. */
+
+	.queue		= fio_ime_aio_queue,
+	/* [한국어] iovec 슬롯에 io_u 적재. can_append 면 기존 iocb 의 iovcnt 증가,
+	 *          아니면 새 ime_aiocb 채움. FIO_Q_QUEUED|BUSY|COMPLETED. */
+
+	.commit		= fio_ime_aio_commit,
+	/* [한국어] 미커밋(cur_commit 부터 head 직전까지) 요청들을 ime_native_aio_{read,write}
+	 *          로 발사. 한 요청은 iovcnt 만큼의 iovec 를 묶어 vector AIO. */
+
+	.getevents	= fio_ime_aio_getevents,
+	/* [한국어] tail 부터 검사. status==IN_PROGRESS 면 cond_wait, 완료면 io_u 들에
+	 *          error/resid 분배 후 event_io_us 로 이전. 반환 = 수확한 io_u 수. */
+
 	.event		= fio_ime_event,
+	/* [한국어] event_io_us[event] 반환. ime_psyncv 와 공유. */
+
 	.open_file	= fio_ime_open_file,
 	.close_file	= fio_ime_close_file,
 	.get_file_size	= fio_ime_get_file_size,
 	.unlink_file  	= fio_ime_unlink_file,
-	.flags       	= FIO_DISKLESSIO,             /* [한국어] 비동기이므로 SYNCIO 아님 - fio 러너가 queue-depth 기반 동작 수행. */
+	/* [한국어] 모든 IME 엔진 공유 파일 콜백. */
+
+	.flags       	= FIO_DISKLESSIO,
+	/* [한국어] FIO_SYNCIO 미설정 — 진정한 비동기 엔진. fio 코어가 commit 시점에
+	 *          issue 시간 기록하고, getevents 가 cond_wait 으로 라이브러리 콜백을 기다림.
+	 *          FIO_DISKLESSIO 만 유지. */
 };
 
 /*
  * [한국어]
- * fio_ime_register - 컴파일된 공유 객체가 로드될 때 fio 런타임에 세 엔진을 모두 등록.
- *                     fio_init 매크로로 .init_array에 등록되어 자동 호출됨.
+ * fio_ime_register - 프로세스 로더가 main() 이전에 자동 호출하는 생성자.
+ *                     세 IME 엔진 vtable 을 fio 의 전역 engine_list 에 등록한다.
+ *
+ * @return: void (생성자는 반환값 무시).
+ *
+ * 동작 메커니즘:
+ *   - fio_init 매크로 = __attribute__((constructor)) = GCC/Clang 의 생성자 속성.
+ *     이 속성이 붙은 함수는 ELF 섹션 .init_array 에 들어가고, ld.so(동적 로더)
+ *     또는 정적 링크의 __libc_start_main 이 main() 호출 직전에 모든 .init_array
+ *     엔트리를 순서대로 실행한다.
+ *   - 결과적으로 사용자가 --ioengine=ime_psync 같은 옵션을 파싱하는 load_ioengine()
+ *     호출 시점에는 이미 세 엔진이 engine_list 에 등록되어 있어 find_ioengine()
+ *     의 strcmp 매칭에 걸린다.
+ *   - register_ioengine() 은 ioengines.c 가 제공하는 헬퍼로, flist_add_tail 로
+ *     전역 engine_list 에 엔트리를 끼워 넣는다. 동일 이름 중복 등록은 체크하지
+ *     않으므로 .so 를 여러 번 dlopen 하면 문제가 될 수 있으나, 정적 링크
+ *     (in-tree) 에서는 생성자가 1회만 돈다.
+ *
+ * 실행 컨텍스트: 메인 스레드(잡 스레드 생성 이전). 다른 생성자들과의 순서는
+ *   링커 결정. 동기화 불필요.
+ *
+ * 호출 체인:
+ *   ld.so / __libc_start_main → [이 함수] → register_ioengine × 3.
  */
 static void fio_init fio_ime_register(void)
 {
-	register_ioengine(&ioengine_prw);   /* [한국어] ime_psync 등록 - 전역 ioengine 리스트에 link. */
-	register_ioengine(&ioengine_pvrw);  /* [한국어] ime_psyncv 등록. */
-	register_ioengine(&ioengine_aio);   /* [한국어] ime_aio 등록. */
+	register_ioengine(&ioengine_prw);
+	/* [한국어] ime_psync vtable 을 engine_list 끝에 link.
+	 *          --ioengine=ime_psync 로 찾을 수 있게 됨. */
+
+	register_ioengine(&ioengine_pvrw);
+	/* [한국어] ime_psyncv vtable 등록. */
+
+	register_ioengine(&ioengine_aio);
+	/* [한국어] ime_aio vtable 등록. 세 엔진 모두 같은 translation unit 에서
+	 *          하나의 constructor 로 일괄 등록(공유 헬퍼 재사용이 목적). */
 }
 
 /*
  * [한국어]
- * fio_ime_unregister - 프로세스 종료 시 fio_exit(.fini_array) 훅에서 호출되어 엔진 해제 및
- *                       thread 모드에서 지연되었던 ime_native_finalize를 수행.
+ * fio_ime_unregister - 프로세스 종료 시 자동 호출되는 소멸자. 엔진 vtable 등록을
+ *                       해제하고, thread 모드에서 미뤄두었던 ime_native_finalize 를
+ *                       마지막으로 호출한다.
+ *
+ * @return: void.
+ *
+ * 동작 메커니즘:
+ *   - fio_exit 매크로 = __attribute__((destructor)) = ELF .fini_array 섹션.
+ *     ld.so / exit() 경로의 atexit 체인이 main() 반환 직후 호출.
+ *   - unregister_ioengine() = flist_del_init 로 engine_list 에서 엔트리 unlink.
+ *     .so 로 재적재 시 중복 등록 방지용 안전장치.
+ *   - thread 모드(use_thread=1)에서는 fio_ime_engine_finalize() 가
+ *     ime_native_finalize 를 건너뛰었으므로 이 소멸자가 "프로세스 수명 끝까지"
+ *     라이브러리 종료를 지연시켰다가 여기서 한 번에 호출한다. fork 모드에서는
+ *     이미 잡 cleanup 단계에서 finalize 가 끝났으므로 여기 도달 시점에는
+ *     fio_ime_is_initialized 가 false 라 이 분기 스킵.
+ *
+ * 에러 처리: ime_native_finalize 실패해도 경고만 로그. 프로세스는 계속 종료.
+ *
+ * 실행 컨텍스트: 메인 스레드(모든 잡 스레드 조인 후).
+ *
+ * 호출 체인:
+ *   exit() / _fini → [이 함수] → unregister_ioengine × 3 + 조건부 ime_native_finalize.
  */
 static void fio_exit fio_ime_unregister(void)
 {
-	unregister_ioengine(&ioengine_prw);  /* [한국어] 전역 리스트에서 제거. */
-	unregister_ioengine(&ioengine_pvrw);
-	unregister_ioengine(&ioengine_aio);
+	unregister_ioengine(&ioengine_prw);
+	/* [한국어] ime_psync 를 engine_list 에서 unlink. */
 
-	if (fio_ime_is_initialized && ime_native_finalize() < 0)  /* [한국어] thread 모드에서는 cleanup이 finalize를 안 했으므로 여기서 마지막에 수행. 실패해도 경고만. */
+	unregister_ioengine(&ioengine_pvrw);
+	/* [한국어] ime_psyncv unlink. */
+
+	unregister_ioengine(&ioengine_aio);
+	/* [한국어] ime_aio unlink. */
+
+	if (fio_ime_is_initialized && ime_native_finalize() < 0)
+		/* [한국어] thread 모드에서 지연된 최종 finalize.
+		 *   조건: fio_ime_is_initialized == true  (ime_native_init 이 한 번이라도 성공했고,
+		 *                                           cleanup 이 thread 모드라 finalize 를 건너뜀).
+		 *   호출: ime_native_finalize() — IME 라이브러리 내부 스레드/RPC 연결 해제.
+		 *   실패: 음수 반환 시 log_err 로 경고만 출력하고 exit 흐름 계속.
+		 *   fork 모드에서는 fio_ime_engine_finalize 가 이미 finalize 했으므로
+		 *   fio_ime_is_initialized == false → 이 분기 스킵. */
 		log_err("Warning: IME did not finalize properly\n");
 }

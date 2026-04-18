@@ -41,15 +41,20 @@
  *
  */
 
-#include <stdio.h>     /* [한국어] log_err/log_info 포매팅 */
-#include <stdlib.h>    /* [한국어] calloc/realloc/free */
-#include <stdint.h>    /* [한국어] int64_t (NBD cookie/size 타입) */
-#include <errno.h>     /* [한국어] errno, EIO/EINVAL */
+#include <stdio.h>     /* [한국어] log_err/log_info 포매팅 — printf 계열 매크로 공급. */
+#include <stdlib.h>    /* [한국어] calloc(nbd_data 0-할당), realloc(completed 배열 확장), free(cleanup). */
+#include <stdint.h>    /* [한국어] int64_t — NBD cookie와 서버 size 반환 타입. */
+#include <errno.h>     /* [한국어] errno 전역, EIO/EINVAL — libnbd 실패 경로의 폴백 에러 코드. */
 
-#include <libnbd.h>    /* [한국어] NBD 클라이언트 API: nbd_create/connect_uri/aio_*/nbd_poll 등 */
+#include <libnbd.h>    /* [한국어] NBD 클라이언트 라이브러리 API:
+                          · nbd_create/nbd_connect_uri — 서버 접속/핸드쉐이크
+                          · nbd_aio_pread/pwrite/trim/flush — 비동기 I/O 제출
+                          · nbd_poll — 상태머신 진행 + 완료 콜백 실행
+                          · nbd_aio_peek_command_completed / nbd_aio_command_completed — 완료 회수
+                          · nbd_get_error/nbd_get_errno — 에러 진단 */
 
-#include "../fio.h"
-#include "../optgroup.h"
+#include "../fio.h"       /* [한국어] thread_data/io_u/ioengine_ops/fio_file, add_file, fio_ro_check 등 코어. */
+#include "../optgroup.h"  /* [한국어] FIO_OPT_C_ENGINE/FIO_OPT_G_NBD — 옵션 카테고리/그룹 상수. */
 
 /* Actually this differs across servers, but for nbdkit ... */
 /* [한국어] NBD 서버별 요청 최대 크기는 상이하나, nbdkit 표준 한계를 가정한다(64MB).
@@ -81,26 +86,39 @@ struct nbd_data {
 	 * getevents 스레드와 동일 스레드에서 실행되어 락 불필요. */
 };
 
-/* Options. */
+/*
+ * [한국어] NBD 엔진 옵션 구조체. option_struct_size로 코어가 잡마다 이 크기만큼
+ * calloc하여 보관하고, options[] 테이블의 off1로 각 필드가 채워진다.
+ */
 struct nbd_options {
-	void *padding;   /* [한국어] off1==0 회피용 더미 */
+	void *padding;
+	/* [한국어] off1==0 회피용 더미 포인터.
+	 * 설정자: 없음(옵션 파서는 이 필드에 기록하지 않음).
+	 * 읽는 자: 없음. uri 필드의 offsetof()를 non-zero로 만드는 구조적 역할.
+	 * 값 범위: 미정의(calloc 0).
+	 * 동기화: 읽히지 않음. */
+
 	char *uri;
-	/* [한국어] NBD 서버 접속 URI. 예: "nbd://host", "nbd+unix:///path/sock".
-	 * 설정자: 옵션 파서. 읽는 자: nbd_setup/nbd_init. 값 범위: NULL 또는 유효 URI 문자열. */
+	/* [한국어] NBD 서버 접속 URI 문자열. 예: "nbd://host:10809", "nbd+unix:///path/sock",
+	 *         "nbds://host"(TLS). libnbd가 스킴별로 TCP/Unix 소켓/TLS 협상을 판별.
+	 * 설정자: fio 옵션 파서가 "uri=..." 값을 FIO_OPT_STR_STORE로 할당(strdup 내부).
+	 * 읽는 자: nbd_setup() 프로브 연결, nbd_init() 잡당 본 연결.
+	 * 값 범위: NULL(미지정 시 에러 처리) 또는 유효 NBD URI.
+	 * 동기화: 잡 시작 이후 불변, 다중 잡이 같은 URI를 읽을 수 있으나 libnbd 핸들은 잡당 분리. */
 };
 
 static struct fio_option options[] = {
 	{
-		.name	= "uri",
-		.lname	= "NBD URI",
-		.help	= "Name of NBD URI",
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_NBD,
-		.type	= FIO_OPT_STR_STORE,
-		.off1	= offsetof(struct nbd_options, uri),
+		.name	= "uri",                                  /* [한국어] 옵션 이름 — 잡 파일/CLI에서 "uri=..." 형태로 지정. */
+		.lname	= "NBD URI",                              /* [한국어] help 출력용 긴 이름. */
+		.help	= "Name of NBD URI",                       /* [한국어] --enghelp=nbd 도움말 문구. */
+		.category = FIO_OPT_C_ENGINE,                      /* [한국어] 엔진 전용 옵션 카테고리. */
+		.group	= FIO_OPT_G_NBD,                          /* [한국어] NBD 엔진 옵션 그룹(optgroup.h). */
+		.type	= FIO_OPT_STR_STORE,                       /* [한국어] 문자열 저장 타입 — 파서가 strdup 후 포인터 기록. */
+		.off1	= offsetof(struct nbd_options, uri),      /* [한국어] nbd_options.uri 필드 오프셋 — padding 덕에 non-zero. */
 	},
 	{
-		.name	= NULL,
+		.name	= NULL,                                    /* [한국어] 옵션 테이블 종료 센티널. */
 	},
 };
 
@@ -405,78 +423,144 @@ static int nbd_getevents(struct thread_data *td, unsigned int min,
 
 /*
  * [한국어]
- * nbd_event - 수확된 완료 중 하나를 반환. fio 코어가 0..nr_events-1 인덱스로 1회씩 호출.
- *            내부 구현은 LIFO로 pop.
+ * nbd_event - 수확된 완료 중 하나를 반환. fio 코어가 getevents 반환값 N에 대해
+ *            0..N-1 인덱스로 1회씩 호출한다. 내부 구현은 인덱스를 무시하고 LIFO pop
+ *            — nr_completed가 제출 순서와 맞지 않아도 단지 "완료 io_u 하나"를 주면 된다.
+ * @td: 잡 컨텍스트.
+ * @event: fio 코어가 전달하는 인덱스(무시).
+ * @return: 완료된 io_u 포인터 또는 NULL.
+ * 호출 체인: do_io → io_u_queued_complete → td_io_event → [nbd_event].
  */
 static struct io_u *nbd_event(struct thread_data *td, int event)
 {
-	struct nbd_data *nbd_data = td->io_ops_data;
+	struct nbd_data *nbd_data = td->io_ops_data; /* [한국어] 잡 상태 역참조. */
 
 	if (nbd_data->nr_completed == 0)
-		return NULL;
+		return NULL; /* [한국어] 완료 큐 비어 있음 — 방어적 반환(정상 경로에선 getevents 이후 N>0). */
 
 	/* XXX We ignore the event number and assume fio calls us
 	 * exactly once for [0..nr_events-1].
 	 */
-	nbd_data->nr_completed--;
-	return nbd_data->completed[nbd_data->nr_completed];
+	nbd_data->nr_completed--;                      /* [한국어] LIFO pop — 말단부터 꺼냄. */
+	return nbd_data->completed[nbd_data->nr_completed]; /* [한국어] 해당 슬롯의 io_u 포인터 반환. */
 }
 
 /*
  * [한국어]
- * nbd_io_u_init - io_u 생성 시 엔진 고유 초기화. engine_data 필드만 NULL로.
+ * nbd_io_u_init - io_u 생성 시 엔진 고유 필드 초기화.
+ * @return: 0 항상 성공.
+ * engine_data는 queue()에서 nbd_data 포인터로 덮어쓰고, cmd_completed가 역참조에 사용.
+ * 호출 체인: io_u 할당 경로(backend.c) → td_io_ops->io_u_init → [nbd_io_u_init].
  */
 static int nbd_io_u_init(struct thread_data *td, struct io_u *io_u)
 {
-	io_u->engine_data = NULL;
+	io_u->engine_data = NULL; /* [한국어] 안전한 초기값 — queue() 진입 전 잘못된 포인터 참조 방지. */
 	return 0;
 }
 
-/* [한국어] nbd_io_u_free: 현재 추가 해제 대상 없음. */
+/*
+ * [한국어] nbd_io_u_free - io_u 해제 시 호출되는 훅.
+ * 엔진이 per-io_u로 할당한 리소스가 없으므로 본문 비어 있음.
+ * 호출 체인: io_u_free 경로 → td_io_ops->io_u_free → [nbd_io_u_free].
+ */
 static void nbd_io_u_free(struct thread_data *td, struct io_u *io_u)
 {
-	/* Nothing needs to be done. */
+	/* Nothing needs to be done. */ /* [한국어] 해제할 엔진 자원 없음 — no-op. */
 }
 
-/* [한국어] nbd_open_file: NBD는 fio가 다루는 파일 개념이 없으므로 no-op 성공. */
+/*
+ * [한국어] nbd_open_file - fio 코어가 가상 파일에 대해 open을 호출할 때의 훅.
+ * FIO_DISKLESSIO 엔진은 실제 파일이 없으므로 no-op 성공을 반환.
+ * 호출 체인: td_io_open_file → [nbd_open_file].
+ */
 static int nbd_open_file(struct thread_data *td, struct fio_file *f)
 {
-	return 0;
+	return 0; /* [한국어] 연결은 이미 nbd_init에서 수립했으므로 추가 작업 없음. */
 }
 
-/* [한국어] nbd_invalidate: 페이지 캐시 무효화 개념 없음 — no-op. */
+/*
+ * [한국어] nbd_invalidate - 로컬 페이지 캐시 무효화 훅.
+ * NBD는 서버 측 블록 장치이며 로컬 페이지 캐시를 사용하지 않으므로 no-op.
+ * 호출 체인: td_io_setup 경로에서 invalidate=1 옵션 시 호출.
+ */
 static int nbd_invalidate(struct thread_data *td, struct fio_file *f)
 {
-	return 0;
+	return 0; /* [한국어] NBD는 로컬 캐시 없음 — no-op. */
 }
 
+/*
+ * [한국어] NBD 엔진의 ioengine_ops 테이블.
+ * 비동기 엔진 계약을 가진 구조체로, queue()가 FIO_Q_QUEUED 반환 후 getevents+event로
+ * 완료 분리 수확을 지원한다. FIO_DISKLESSIO로 파일 경로 없이도 동작.
+ * ioengines.c::load_ioengine("nbd")가 이 구조체를 td->io_ops에 바인딩.
+ */
 FIO_STATIC struct ioengine_ops ioengine = {
 	.name			= "nbd",
+	/* [한국어] --ioengine=nbd에서 사용될 식별자. engine_list 검색 키. */
+
 	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] fio 코어↔엔진 ABI 버전. 불일치 시 로드 거부. */
+
 	.options		= options,
+	/* [한국어] 위의 uri 옵션 테이블 — 코어 옵션 파서가 참조. */
+
 	.option_struct_size	= sizeof(struct nbd_options),
+	/* [한국어] 잡당 옵션 저장용 메모리 크기 — 코어가 calloc하여 off1로 필드 기록. */
+
 	.flags			= FIO_DISKLESSIO | FIO_NOEXTEND,
+	/* [한국어] 엔진 속성 비트:
+	 *   FIO_DISKLESSIO — 로컬 파일이 없어도 동작하는 엔진(네트워크 백엔드).
+	 *                   fio 코어의 파일 통계/filesetup 경로에서 파일 크기·존재 확인을 생략하도록 표시.
+	 *   FIO_NOEXTEND   — 서버가 내보낸 export 크기를 넘어서 확장 불가(NBD는 고정 용량).
+	 * getevents/event를 구현하므로 FIO_SYNCIO는 없음 → 비동기 계약. */
 
 	.setup			= nbd_setup,
+	/* [한국어] 잡 파싱 직후 1회 호출 — nbd_data 할당 + "nbd" 가상 파일 add_file + 동기 프로브 연결로
+	 *          export size 취득 후 close. 호출자: td_io_init 초기 단계. */
+
 	.init			= nbd_init,
+	/* [한국어] 각 잡 스레드가 본 AIO 연결을 수립(nbd_create + nbd_connect_uri). */
+
 	.cleanup		= nbd_cleanup,
+	/* [한국어] 잡 종료 시 nbd_close + free(nbd_data). init/setup과 대칭. */
+
 	.queue			= nbd_queue,
+	/* [한국어] ddir에 따라 aio_pread/pwrite/trim/flush 발행. 성공 시 FIO_Q_QUEUED.
+	 *          XFER 상한은 NBD_MAX_REQUEST_SIZE(64MiB) — assert로 강제. */
+
 	.getevents		= nbd_getevents,
+	/* [한국어] nbd_poll로 상태머신을 진행시키고 retire_commands로 완료 cookie 회수 후 개수 반환.
+	 *          min까지 블로킹. timeout은 ms 단위로 변환. */
+
 	.event			= nbd_event,
+	/* [한국어] nr_completed에서 LIFO pop하여 완료 io_u 반환. 인덱스는 무시(코어 규약상 1회씩 호출). */
+
 	.io_u_init		= nbd_io_u_init,
+	/* [한국어] io_u 생성 시 engine_data=NULL 초기화. queue()에서 nbd_data 역링크로 덮어씀. */
+
 	.io_u_free		= nbd_io_u_free,
+	/* [한국어] io_u 해제 시 — 엔진이 malloc한 per-iou 상태 없음, no-op. */
 
 	.open_file		= nbd_open_file,
+	/* [한국어] FIO_DISKLESSIO이므로 실제 open 불필요 — no-op 성공. */
+
 	.invalidate		= nbd_invalidate,
+	/* [한국어] 로컬 페이지 캐시 무효화 개념 없음 — no-op. */
 };
 
-/* [한국어] 생성자/소멸자 — 엔진 레지스트리 등록/해제 */
+/*
+ * [한국어] constructor 속성 — fio 바이너리 링크 시 자동 호출되어 NBD 엔진을
+ * engine_list에 등록. 이후 --ioengine=nbd가 find_ioengine으로 조회 가능해짐.
+ */
 static void fio_init fio_nbd_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine); /* [한국어] engine_list에 tail-add — 초기화 단계라 락 불필요. */
 }
 
+/*
+ * [한국어] destructor 속성 — 프로세스 종료 직전 engine_list에서 제거.
+ */
 static void fio_exit fio_nbd_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine); /* [한국어] flist_del_init 해제. */
 }

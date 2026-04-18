@@ -10,33 +10,114 @@
  *
  */
 /*
- * [한국어 설명] fio I/O 엔진 프레임워크 (ioengines.c)
+ * [한국어 설명] fio I/O 엔진 플러그인 프레임워크 (ioengines.c)
  *
  * === 파일의 역할 ===
- * 이 파일은 I/O 엔진의 로딩, 등록/해제, 초기화/종료, 그리고 I/O 요청의
- * 준비(prep) → 큐잉(queue) → 커밋(commit) → 완료 수집(getevents) 전체 생명주기를
- * 관리하는 중간 계층(glue layer)을 제공한다. 각 I/O 엔진(libaio, io_uring, sync 등)은
- * ioengine_ops 구조체의 콜백을 구현하여 이 프레임워크에 등록한다.
+ * 이 파일은 fio의 "I/O 엔진 플러그인 계약(plugin contract)"을 구현하는 핵심 허브다.
+ * 모든 실제 I/O 백엔드(libaio, io_uring, sync, net, rdma, nvme, http 등 engines/*.c)는
+ * struct ioengine_ops(fio.h 정의)에 콜백 함수 포인터를 담아 이 파일에 등록하며, backend.c의
+ * 잡 루프(do_io)는 오직 이 파일이 노출하는 td_io_*() 래퍼만 호출한다. 즉 ioengines.c는
+ * "잡 메인 루프와 구체 엔진 사이의 유일한 인터페이스 계층"이며, 엔진 로딩(정적 등록 +
+ * dlopen 동적 로딩), 엔진 능력 검증(check_engine_ops), io_u 생명주기 디스패치
+ * (prep → queue → commit → getevents → event), 파일 열기/닫기/삭제/크기조회 디스패치,
+ * 그리고 배치·in-flight·queued 카운터와 계측 훅(io_u_mark_*)까지 모두 담당한다.
+ * 엔진이 동기냐 비동기냐, offload 모드 사용 가능 여부, TRIM이 동기화되어야 하는지 등의
+ * 런타임 분기도 여기서 플래그(FIO_SYNCIO/FIO_NO_OFFLOAD/FIO_ASYNCIO_SYNC_TRIM 등)를
+ * 통해 해석된다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * backend.c의 do_io()가 td_io_*() 함수를 호출하고, 이 함수들이 내부적으로
- * 등록된 엔진의 콜백을 호출한다.
- * 호출 체인: backend.c → td_io_prep/queue/commit/getevents [이 파일] → engines/*.c
- * 엔진 로드: init.c → load_ioengine() [이 파일] → dlopen()/정적 링크
+ * fio 실행 흐름에서 이 파일의 함수들은 아래 순서로 잡 스레드 컨텍스트에서 호출된다:
+ *   init.c: ioengine_load → load_ioengine(이 파일) → (내장) find_ioengine |
+ *                                                    (외부) dlopen_ioengine → dlsym/get_ioengine
+ *   backend.c: thread_main → td_io_init → td_io_open_file → 루프{td_io_prep → td_io_queue →
+ *              (필요 시) td_io_commit → td_io_getevents → td_io_event} → td_io_close_file →
+ *              close_ioengine
+ * 이 파일은 "fio 메인 프로세스"가 아니라 **각 잡 스레드/프로세스** 컨텍스트에서 실행되며,
+ * 대부분의 함수는 단일 잡 스레드 전용이므로 별도 동기화가 불필요하다. 다만 offload 제출
+ * 모드에서는 제출/완료 스레드가 분리되어 overlap_check 뮤텍스로 동일 오프셋 경합을 막는다.
+ * 전역 engine_list는 register_ioengine/unregister_ioengine이 조작하지만, 이는 초기 모듈
+ * 로드(constructor) 시점에만 호출되므로 잡 병렬 실행 중에는 읽기 전용으로 취급된다.
  *
  * === 타 모듈과의 연결 ===
- * - backend.c: do_io()/thread_main()에서 td_io_*() 함수 호출
- * - init.c: ioengine_load()에서 load_ioengine() 호출
- * - engines/*.c: 각 엔진이 ioengine_ops를 구현하고 register_ioengine()으로 등록
- * - io_u.c: io_u 구조체를 td_io_queue()에 전달
- * - filesetup.c: td_io_open_file()/td_io_close_file()로 파일 관리
+ * - backend.c: do_io()/thread_main()이 td_io_prep/queue/commit/getevents/event를 호출하여
+ *   io_u를 실제 I/O 백엔드에 흘려보낸다. td_io_queue 반환값(FIO_Q_*)은 backend가 바로 해석.
+ * - init.c: ioengine_load()가 load_ioengine()을 호출하여 td->io_ops를 채운다. 실패 시 잡 중단.
+ * - engines/*.c: 각 엔진 .c는 FIO_STATIC __attribute__((constructor)) 함수에서
+ *   register_ioengine(&ioengine)을 호출하여 자기 자신을 engine_list에 추가한다. 외부 엔진은
+ *   dlopen된 .so가 자체 constructor로 register_ioengine을 호출하거나,
+ *   dlsym으로 직접 ioengine_ops 심볼/ get_ioengine() 팩토리를 노출한다.
+ * - io_u.c: get_io_u가 free 리스트에서 io_u를 꺼내 prep/queue로 보내고, put_io_u가 완료된
+ *   io_u를 회수한다. 이 파일은 io_u->flags에 IO_U_F_FLIGHT를 설정/해제한다.
+ * - filesetup.c / iolog.c: td_io_open_file/close_file/unlink_file/get_file_size를 통해
+ *   fio_file 생명주기 조작. log_io_u()/log_file()로 write-iolog와 파일 이벤트 로그 기록.
+ * - zbd.c: zbd_queue_io_u가 queue() 반환 직후 ZBD 쓰기 포인터/존 상태를 갱신.
+ * - diskutil.c: disk_util_inc/dec로 파일이 물려 있는 디스크의 사용률 추적.
+ * 공유 핵심 자료구조: struct thread_data(td) — td->io_ops(이 엔진의 ops), td->io_ops_data
+ * (엔진 전용 불투명 상태), td->io_u_queued/io_u_in_flight/cur_depth(배치/깊이 카운터),
+ * td->io_issues[]/io_issue_bytes[](통계 누적), td->last_ddir_issued(마지막 방향),
+ * td->ts(thread_stat — total_io_u[] 등).
  *
  * === 주요 함수/구조체 요약 ===
- * - load_ioengine(): I/O 엔진을 이름으로 찾아 로드 (동적/정적)
- * - td_io_init(): 엔진 초기화 콜백 호출
- * - td_io_queue(): I/O 요청을 엔진에 제출
- * - td_io_getevents(): 완료된 I/O 이벤트 수집
- * - close_ioengine(): 엔진 자원 해제 및 정리
+ * 엔진 로딩/정리:
+ *   - register_ioengine / unregister_ioengine: 정적으로 링크된 엔진이 constructor에서
+ *     자기를 engine_list에 등록/해제. fio.h의 FIO_STATIC 매크로와 짝을 이룬다.
+ *   - load_ioengine: (1) 이름으로 내장 엔진 검색 → (2) 실패 시 dlopen(system path) →
+ *     (3) dlopen_external(FIO_EXT_ENG_DIR/fio-<name>.so) → (4) check_engine_ops 검증.
+ *   - dlopen_ioengine: dlsym으로 "<name>"/"ioengine" 전역 심볼을 찾거나 get_ioengine()
+ *     팩토리를 호출(C++ 엔진 지원). ops->dlhandle에 핸들을 박아 나중 dlclose용으로 저장.
+ *   - free_ioengine: init 전 실패 경로용 정리. 엔진 옵션 free + dlclose.
+ *   - close_ioengine: 잡 종료 시 엔진 cleanup() 호출 후 free_ioengine.
+ * io_u 생명주기 디스패치:
+ *   - td_io_prep: queue 이전 엔진별 사전 준비(libaio의 iocb 셋업 등), 파일 락 획득.
+ *   - td_io_queue: 핵심 제출 경로. IO_U_F_FLIGHT 셋 → issue 통계 → 엔진 queue() 호출 →
+ *     ZBD 후처리 → FIO_Q_COMPLETED/QUEUED/BUSY 별 분기 후처리 → 필요 시 자동 commit.
+ *   - td_io_commit: 쌓인 queued를 한 번에 OS에 제출(예: io_uring_enter, io_submit).
+ *     queued → in_flight로 카운터 이동.
+ *   - td_io_getevents: OS로부터 완료 수집. min>0이면 먼저 commit으로 플러시. 완료 수만큼
+ *     io_u_in_flight 감소 및 io_u_mark_complete로 깊이 히스토그램 기록.
+ *   - td_io_event: 수집된 n번째 완료를 io_u로 복원(엔진이 event 콜백으로 제공).
+ * 파일/메타 디스패치: td_io_init / td_io_open_file / td_io_close_file / td_io_unlink_file /
+ *   td_io_get_file_size / fio_io_sync. fio_show_ioengine_help는 --enghelp CLI 지원.
+ *
+ * === I/O 엔진 플러그인 계약 상세 ===
+ * [queue() 반환값 의미]
+ *   - FIO_Q_COMPLETED: queue() 호출 중에 I/O가 "동기적으로 완료"됨. 동기 엔진의 일반 경로.
+ *     호출자는 즉시 io_u->error를 보고 put_io_u 혹은 verify 파이프라인으로 넘긴다.
+ *   - FIO_Q_QUEUED: 비동기 엔진이 내부 제출 버퍼에 io_u를 넣었지만 아직 OS/하드웨어에는
+ *     도달하지 않음(또는 도달했으나 완료 대기). io_u_queued++ 되며, iodepth_batch에
+ *     도달하거나 td_io_commit 호출 시 실제 제출이 이뤄진다. 이후 td_io_getevents/event로
+ *     완료를 수확한다.
+ *   - FIO_Q_BUSY: 엔진이 현재 더 이상 요청을 받을 수 없음(큐 포화/자원 부족). 호출자는
+ *     io_u를 "requeue"하여 나중에 재시도한다. 이 파일은 BUSY 반환 시 이미 증가시킨
+ *     io_issues[]/issue_bytes[] 카운터를 롤백하고 IO_U_F_FLIGHT를 해제한다.
+ * [ioengine_ops 플래그 비트 의미] (fio.h)
+ *   - FIO_SYNCIO:        queue()가 동기식이므로 event()/getevents() 불필요. issue_time을
+ *                        queue 진입 시점에 기록한다.
+ *   - FIO_DISKLESSIO:    실제 블록/파일 I/O 없음(null, net, http 등). invalidate_cache,
+ *                        fadvise, write_hint, O_DIRECT 설정 경로를 통째로 건너뛴다.
+ *   - FIO_NOIO:          완전한 no-op(cpu 엔진 등). I/O 통계 대부분 비활성.
+ *   - FIO_RAWIO:         로우 블록 디바이스 필요. 섹터 정렬/O_DIRECT 강제 경로 활성.
+ *   - FIO_MEMALIGN:      엔진이 I/O 버퍼에 정렬 제약을 요구 → iomem 할당에서 정렬 적용.
+ *   - FIO_PIPEIO:        파이프/소켓형. 랜덤 I/O 금지(seek 불가) 검사 트리거.
+ *   - FIO_BARRIER:       쓰기 장벽 지원 엔진.
+ *   - FIO_UNIDIR:        단방향 I/O만 가능(읽기/쓰기 혼용 불가) — verify 경로에서 체크.
+ *   - FIO_NOEXTEND:      파일 크기 확장을 엔진이 허용하지 않음(미리 할당 필요).
+ *   - FIO_NODISKUTIL:    디스크 사용률 계측 불가 → disk_util 비활성.
+ *   - FIO_ASYNCIO_SYNC_TRIM: 비동기 엔진이지만 DDIR_TRIM은 동기 경로로 처리해야 함
+ *                        (io_uring의 discard 미지원 경로 등). async_ioengine_sync_trim로 분기.
+ *   - FIO_ASYNCIO_SETS_ISSUE_TIME: 엔진이 스스로 io_u->issue_time을 기록 → 이 파일의
+ *                        fio_gettime 호출을 건너뛴다(정확한 커널 제출 시점 측정용).
+ *   - FIO_RO:            읽기 전용 엔진. fio_ro_check가 쓰기 요청 차단.
+ *   - FIO_MULTI_RANGE_TRIM: 한 queue()에서 여러 TRIM range 처리 가능(NVMe DSM 등).
+ *   - FIO_NO_OFFLOAD:    offload 제출 모드와 호환 안 됨 — check_engine_ops에서 거부.
+ * [계측 훅 호출 시점]
+ *   - io_u_mark_submit(n): commit() 없는 엔진은 td_io_queue 말미에 1로 호출, commit이 있는
+ *     엔진은 backend/commit 경로에서 배치 단위로 호출 → thread_stat.io_u_submit[] 히스토그램.
+ *   - io_u_mark_complete(n): commit 없는 엔진은 queue 말미에, 있는 엔진은 getevents가 수확한
+ *     이벤트 수로 호출 → thread_stat.io_u_complete[] 히스토그램.
+ *   - io_u_mark_depth(n): commit() 시 "이번 배치에서 제출하는 깊이"를 기록 → iodepth 분포.
+ *   - (td->io_u_queued++ / io_u_in_flight±): queue()가 QUEUED 반환 시 증가, commit에서
+ *     queued→in_flight 이동, getevents에서 in_flight 감소.
  */
 
 /* 표준 라이브러리 헤더 */

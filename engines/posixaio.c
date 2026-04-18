@@ -35,13 +35,14 @@
  * IO engine that uses the posix defined aio interface.
  *
  */
-#include <stdio.h>    /* [한국어] 디버그 로그 포매팅 */
-#include <stdlib.h>   /* [한국어] calloc/free — 상태/이벤트 배열 할당 */
-#include <unistd.h>   /* [한국어] 표준 POSIX API */
-#include <errno.h>    /* [한국어] errno 및 에러 코드(EINPROGRESS/ECANCELED/EAGAIN 등) */
-#include <fcntl.h>    /* [한국어] O_SYNC 플래그 — aio_fsync 호출에 사용 */
+#include <stdio.h>    /* [한국어] log_*/디버그 포매팅 공급. */
+#include <stdlib.h>   /* [한국어] calloc(posixaio_data/aio_events 할당), free(cleanup 해제). */
+#include <unistd.h>   /* [한국어] POSIX 기본 API 타입(ssize_t 등) 공급. */
+#include <errno.h>    /* [한국어] errno 및 EINPROGRESS/ECANCELED/EAGAIN — aio_error/aio_read 반환 해석. */
+#include <fcntl.h>    /* [한국어] O_SYNC — aio_fsync(O_SYNC,…) 호출 인자로 사용(메타데이터+데이터 동기화). */
 
-#include "../fio.h"   /* [한국어] fio 코어 공용 타입/매크로 */
+#include "../fio.h"   /* [한국어] thread_data, io_u, ioengine_ops, generic_open_file 등 코어 공용.
+                         os_aiocb_t(= struct aiocb)는 os/의 플랫폼 헤더에서 typedef. */
 
 /*
  * [한국어] POSIX AIO 엔진의 잡별 상태.
@@ -307,36 +308,66 @@ static int fio_posixaio_init(struct thread_data *td)
 }
 
 /*
- * [한국어]
- * ioengine (posixaio) - ioengine_ops 정의.
- * flags:
- *  - FIO_ASYNCIO_SYNC_TRIM: TRIM은 동기 경로로 처리(코어에 힌트)
- *  - FIO_ASYNCIO_SYNC_SYNCFS: syncfs도 동기 처리
+ * [한국어] POSIX AIO 엔진의 ioengine_ops 테이블.
+ * 비동기 엔진이지만 TRIM/syncfs는 POSIX AIO 명세에 없어 동기 경로로 폴백한다 —
+ * FIO_ASYNCIO_SYNC_TRIM/SYNCFS 플래그가 그 사실을 코어에 알려 overlapping 제출을 막는다.
+ * ioengines.c::load_ioengine("posixaio")가 이 구조체를 td->io_ops에 바인딩.
  */
 static struct ioengine_ops ioengine = {
 	.name		= "posixaio",
+	/* [한국어] --ioengine=posixaio 식별자. */
+
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] 코어-엔진 ABI 버전 체크 키. */
+
 	.flags		= FIO_ASYNCIO_SYNC_TRIM |
 				FIO_ASYNCIO_SYNC_SYNCFS,
+	/* [한국어] 엔진 속성 비트:
+	 *   FIO_ASYNCIO_SYNC_TRIM   — TRIM은 do_io_u_trim 동기 경로 사용. 코어는 큐 드레인을 강제.
+	 *   FIO_ASYNCIO_SYNC_SYNCFS — syncfs(2)도 동기 처리(POSIX AIO에 해당 opcode 없음).
+	 * 나머지는 표준 비동기 엔진처럼 queue/getevents/event 3단으로 완료. */
+
 	.init		= fio_posixaio_init,
+	/* [한국어] posixaio_data + aio_events 배열 calloc. 호출자: td_io_init. */
+
 	.prep		= fio_posixaio_prep,
+	/* [한국어] io_u → aiocb(fildes/buf/nbytes/offset/SIGEV_NONE) 세팅 + io_u->seen=0 리셋. */
+
 	.queue		= fio_posixaio_queue,
+	/* [한국어] aio_read/aio_write/aio_fsync 제출. EAGAIN → FIO_Q_BUSY(백프레셔). */
+
 	.getevents	= fio_posixaio_getevents,
+	/* [한국어] td->io_u_all 스캔 + aio_error 폴링 + aio_suspend 대기 루프. */
+
 	.event		= fio_posixaio_event,
+	/* [한국어] pd->aio_events[event] 직접 반환. */
+
 	.cleanup	= fio_posixaio_cleanup,
+	/* [한국어] aio_events/pd 해제. init와 대칭. */
+
 	.open_file	= generic_open_file,
+	/* [한국어] 기본 open(2) 기반 파일 열기 위임 — POSIX AIO 고유 로직 불필요. */
+
 	.close_file	= generic_close_file,
+	/* [한국어] 기본 close(2) 위임. */
+
 	.get_file_size	= generic_get_file_size,
+	/* [한국어] 기본 stat(2) 기반 크기 질의. */
 };
 
-/* [한국어] 프로세스 로드시 생성자 — ioengine 자동 등록 */
+/*
+ * [한국어] constructor — 링크 시 자동 호출되어 엔진을 engine_list에 등록.
+ * 이후 --ioengine=posixaio 조회 가능.
+ */
 static void fio_init fio_posixaio_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine); /* [한국어] engine_list tail-add. */
 }
 
-/* [한국어] 프로세스 종료시 소멸자 — 등록 해제 */
+/*
+ * [한국어] destructor — 프로세스 종료 직전 등록 해제.
+ */
 static void fio_exit fio_posixaio_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine); /* [한국어] flist_del_init. */
 }

@@ -3,58 +3,214 @@
  *
  * === 파일의 역할 ===
  * 이 파일은 fio의 I/O 엔진 플러그인 중 하나로, Linux 커널의 SCSI Generic(SG) v3
- * 인터페이스를 사용하여 SCSI 장치(HDD/SSD/테이프/광학장치 등)에 SCSI CDB
- * (Command Descriptor Block)를 직접 전달하는 로우-레벨 I/O 엔진이다.
- * 일반 read()/write() 경로가 아니라 SG_IO ioctl 또는 /dev/sgY 캐릭터 디바이스에
- * 대한 write()/read() 시스템 호출을 통해 READ(10/16), WRITE(10/16),
- * WRITE AND VERIFY, WRITE SAME, WRITE STREAM, VERIFY, UNMAP, SYNCHRONIZE CACHE
- * 등 SCSI 명령을 직접 발행한다.
- * /dev/sdX 블록 디바이스 또는 direct=1/sync=1 설정의 /dev/sgY에서는 SG_IO ioctl로
- * 동기 실행하며, 그 외의 /dev/sgY(direct=0, sync=0)에서는 write()로 제출한 뒤
- * poll()/read()로 비동기 완료를 수확하는 2중 모드를 지원한다.
- * 또한 엔진 고유 옵션(hipri, readfua, writefua, sg_write_mode, stream_id)을 통해
- * HIPRI 폴링, FUA(Force Unit Access) 플래그, WRITE 모드 선택, 스트림 ID 설정이 가능하다.
+ * 인터페이스를 사용하여 SCSI 장치(HDD/SSD/테이프/광학장치/광디스크/iSCSI/SAS/FC/USB
+ * Mass Storage 등 모든 SCSI Transport 위 디바이스)에 SCSI CDB(Command Descriptor
+ * Block)를 사용자 공간에서 직접 발행하는 로우-레벨 I/O 엔진이다.
+ *
+ * 일반 read()/write() 경로(파일시스템 또는 블록 계층 위)가 아니라 다음 두 경로 중
+ * 하나로 SCSI 명령을 직접 발행한다:
+ *   (1) 동기 경로 — ioctl(fd, SG_IO, struct sg_io_hdr *hdr): 커널 SG 드라이버가
+ *       hdr.cmdp(CDB)와 hdr.dxferp(데이터 버퍼)를 받아 SCSI mid-level → LLD(Low
+ *       Level Driver, HBA 드라이버) → HBA 펌웨어로 전달, 완료까지 블로킹.
+ *   (2) 비동기 경로 — write(fd, hdr, sizeof(*hdr))로 SG 드라이버 큐에 명령 적재
+ *       후 즉시 반환, 추후 poll(fd, POLLIN) → read(fd, hdr, sizeof(*hdr))로
+ *       완료 hdr 수신. 이 경로는 /dev/sgY 캐릭터 디바이스에서만 가능하며,
+ *       direct=0 + sync=0 인 경우에만 활성화된다.
+ *
+ * 발행 가능한 SCSI 명령(SBC-3/4 / SPC-4):
+ *   - READ(10) opcode 0x28 / READ(16) opcode 0x88 — LBA 32b/64b
+ *   - WRITE(10) 0x2A / WRITE(16) 0x8A
+ *   - WRITE AND VERIFY(10) 0x2E / (16) 0x8E — 쓰기 후 매체 검증 1패스
+ *   - WRITE SAME(10) 0x41 / (16) 0x93 — 동일 1블록을 N개 LBA에 반복 기록
+ *   - WRITE SAME(16) + NDOB(No Data-Out Buffer, byte1 bit0) — 0 패턴 채우기 트림 대체
+ *   - WRITE STREAM(16) 0x9A — 스트림 ID로 host hint 전달 (SBC-4 streams)
+ *   - VERIFY(10) 0x2F / (16) 0x8F — BYTCHK 비트로 매체-only/호스트 비교/반복 비교
+ *   - UNMAP 0x42 — 디스카드(TRIM 등가). 여러 LBA range를 parameter list로 묶어 한 번에 발행
+ *   - SYNCHRONIZE CACHE(10) 0x35 / (16) 0x91 — 휘발성 캐시 매체로 강제 플러시
+ *   - READ CAPACITY(10) 0x25 / (16) 0x9E SA=0x10 — 디바이스 용량/블록 크기 조회
+ *   - STREAM CONTROL(16) 0x9E SA=0x34/0x54 — 스트림 ID OPEN/CLOSE
+ *
+ * 엔진 고유 옵션:
+ *   - hipri          : SGV4_FLAG_HIPRI(0x800) — 폴링 기반 완료(io_uring HIPRI 유사)
+ *   - readfua        : 모든 READ에 FUA(Force Unit Access, CDB byte1 bit3) 비트 — 캐시 우회 매체 직접 읽기
+ *   - writefua       : 모든 WRITE/STREAM에 FUA 비트 — 매체 영속성 보장 후 완료
+ *   - sg_write_mode  : write/write_and_verify/write_same/write_same_ndob/verify_bytchk_*/write_stream
+ *   - stream_id      : WRITE STREAM(16)에 사용할 스트림 ID(0=자동 할당)
  *
  * === 전체 아키텍처에서의 위치 ===
  * fio는 main()[fio.c] → fio_backend()[backend.c] → 각 잡(thread_data) 스레드를
  * 생성하고, 각 잡은 등록된 ioengine_ops의 콜백(init/prep/queue/commit/getevents/
  * event/cleanup/open_file/close_file/get_file_size/errdetails)을 통해 I/O를 수행한다.
- * 이 파일은 정적 초기화 함수 fio_sgio_register()(fio_init 생성자)로 자신의
- * ioengine_ops("sg") 인스턴스를 전역 ioengine 리스트에 등록하고, 언로드 시
- * fio_sgio_unregister()가 해제한다.
+ * 이 파일은 정적 초기화 함수 fio_sgio_register()(fio_init 생성자, ELF .init_array)로
+ * 자신의 ioengine_ops("sg") 인스턴스를 전역 ioengine 리스트(register_ioengine() →
+ * flist_add_tail)에 등록하고, 언로드 시 fio_sgio_unregister()(fio_exit 소멸자)가
+ * 해제한다.
+ *
+ * 콜백 호출 순서(잡 스레드 한 라이프사이클):
+ *   1. ioengine_ops 등록(생성자) → init.c에서 잡 파일 파싱 시 .options/.option_struct_size
+ *      참조 → CLI 옵션 파싱
+ *   2. backend.c가 td 스레드 시작:
+ *        td_io_init() → fio_sgio_init()              [iodepth/nr_files 기반 풀 할당]
+ *        td_io_get_file_size() → fio_sgio_get_file_size() [RCAP으로 디바이스 크기 조회]
+ *        td_io_open_file()  → fio_sgio_open()          [generic_open_file + type_check + STREAM open]
+ *        td_io_prep()        → fio_sgio_prep()         [io_u → CDB 인코딩]
+ *        td_io_queue()       → fio_sgio_queue()        [ioctl(SG_IO) 또는 write(2)]
+ *        td_io_commit()      → fio_sgio_commit()       [TRIM 누적분 일괄 제출, 비동기 모드]
+ *        td_io_getevents()   → fio_sgio_getevents()    [poll(2) + read(2)로 완료 수확]
+ *        td_io_event(idx)    → fio_sgio_event()        [수확된 io_u 인덱스→포인터 변환]
+ *        td_io_errdetails()  → fio_sgio_errdetails()   [SG_INFO_CHECK 시 sense/host/driver 디코드]
+ *        td_io_close_file()  → fio_sgio_close()        [STREAM close + generic_close_file]
+ *        td_io_cleanup()     → fio_sgio_cleanup()      [모든 풀 free]
+ *
+ * 동기 vs 비동기 모드 결정 매트릭스:
+ *   /dev/sdX (FIO_TYPE_BLOCK)                    → 항상 ioctl(SG_IO) 동기
+ *                                                  type_check가 commit/getevents/event=NULL로 무력화
+ *   /dev/sgN (FIO_TYPE_CHAR) + direct=1|sync=1   → write+read 동기(do_sync=1) 경로
+ *   /dev/sgN (FIO_TYPE_CHAR) + direct=0 sync=0   → write 비동기 → poll+read getevents
+ *
  * 실행 컨텍스트는 호스트 유저스페이스이며, 각 잡 스레드에서 td_io_queue() →
- * queue() → ioctl(SG_IO)/write() 순으로 SCSI 명령이 커널 SG 드라이버를 거쳐
- * 블록 계층 및 HBA 드라이버로 전달된다.
- * FIO_SYNCIO 플래그가 설정되어 있어 td_io_queue()는 queue() 호출 전에 issue_time을
- * 기록하며, FIO_RAWIO 플래그는 이 엔진이 원시 디바이스만 다룸을, FIO_RO_NEEDS_RW_OPEN은
- * 읽기-전용 워크로드라도 RW 모드로 open해야 함을 의미한다.
+ * queue() → ioctl(SG_IO)/write() 순으로 SCSI 명령이 커널 SG 드라이버 → SCSI mid-layer
+ * → blk-mq → HBA LLD → HBA 펌웨어 → 디바이스로 전달된다. 완료는 인터럽트 → softirq →
+ * SG 드라이버 큐 → poll() wakeup → read() 회수로 사용자 공간에 반환된다.
+ *
+ * 플래그 조합:
+ *   - FIO_SYNCIO         : td_io_queue()가 queue() 호출 전 issue_time을 기록(SG는 본질적으로
+ *                          큐잉이 즉시 발행이며 latency 측정의 기준점이 queue() 직전이어야 정확).
+ *   - FIO_RAWIO          : 이 엔진이 원시 디바이스만 다루며 파일시스템 위에서 동작 불가
+ *                          (filename=/dev/sdX 또는 /dev/sgN 만 허용).
+ *   - FIO_RO_NEEDS_RW_OPEN: 읽기-전용 워크로드라도 /dev/sgN을 RW 모드로 open해야 함
+ *                          (write(2) 시스템 호출로 명령을 제출해야 하므로 fd가 RW여야 함).
  *
  * === 타 모듈과의 연결 ===
- * 상위 의존: fio.h(thread_data, io_u, fio_file, ioengine_ops 정의),
- *   optgroup.h(FIO_OPT_G_SG 옵션 그룹), Linux scsi/sg.h(sg_io_hdr, SG_IO, SG_INFO_CHECK,
- *   SG_DXFER_* 등). 커널 SG v3 드라이버(/dev/sgN)에 ioctl/read/write로 의존한다.
- * 하위 의존: 없음(이 엔진은 플러그인 말단). 단, fio 공통 유틸 io_u_mark_*,
- *   io_u_queued, io_u_sync_complete, generic_open_file/close_file, fio_gettime,
- *   td_verror, dprint, log_err, fio_set_fd_nonblocking을 호출한다.
- * 데이터 흐름: io_u (fio 논리 I/O 단위, offset/buflen/buf/ddir 포함) → fio_sgio_prep()에서
- *   io_u->hdr(sg_io_hdr) 구성 → fio_sgio_queue()에서 커널로 제출 → 완료 시
- *   getevents()가 read()로 sg_io_hdr을 수확하여 events[]에 채우고, event()로
- *   fio 코어에 개별 io_u 반환. TRIM의 경우 여러 io_u를 하나의 UNMAP 파라미터 리스트로
- *   묶어 commit()에서 일괄 제출한다.
+ * 상위 의존:
+ *   - ../fio.h        : thread_data, io_u(offset/xfer_buflen/xfer_buf/ddir/index/file/error/
+ *                       resid/issue_time/hdr 등), fio_file(fd/file_name/filetype/real_file_size/
+ *                       engine_pos), ioengine_ops, fio_q_status(FIO_Q_COMPLETED/QUEUED/BUSY),
+ *                       FIO_SYNCIO/RAWIO/RO_NEEDS_RW_OPEN 플래그, ddir_sync, td_verror,
+ *                       dprint(FD_IO/FD_FILE/FD_ZBD), io_u_mark_submit/complete, io_u_queued,
+ *                       io_u_sync_complete, fio_ro_check, fio_fill_issue_time, fio_gettime,
+ *                       fio_set_fd_nonblocking, generic_open_file/generic_close_file,
+ *                       fio_file_size_known/set_size_known, register_ioengine/unregister_ioengine,
+ *                       fio_init/fio_exit(GCC constructor/destructor 매크로), be16/32/64_to_cpu/
+ *                       cpu_to_be*, strlcat, log_err.
+ *   - ../optgroup.h   : FIO_OPT_C_ENGINE/FIO_OPT_G_SG (옵션 카테고리/그룹 상수).
+ *   - <scsi/sg.h>     : 커널 UAPI — struct sg_io_hdr, SG_IO ioctl 매크로, SG_INFO_CHECK,
+ *                       SG_DXFER_FROM_DEV/TO_DEV/NONE, SG_GET_VERSION_NUM. 본 파일에서
+ *                       명시적으로 #include 하지 않지만 fio.h가 OS 헤더 체인을 통해 포함.
+ *   - <linux/fs.h>    : BLKSSZGET (블록 디바이스 논리 섹터 크기 조회 ioctl).
+ *   - <poll.h>/<unistd.h>/<errno.h>/<stdlib.h>/<stdio.h> : 표준 POSIX/C.
+ *
+ * 하위 의존: 없음(이 엔진은 플러그인 말단). fio 공통 유틸을 호출만 한다.
+ *
+ * 데이터 흐름:
+ *   io_u (fio 논리 I/O 단위) ──prep──▶ io_u->hdr(sg_io_hdr) 구성
+ *      offset/buflen/buf/ddir         hdr.cmdp = sgio_cmd.cdb (16B)
+ *                                     hdr.sbp  = sgio_cmd.sb  (64B sense)
+ *                                     hdr.usr_ptr = io_u   ◀ 완료 식별 핵심 (커널이 그대로 echo back)
+ *   ──queue──▶ ioctl(SG_IO) 또는 write(/dev/sgN, hdr) ──▶ 커널 SG ──▶ blk-mq ──▶ HBA
+ *   ──완료(인터럽트) ──▶ SG 드라이버 큐 ──poll/read──▶ getevents()의 sd->sgbuf
+ *   ──hdr.usr_ptr 역참조 ──▶ events[] ──event(idx)──▶ td_io_event ──▶ fio 통계 누적
+ *
+ * TRIM(UNMAP)은 다대일 관계 — 여러 io_u의 (LBA, len) 쌍을 하나의 UNMAP parameter list로
+ * 묶어 한 번의 SCSI 명령으로 발행한다. 비동기 모드에서는 prep()/queue()가 누적만 하고
+ * commit()이 일괄 제출하며, 완료 수확 시 대표 io_u의 완료가 전체 누적 io_u의 완료를
+ * 의미한다(getevents()에서 unmap_range_count만큼 events[]를 확장).
+ *
  * 공유 상태: thread_data(td) 단위로 생성된 struct sgio_data가 td->io_ops_data에
- *   보관되어 모든 콜백에서 공유된다.
+ *   보관되어 모든 콜백에서 공유된다. 잡 스레드는 단일이므로 별도 락 불필요.
  *
  * === 주요 함수/구조체 요약 ===
- * - fio_sgio_init(): td별 sgio_data/sgio_trim 큐 배열 할당 및 초기화.
- * - fio_sgio_prep(): io_u에 대응하는 SCSI CDB 구성(READ/WRITE/UNMAP/SYNCCACHE).
- * - fio_sgio_queue(): ioctl(SG_IO) 또는 write()로 SCSI 명령 제출.
- * - fio_sgio_commit(): 큐잉된 UNMAP 범위들을 하나의 UNMAP 명령으로 일괄 제출.
- * - fio_sgio_getevents(): poll() + read()로 비동기 완료 수확, TRIM 확장 처리.
- * - fio_sgio_read_capacity(): READ CAPACITY(10/16)로 블록 크기와 max LBA 조회.
- * - fio_sgio_errdetails(): sg_io_hdr의 host/driver/SCSI 상태를 사람이 읽는 문자열로 변환.
- * - struct sgio_cmd: io_u당 CDB(16B)와 sense buffer(64B) 저장소.
- * - struct sgio_trim: 한 UNMAP 명령에 묶인 TRIM io_u 집합과 파라미터 리스트.
- * - struct sgio_data: 이 엔진의 td 단위 상태(명령 풀, 이벤트, poll fd, trim 큐, bs 등).
+ * 함수(엔진 콜백):
+ *   - fio_sgio_init()         : iodepth × sizeof(sgio_cmd/sg_io_hdr) 풀, nr_files × pollfd
+ *                               할당. trim_queues[] 슬롯 iodepth개 초기화. type_checked=0.
+ *   - fio_sgio_get_file_size(): RCAP(10/16)으로 blksz/max_lba 조회 → real_file_size 설정.
+ *   - fio_sgio_open()         : generic_open_file + (최초 1회) type_check + WRITE STREAM 세팅.
+ *   - fio_sgio_close()        : 자동 할당된 STREAM 해제 + generic_close_file.
+ *   - fio_sgio_prep()         : ddir별 CDB 인코딩(READ/WRITE/UNMAP/SYNC + 모드 분기).
+ *   - fio_sgio_queue()        : 동기/비동기/TRIM 분기 후 fio_sgio_doio()로 위임.
+ *   - fio_sgio_commit()       : 비동기 TRIM 누적분을 한 UNMAP으로 일괄 발행.
+ *   - fio_sgio_getevents()    : poll() + read()로 sg_io_hdr 회수, TRIM 완료 펼침.
+ *   - fio_sgio_event()        : sd->events[idx] → io_u 반환.
+ *   - fio_sgio_errdetails()   : host_status/driver_status/SCSI status/sense/CDB 디코드 문자열.
+ *   - fio_sgio_cleanup()      : 모든 풀 free.
+ *
+ * 함수(내부 헬퍼):
+ *   - sgio_get_be16/32/64, sgio_set_be16/32/64 : BE 직렬화 유틸.
+ *   - sgio_unbuffered()        : O_DIRECT/sync_io 동기 모드 판정.
+ *   - sgio_hdr_init()          : sg_io_hdr 공통 필드 채우기(interface_id='S', cmdp/sbp/usr_ptr).
+ *   - pollin_events()/sg_fd_read(): poll/read 보조.
+ *   - fio_sgio_ioctl_doio()/rw_doio()/doio(): 동기/비동기 발행 경로.
+ *   - fio_sgio_rw_lba()         : LBA 크기에 따라 10B/16B CDB 레이아웃 인코딩.
+ *   - fio_sgio_unmap_setup()    : UNMAP parameter list 헤더 길이 필드 확정.
+ *   - fio_sgio_read_capacity()  : RCAP(10) → 32b 포화 시 RCAP(16) 폴백.
+ *   - fio_sgio_type_check()     : BLOCK이면 BLKSSZGET, CHAR이면 SG_GET_VERSION_NUM + RCAP.
+ *   - fio_sgio_stream_control() : OPEN/CLOSE STREAM(16) 발행, 스트림 ID 자동 할당/해제.
+ *
+ * 구조체:
+ *   - struct sgio_cmd  : io_u당 CDB(16B)와 sense buffer(MAX_SB=64B) 저장소.
+ *   - struct sgio_trim : 한 UNMAP에 묶인 TRIM io_u 집합과 parameter list 버퍼.
+ *   - struct sgio_data : 잡 td 단위 상태(cmds/events/pfds/fd_flags/sgbuf/bs/trim_queues 등).
+ *   - struct sg_options: 엔진 옵션(hipri/readfua/writefua/write_mode/stream_id).
+ *
+ * === SG v3 sg_io_hdr 핵심 필드 핸드북 ===
+ * struct sg_io_hdr (커널 UAPI, scsi/sg.h):
+ *   .interface_id   : 항상 'S' (SG v3 magic).
+ *   .dxfer_direction: SG_DXFER_FROM_DEV(-3) / TO_DEV(-2) / NONE(-1) / TO_FROM_DEV(-4).
+ *   .cmd_len        : CDB 길이(보통 6/10/12/16). UNMAP=10, READ/WRITE(10/16)=10/16, RCAP(10)=10/(16)=16.
+ *   .mx_sb_len      : sense buffer 최대 수신 크기.
+ *   .iovec_count    : 0=단일 버퍼(dxferp 사용), >0=scatter/gather.
+ *   .dxfer_len      : 데이터 전송 바이트(CDB 자체와 별개).
+ *   .dxferp         : 데이터 버퍼 포인터(또는 iovec 배열).
+ *   .cmdp           : CDB 버퍼 포인터.
+ *   .sbp            : sense data 수신 버퍼.
+ *   .timeout        : ms 단위 타임아웃(이 엔진은 SCSI_TIMEOUT_MS=30000 고정).
+ *   .flags          : SG_FLAG_DIRECT_IO(0x1=DMA 직접/페이지 핀), SGV4_FLAG_HIPRI(0x800=폴링).
+ *   .pack_id        : 사용자 태그(이 엔진은 io_u->index 사용, 디버깅용).
+ *   .usr_ptr        : 사용자 포인터(이 엔진은 io_u 주소 — 완료 hdr에서 io_u 복원의 핵심).
+ *   .status         : SCSI status byte(0=GOOD, 0x02=CHECK CONDITION, 0x18=RESERVATION CONFLICT 등).
+ *   .masked_status  : status >> 1 후 마스킹.
+ *   .msg_status/sb_len_wr/host_status/driver_status : 각 계층 상태.
+ *   .resid          : 미전송 바이트(부분 완료).
+ *   .duration       : 명령 소요 ms.
+ *   .info           : SG_INFO_CHECK(0x1=에러 상세 있음) / SG_INFO_DIRECT_IO_MASK 등.
+ *
+ * === SCSI sense data / 에러 처리 ===
+ * SCSI 명령이 실패하면 디바이스가 sense data(최대 252B, 보통 18B fixed format 또는
+ * descriptor format)를 응답한다. SG 드라이버는 이를 hdr.sbp에 복사하고 hdr.info에
+ * SG_INFO_CHECK 비트를 세팅한다. sense data의 핵심 필드:
+ *   - sense key (4 bits): NO_SENSE/RECOVERED/NOT_READY/MEDIUM_ERROR/HARDWARE_ERROR/
+ *                          ILLEGAL_REQUEST/UNIT_ATTENTION/DATA_PROTECT/BLANK_CHECK/
+ *                          ABORTED_COMMAND/MISCOMPARE 등.
+ *   - ASC/ASCQ (Additional Sense Code/Qualifier): 에러의 구체 원인.
+ *     예) 0x21/0x00 = LBA OUT OF RANGE, 0x27/0x00 = WRITE PROTECTED,
+ *         0x29/0x00 = POWER ON RESET, 0x44/0x00 = INTERNAL TARGET FAILURE.
+ * 본 엔진의 fio_sgio_errdetails()는 sense 바이트를 헥스 덤프하고 host/driver/SCSI
+ * 상태 코드를 사람이 읽는 문자열로 변환한다(fio --debug=io 또는 verify 실패 시 출력).
+ *
+ * === ZBD/ZAC 통합 (참고) ===
+ * SG 엔진 자체는 ZBD 콜백(get_zoned_model/report_zones/reset_wp/finish_zone/
+ * get_max_open_zones/move_zone_wp)을 직접 구현하지 않는다 — 이는 libzbc 엔진의 역할이며,
+ * libzbc가 내부적으로 같은 SG_IO ioctl을 통해 REPORT ZONES(0x95)/RESET WRITE POINTER
+ * (0x94 SA=0x04)/CLOSE ZONE(SA=0x01)/FINISH ZONE(SA=0x02)/OPEN ZONE(SA=0x03) CDB를
+ * 발행한다. 이 파일은 표준 R/W/TRIM/SYNC만 처리하고, 존 디바이스에서 사용하려면
+ * libzbc 엔진을 사용해야 한다.
+ *
+ * === cmdprio 통합 (참고) ===
+ * fio의 cmdprio 유틸(engines/cmdprio.c)은 libaio/io_uring 등에서 io_u별 ioprio를
+ * IOPRIO_CLASS_RT/BE/IDLE로 분기 설정한다. SG 엔진은 현재 cmdprio_options를 등록하지
+ * 않으며(opts[] 테이블에 CMDPRIO_OPTIONS 매크로 미사용), io_u별 우선순위 분기 기능이
+ * 없다. SCSI 자체는 task attribute(SIMPLE/HEAD OF QUEUE/ORDERED/ACA)로 우선순위
+ * 표현이 가능하지만 본 파일은 그 기능을 노출하지 않는다.
+ *
+ * === streamid (SBC-4 streams) ===
+ * WRITE STREAM(16) opcode 0x9A는 host가 데이터의 "스트림 ID"를 디바이스에 전달해
+ * 같은 스트림 데이터를 같은 NAND 블록(SSD) 또는 같은 zone(ZNS)에 묶도록 힌트한다.
+ * 이는 GC(Garbage Collection) 효율을 높이고 WAF(Write Amplification Factor)를 낮춘다.
+ * 사용 흐름:
+ *   1. open_file() — STREAM CONTROL(16) SA=0x34(OPEN STREAM)으로 스트림 ID 자동 할당
+ *      (stream_id=0 옵션) 또는 사용자가 명시한 ID 사용.
+ *   2. prep() — WRITE STREAM(16) CDB[10..11]에 BE16 스트림 ID 인코딩.
+ *   3. close_file() — STREAM CONTROL(16) SA=0x54(CLOSE STREAM)으로 자동 할당된 ID 해제.
  */
 
 /*
@@ -108,14 +264,56 @@
  *    issue_time			set in commit()
  *
  */
-#include <stdio.h>   /* [한국어] 표준 I/O(snprintf 등) — 에러 메시지 포맷에 필요 */
-#include <stdlib.h>  /* [한국어] calloc/free/exit — 내부 버퍼 동적 할당에 필요 */
-#include <unistd.h>  /* [한국어] read/write/close/usleep — 시스템 호출 인터페이스 */
-#include <errno.h>   /* [한국어] errno/EAGAIN/EINTR/EIO/EINVAL — 시스템 호출 오류 코드 */
-#include <poll.h>    /* [한국어] poll()/struct pollfd/POLLIN — 비동기 완료 대기용 */
+#include <stdio.h>
+/* [한국어] 표준 I/O 라이브러리 — snprintf(에러 메시지 포맷, fio_sgio_errdetails의
+ * msgchunk 작성)에 사용. printf 계열은 이 파일에서 직접 호출하지 않으나 fio.h가
+ * 내부적으로 의존하므로 명시 포함 관행. */
 
-#include "../fio.h"       /* [한국어] fio 핵심 헤더: thread_data, io_u, fio_file, ioengine_ops 등 */
-#include "../optgroup.h"  /* [한국어] FIO_OPT_C_ENGINE/FIO_OPT_G_SG 등 옵션 카테고리·그룹 상수 */
+#include <stdlib.h>
+/* [한국어] C 표준 — calloc(sgio_data/sgio_cmd 배열/sgio_trim/unmap_param/trim_io_us/
+ * pollfd/fd_flags/sgbuf/events 등 모든 풀 할당, errdetails msg 1024B 할당), free
+ * (cleanup에서 역순 해제). NULL/size_t 정의도 공급. */
+
+#include <unistd.h>
+/* [한국어] POSIX — read(2)/write(2)(/dev/sgN 비동기 경로의 명령 제출과 완료 회수),
+ * close(2)(read_capacity의 독립 fd 닫기), usleep(2)(getevents 재시도 1ms 백오프).
+ * fcntl 매크로 F_SETFL은 fio_set_fd_nonblocking 내부에서 사용. */
+
+#include <errno.h>
+/* [한국어] errno 전역 변수 + 오류 코드 매크로 공급:
+ *   - EAGAIN  : sg_fd_read에서 비차단 모드의 일시적 데이터 부족 → 재시도
+ *   - EINTR   : 시그널에 의한 시스템 호출 중단 → 재시도
+ *   - EIO     : SG_INFO_CHECK 발생 또는 RCAP 응답 비정상 → io_u->error 표시
+ *   - EINVAL  : prep에서 블록 크기 미정렬, type_check에서 지원하지 않는 파일 타입
+ *   - ENOMEM  : (간접) calloc 실패 시 (단, 이 파일은 NULL 체크 없음 — fio 관행) */
+
+#include <poll.h>
+/* [한국어] poll(2) 시스템 호출 + struct pollfd + POLLIN/POLLERR 매크로.
+ * fio_sgio_getevents()가 무한 timeout(-1)으로 호출하여 /dev/sgN의 완료 데이터가
+ * 도착할 때까지 대기. min==0(논블로킹) 경로에서는 poll을 스킵하고 직접 read 시도. */
+
+#include "../fio.h"
+/* [한국어] fio 코어 헤더 — 본 엔진이 사용하는 거의 모든 심볼을 간접 공급:
+ *   타입: struct thread_data(td), struct io_u, struct fio_file, struct ioengine_ops,
+ *         enum fio_q_status (FIO_Q_COMPLETED/QUEUED/BUSY), enum fio_ddir (DDIR_READ/
+ *         WRITE/TRIM/SYNC), fio_unused 매크로, OS_O_DIRECT 등.
+ *   상수: FIO_SYNCIO, FIO_RAWIO, FIO_RO_NEEDS_RW_OPEN(ioengine_ops.flags 비트),
+ *         FIO_TYPE_BLOCK, FIO_TYPE_CHAR, FIO_IOOPS_VERSION (엔진 ABI 버전).
+ *   유틸: io_u_mark_submit/complete, io_u_queued, io_u_sync_complete, fio_ro_check,
+ *         fio_fill_issue_time, fio_gettime, fio_set_fd_nonblocking, generic_open_file/
+ *         generic_close_file, fio_file_size_known/set_size_known, register_ioengine/
+ *         unregister_ioengine, fio_init/fio_exit (GCC constructor/destructor 매크로),
+ *         td_verror, dprint, log_err, strlcat, ddir_sync, clear_io_u.
+ *   엔디언: be16_to_cpu/be32_to_cpu/be64_to_cpu, cpu_to_be16/32/64.
+ *   OS UAPI 체인: scsi/sg.h(struct sg_io_hdr, SG_IO, SG_INFO_CHECK, SG_DXFER_*,
+ *         SG_GET_VERSION_NUM, SGV4_FLAG_HIPRI), linux/fs.h(BLKSSZGET). */
+
+#include "../optgroup.h"
+/* [한국어] 옵션 카테고리/그룹 상수:
+ *   - FIO_OPT_C_ENGINE: 옵션 카테고리 = "엔진"
+ *   - FIO_OPT_G_SG    : 옵션 그룹 = "SG 엔진"
+ * options[] 테이블의 각 엔트리에 .category/.group으로 부여되어 --help 출력과
+ * jobspec 검증에서 옵션이 어느 엔진/카테고리에 속하는지 분류된다. */
 
 #ifdef FIO_HAVE_SGIO
 /* [한국어] configure가 Linux scsi/sg.h 존재를 확인한 경우에만 실제 엔진을 빌드한다.
@@ -182,8 +380,23 @@ struct sg_options {
 	 * 값 범위: 0=자동 오픈(STREAM_CONTROL로 할당), >0=명시적 스트림. 동기화: td 로컬. */
 };
 
-/* [한국어] fio 옵션 테이블. engine 초기화 시 parse_options에 등록되어
- * CLI/잡 파일에서 해당 키워드가 sg_options의 대응 필드로 파싱되도록 한다. */
+/* [한국어] === fio 옵션 테이블 (sg 엔진 전용) ===
+ * engine 초기화 시 fio 옵션 파서(options.c의 parse_options)에 .options로 전달되어
+ * CLI(--hipri/--readfua=1 등)와 잡 파일(hipri=1/readfua=1)에서 해당 키워드를
+ * sg_options 구조체의 대응 필드로 파싱하도록 한다.
+ *
+ * 각 엔트리 공통 규약(fio_option 스키마):
+ *   - .name       : 짧은 키 이름(CLI/잡 파일에서 사용)
+ *   - .lname      : 긴 설명 이름(--help 상세 표시)
+ *   - .type       : FIO_OPT_STR_SET(값 없이 1로 토글) / FIO_OPT_BOOL / FIO_OPT_INT /
+ *                   FIO_OPT_STR(posval 배열로 열거형)
+ *   - .off1       : 대상 필드의 구조체 내 오프셋(offsetof) — 파서가 td->eo + off1에 기록
+ *   - .help       : --help 한 줄 설명
+ *   - .def        : 기본값(문자열) — 파서가 타입에 맞게 해석
+ *   - .posval     : FIO_OPT_STR일 때 허용되는 문자열↔enum 매핑 테이블(최대 16개)
+ *   - .category   : 옵션 분류(FIO_OPT_C_ENGINE = "엔진 옵션")
+ *   - .group      : 엔진별 서브그룹(FIO_OPT_G_SG)
+ * 배열 종단: .name=NULL 센티넬 필수. */
 static struct fio_option options[] = {
         {
                 .name   = "hipri",                      /* [한국어] 옵션 이름(짧음) */
@@ -195,32 +408,32 @@ static struct fio_option options[] = {
                 .group  = FIO_OPT_G_SG,                 /* [한국어] 그룹: SG 엔진 */
         },
 	{
-		.name	= "readfua",                            /* [한국어] READ에 FUA 설정 */
-		.lname	= "sg engine read fua flag support",
+		.name	= "readfua",                            /* [한국어] 옵션 이름: READ에 FUA 설정 */
+		.lname	= "sg engine read fua flag support",    /* [한국어] 긴 설명 */
+		.type	= FIO_OPT_BOOL,                         /* [한국어] 부울(0/1) 타입 */
+		.off1	= offsetof(struct sg_options, readfua), /* [한국어] 저장 오프셋 */
+		.help	= "Set FUA flag (force unit access) for all Read operations", /* [한국어] 도움말 */
+		.def	= "0",                                  /* [한국어] 기본값 0(FUA 미사용) */
+		.category = FIO_OPT_C_ENGINE,                   /* [한국어] 엔진 카테고리 */
+		.group	= FIO_OPT_G_SG,                         /* [한국어] SG 그룹 */
+	},
+	{
+		.name	= "writefua",                           /* [한국어] 옵션 이름: WRITE에 FUA 설정 */
+		.lname	= "sg engine write fua flag support",   /* [한국어] 긴 설명 */
 		.type	= FIO_OPT_BOOL,                         /* [한국어] 부울 타입 */
-		.off1	= offsetof(struct sg_options, readfua),
-		.help	= "Set FUA flag (force unit access) for all Read operations",
+		.off1	= offsetof(struct sg_options, writefua),/* [한국어] 저장 오프셋 */
+		.help	= "Set FUA flag (force unit access) for all Write operations", /* [한국어] 도움말 */
 		.def	= "0",                                  /* [한국어] 기본값 0 */
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_SG,
+		.category = FIO_OPT_C_ENGINE,                   /* [한국어] 엔진 카테고리 */
+		.group	= FIO_OPT_G_SG,                         /* [한국어] SG 그룹 */
 	},
 	{
-		.name	= "writefua",                           /* [한국어] WRITE에 FUA 설정 */
-		.lname	= "sg engine write fua flag support",
-		.type	= FIO_OPT_BOOL,
-		.off1	= offsetof(struct sg_options, writefua),
-		.help	= "Set FUA flag (force unit access) for all Write operations",
-		.def	= "0",
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_SG,
-	},
-	{
-		.name	= "sg_write_mode",                      /* [한국어] WRITE 모드 선택 */
-		.lname	= "specify sg write mode",
-		.type	= FIO_OPT_STR,                          /* [한국어] 문자열 열거형 */
-		.off1	= offsetof(struct sg_options, write_mode),
-		.help	= "Specify SCSI WRITE mode",
-		.def	= "write",                              /* [한국어] 기본 "write" = FIO_SG_WRITE */
+		.name	= "sg_write_mode",                      /* [한국어] 옵션 이름: WRITE 모드 선택 */
+		.lname	= "specify sg write mode",              /* [한국어] 긴 설명 */
+		.type	= FIO_OPT_STR,                          /* [한국어] 문자열 열거형(posval 매핑) */
+		.off1	= offsetof(struct sg_options, write_mode), /* [한국어] 저장 오프셋 */
+		.help	= "Specify SCSI WRITE mode",            /* [한국어] 도움말 */
+		.def	= "write",                              /* [한국어] 기본값 "write" = FIO_SG_WRITE */
 		.posval = {
 			  /* [한국어] 허용 값 테이블: ival(CLI 문자열) → oval(enum). */
 			  { .ival = "write",
@@ -270,17 +483,17 @@ static struct fio_option options[] = {
 		.group	= FIO_OPT_G_SG,
 	},
 	{
-		.name	= "stream_id",                          /* [한국어] 스트림 ID */
-		.lname	= "stream id for WRITE STREAM(16) commands",
-		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct sg_options, stream_id),
-		.help	= "Stream ID for WRITE STREAM(16) commands",
-		.def	= "0",                                  /* [한국어] 0=자동 할당 모드 */
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_SG,
+		.name	= "stream_id",                          /* [한국어] 옵션 이름: 스트림 ID */
+		.lname	= "stream id for WRITE STREAM(16) commands", /* [한국어] 긴 설명 */
+		.type	= FIO_OPT_INT,                          /* [한국어] 정수 타입 */
+		.off1	= offsetof(struct sg_options, stream_id), /* [한국어] 저장 오프셋 (uint16_t) */
+		.help	= "Stream ID for WRITE STREAM(16) commands", /* [한국어] 도움말 */
+		.def	= "0",                                  /* [한국어] 0=자동 할당 모드(OPEN STREAM로 얻음) */
+		.category = FIO_OPT_C_ENGINE,                   /* [한국어] 엔진 카테고리 */
+		.group	= FIO_OPT_G_SG,                         /* [한국어] SG 그룹 */
 	},
 	{
-		.name	= NULL,                                 /* [한국어] 센티넬 — 옵션 테이블 종료 표식 */
+		.name	= NULL,                                 /* [한국어] 센티넬 — 옵션 테이블 종료 표식(필수) */
 	},
 };
 
@@ -1769,25 +1982,115 @@ static int fio_sgio_get_file_size(struct thread_data *td, struct fio_file *f)
 }
 
 
-/* [한국어] SG I/O 엔진 등록 테이블. fio_sgio_register()가 register_ioengine()에 전달.
- * fio 코어는 .name="sg"로 lookup하여 해당 콜백들로 td_io_* 매크로를 구동한다. */
+/* [한국어] === SG I/O 엔진 등록 테이블 (ioengine_ops, 엔진 vtable) ===
+ * fio_sgio_register()(fio_init 생성자)가 이 구조체의 주소를 register_ioengine()에
+ * 전달하여 전역 ioengine 리스트(flist)에 추가한다. 사용자가 --ioengine=sg 또는
+ * jobspec에서 ioengine=sg를 지정하면 fio 코어(ioengines.c)가 .name으로 lookup하여
+ * 본 콜백들로 td_io_* 매크로(td_io_init/td_io_prep/td_io_queue/td_io_commit/
+ * td_io_getevents/td_io_event/td_io_open_file/td_io_close_file/td_io_get_file_size/
+ * td_io_errdetails/td_io_cleanup)를 구동한다. */
 static struct ioengine_ops ioengine = {
-	.name		= "sg",                                  /* [한국어] --ioengine=sg */
-	.version	= FIO_IOOPS_VERSION,                     /* [한국어] 엔진 ABI 버전 체크 */
-	.init		= fio_sgio_init,                         /* [한국어] td별 초기화 */
-	.prep		= fio_sgio_prep,                         /* [한국어] io_u → CDB 구성 */
-	.queue		= fio_sgio_queue,                        /* [한국어] 제출 */
-	.commit		= fio_sgio_commit,                       /* [한국어] TRIM 일괄 제출 */
-	.getevents	= fio_sgio_getevents,                    /* [한국어] 완료 수확 */
-	.errdetails	= fio_sgio_errdetails,                   /* [한국어] 에러 상세화 */
-	.event		= fio_sgio_event,                        /* [한국어] 인덱스→io_u */
-	.cleanup	= fio_sgio_cleanup,                      /* [한국어] 자원 해제 */
-	.open_file	= fio_sgio_open,                         /* [한국어] 파일 오픈+타입검사+스트림 */
-	.close_file	= fio_sgio_close,                        /* [한국어] 스트림 해제+close */
-	.get_file_size	= fio_sgio_get_file_size,            /* [한국어] RCAP 기반 크기 조회 */
-	.flags		= FIO_SYNCIO | FIO_RAWIO | FIO_RO_NEEDS_RW_OPEN, /* [한국어] 동기/원시/RW 오픈 강제 */
-	.options	= options,                               /* [한국어] 엔진 전용 옵션 */
-	.option_struct_size	= sizeof(struct sg_options)      /* [한국어] 옵션 구조체 크기 */
+	.name		= "sg",
+	/* [한국어] 엔진 식별자(고유 문자열).
+	 * 설정자: 본 정적 초기화. 읽는 자: load_ioengine() lookup, --help 출력.
+	 * 값 범위: NUL 종단 ASCII. 동기화: 전역 리스트 수정은 register_ioengine 진입점에서만. */
+
+	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] 엔진 ABI 버전 — fio 코어가 등록 시 자신의 빌드 버전과 일치하는지 확인.
+	 * 설정자: 빌드 시 fio.h 매크로로 결정(fio v3.42 기준 특정 정수).
+	 * 읽는 자: register_ioengine()가 mismatch 시 거부.
+	 * 값 범위: fio 빌드 버전 정수. 동기화: 컴파일 타임 상수. */
+
+	.init		= fio_sgio_init,
+	/* [한국어] td별 엔진 초기화 콜백. iodepth × sgio_cmd, sgio_trim 큐 풀 할당.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_init()이 잡 시작 시 호출.
+	 * 호출 시점: 잡 스레드 시작 직후, open_file 이전.
+	 * 반환: 0=성공, !=0=잡 실패. */
+
+	.prep		= fio_sgio_prep,
+	/* [한국어] io_u → SCSI CDB 인코딩 콜백.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_prep()이 매 io_u 발행 직전 호출.
+	 * 호출 시점: get_io_u() 후 td_io_queue() 호출 직전.
+	 * 반환: 0=성공, EINVAL 등=실패. */
+
+	.queue		= fio_sgio_queue,
+	/* [한국어] I/O 제출 콜백. 동기/비동기/TRIM 분기 후 ioctl(SG_IO) 또는 write(2).
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_queue()가 매 io_u마다 호출.
+	 * 호출 시점: prep() 직후. 반환: FIO_Q_COMPLETED(즉시 완료) / FIO_Q_QUEUED(비동기
+	 * 큐잉, getevents 대기) / FIO_Q_BUSY(현재 미사용). */
+
+	.commit		= fio_sgio_commit,
+	/* [한국어] 누적된 비동기 TRIM 일괄 제출 콜백.
+	 * 설정자: 본 정적 초기화. 단, type_check가 BLOCK 디바이스에서 NULL로 덮어쓴다.
+	 * 읽는 자: td_io_commit()이 큐잉 페이즈 종료 시 호출.
+	 * 호출 시점: queue()로 누적된 TRIM이 있을 때.
+	 * 반환: 0=성공, <0=에러. */
+
+	.getevents	= fio_sgio_getevents,
+	/* [한국어] 비동기 완료 수확 콜백. poll(2) + read(2)로 sg_io_hdr 회수.
+	 * 설정자: 본 정적 초기화. 단, BLOCK 디바이스는 type_check가 NULL로 덮어씀.
+	 * 읽는 자: td_io_getevents()가 io_u가 in-flight일 때만 호출.
+	 * 반환: 수확 개수(>=0) 또는 음수 errno. */
+
+	.errdetails	= fio_sgio_errdetails,
+	/* [한국어] 에러 상세 문자열 생성 콜백 — verify 실패/IO 에러 출력 시 사용.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_errdetails()가 io_u->error 발생 시 호출.
+	 * 반환: 힙 할당 문자열(호출자 free 책임). */
+
+	.event		= fio_sgio_event,
+	/* [한국어] 수확된 이벤트 인덱스 → io_u 변환 콜백.
+	 * 설정자: 본 정적 초기화. 단, BLOCK 디바이스는 type_check가 NULL로 덮어씀.
+	 * 읽는 자: td_io_event(idx)가 getevents 반환 후 idx in [0, count)로 호출.
+	 * 반환: 해당 io_u 포인터(NULL 불가). */
+
+	.cleanup	= fio_sgio_cleanup,
+	/* [한국어] td별 엔진 자원 해제 콜백. 모든 calloc 풀을 free.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_cleanup()이 잡 종료 시 호출.
+	 * 호출 시점: close_file 모두 완료 후. */
+
+	.open_file	= fio_sgio_open,
+	/* [한국어] 파일 오픈 콜백. generic_open_file + 1회성 type_check + STREAM open.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_open_file()이 각 파일별로 호출.
+	 * 반환: 0=성공. */
+
+	.close_file	= fio_sgio_close,
+	/* [한국어] 파일 클로즈 콜백. 자동 할당된 STREAM 해제 + generic_close_file.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_close_file()이 호출.
+	 * 반환: 0=성공. */
+
+	.get_file_size	= fio_sgio_get_file_size,
+	/* [한국어] 디바이스 크기 조회 콜백. RCAP(10/16) → real_file_size.
+	 * 설정자: 본 정적 초기화. 읽는 자: td_io_get_file_size()가 init 전에도 호출 가능.
+	 * 반환: 0=성공. */
+
+	.flags		= FIO_SYNCIO | FIO_RAWIO | FIO_RO_NEEDS_RW_OPEN,
+	/* [한국어] 엔진 동작 특성 비트마스크:
+	 *   - FIO_SYNCIO          : queue() 진입 전 td_io_queue()가 issue_time을 기록해야
+	 *                           함을 의미. 본 엔진은 SG_IO ioctl이 본질적으로 동기적
+	 *                           이고, /dev/sgN write 경로도 발행 직후 즉시 반환되므로
+	 *                           "queue 호출 = 발행"이라는 가정이 유효.
+	 *   - FIO_RAWIO           : 파일시스템 위가 아닌 원시 디바이스만 다룸을 명시.
+	 *                           filename=/dev/sdX 또는 /dev/sgN만 허용되며, 일반 파일
+	 *                           대상으로 사용하면 type_check가 거부.
+	 *   - FIO_RO_NEEDS_RW_OPEN: rw=read 워크로드라도 fd를 RW(O_RDWR)로 open해야 함.
+	 *                           /dev/sgN에 write(2)로 명령을 제출하기 위해 fd가 RW여야
+	 *                           하기 때문. /dev/sdX(BLOCK)는 ioctl만 쓰므로 무관.
+	 * 미설정 비트 의미:
+	 *   - FIO_DISKLESSIO      : 미설정 — 실제 디바이스 fd가 필요.
+	 *   - FIO_NOEXTEND        : 미설정 — 디바이스 크기 변경 불가는 별도 처리.
+	 *   - FIO_MEMALIGN        : 미설정 — fio가 SG 엔진의 메모리 정렬을 강제하지 않음
+	 *                           (단, O_DIRECT 시 사용자가 dma_alignment 만족해야 함).
+	 *   - FIO_PIPEIO/UNIDIR/BARRIER/FAKEIO : 미설정 — 일반 R/W 디바이스 엔진. */
+
+	.options	= options,
+	/* [한국어] 엔진 전용 옵션 테이블 포인터. fio 옵션 파서에 등록됨.
+	 * 설정자: 본 정적 초기화. 읽는 자: parse_options/show_engine_help.
+	 * 값 범위: NULL 종단 fio_option 배열. */
+
+	.option_struct_size	= sizeof(struct sg_options)
+	/* [한국어] 옵션 구조체 크기 — fio 코어가 td->eo 영역을 이 크기로 calloc.
+	 * 설정자: 본 정적 초기화. 읽는 자: 옵션 파서가 td->eo 할당 시 사용.
+	 * 값 범위: sizeof(struct sg_options). */
 };
 
 #else /* FIO_HAVE_SGIO */
@@ -1810,11 +2113,17 @@ static int fio_sgio_init(struct thread_data fio_unused *td)
 	return 1;
 }
 
-/* [한국어] SG 미지원 환경용 최소 엔진 정의 — init만 존재하고 즉시 실패. */
+/* [한국어] SG 미지원 환경용 최소 엔진 정의 — init만 존재하고 즉시 실패.
+ * 이 stub 엔진은 "sg" 이름을 차지하여 --ioengine=sg 지정 시 parse 단계를 통과하지만,
+ * init 단계에서 "fio: ioengine sg not available" 메시지와 함께 잡을 실패시킨다. */
 static struct ioengine_ops ioengine = {
 	.name		= "sg",
+	/* [한국어] 엔진 이름(FIO_HAVE_SGIO 분기와 동일해야 함 — 사용자 혼동 방지). */
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] ABI 버전(동일 fio 빌드이므로 동일 상수). */
 	.init		= fio_sgio_init,
+	/* [한국어] 즉시 실패 stub. 다른 콜백(prep/queue/...)은 미정의이므로 fio가
+	 * init 실패를 보고 잡을 종료하므로 호출되지 않는다. */
 };
 
 #endif
@@ -1822,21 +2131,46 @@ static struct ioengine_ops ioengine = {
 /*
  * [한국어]
  * fio_sgio_register - 전역 ioengine 리스트에 SG 엔진 등록 (fio_init 생성자)
- * 라이브러리 로드 시 자동 실행되어 --ioengine=sg 사용 가능해짐.
- * 호출 체인: (loader) → [이 함수] → register_ioengine()
+ *
+ * @return: 없음
+ *
+ * GCC __attribute__((constructor)) 매크로(fio_init)로 표기되어 ELF 로더가 .init_array
+ * 섹션을 처리하는 시점(즉, main() 진입 이전)에 자동 실행된다. fio가 정적 링크된 모든
+ * I/O 엔진은 이 패턴으로 자기 ioengine_ops를 전역 리스트에 추가하므로, 사용자가
+ * --ioengine=sg를 지정하면 ioengines.c의 load_ioengine()이 lookup만으로 발견할 수 있다.
+ *
+ * 실행 컨텍스트: 메인 프로세스, 단일 스레드(다른 엔진 생성자와 직렬 실행 — 리스트는
+ * flist_add_tail로 단방향 추가만 하므로 락 불필요).
+ *
+ * 호출 체인:
+ *   ld.so/ld-linux의 .init_array 처리 → [이 함수] → register_ioengine() → flist_add_tail(&ioengine.list)
  */
 static void fio_init fio_sgio_register(void)
 {
-	register_ioengine(&ioengine);             /* [한국어] fio 엔진 리스트에 추가 */
+	register_ioengine(&ioengine);
+	/* [한국어] 전역 ioengine 리스트(ioengines.c의 engine_list)에 본 엔진을 추가.
+	 * register_ioengine()은 단순히 ioengine_ops.list 노드를 flist_add_tail로 enqueue. */
 }
 
 /*
  * [한국어]
  * fio_sgio_unregister - 엔진 등록 해제 (fio_exit 소멸자)
- * 라이브러리 언로드 시 자동 실행.
- * 호출 체인: (loader) → [이 함수] → unregister_ioengine()
+ *
+ * @return: 없음
+ *
+ * GCC __attribute__((destructor)) 매크로(fio_exit)로 표기되어 ELF 로더가 .fini_array
+ * 섹션을 처리하는 시점(프로세스 종료 직전, exit() / _Exit() 흐름의 atexit 체인)에
+ * 자동 실행된다. 정적 링크 환경에서는 사실상 부수효과가 거의 없지만, 동적 링크
+ * (dlopen으로 외부 엔진 로딩) 환경에서 안전한 dlclose를 위해 필요하다.
+ *
+ * 실행 컨텍스트: 메인 프로세스 종료 단계, 단일 스레드.
+ *
+ * 호출 체인:
+ *   exit()/_exit()의 atexit/.fini_array → [이 함수] → unregister_ioengine() → flist_del_init
  */
 static void fio_exit fio_sgio_unregister(void)
 {
-	unregister_ioengine(&ioengine);           /* [한국어] fio 엔진 리스트에서 제거 */
+	unregister_ioengine(&ioengine);
+	/* [한국어] 전역 리스트에서 본 엔진을 제거(flist_del_init). 이후 다시 register
+	 * 가능하도록 list 노드를 빈 상태로 초기화. */
 }

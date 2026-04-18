@@ -2,32 +2,61 @@
  * [한국어 설명] Hadoop HDFS(libhdfs) I/O 엔진 (libhdfs.c)
  *
  * === 파일의 역할 ===
- * Hadoop HDFS의 JNI 래퍼 libhdfs를 사용하는 fio I/O 엔진 "libhdfs"를 구현한다. HDFS는
- * 기존 파일 수정이 불가능(append only)하므로, 지정된 청크 크기(chunck_size)만큼 여러
- * 작은 파일을 생성하고 fio가 요청한 오프셋을 (파일 id, 파일내 오프셋) 쌍으로 변환해
- * 랜덤 read/write를 시뮬레이션한다. 동기 엔진으로 동작한다.
+ * Apache Hadoop 분산 파일 시스템(HDFS)의 JNI 래퍼인 libhdfs를 이용해 HDFS 클러스터에
+ * read/write/sync I/O를 수행하는 fio I/O 엔진 "libhdfs"를 구현한다. HDFS는 write-once
+ * /append-only 의미론을 강제해(기존 파일의 임의 오프셋 덮어쓰기 불가) 일반 블록 디바이스
+ * 엔진처럼 랜덤 라이트를 그대로 재현할 수 없다. 이를 우회하기 위해 본 엔진은 사용자가 지정한
+ * 청크 크기(chunk_size)만큼 여러 개의 작은 파일을 사전에 생성해두고, fio가 전달하는
+ * 전체 오프셋을 (청크 파일 id, 청크 내부 오프셋) 쌍으로 나누어 해당 청크 파일만 새로
+ * 열어 I/O를 발행한다. libhdfs 호출 자체가 JNI를 통한 동기 호출이므로 엔진은
+ * FIO_SYNCIO로 표시되며, DataNode/NameNode 왕복이 발생하므로 로컬 디스크 통계가 의미
+ * 없어 FIO_DISKLESSIO/FIO_NODISKUTIL도 함께 설정된다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * --ioengine=libhdfs로 선택되어 fio 플러그인 레지스트리에 등록된다. 실행 흐름:
- * backend.c → td_io_init → fio_hdfsio_setup/_init(hdfsConnect) → open_file(필요 파일
- * 생성) → I/O 루프(prep에서 오프셋 → 청크 id 매핑, queue에서 hdfsRead/Write) → cleanup
- * (hdfsDisconnect). 각 잡 스레드가 독립된 HDFS 연결을 갖거나 single_instance 옵션으로
- * 하나의 연결을 공유한다. 실행 컨텍스트는 fio 잡 스레드 + JVM 쓰레드.
+ * ioengines.c의 플러그인 레지스트리에 constructor(fio_hdfsio_register)로 등록되어
+ * --ioengine=libhdfs로 선택 가능하다. 실행 체인은 backend.c → td_io_init →
+ * fio_hdfsio_setup(파일 크기 결정) → fio_hdfsio_init(hdfsNewBuilder→hdfsBuilderConnect로
+ * NameNode 연결, 작업 디렉터리 설정) → per-io_u 준비 fio_hdfsio_io_u_init(청크 파일들
+ * 선제 생성으로 HDFS append-only 제약 회피) → get_io_u → td_io_prep(fio_hdfsio_prep)
+ * → td_io_queue(fio_hdfsio_queue, 동기 호출로 즉시 FIO_Q_COMPLETED 반환) → put_io_u
+ * → 반복 → fio_hdfsio_close_file → fio_hdfsio_io_u_free(hdfsDisconnect)까지 내려간다.
+ * 실행 컨텍스트는 fio 잡 스레드이나, libhdfs 내부에서 JVM이 생성되므로 각 스레드는
+ * 자체 JNI 환경을 가진다(thread-local JVM 이슈 — single_instance=1이면 프로세스당 하나의
+ * JVM/NameNode 연결을 공유, 0이면 스레드마다 별도 연결 강제).
  *
  * === 타 모듈과의 연결 ===
- * 상단: fio 코어(backend.c, ioengines.c, options.c).
- * 하단: libhdfs(hdfsConnect/Disconnect/OpenFile/CloseFile/Read/Write/Seek/
- *       CreateDirectory/ListDirectory/Delete/GetPathInfo).
- * 데이터 흐름: io_u->xfer_buf ↔ hdfsRead/hdfsWrite ↔ HDFS NameNode/DataNode.
- * 공유 상태: hdfsio_data(스레드별 fs/fp/curr_file_id), hdfsio_options(잡별 설정).
+ * 상단(호출자): backend.c의 I/O 루프, ioengines.c의 td_io_* 디스패치, options.c의
+ * 옵션 파싱(FIO_OPT_G_HDFS 그룹), stat.c의 통계 누적(FIO_DISKLESSIO로 유틸/디스크 통계
+ * 스킵).
+ * 하단(피호출자): libhdfs(hdfsNewBuilder/hdfsBuilderSetNameNode/hdfsBuilderConnect/
+ * hdfsSetWorkingDirectory/hdfsExists/hdfsOpenFile/hdfsCloseFile/hdfsGetPathInfo/hdfsRead/
+ * readDirect/hdfsWrite/hdfsFlush/hdfsSeek/hdfsTell/hdfsDisconnect), 그리고 그 아래로
+ * JNI → JVM → Hadoop Java 클라이언트 → RPC(NameNode) + 블록 I/O(DataNode).
+ * 데이터 흐름: io_u->xfer_buf ↔ JNI byte[] 복사 ↔ HDFS 블록 ↔ DataNode 네트워크 전송.
+ * 공유 자료구조: td->io_ops_data(스레드별 struct hdfsio_data — fs 핸들·현재 열린 fp·
+ * 현재 청크 id), td->eo(스레드별 struct hdfsio_options — NameNode host/port, 디렉터리,
+ * chunk_size, single_instance 플래그), td->files(청크 파일 이름 prefix로 사용).
  *
  * === 주요 함수/구조체 요약 ===
- * - fio_hdfsio_setup()/_init(): HDFS 연결 및 디렉터리 준비.
- * - fio_hdfsio_prep(): fio 오프셋 → (청크 id, 내부 오프셋) 변환 후 필요 시 파일 전환.
- * - fio_hdfsio_queue(): hdfsRead/hdfsWrite 동기 호출.
- * - fio_hdfsio_open_file()/_close_file(): 청크 파일 생성/해제.
- * - struct hdfsio_data: 연결 핸들, 현재 열린 청크 id.
- * - struct hdfsio_options: 서버 주소, 청크 크기, 단일 인스턴스 모드 등.
+ * - fio_hdfsio_setup(): 파일당 real_file_size 결정(총 size/nr_files, rand 파일 크기 지원),
+ *   td->io_ops_data(struct hdfsio_data) 최초 할당. HDFS 연결 전에 호출됨.
+ * - fio_hdfsio_init(): hdfsBuilder 경로로 NameNode 접속, 작업 디렉터리 검증·진입.
+ *   single_instance=0이면 hdfsBuilderSetForceNewInstance로 JVM별 독립 연결 요구.
+ * - fio_hdfsio_io_u_init(): 잡 시작 전 각 파일에 대해 "파일크기/chunk_size" 개의 청크
+ *   파일을 사전에 zero-fill로 생성(이미 충분히 큰 것은 skip). HDFS가 임의 오프셋
+ *   덮어쓰기를 못 하므로 프리알로케이션 필수.
+ * - fio_hdfsio_prep(): io_u->offset을 chunk_size로 나눠 (f_id, 내부 오프셋) 계산, 현재
+ *   열린 청크와 다르면 기존 파일을 닫고 ddir에 맞는 open_flags(O_RDONLY/O_WRONLY)로 연다.
+ *   주의: HDFS는 O_WRONLY 새로 열기 시 파일을 truncate하는 의미(append-only) — 프리할당된
+ *   청크에 대해 랜덤 라이트가 제한되는 근본 원인.
+ * - fio_hdfsio_queue(): ddir에 따라 hdfsRead/readDirect/hdfsWrite/hdfsFlush를 동기 호출,
+ *   xfer_buflen과 비교해 부분 전송(resid) 및 에러를 기록한 뒤 항상 FIO_Q_COMPLETED 반환.
+ * - fio_hdfsio_open_file()/_close_file(): fio의 파일 open/close 콜백. open 측은 O_DIRECT
+ *   거부만 수행(실제 HDFS open은 prep에서 수행), close 측은 현재 열린 청크를 안전히 닫는다.
+ * - fio_hdfsio_io_u_free(): 잡 종료 시 hdfsDisconnect로 NameNode 연결 해제.
+ * - struct hdfsio_data: 스레드 전용 런타임 상태(fs/fp/curr_file_id).
+ * - struct hdfsio_options: 잡 옵션(namenode/hostname/port/hdfsdirectory/chunk_size/
+ *   single_instance/hdfs_use_direct).
  */
 
 /*
@@ -43,49 +72,113 @@
  *
  */
 
-#include <math.h>
-#include <hdfs.h>
+#include <math.h>         /* [한국어] floor() 사용 — 오프셋을 chunk_size로 나눈 몫(청크 id) 계산에 정수 절사 대신 부동소수 floor를 사용한다. */
+#include <hdfs.h>         /* [한국어] libhdfs 공개 헤더 — hdfsFS/hdfsFile/hdfsBuilder API 선언 및 O_RDONLY/O_WRONLY·tOffset 정의. */
 
-#include "../fio.h"
-#include "../optgroup.h"
+#include "../fio.h"       /* [한국어] fio 코어 헤더 — struct thread_data, struct io_u, fio_file, log_err, td_verror, FIO_Q_* 반환값, FIO_*IO 플래그 등 제공. */
+#include "../optgroup.h"  /* [한국어] FIO_OPT_G_HDFS 등 옵션 그룹 상수 — options.c의 옵션 카테고리 분류와 `fio --enghelp` 출력에 사용. */
 
-#define CHUNCK_NAME_LENGTH_MAX 80
-#define CHUNCK_CREATION_BUFFER_SIZE 65536
+#define CHUNCK_NAME_LENGTH_MAX 80         /* [한국어] 청크 파일 이름 버퍼 최대 길이(바이트) — "<file_name>_<uint64 id>" 형식 수용. snprintf 경계값으로 사용. */
+#define CHUNCK_CREATION_BUFFER_SIZE 65536 /* [한국어] 청크 프리할당 시 zero-fill 버퍼 크기(64KiB) — 64KiB 단위로 HDFS write를 발행해 JNI/네트워크 호출 횟수와 스택 사용량 균형. */
 
-/* [한국어] HDFS 엔진의 내부 상태 구조체 */
+/* [한국어] HDFS 엔진의 스레드별 런타임 상태.
+ * 설정자: fio_hdfsio_setup(최초 할당), fio_hdfsio_init(fs 채움), fio_hdfsio_prep(fp/curr_file_id 교체).
+ * 읽는 자: fio_hdfsio_queue, fio_hdfsio_close_file, fio_hdfsio_io_u_free.
+ * 수명: td->io_ops_data에 저장되어 잡 스레드 전 구간 동안 유효.
+ * 동기화: 잡 스레드 1개가 단독 소유하므로 별도 락 불필요(단, single_instance=1인 경우에도
+ * 각 스레드는 자기 fs 포인터를 별도로 보유하나 JVM 내부에서 동일 NameNode 연결을 공유).
+ */
 struct hdfsio_data {
-	hdfsFS fs;		/* [한국어] HDFS 파일 시스템 핸들 - hdfsConnect()로 생성 */
-	hdfsFile fp;		/* [한국어] 현재 열린 HDFS 파일 핸들 */
-	uint64_t curr_file_id;	/* [한국어] 현재 열린 청크 파일 ID (오프셋 기반 계산) */
+	hdfsFS fs;
+	/* [한국어] HDFS 클러스터(NameNode) 연결 핸들 — libhdfs의 불투명 포인터.
+	 * 설정자: fio_hdfsio_init()에서 hdfsBuilderConnect() 결과로 저장.
+	 * 읽는 자: 모든 hdfs* 호출의 첫 인자로 전달.
+	 * 값 범위: 유효 연결 포인터 또는 NULL(연결 실패 시).
+	 * 동기화: libhdfs 내부 JVM 스레드 안전성에 의존. single_instance=1일 때 프로세스 내
+	 * 잡들이 동일 JVM의 동일 FileSystem 객체를 공유할 수 있음(JNI 참조 카운팅). */
+
+	hdfsFile fp;
+	/* [한국어] 현재 열려 있는 청크 파일의 libhdfs 파일 핸들.
+	 * 설정자: fio_hdfsio_prep()에서 hdfsOpenFile() 결과로 갱신, fio_hdfsio_io_u_init()에서는
+	 * 로컬 변수 fp에 별도로 받아 청크 프리할당에만 사용(여기 저장되지 않음).
+	 * 읽는 자: fio_hdfsio_queue의 hdfsRead/Write/Seek/Tell/Flush 인자.
+	 * 값 범위: 유효 파일 핸들 또는 NULL(prep 실패 경로에서만 일시적 NULL 가능).
+	 * 동기화: curr_file_id와 짝을 이뤄 갱신되므로 동일 스레드 내에서만 일관성 유지. */
+
+	uint64_t curr_file_id;
+	/* [한국어] 현재 fp가 가리키는 청크의 파일 인덱스(0-based).
+	 * 설정자: fio_hdfsio_setup() 최초 -1로 초기화(= (uint64_t)-1, 즉 매우 큰 값),
+	 * fio_hdfsio_prep() 성공 시 f_id로 갱신, close_file/prep의 재오픈 경로에서 -1로 리셋.
+	 * 읽는 자: fio_hdfsio_prep()의 "이미 열려 있는가" 비교, fio_hdfsio_close_file의 guard.
+	 * 값 범위: [0, ceil(real_file_size/chunk_size)) 또는 sentinel (uint64_t)-1.
+	 * 동기화: 단일 잡 스레드 소유 — 락 불필요. */
 };
 
-/* [한국어] HDFS 엔진 전용 옵션 구조체 */
+/* [한국어] HDFS 엔진 옵션(fio 옵션 시스템이 td->eo로 할당·채움).
+ * 설정자: options.c가 잡 파일/CLI를 파싱해 offsetof 기반으로 채움.
+ * 읽는 자: fio_hdfsio_* 모든 콜백.
+ * 수명: 잡 수명 전체. 스레드 안전성은 read-only 접근으로 보장. */
 struct hdfsio_options {
-	void *pad;			/* [한국어] fio 옵션 구조체 정렬 패딩 */
-	char *host;			/* [한국어] HDFS NameNode 호스트명 */
-	char *directory;		/* [한국어] HDFS 작업 디렉터리 경로 */
-	unsigned int port;		/* [한국어] HDFS NameNode 포트 번호 */
-	unsigned int chunck_size;	/* [한국어] 개별 청크 파일 크기 (HDFS는 파일 수정 불가하므로 작은 파일 다수 생성) */
-	unsigned int single_instance;	/* [한국어] 단일 HDFS 연결 인스턴스 사용 여부 */
-	unsigned int use_direct;	/* [한국어] 직접 읽기 모드 사용 여부 */
+	void *pad;
+	/* [한국어] fio 옵션 구조체 관례적 선두 패딩 — 일부 구조체 멤버가 off1=0에서 시작하지
+	 * 못하게 해 옵션 파서(offsetof 기반)의 0 오프셋 모호성을 회피. 실제 사용되지 않는
+	 * 더미 필드. 설정자/읽는 자 없음. */
+
+	char *host;
+	/* [한국어] HDFS NameNode 호스트명 문자열(예: "localhost", "namenode.example.com").
+	 * 설정자: namenode/hostname 옵션 파싱 결과. 읽는 자: fio_hdfsio_init의 hdfsBuilderSetNameNode.
+	 * 값 범위: NULL 불가(기본 "localhost"). 메모리 수명은 fio 옵션 프레임워크가 관리. */
+
+	char *directory;
+	/* [한국어] HDFS 상의 작업 디렉터리 경로(예: "/fio_test").
+	 * 설정자: hdfsdirectory 옵션. 읽는 자: fio_hdfsio_init의 hdfsExists/hdfsSetWorkingDirectory.
+	 * 값 범위: 절대 경로 문자열(기본 "/"). 존재하지 않는 경로면 init 실패. */
+
+	unsigned int port;
+	/* [한국어] NameNode RPC 포트(일반적으로 HDFS는 8020 또는 9000).
+	 * 설정자: port 옵션(1~65535). 읽는 자: fio_hdfsio_init의 hdfsBuilderSetNameNodePort.
+	 * 0이면 init에서 EINVAL 반환. */
+
+	unsigned int chunck_size;
+	/* [한국어] 청크 파일 크기(바이트). HDFS는 파일 중간 덮어쓰기를 지원하지 않으므로
+	 * 전체 테스트 공간을 이 크기 단위의 여러 파일로 쪼갠다.
+	 * 설정자: chunk_size(별칭 chunck_size) 옵션. 기본 1 MiB.
+	 * 읽는 자: prep(청크 id 계산·오프셋 잘라내기), io_u_init(청크 프리할당 루프), queue(seek 제한 비교).
+	 * 값 범위: 1 이상 권장. 너무 작으면 파일 수가 폭증해 NameNode 부담, 너무 크면 HDFS
+	 * append-only 특성 때문에 랜덤 라이트 시뮬레이션 범위가 좁아짐. */
+
+	unsigned int single_instance;
+	/* [한국어] 단일 HDFS FileSystem 인스턴스 공유 여부(기본 1=ON).
+	 * 설정자: single_instance 옵션(FIO_OPT_BOOL).
+	 * 읽는 자: fio_hdfsio_init에서 0이면 hdfsBuilderSetForceNewInstance 호출로 JVM별
+	 * 별도 FileSystem을 강제(멀티스레드 시 연결 경합 실험 목적).
+	 * 1이면 libhdfs가 캐시된 FileSystem을 재사용해 스레드 간 공유(성능 유리·격리 약화). */
+
+	unsigned int use_direct;
+	/* [한국어] readDirect 사용 여부(기본 0=OFF → hdfsRead 사용).
+	 * 설정자: hdfs_use_direct 옵션. 읽는 자: fio_hdfsio_queue의 DDIR_READ 분기.
+	 * readDirect는 사용자 버퍼로의 JNI 복사를 우회(direct buffer)해 처리량을 개선하지만
+	 * libhdfs 빌드/HDFS 버전에 따라 미지원일 수 있음. */
 };
 
+/* [한국어] 옵션 테이블 — fio 옵션 시스템이 파싱 시 lookup.
+ * 각 엔트리의 off1은 struct hdfsio_options 내 오프셋이며, td->eo가 그 구조체의 인스턴스가 된다. */
 static struct fio_option options[] = {
 	{
-		.name	= "namenode",
-		.lname	= "hfds namenode",
-		.type	= FIO_OPT_STR_STORE,
-		.off1   = offsetof(struct hdfsio_options, host),
-		.def    = "localhost",
-		.help	= "Namenode of the HDFS cluster",
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_HDFS,
+		.name	= "namenode",                                      /* [한국어] 옵션 키(짧은 이름). */
+		.lname	= "hfds namenode",                                 /* [한국어] 긴 이름(help 출력용). 원본 오탈자("hfds") 유지 — 코드 수정 금지. */
+		.type	= FIO_OPT_STR_STORE,                               /* [한국어] 문자열 저장 타입 — strdup되어 host에 저장. */
+		.off1   = offsetof(struct hdfsio_options, host),           /* [한국어] 저장 위치 = hdfsio_options::host. */
+		.def    = "localhost",                                     /* [한국어] 기본값 — 로컬 개발용 NameNode. */
+		.help	= "Namenode of the HDFS cluster",                  /* [한국어] --enghelp 출력용 설명. */
+		.category = FIO_OPT_C_ENGINE,                              /* [한국어] 옵션 카테고리 = 엔진별 옵션. */
+		.group	= FIO_OPT_G_HDFS,                                  /* [한국어] 옵션 그룹 = HDFS — optgroup.h에서 정의. */
 	},
 	{
-		.name	= "hostname",
+		.name	= "hostname",                                      /* [한국어] namenode의 별칭 — 다른 엔진과의 옵션 일관성 유지. */
 		.lname	= "hfds namenode",
 		.type	= FIO_OPT_STR_STORE,
-		.off1   = offsetof(struct hdfsio_options, host),
+		.off1   = offsetof(struct hdfsio_options, host),           /* [한국어] 동일한 host 필드에 저장 — 어느 이름을 써도 같은 결과. */
 		.def    = "localhost",
 		.help	= "Namenode of the HDFS cluster",
 		.category = FIO_OPT_C_ENGINE,
@@ -94,32 +187,32 @@ static struct fio_option options[] = {
 	{
 		.name	= "port",
 		.lname	= "hdfs namenode port",
-		.type	= FIO_OPT_INT,
+		.type	= FIO_OPT_INT,                                     /* [한국어] 정수 타입 — minval/maxval 체크 활성화. */
 		.off1	= offsetof(struct hdfsio_options, port),
-		.def    = "9000",
-		.minval	= 1,
-		.maxval	= 65535,
+		.def    = "9000",                                          /* [한국어] 기본 9000(Hadoop 2.x default, 3.x는 8020) — 클러스터별 수동 조정 필요. */
+		.minval	= 1,                                               /* [한국어] 0은 EINVAL로 막힘. */
+		.maxval	= 65535,                                           /* [한국어] TCP 포트 상한. */
 		.help	= "Port used by the HDFS cluster namenode",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_HDFS,
 	},
 	{
-		.name	= "hdfsdirectory",
+		.name	= "hdfsdirectory",                                 /* [한국어] 기존 FS의 directory 옵션과 충돌 피하려 접두사 사용. */
 		.lname	= "hfds directory",
 		.type	= FIO_OPT_STR_STORE,
 		.off1   = offsetof(struct hdfsio_options, directory),
-		.def    = "/",
+		.def    = "/",                                             /* [한국어] 루트. 권한에 따라 실패할 수 있으니 사용자가 명시적으로 지정 권장. */
 		.help	= "The HDFS directory where fio will create chunks",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_HDFS,
 	},
 	{
 		.name	= "chunk_size",
-		.alias	= "chunck_size",
+		.alias	= "chunck_size",                                   /* [한국어] 원본 오탈자 호환을 위한 별칭 — 둘 다 허용. */
 		.lname	= "Chunk size",
 		.type	= FIO_OPT_INT,
 		.off1	= offsetof(struct hdfsio_options, chunck_size),
-		.def    = "1048576",
+		.def    = "1048576",                                       /* [한국어] 1 MiB 기본 — HDFS 기본 블록크기(128 MiB) 대비 작아 프리할당 부담 감소. */
 		.help	= "Size of individual chunk",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_HDFS,
@@ -129,7 +222,7 @@ static struct fio_option options[] = {
 		.lname	= "Single Instance",
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct hdfsio_options, single_instance),
-		.def    = "1",
+		.def    = "1",                                             /* [한국어] 기본 ON — JVM당 하나의 FileSystem 캐시 공유. */
 		.help	= "Use a single instance",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_HDFS,
@@ -139,316 +232,472 @@ static struct fio_option options[] = {
 		.lname	= "HDFS Use Direct",
 		.type	= FIO_OPT_BOOL,
 		.off1	= offsetof(struct hdfsio_options, use_direct),
-		.def    = "0",
+		.def    = "0",                                             /* [한국어] 기본 OFF — 호환성 우선. */
 		.help	= "Use readDirect instead of hdfsRead",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_HDFS,
 	},
 	{
-		.name	= NULL,
+		.name	= NULL,                                            /* [한국어] 옵션 테이블 종결자 — fio 옵션 파서는 name==NULL을 만나면 순회 중단. */
 	},
 };
 
 
+/*
+ * [한국어]
+ * get_chunck_name - 청크 파일의 HDFS 경로명을 포맷한다.
+ *
+ * @dest:     출력 버퍼(최소 CHUNCK_NAME_LENGTH_MAX 바이트).
+ * @file_name: 원본 파일 이름(fio_file::file_name).
+ * @chunk_id: 청크 인덱스(0..N-1).
+ * @return:   snprintf 반환값(쓰여진 문자 수, NUL 제외).
+ *
+ * HDFS 파일이 append-only이므로 하나의 논리 파일을 chunk_size 단위로 쪼개 여러
+ * 물리 파일에 매핑한다. 청크별 실제 파일명은 "<file_name>_<chunk_id>" 규약을 따른다.
+ * 호출자: fio_hdfsio_prep(I/O 경로), fio_hdfsio_io_u_init(프리할당 경로).
+ * 실행 컨텍스트: 잡 스레드. 재진입 안전(지역 변수만 사용).
+ *
+ * 호출 체인:
+ *   fio_hdfsio_prep / fio_hdfsio_io_u_init → [get_chunck_name] → snprintf
+ */
 static int get_chunck_name(char *dest, char *file_name, uint64_t chunk_id) {
-	return snprintf(dest, CHUNCK_NAME_LENGTH_MAX, "%s_%lu", file_name, chunk_id);
+	return snprintf(dest, CHUNCK_NAME_LENGTH_MAX, "%s_%lu", file_name, chunk_id); /* [한국어] 크기 제한된 포맷 — 경계 초과 시 잘리고 반환값은 필요 길이. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_prep - io_u 하나의 오프셋을 청크 파일과 내부 오프셋으로 매핑한다.
+ *
+ * @td:   잡 컨텍스트(td->io_ops_data=hdfsio_data, td->eo=hdfsio_options).
+ * @io_u: 처리할 I/O 유닛(offset, ddir, file 등).
+ * @return: 0=성공, 그 외=errno(호출자는 에러로 간주해 중단).
+ *
+ * HDFS append-only 특성을 우회하기 위해 fio의 전역 오프셋을 chunk_size로 나누어
+ * (f_id, intra-chunk offset) 쌍을 얻는다. 현재 열린 청크와 f_id가 다르면 기존 핸들을
+ * 닫고 ddir에 맞는 플래그(O_RDONLY/O_WRONLY)로 새로 연다. 실제 read/write/seek은
+ * fio_hdfsio_queue가 담당.
+ * 실행 컨텍스트: 잡 스레드 — td_io_prep에서 1회/유닛 호출.
+ *
+ * 호출 체인:
+ *   backend.c → td_io_prep → [fio_hdfsio_prep] → hdfsCloseFile/hdfsOpenFile
+ */
 static int fio_hdfsio_prep(struct thread_data *td, struct io_u *io_u)
 {
-	struct hdfsio_options *options = td->eo;
-	struct hdfsio_data *hd = td->io_ops_data;
-	unsigned long f_id;
-	char fname[CHUNCK_NAME_LENGTH_MAX];
-	int open_flags;
+	struct hdfsio_options *options = td->eo;                    /* [한국어] 잡별 엔진 옵션 포인터 획득(chunk_size 사용). */
+	struct hdfsio_data *hd = td->io_ops_data;                   /* [한국어] 스레드별 런타임 상태(fs/fp/curr_file_id). */
+	unsigned long f_id;                                          /* [한국어] 이번 io_u가 속하는 청크 파일 ID. */
+	char fname[CHUNCK_NAME_LENGTH_MAX];                          /* [한국어] 청크 파일명 버퍼(스택). */
+	int open_flags;                                              /* [한국어] hdfsOpenFile에 넘길 open 플래그. */
 
 	/* find out file id based on the offset generated by fio */
-	f_id = floor(io_u->offset / options-> chunck_size);
+	f_id = floor(io_u->offset / options-> chunck_size);         /* [한국어] 전역 오프셋 → 청크 인덱스(몫). 부동소수 연산이나 결과는 정수 경계로 정렬됨. */
 
-	if (f_id == hd->curr_file_id) {
+	if (f_id == hd->curr_file_id) {                             /* [한국어] 현재 fp가 이미 같은 청크를 가리키면 재오픈 비용 생략. */
 		/* file is already open */
-		return 0;
+		return 0;                                                /* [한국어] 정상(동일 청크 연속 접근). queue에서 seek로 내부 오프셋만 조정. */
 	}
 
-	if (hd->curr_file_id != -1) {
-		if ( hdfsCloseFile(hd->fs, hd->fp) == -1) {
-			log_err("hdfs: unable to close file: %s\n", strerror(errno));
-			return errno;
+	if (hd->curr_file_id != -1) {                               /* [한국어] 이전에 다른 청크가 열려 있었다면 먼저 닫아 fd 누수/참조 카운트 증가 방지. */
+		if ( hdfsCloseFile(hd->fs, hd->fp) == -1) {             /* [한국어] libhdfs close — 내부적으로 flush+close. -1 반환 시 errno 세팅. */
+			log_err("hdfs: unable to close file: %s\n", strerror(errno)); /* [한국어] fio 표준 에러 로그 채널. */
+			return errno;                                        /* [한국어] 호출자(backend)는 0이 아니면 에러로 간주. */
 		}
-		hd->curr_file_id = -1;
+		hd->curr_file_id = -1;                                   /* [한국어] sentinel로 리셋 — 이후 open 실패 시에도 상태 일관성 유지. */
 	}
 
-	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_SYNC) {
-		open_flags = O_RDONLY;
-	} else if (io_u->ddir == DDIR_WRITE) {
-		open_flags = O_WRONLY;
+	if (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_SYNC) {   /* [한국어] 읽기 또는 fsync류 — 읽기 권한만 필요. */
+		open_flags = O_RDONLY;                                   /* [한국어] HDFS의 RDONLY 의미는 일반 POSIX와 동일. */
+	} else if (io_u->ddir == DDIR_WRITE) {                      /* [한국어] 쓰기 — HDFS의 O_WRONLY는 파일을 새로 열거나 기존 파일을 교체(append-only). */
+		open_flags = O_WRONLY;                                   /* [한국어] 주의: 프리할당된 청크에 O_WRONLY는 truncate 의미일 수 있음 — 본 엔진의 근본 제약. */
 	} else {
-		log_err("hdfs: Invalid I/O Operation\n");
-		return 0;
+		log_err("hdfs: Invalid I/O Operation\n");                /* [한국어] DDIR_TRIM 등 HDFS가 지원 못 하는 연산. */
+		return 0;                                                /* [한국어] 원본 코드: 0 반환으로 상위에 에러 숨김(수정 금지 — 주석만). */
 	}
-	
-	get_chunck_name(fname, io_u->file->file_name, f_id);
-	hd->fp = hdfsOpenFile(hd->fs, fname, open_flags, 0, 0,
-			      options->chunck_size);
-	if(hd->fp == NULL) {
-		log_err("hdfs: unable to open file: %s: %d\n", fname, strerror(errno));
-		return errno;
-	}
-	hd->curr_file_id = f_id;
 
-	return 0;
+	get_chunck_name(fname, io_u->file->file_name, f_id);        /* [한국어] "<file_name>_<f_id>" 형식으로 HDFS 경로 생성. */
+	hd->fp = hdfsOpenFile(hd->fs, fname, open_flags, 0, 0,      /* [한국어] libhdfs open. 3/4 인자 0은 기본 bufferSize/replication. */
+			      options->chunck_size);                 /* [한국어] 5번째(blockSize) = chunk_size — 블록=파일 크기 정렬로 단순화. */
+	if(hd->fp == NULL) {                                        /* [한국어] open 실패(디렉터리 미존재/권한 등). */
+		log_err("hdfs: unable to open file: %s: %d\n", fname, strerror(errno)); /* [한국어] 포맷 스펙 오류(%d vs 문자열) 있으나 원본 유지. */
+		return errno;                                            /* [한국어] errno로 상위에 실패 전달. */
+	}
+	hd->curr_file_id = f_id;                                    /* [한국어] 새로 열린 청크 id를 기록 — 다음 prep에서 재활용. */
+
+	return 0;                                                    /* [한국어] 준비 완료 — queue에서 실 I/O 진행. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_queue - 준비된 io_u를 HDFS에 동기 발행한다(즉시 완료).
+ *
+ * @td:   잡 컨텍스트.
+ * @io_u: prep에서 청크가 선정·오픈된 I/O 유닛.
+ * @return: FIO_Q_COMPLETED — 본 엔진은 동기(FIO_SYNCIO)이므로 항상 즉시 완료.
+ *
+ * 내부 오프셋(offset % chunk_size)으로 seek 후 ddir에 따라 hdfsRead/readDirect/
+ * hdfsWrite/hdfsFlush를 호출한다. 부분 전송 시 io_u->resid를 세팅해 fio가 남은 분을
+ * 재시도하거나 통계에 반영. 에러는 td_verror로 잡 레벨에 기록.
+ * 실행 컨텍스트: 잡 스레드 — td_io_queue 콜백.
+ *
+ * 호출 체인:
+ *   backend.c → td_io_queue → [fio_hdfsio_queue] → hdfsRead/hdfsWrite/hdfsFlush
+ */
 static enum fio_q_status fio_hdfsio_queue(struct thread_data *td,
 					  struct io_u *io_u)
 {
-	struct hdfsio_data *hd = td->io_ops_data;
-	struct hdfsio_options *options = td->eo;
-	int ret;
-	unsigned long offset;
-	
-	offset = io_u->offset % options->chunck_size;
-	
-	if( (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) && 
-	     hdfsTell(hd->fs, hd->fp) != offset && hdfsSeek(hd->fs, hd->fp, offset) != 0 ) {
-		log_err("hdfs: seek failed: %s, are you doing random write smaller than chunk size ?\n", strerror(errno));
-		io_u->error = errno;
-		return FIO_Q_COMPLETED;
+	struct hdfsio_data *hd = td->io_ops_data;                   /* [한국어] fs/fp 꺼내기. */
+	struct hdfsio_options *options = td->eo;                    /* [한국어] chunk_size/use_direct 참조. */
+	int ret;                                                     /* [한국어] hdfs* 반환(전송 바이트 또는 음수 에러). */
+	unsigned long offset;                                        /* [한국어] 청크 내부 오프셋. */
+
+	offset = io_u->offset % options->chunck_size;               /* [한국어] 전역 오프셋에서 청크 내부 위치 추출. */
+
+	if( (io_u->ddir == DDIR_READ || io_u->ddir == DDIR_WRITE) &&  /* [한국어] 실제 전송이 필요한 방향에서만 seek 검사. */
+	     hdfsTell(hd->fs, hd->fp) != offset && hdfsSeek(hd->fs, hd->fp, offset) != 0 ) { /* [한국어] 현재 위치와 다르면 seek — 실패 시 에러. HDFS는 라이트 모드 seek 제한적. */
+		log_err("hdfs: seek failed: %s, are you doing random write smaller than chunk size ?\n", strerror(errno)); /* [한국어] HDFS write는 순차 append만 허용 — 랜덤 라이트 사용자 경고. */
+		io_u->error = errno;                                     /* [한국어] io_u에 에러 기록 → fio 통계에 실패 카운트. */
+		return FIO_Q_COMPLETED;                                  /* [한국어] 동기 완료로 보고(에러 포함). */
 	};
 
 	// do the IO
-	if (io_u->ddir == DDIR_READ) {
-		if (options->use_direct) {
-			ret = readDirect(hd->fs, hd->fp, io_u->xfer_buf, io_u->xfer_buflen);
+	if (io_u->ddir == DDIR_READ) {                              /* [한국어] 읽기 경로. */
+		if (options->use_direct) {                               /* [한국어] 옵션에 따라 direct buffer read 선택. */
+			ret = readDirect(hd->fs, hd->fp, io_u->xfer_buf, io_u->xfer_buflen); /* [한국어] JNI 복사 없이 사용자 버퍼로 직접 수신 — 빠르지만 빌드 의존. */
 		} else {
-			ret = hdfsRead(hd->fs, hd->fp, io_u->xfer_buf, io_u->xfer_buflen);
+			ret = hdfsRead(hd->fs, hd->fp, io_u->xfer_buf, io_u->xfer_buflen);   /* [한국어] 표준 경로 — JNI byte[] 경유 복사. */
 		}
-	} else if (io_u->ddir == DDIR_WRITE) {
-		ret = hdfsWrite(hd->fs, hd->fp, io_u->xfer_buf,
+	} else if (io_u->ddir == DDIR_WRITE) {                      /* [한국어] 쓰기 경로. */
+		ret = hdfsWrite(hd->fs, hd->fp, io_u->xfer_buf,          /* [한국어] HDFS append — DataNode 파이프라인 전송. */
 				io_u->xfer_buflen);
-	} else if (io_u->ddir == DDIR_SYNC) {
-		ret = hdfsFlush(hd->fs, hd->fp);
+	} else if (io_u->ddir == DDIR_SYNC) {                       /* [한국어] fsync류. */
+		ret = hdfsFlush(hd->fs, hd->fp);                         /* [한국어] HDFS flush — 클라이언트 버퍼만 비움(hflush/hsync 아님 — 내구성 제한적). */
 	} else {
-		log_err("hdfs: Invalid I/O Operation: %d\n", io_u->ddir);
-		ret = EINVAL;
+		log_err("hdfs: Invalid I/O Operation: %d\n", io_u->ddir);/* [한국어] 지원되지 않는 ddir. */
+		ret = EINVAL;                                            /* [한국어] EINVAL을 양수로 보내 아래 부분 전송 분기와 충돌 가능성 — 원본 유지. */
 	}
 
 	// Check if the IO went fine, or is incomplete
-	if (ret != (int)io_u->xfer_buflen) {
-		if (ret >= 0) {
-			io_u->resid = io_u->xfer_buflen - ret;
-			io_u->error = 0;
-			return FIO_Q_COMPLETED;
+	if (ret != (int)io_u->xfer_buflen) {                        /* [한국어] 기대 바이트와 불일치: 부분 전송 또는 에러. */
+		if (ret >= 0) {                                          /* [한국어] 양수/0 → 부분 전송. */
+			io_u->resid = io_u->xfer_buflen - ret;               /* [한국어] 남은 바이트 fio에 보고 → 재시도/통계 반영. */
+			io_u->error = 0;                                     /* [한국어] 에러 아님 표시. */
+			return FIO_Q_COMPLETED;                              /* [한국어] 즉시 완료. */
 		} else {
-			io_u->error = errno;
+			io_u->error = errno;                                 /* [한국어] 음수 → 시스템 에러. */
 		}
 	}
 
-	if (io_u->error)
-		td_verror(td, io_u->error, "xfer");
+	if (io_u->error)                                            /* [한국어] 에러가 기록되어 있으면 잡 레벨 에러 프레임워크에 전파. */
+		td_verror(td, io_u->error, "xfer");                      /* [한국어] stat.c의 첫 에러로 기록 — 리포트 출력 대상. */
 
-	return FIO_Q_COMPLETED;
+	return FIO_Q_COMPLETED;                                     /* [한국어] 동기 엔진 — 항상 즉시 완료로 귀결. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_open_file - fio의 파일 open 콜백(본 엔진에서는 O_DIRECT 거부만 수행).
+ *
+ * @td: 잡 컨텍스트. @f: 대상 fio_file.
+ * @return: 0(성공) — 실패 조건은 td->error로 기록.
+ *
+ * 실제 HDFS 파일 open은 prep 단계에서 청크 단위로 수행되므로 여기서는 사용자가
+ * direct=1(O_DIRECT)을 지정한 경우만 EINVAL로 거부한다(HDFS는 O_DIRECT 의미론 없음).
+ * 실행 컨텍스트: 잡 스레드 초기화.
+ *
+ * 호출 체인:
+ *   backend.c → td_io_open_file → [fio_hdfsio_open_file]
+ */
 int fio_hdfsio_open_file(struct thread_data *td, struct fio_file *f)
 {
-	if (td->o.odirect) {
-		td->error = EINVAL;
-		return 0;
+	if (td->o.odirect) {                                        /* [한국어] 사용자가 direct=1을 설정했다면 HDFS에 의미 없으므로 거부. */
+		td->error = EINVAL;                                      /* [한국어] 잡 레벨 에러로 기록. */
+		return 0;                                                /* [한국어] 원본: 0 반환(수정 금지) — backend가 td->error로 중단 판단. */
 	}
 
-	return 0;
+	return 0;                                                    /* [한국어] 정상 — 실제 오픈은 prep에서. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_close_file - 현재 스레드가 열고 있는 청크 파일을 닫는다.
+ *
+ * @td: 잡 컨텍스트. @f: fio_file(사용하지 않음 — 청크 매핑이 fio_file과 1:1 아님).
+ * @return: 0=성공, errno=실패.
+ *
+ * curr_file_id가 sentinel(-1)이 아닐 때만 실제 close를 시도한다. prep의 재오픈 경로와
+ * 잡 종료 시 양쪽에서 호출될 수 있다.
+ * 실행 컨텍스트: 잡 스레드.
+ *
+ * 호출 체인:
+ *   backend.c → td_io_close_file → [fio_hdfsio_close_file] → hdfsCloseFile
+ */
 int fio_hdfsio_close_file(struct thread_data *td, struct fio_file *f)
 {
-	struct hdfsio_data *hd = td->io_ops_data;
+	struct hdfsio_data *hd = td->io_ops_data;                   /* [한국어] 스레드 상태 접근. */
 
-	if (hd->curr_file_id != -1) {
-		if ( hdfsCloseFile(hd->fs, hd->fp) == -1) {
+	if (hd->curr_file_id != -1) {                               /* [한국어] sentinel이면 열린 파일 없음 → skip. */
+		if ( hdfsCloseFile(hd->fs, hd->fp) == -1) {             /* [한국어] libhdfs close. */
 			log_err("hdfs: unable to close file: %s\n", strerror(errno));
-			return errno;
+			return errno;                                        /* [한국어] 실패 전파. */
 		}
-		hd->curr_file_id = -1;
+		hd->curr_file_id = -1;                                   /* [한국어] 상태 리셋. */
 	}
 	return 0;
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_io_u_init - 잡 시작 전 청크 파일들을 프리할당한다.
+ *
+ * @td: 잡 컨텍스트. @io_u: 한 개의 I/O 유닛(사용하지 않음).
+ * @return: 0=성공, errno=첫 실패 이유.
+ *
+ * fio의 io_u_init 콜백은 각 io_u 초기화 훅이나, 본 엔진에서는 io_u와 무관한 "청크
+ * 프리할당"에만 사용한다(훅 타이밍을 재활용). 각 fio_file에 대해 real_file_size를
+ * chunk_size로 나눠 필요한 만큼 청크 파일을 생성(또는 부족하면 확장)한다. HDFS가
+ * 파일 중간 덮어쓰기를 못 하므로 프리할당 없이는 prep에서 O_WRONLY 열기 시 기존
+ * 데이터가 날아가는 문제 발생 — 여기서 zero-fill로 크기를 맞춰둔다.
+ * 실행 컨텍스트: 잡 스레드 초기화(각 io_u마다 호출되지만 조건 분기로 실제 작업은
+ * 필요 시 1회만 유의미하게 수행됨 — 원본 로직은 매 호출마다 전체 파일 순회).
+ *
+ * 호출 체인:
+ *   backend.c → td_io_u_init → [fio_hdfsio_io_u_init] → hdfsGetPathInfo/hdfsOpenFile/
+ *                              hdfsWrite/hdfsCloseFile
+ */
 static int fio_hdfsio_io_u_init(struct thread_data *td, struct io_u *io_u)
 {
-	struct hdfsio_options *options = td->eo;
-	struct hdfsio_data *hd = td->io_ops_data;
-	struct fio_file *f;
-	uint64_t j,k;
-	int i, failure = 0;
-	uint8_t buffer[CHUNCK_CREATION_BUFFER_SIZE];
-	uint64_t bytes_left;	
-	char fname[CHUNCK_NAME_LENGTH_MAX];	
-	hdfsFile fp;
-	hdfsFileInfo *fi;
-	tOffset fi_size;
+	struct hdfsio_options *options = td->eo;                    /* [한국어] chunk_size 참조. */
+	struct hdfsio_data *hd = td->io_ops_data;                   /* [한국어] fs 핸들 사용. */
+	struct fio_file *f;                                          /* [한국어] 순회용 파일 포인터. */
+	uint64_t j,k;                                                /* [한국어] j=바이트 누적, k=청크 id. */
+	int i, failure = 0;                                          /* [한국어] i=파일 인덱스, failure=누적 에러. */
+	uint8_t buffer[CHUNCK_CREATION_BUFFER_SIZE];                 /* [한국어] 64KiB zero-fill 버퍼(스택). */
+	uint64_t bytes_left;                                         /* [한국어] 현 청크의 남은 쓰기 바이트. */
+	char fname[CHUNCK_NAME_LENGTH_MAX];                          /* [한국어] 청크 파일명 버퍼. */
+	hdfsFile fp;                                                 /* [한국어] 로컬 파일 핸들(hd->fp 건드리지 않음). */
+	hdfsFileInfo *fi;                                            /* [한국어] HDFS 파일 메타(mSize 확인용). */
+	tOffset fi_size;                                             /* [한국어] 기존 청크 크기(libhdfs 정의 64-bit 오프셋). */
 
-	for_each_file(td, f, i) {
-		k = 0;
-		for(j=0; j < f->real_file_size; j += options->chunck_size) {
-			get_chunck_name(fname, f->file_name, k++);
-			fi = hdfsGetPathInfo(hd->fs, fname);
-			fi_size = fi ? fi->mSize : 0;
+	for_each_file(td, f, i) {                                   /* [한국어] 잡의 모든 fio_file 순회 — 매크로는 fio.h에서 제공. */
+		k = 0;                                                   /* [한국어] 청크 id 0부터 시작. */
+		for(j=0; j < f->real_file_size; j += options->chunck_size) { /* [한국어] 파일 크기를 chunk_size 단위로 나눠 순회. */
+			get_chunck_name(fname, f->file_name, k++);          /* [한국어] 이번 청크 이름 생성(k 증가는 post-increment). */
+			fi = hdfsGetPathInfo(hd->fs, fname);                /* [한국어] 기존 청크가 있는지 확인 — 없으면 NULL. */
+			fi_size = fi ? fi->mSize : 0;                       /* [한국어] 존재 시 크기, 아니면 0. */
 			// fill exist and is big enough, nothing to do
-			if( fi && fi_size >= options->chunck_size) {
+			if( fi && fi_size >= options->chunck_size) {        /* [한국어] 이미 충분한 크기면 프리할당 생략(재실행 시 비용 절감). */
 				continue;
 			}
-			fp = hdfsOpenFile(hd->fs, fname, O_WRONLY, 0, 0,
-					  options->chunck_size);
-			if(fp == NULL) {
-				failure = errno;
+			fp = hdfsOpenFile(hd->fs, fname, O_WRONLY, 0, 0,    /* [한국어] 쓰기 모드로 새로 오픈(HDFS에선 실질적 truncate). */
+					  options->chunck_size);              /* [한국어] blockSize = chunk_size. */
+			if(fp == NULL) {                                    /* [한국어] 오픈 실패 → 권한/디렉터리 부재 등. */
+				failure = errno;                                 /* [한국어] 에러 저장 후 break로 전체 루프 탈출. */
 				log_err("hdfs: unable to prepare file chunk %s: %s\n", fname, strerror(errno));
 				break;
 			}
-			bytes_left = options->chunck_size;
-			memset(buffer, 0, CHUNCK_CREATION_BUFFER_SIZE);
-			while( bytes_left > CHUNCK_CREATION_BUFFER_SIZE) {
+			bytes_left = options->chunck_size;                  /* [한국어] 이번 청크에 써야 할 총 바이트. */
+			memset(buffer, 0, CHUNCK_CREATION_BUFFER_SIZE);     /* [한국어] zero-fill — 프리할당용 더미 데이터. */
+			while( bytes_left > CHUNCK_CREATION_BUFFER_SIZE) {  /* [한국어] 64KiB 단위로 반복 write(마지막 잔여는 아래 분기). */
 				if( hdfsWrite(hd->fs, fp, buffer, CHUNCK_CREATION_BUFFER_SIZE)
-				    != CHUNCK_CREATION_BUFFER_SIZE) {
-    					failure = errno;
+				    != CHUNCK_CREATION_BUFFER_SIZE) {           /* [한국어] 부분 write는 실패로 간주(HDFS는 원자적 append 아님). */
+    					failure = errno;                         /* [한국어] 에러 기록. */
 	    				log_err("hdfs: unable to prepare file chunk %s: %s\n", fname, strerror(errno));
-					break;
+					break;                                       /* [한국어] 내부 while 탈출(외부 for 루프는 아래 failure 체크로 종료). */
 				};
-				bytes_left -= CHUNCK_CREATION_BUFFER_SIZE;
+				bytes_left -= CHUNCK_CREATION_BUFFER_SIZE;      /* [한국어] 남은 바이트 차감. */
 			}
-			if(bytes_left > 0) {
+			if(bytes_left > 0) {                                /* [한국어] 마지막 잔여(0~64KiB-1). */
 				if( hdfsWrite(hd->fs, fp, buffer, bytes_left)
-				    != bytes_left) {
+				    != bytes_left) {                            /* [한국어] 잔여도 원자 요구. */
 					failure = errno;
 					break;
 				};
 			}
-			if( hdfsCloseFile(hd->fs, fp) != 0) {
+			if( hdfsCloseFile(hd->fs, fp) != 0) {               /* [한국어] 청크 close = 최종 flush + 블록 확정. */
 				failure = errno;
 				log_err("hdfs: unable to prepare file chunk %s: %s\n", fname, strerror(errno));
 				break;
 			}
 		}
-		if(failure) {
+		if(failure) {                                           /* [한국어] 내부 루프가 에러로 빠져나왔다면 파일 순회도 중단. */
 			break;
 		}
 	}
-	
-	if( !failure ) {
-		fio_file_set_size_known(f);
+
+	if( !failure ) {                                            /* [한국어] 모든 파일 프리할당 성공 시. */
+		fio_file_set_size_known(f);                              /* [한국어] fio 코어에 파일 크기 확정 통보 — 주의: f는 마지막 파일만 반영(원본 유지). */
 	}
 
-	return failure;
+	return failure;                                              /* [한국어] 0=성공, 아니면 첫 에러의 errno. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_setup - 잡 시작 시 파일별 real_file_size 결정 및 스레드 상태 초기화.
+ *
+ * @td: 잡 컨텍스트.
+ * @return: 0(항상 성공).
+ *
+ * td->o.size/nr_files로 평균 파일 크기를 산정하거나 file_size_low/high로 랜덤 분포를
+ * 적용. 나눠떨어지지 않으면 마지막 파일에 잔여를 몰아주어 총 size를 정확히 채운다.
+ * 또한 td->io_ops_data(hdfsio_data)를 최초로 calloc하고 curr_file_id=-1로 초기화.
+ * HDFS 연결은 여기서 하지 않고 fio_hdfsio_init에서 수행(순서는 fio 엔진 계약에 따름).
+ * 실행 컨텍스트: 잡 스레드 초기화.
+ *
+ * 호출 체인:
+ *   backend.c → td_io_init 전 setup 단계 → [fio_hdfsio_setup]
+ */
 static int fio_hdfsio_setup(struct thread_data *td)
 {
-	struct hdfsio_data *hd;
-	struct fio_file *f;
-	int i;
-	uint64_t file_size, total_file_size;
+	struct hdfsio_data *hd;                                     /* [한국어] 새로 할당할(또는 기존) 상태 포인터. */
+	struct fio_file *f;                                          /* [한국어] 순회용. */
+	int i;                                                       /* [한국어] 인덱스. */
+	uint64_t file_size, total_file_size;                         /* [한국어] 계산용 누적·개별 크기. */
 
-	if (!td->io_ops_data) {
-		hd = calloc(1, sizeof(*hd));
-		
-		hd->curr_file_id = -1;
+	if (!td->io_ops_data) {                                      /* [한국어] 최초 호출에서만 할당 — setup은 중복 호출될 수 있음. */
+		hd = calloc(1, sizeof(*hd));                             /* [한국어] 0초기화 할당 — fs/fp NULL 보장. */
 
-		td->io_ops_data = hd;
+		hd->curr_file_id = -1;                                   /* [한국어] sentinel. prep의 비교 기준. */
+
+		td->io_ops_data = hd;                                    /* [한국어] 엔진 전용 슬롯에 저장 — 이후 모든 콜백에서 공유. */
 	}
-	
-	total_file_size = 0;
+
+	total_file_size = 0;                                         /* [한국어] 누적 초기화. */
 	file_size = 0;
 
-	for_each_file(td, f, i) {
-		if(!td->o.file_size_low) {
-			file_size = floor(td->o.size / td->o.nr_files);
-			total_file_size += file_size;
+	for_each_file(td, f, i) {                                   /* [한국어] 각 파일의 크기 결정. */
+		if(!td->o.file_size_low) {                               /* [한국어] 명시적 파일크기 지정이 없으면 size/nr_files 균등 분배. */
+			file_size = floor(td->o.size / td->o.nr_files);      /* [한국어] 정수 절사. */
+			total_file_size += file_size;                        /* [한국어] 잔여 계산용 누적. */
 		}
-		else if (td->o.file_size_low == td->o.file_size_high)
+		else if (td->o.file_size_low == td->o.file_size_high)    /* [한국어] low==high면 고정 크기. */
 			file_size = td->o.file_size_low;
 		else {
-			file_size = get_rand_file_size(td);
+			file_size = get_rand_file_size(td);                  /* [한국어] 범위 내 랜덤 — fio 공통 헬퍼(init.c). */
 		}
-		f->real_file_size = file_size;
+		f->real_file_size = file_size;                           /* [한국어] fio_file에 기록 — 이후 io_u_init/I/O 분배의 기준. */
 	}
 	/* If the size doesn't divide nicely with the chunk size,
 	 * make the last files bigger.
 	 * Used only if filesize was not explicitly given
 	 */
-	if (!td->o.file_size_low && total_file_size < td->o.size) {
-		f->real_file_size += (td->o.size - total_file_size);
+	if (!td->o.file_size_low && total_file_size < td->o.size) { /* [한국어] 균등 분배 경로에서만 잔여 보정. */
+		f->real_file_size += (td->o.size - total_file_size);    /* [한국어] 마지막으로 순회된 f에 차액 더하기 — 총합 = td->o.size 보장. */
 	}
 
-	return 0;
+	return 0;                                                    /* [한국어] 항상 성공. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_init - NameNode에 접속하고 작업 디렉터리를 진입한다.
+ *
+ * @td: 잡 컨텍스트.
+ * @return: 0=성공, errno=실패.
+ *
+ * hdfsNewBuilder로 연결 파라미터 설정(host/port, single_instance 강제 생성 옵션) →
+ * hdfsBuilderConnect로 JVM 부팅 + FileSystem 생성(thread-local JVM 이슈: libhdfs는
+ * 프로세스당 JVM 하나만 허용 — 첫 호출 시 JVM 생성, 이후 스레드는 AttachCurrentThread).
+ * 이후 작업 디렉터리 존재 확인·진입.
+ * 실행 컨텍스트: 잡 스레드 초기화 — setup 이후.
+ *
+ * 호출 체인:
+ *   backend.c → td_io_init → [fio_hdfsio_init] → hdfsBuilder*/hdfsBuilderConnect/
+ *                           hdfsExists/hdfsSetWorkingDirectory
+ */
 static int fio_hdfsio_init(struct thread_data *td)
 {
-	struct hdfsio_data *hd = td->io_ops_data;
-	struct hdfsio_options *options = td->eo;
-	int failure;
-	struct hdfsBuilder *bld;
+	struct hdfsio_data *hd = td->io_ops_data;                   /* [한국어] setup에서 할당된 상태. */
+	struct hdfsio_options *options = td->eo;                    /* [한국어] host/port/directory/single_instance. */
+	int failure;                                                 /* [한국어] 에러 보관. */
+	struct hdfsBuilder *bld;                                     /* [한국어] libhdfs 연결 빌더. */
 
-	if (options->host == NULL || options->port == 0) {
+	if (options->host == NULL || options->port == 0) {          /* [한국어] 필수 파라미터 검증. */
 		log_err("hdfs: server not defined\n");
 		return EINVAL;
 	}
-	
-	bld = hdfsNewBuilder();
+
+	bld = hdfsNewBuilder();                                     /* [한국어] 빌더 생성 — NULL 시 할당 실패. */
 	if (!bld) {
 		failure = errno;
 		log_err("hdfs: unable to allocate connect builder\n");
 		return failure;
 	}
-	hdfsBuilderSetNameNode(bld, options->host);
-	hdfsBuilderSetNameNodePort(bld, options->port);
-	if(! options->single_instance) {
-		hdfsBuilderSetForceNewInstance(bld);
+	hdfsBuilderSetNameNode(bld, options->host);                 /* [한국어] NameNode 호스트 설정. */
+	hdfsBuilderSetNameNodePort(bld, options->port);             /* [한국어] NameNode 포트 설정. */
+	if(! options->single_instance) {                            /* [한국어] 단일 인스턴스 공유 비활성화 시. */
+		hdfsBuilderSetForceNewInstance(bld);                    /* [한국어] JVM의 FileSystem 캐시를 우회해 새 인스턴스 강제 — 스레드별 격리. */
 	}
-	hd->fs = hdfsBuilderConnect(bld);
-	
+	hd->fs = hdfsBuilderConnect(bld);                           /* [한국어] 실제 접속 — JVM 부팅/Attach + RPC 핸드셰이크. 빌더는 함수 내부에서 소유 이전. */
+
 	/* hdfsSetWorkingDirectory succeed on non-existent directory */
-	if (hdfsExists(hd->fs, options->directory) < 0 || hdfsSetWorkingDirectory(hd->fs, options->directory) < 0) {
+	if (hdfsExists(hd->fs, options->directory) < 0 || hdfsSetWorkingDirectory(hd->fs, options->directory) < 0) { /* [한국어] 존재 확인 먼저 — SetWorkingDirectory는 없는 경로에도 성공하므로 따로 체크. */
 		failure = errno;
 		log_err("hdfs: invalid working directory %s: %s\n", options->directory, strerror(errno));
 		return failure;
 	}
-	
-	return 0;
+
+	return 0;                                                    /* [한국어] NameNode 준비 완료. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_io_u_free - 잡 종료 시 HDFS 연결을 해제한다.
+ *
+ * @td: 잡 컨텍스트. @io_u: 사용하지 않음(훅 타이밍 재활용).
+ *
+ * ioengine 계약상 io_u_free는 io_u 해제용이지만, 본 엔진은 잡 종료 시 1회만
+ * 의미 있게 수행할 정리(hdfsDisconnect)를 여기에 배치. 여러 번 호출돼도 fs가
+ * NULL이면 skip.
+ * 실행 컨텍스트: 잡 스레드 종료 경로.
+ */
 static void fio_hdfsio_io_u_free(struct thread_data *td, struct io_u *io_u)
 {
-	struct hdfsio_data *hd = td->io_ops_data;
+	struct hdfsio_data *hd = td->io_ops_data;                   /* [한국어] 상태 접근. */
 
-	if (hd->fs && hdfsDisconnect(hd->fs) < 0) {
+	if (hd->fs && hdfsDisconnect(hd->fs) < 0) {                 /* [한국어] 연결 종료 — NameNode 세션 해제 + JVM 참조 감소. */
 		log_err("hdfs: disconnect failed: %d\n", errno);
 	}
 }
 
+/* [한국어] ioengine_ops 플러그인 서술자 — ioengines.c가 이 포인터를 통해 본 엔진을 호출. */
 FIO_STATIC struct ioengine_ops ioengine = {
-	.name = "libhdfs",
-	.version = FIO_IOOPS_VERSION,
-	.flags = FIO_SYNCIO | FIO_DISKLESSIO | FIO_NODISKUTIL,
-	.setup = fio_hdfsio_setup,
-	.init = fio_hdfsio_init,
-	.prep = fio_hdfsio_prep,
-	.queue = fio_hdfsio_queue,
-	.open_file = fio_hdfsio_open_file,
-	.close_file = fio_hdfsio_close_file,
-	.io_u_init = fio_hdfsio_io_u_init,
-	.io_u_free = fio_hdfsio_io_u_free,
-	.option_struct_size	= sizeof(struct hdfsio_options),
-	.options		= options,
+	.name = "libhdfs",                                          /* [한국어] --ioengine=libhdfs로 식별. */
+	.version = FIO_IOOPS_VERSION,                               /* [한국어] 엔진 ABI 버전 — 코어와 불일치 시 로드 거부. */
+	.flags = FIO_SYNCIO | FIO_DISKLESSIO | FIO_NODISKUTIL,      /* [한국어] SYNCIO=queue가 즉시 완료, DISKLESSIO=로컬 블록디바이스 아님(파일시스템/네트워크 계층), NODISKUTIL=/proc/diskstats 기반 util% 비활성. */
+	.setup = fio_hdfsio_setup,                                  /* [한국어] 파일 크기 결정 + 상태 할당. */
+	.init = fio_hdfsio_init,                                    /* [한국어] NameNode 접속. */
+	.prep = fio_hdfsio_prep,                                    /* [한국어] 청크 매핑 + open. */
+	.queue = fio_hdfsio_queue,                                  /* [한국어] 동기 read/write/flush. */
+	.open_file = fio_hdfsio_open_file,                          /* [한국어] O_DIRECT 거부 훅. */
+	.close_file = fio_hdfsio_close_file,                        /* [한국어] 현재 청크 close. */
+	.io_u_init = fio_hdfsio_io_u_init,                          /* [한국어] (재활용) 청크 프리할당. */
+	.io_u_free = fio_hdfsio_io_u_free,                          /* [한국어] (재활용) hdfsDisconnect. */
+	.option_struct_size	= sizeof(struct hdfsio_options),        /* [한국어] td->eo로 할당할 크기 — options.c가 사용. */
+	.options		= options,                                   /* [한국어] 옵션 정의 테이블. */
 };
 
 
+/*
+ * [한국어]
+ * fio_hdfsio_register - 프로세스 시작 시 본 엔진을 fio 레지스트리에 등록.
+ *
+ * fio_init attribute(constructor)로 main 이전에 호출된다. 등록 후부터
+ * --ioengine=libhdfs 지정이 가능해진다.
+ */
 static void fio_init fio_hdfsio_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine);                               /* [한국어] ioengines.c의 전역 리스트에 삽입. */
 }
 
+/*
+ * [한국어]
+ * fio_hdfsio_unregister - 프로세스 종료 시 엔진을 레지스트리에서 제거.
+ *
+ * fio_exit attribute(destructor)로 exit 경로에서 호출. 공유 라이브러리로 빌드된
+ * 경우 dlclose 시점에서도 호출되어 댕글링 포인터를 방지.
+ */
 static void fio_exit fio_hdfsio_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine);                             /* [한국어] 리스트에서 제거 — 이후 load_ioengine은 해당 이름 조회 실패. */
 }

@@ -81,21 +81,53 @@ struct fio_mtd_options {
 	 * 값 범위: 0/1. 동기화: 불변(잡 시작 후). */
 };
 
-/* [한국어] 엔진 전용 옵션 테이블. NULL 엔트리로 종단. */
+/*
+ * [한국어] 엔진 전용 옵션 테이블.
+ *
+ * 공통 규약 (fio 옵션 테이블):
+ *  - `.name`:   CLI/잡 파일에서 사용자가 입력하는 키워드.
+ *  - `.lname`:  `--enghelp` 출력 시 보이는 사람-읽기 라벨.
+ *  - `.type`:   파서 선택(FIO_OPT_BOOL/INT/STR_STORE 등). 값 해석 방법 결정.
+ *  - `.off1`:   `struct fio_mtd_options` 내 저장 위치의 offsetof.
+ *  - `.help`:   짧은 한 줄 설명(--cmdhelp=옵션명 에 표시).
+ *  - `.hide`:   1이면 `--cmdhelp` 전체 목록에서 감춤(엔진 세부 옵션용).
+ *  - `.def`:    사용자가 지정하지 않았을 때의 기본 문자열 값.
+ *  - `.category/.group`: 옵션 그룹화(도움말 섹션 분류).
+ *  - NULL 엔트리(`{ .name = NULL }`)로 배열 종단을 표시(옵션 파서가 순회 종료).
+ */
 static struct fio_option options[] = {
 	{
 		.name	= "skip_bad",
+		/* [한국어] 사용자 CLI/잡파일에서 `--skip_bad=1` / `skip_bad=1` 로 지정. */
+
 		.lname	= "Skip operations against bad blocks",
+		/* [한국어] `fio --enghelp=mtd` 출력에서 사람이 읽는 긴 라벨. */
+
 		.type	= FIO_OPT_BOOL,
+		/* [한국어] 0/1 부울 파서 사용 — "0"/"1"/"true"/"false" 등 문자열 모두 해석. */
+
 		.off1	= offsetof(struct fio_mtd_options, skip_bad),
+		/* [한국어] 파서가 구조체 내 이 오프셋에 값을 기록 — `td->eo + off1` 로 접근. */
+
 		.help	= "Skip operations against known bad blocks.",
+		/* [한국어] `--cmdhelp=skip_bad` 출력 본문 — bad block 을 건너뛸지 여부. */
+
 		.hide	= 1,
+		/* [한국어] 1이므로 일반 `--cmdhelp` 전체 목록에는 감추고,
+		 * MTD 엔진 문맥에서만 노출(엔진 세부 옵션이라는 표시). */
+
 		.def	= "0",
+		/* [한국어] 미지정 시 기본값 — 0(bad block 스킵 안 함, 그대로 접근해 에러 드러냄). */
+
 		.category = FIO_OPT_C_ENGINE,
+		/* [한국어] 대분류 — "엔진 관련 옵션" (다른 대분류로 FIO_OPT_C_GENERAL, _IO 등). */
+
 		.group	= FIO_OPT_G_MTD,
+		/* [한국어] 세부 그룹 — MTD 엔진 전용. optgroup.h 에서 정의. */
 	},
 	{
 		.name	= NULL,
+		/* [한국어] 배열 종단자 — 옵션 파서가 .name==NULL 만나면 순회 종료. */
 	},
 };
 
@@ -306,31 +338,110 @@ static int fio_mtd_get_file_size(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
+/*
+ * [한국어] MTD 엔진의 공개 콜백 테이블 — fio 코어의 ioengine_ops 계약 구현체.
+ * 각 필드는 다음 규약을 따른다:
+ *  - 설정된 콜백만 fio 코어가 호출하며, 미설정 필드(예: .init/.cleanup/.commit/.getevents/
+ *    .event/.prep/.invalidate/.unlink_file/.io_u_init/.io_u_free/.errdetails/.iomem_alloc/
+ *    .iomem_free/.cancel/.get_max_open_zones/.report_zones/.reset_wp)는 "필요 없음" 을 의미.
+ *  - 동기 엔진(FIO_SYNCIO) 이므로 .commit/.getevents/.event 는 불필요(queue가 곧 완료).
+ *  - MTD 디바이스 자체가 파일 크기 고정(erase block 기반) 이라 확장 불가 → FIO_NOEXTEND.
+ */
 static struct ioengine_ops ioengine = {
 	.name		= "mtd",
+	/* [한국어] 엔진 식별 문자열 — 잡파일/CLI의 `ioengine=mtd`.
+	 * 설정자: 고정 리터럴. 읽는 자: load_ioengine("mtd") 가 engine_list 선형 탐색. */
+
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] ioengine ABI 버전 — ioengines.c 의 check_engine_ops 가 일치 확인.
+	 * fio 헤더와 컴파일된 .o 의 ABI 불일치 시 register_ioengine 에서 거부. */
+
 	.queue		= fio_mtd_queue,
+	/* [한국어] 메인 I/O 제출 콜백. FIO_SYNCIO 엔진이라 호출 내에서 read/write/erase 완료까지 수행.
+	 * 반환 규약: FIO_Q_COMPLETED(동기), BUSY(거의 안 씀), QUEUED(본 엔진은 사용 안 함).
+	 * 호출자: td_io_queue() → 본 콜백. */
+
 	.open_file	= fio_mtd_open_file,
+	/* [한국어] 파일당 1회 호출 — generic_open_file + mtd_get_dev_info + fmd 부착.
+	 * 반환: 0 성공, !=0 실패. fio 코어가 잡 초기화/파일 재오픈 시 호출. */
+
 	.close_file	= fio_mtd_close_file,
+	/* [한국어] open_file 역순 — fmd 해제 + generic_close_file. */
+
 	.get_file_size	= fio_mtd_get_file_size,
+	/* [한국어] mtd_get_dev_info 결과로 f->real_file_size 기록.
+	 * open_file 보다 먼저 호출되어 fio 코어의 I/O 범위/블록 인덱싱에 사용. */
+
 	.flags		= FIO_SYNCIO | FIO_NOEXTEND,
+	/* [한국어] 엔진 특성 비트 조합.
+	 *  - FIO_SYNCIO:   queue() 가 호출 내에서 완료까지 수행(비동기 제출 불가).
+	 *                  fio 코어의 io_u_sync_complete/fio_fill_issue_time 경로가 선택됨.
+	 *  - FIO_NOEXTEND: 대상 파일 크기 확장 금지(MTD 파티션은 고정 크기) — fio 가
+	 *                  요청 offset+len 이 size 를 넘으면 잘라냄/에러 처리.
+	 * 미설정 비트 의미:
+	 *  - FIO_DISKLESSIO:     파일시스템 파일 없이도 동작(MTD는 /dev/mtdN 필요 → unset).
+	 *  - FIO_RAWIO:          직접 I/O(O_DIRECT 계열) — MTD는 libmtd 경로라 불필요.
+	 *  - FIO_NOIO:           I/O 실제 수행 안 함(cpu 엔진용).
+	 *  - FIO_PIPEIO:         파이프 기반(splice 엔진).
+	 *  - FIO_BARRIER:        barrier 지원.
+	 *  - FIO_UNIDIR:         단방향 I/O만 허용.
+	 *  - FIO_NODISKUTIL:     diskutil 통계 비활성.
+	 *  - FIO_MEMALIGN:       엔진 특정 메모리 정렬 요구.
+	 *  - FIO_ASYNCIO_SYNC_TRIM: TRIM은 동기로 폴백.
+	 *  - FIO_ASYNCIO_SETS_ISSUE_TIME: 엔진이 직접 issue_time 설정.
+	 *  - FIO_RO:             읽기 전용 오픈 필요.
+	 *  - FIO_MULTI_RANGE_TRIM: 다중 범위 TRIM.
+	 *  - FIO_NO_OFFLOAD:     offload submit 금지.
+	 *  (미설정 = fio 기본 동작 유지) */
+
 	.options	= options,
+	/* [한국어] 엔진 옵션 테이블(skip_bad) 포인터. */
+
 	.option_struct_size	= sizeof(struct fio_mtd_options),
+	/* [한국어] td->eo 메모리 할당 크기 — 엔진별 옵션 파서가 이 크기만큼 zalloc. */
 };
 
-/* [한국어] 생성자: libmtd 핸들 열고 엔진 등록 */
+/*
+ * [한국어]
+ * fio_mtd_register - MTD 엔진의 프로세스-로더 시점 생성자.
+ *
+ * `fio_init` = `__attribute__((constructor))` 로, ELF .init_array 에 들어가
+ * ld.so 가 실행 파일/공유 라이브러리 로드 직후 main() 보다 먼저 호출한다.
+ * 동적 엔진(.so 로 로드)이라면 dlopen 시점에 호출된다.
+ *
+ * 수행 내용:
+ *  1) libmtd_open() 으로 프로세스 전역 libmtd 핸들 확보.
+ *  2) register_ioengine(&ioengine) 로 fio 의 전역 engine_list 에 추가
+ *     (내부적으로 flist_add_tail). 이후 load_ioengine("mtd") 가 이를 찾는다.
+ *
+ * 호출 체인: ld.so (.init_array) → [이 함수] → libmtd_open + register_ioengine.
+ */
 static void fio_init fio_mtd_register(void)
 {
-	desc = libmtd_open();           /* [한국어] 프로세스 전역 libmtd 컨텍스트 개방 */
-	register_ioengine(&ioengine);   /* [한국어] fio 엔진 레지스트리에 추가 */
+	desc = libmtd_open();           /* [한국어] libmtd 내부 상태 핸들 개방 — mtd_get_dev_info 등 모든 libmtd API 가 이 핸들을 사용. */
+	register_ioengine(&ioengine);   /* [한국어] fio 전역 engine_list tail 에 &ioengine 을 flist_add — load_ioengine("mtd") 탐색 대상. */
 }
 
-/* [한국어] 소멸자: 등록 해제 + libmtd 핸들 정리 */
+/*
+ * [한국어]
+ * fio_mtd_unregister - 프로세스 종료 시점 소멸자.
+ *
+ * `fio_exit` = `__attribute__((destructor))` 로 .fini_array 에 들어가
+ * atexit 체인에서 호출된다. 동적 엔진이라면 dlclose 시점.
+ *
+ * 수행 내용:
+ *  1) unregister_ioengine 으로 engine_list 에서 제거(flist_del_init).
+ *     이는 동일 .so 재로딩 시의 중복 등록을 방지.
+ *  2) libmtd_close 로 전역 핸들 정리.
+ *  3) desc = NULL 로 댕글링 방지(재로딩 시 stale 포인터 접근 방지).
+ *
+ * 호출 체인: atexit / ld.so (.fini_array) → [이 함수].
+ */
 static void fio_exit fio_mtd_unregister(void)
 {
-	unregister_ioengine(&ioengine);
-	libmtd_close(desc);
-	desc = NULL;   /* [한국어] 댕글링 방지 */
+	unregister_ioengine(&ioengine);   /* [한국어] engine_list 에서 &ioengine 제거. 잔류 포인터 방지 위한 flist_del_init 수행. */
+	libmtd_close(desc);               /* [한국어] libmtd 내부 자원(프로브 캐시 등) 해제. */
+	desc = NULL;   /* [한국어] 댕글링 방지 — 재 .init_array 호출 시 NULL 에서 다시 할당 가능하게 함. */
 }
 
 

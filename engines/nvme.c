@@ -51,6 +51,26 @@
  * 읽기 시: 읽은 데이터로부터 CRC를 재계산하여 저장된 가드 태그와 비교.
  * PI 위치(pi_loc)에 따라 메타데이터의 시작 또는 끝에 PI 튜플이 위치.
  * 확장 LBA(lba_ext > 0)이면 데이터+메타데이터가 연속, 아니면 별도 버퍼.
+ *
+ * === 본 파일의 비-엔진 성격 ===
+ * nvme.c 는 ioengine_ops vtable 을 등록하지 않는다(즉, .name="nvme" 같은
+ * 엔진이 따로 존재하지 않는다). 대신 io_uring_cmd / xnvme(io_uring_cmd 백엔드) /
+ * sg(NVMe 경유) 같은 정식 엔진들이 자신의 prep/event/zbd 콜백 안에서
+ * fio_nvme_* 함수를 호출하는 "공유 라이브러리" 역할만 한다. 그래서
+ * fio_init/fio_exit 생성자도 없으며, register_ioengine 도 호출하지 않는다.
+ * 빌드 시 같은 디렉토리의 다른 엔진 .o 와 함께 링크되어 fio 본체에 정적으로
+ * 포함된다(외부 .so 가 아님).
+ *
+ * === ioctl(NVME_IOCTL_*) vs io_uring_cmd 경로 비교 ===
+ * 본 파일이 사용하는 두 가지 커널 진입 경로:
+ *  - ioctl(NVME_IOCTL_ADMIN_CMD, struct nvme_passthru_cmd*): 동기. nvme_identify()
+ *    가 사용. Admin 큐로 전달되며 디바이스 응답까지 잡 스레드 블록.
+ *  - ioctl(NVME_IOCTL_IO_CMD, struct nvme_passthru_cmd*): 동기. nvme_report_zones,
+ *    fio_nvme_reset_wp, nvme_fdp_reclaim_unit_handle_status 가 사용. I/O 큐로
+ *    전달되지만 호스트 시점에서는 동기.
+ *  - io_uring_cmd 의 IORING_OP_URING_CMD(SQE.cmd_op = NVME_URING_CMD_IO[_VEC]):
+ *    비동기. 본 파일은 prep 까지만 담당하고 실제 제출/완료 수확은 엔진 본체
+ *    (engines/io_uring.c) 의 io_uring_enter / CQE 폴링 경로가 처리.
  */
 
 #include "nvme.h"                /* [한국어] 이 파일이 구현하는 NVMe 헬퍼들의 공개 선언/구조체 */

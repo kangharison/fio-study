@@ -44,14 +44,15 @@
  * a memory mapped region of the file.
  *
  */
-#include <stdio.h>       /* [한국어] 로그 출력 포매팅 */
-#include <stdlib.h>      /* [한국어] calloc/free */
-#include <errno.h>       /* [한국어] errno 및 EIO/EINVAL */
-#include <sys/mman.h>    /* [한국어] mmap/munmap/msync/madvise, PROT_*/MAP_* 매크로 */
+#include <stdio.h>       /* [한국어] log_err/log_info의 printf-계열 포매팅을 공급. */
+#include <stdlib.h>      /* [한국어] calloc(fmd 할당) / free(fmd 해제) — malloc 계열. */
+#include <errno.h>       /* [한국어] errno 전역과 EIO/EINVAL — mmap/munmap/msync/madvise 실패 경로 공용. */
+#include <sys/mman.h>    /* [한국어] mmap(2)/munmap(2)/msync(2)/madvise(2)/posix_madvise(3),
+                            PROT_READ/WRITE, MAP_SHARED/PRIVATE, MS_SYNC, POSIX_MADV_* 매크로 공급. */
 
-#include "../fio.h"
-#include "../optgroup.h"
-#include "../verify.h"
+#include "../fio.h"       /* [한국어] thread_data/fio_file/io_u/ioengine_ops 등 코어 자료구조, page_size/page_mask 전역. */
+#include "../optgroup.h"  /* [한국어] FIO_OPT_C_ENGINE/FIO_OPT_G_MMAP — 옵션 카테고리/그룹 상수. */
+#include "../verify.h"    /* [한국어] VERIFY_NONE 등 verify 모드 상수 — PROT_READ 추가 판단에 사용. */
 
 /*
  * Limits us to 1GiB of mapped files in total on 32-bit architectures
@@ -90,25 +91,39 @@ struct fio_mmap_data {
 #ifdef CONFIG_HAVE_THP
 /*
  * [한국어] CONFIG_HAVE_THP 빌드 시에만 존재하는 엔진 옵션 구조체.
- * thp=1이면 MADV_HUGEPAGE + MAP_PRIVATE 매핑을 사용한다.
+ * thp=1이면 MADV_HUGEPAGE 힌트 + MAP_PRIVATE 매핑을 사용해 커널 VM이 2MiB/1GiB
+ * huge page로 병합하도록 유도한다(Transparent Huge Pages).
+ * option_struct_size = sizeof(struct mmap_options)로 ioengine.options 테이블과 연동.
  */
 struct mmap_options {
-	void *pad;              /* [한국어] off1==0 회피 더미 */
-	unsigned int thp;        /* [한국어] 0/1 — THP 힌트 여부 */
+	void *pad;
+	/* [한국어] 옵션 파서의 off1==0 판정 회피용 더미 포인터.
+	 * 설정자: 없음(의미 있는 값 할당되지 않음).
+	 * 읽는 자: 없음. 단지 뒤따르는 실제 옵션 필드의 offsetof()가 0이 되지 않게 함.
+	 * 값 범위: 미정의(잡 시작 시 calloc 0).
+	 * 동기화: 읽히지 않으므로 동기화 불필요. */
+
+	unsigned int thp;
+	/* [한국어] Transparent Huge Pages 사용 여부 플래그(0 또는 1).
+	 * 설정자: fio 옵션 파서가 "thp=1" 지정 시 이 필드에 기록.
+	 * 읽는 자: fio_madvise_file()의 MADV_HUGEPAGE 호출, fio_mmap_get_shared()의
+	 *          MAP_PRIVATE 선택 분기.
+	 * 값 범위: 0(기본, MAP_SHARED), 1(MAP_PRIVATE + MADV_HUGEPAGE).
+	 * 동기화: 잡 시작 이후 불변, 잡 스레드 단독 읽기. */
 };
 
 static struct fio_option options[] = {
 	{
-		.name	= "thp",
-		.lname	= "Transparent Huge Pages",
-		.type	= FIO_OPT_INT,
-		.off1	= offsetof(struct mmap_options, thp),
-		.help	= "Memory Advise Huge Page",
-		.category = FIO_OPT_C_ENGINE,
-		.group	= FIO_OPT_G_MMAP,
+		.name	= "thp",                                  /* [한국어] 잡 파일/CLI 옵션 이름 (--thp). */
+		.lname	= "Transparent Huge Pages",               /* [한국어] help 출력용 긴 이름. */
+		.type	= FIO_OPT_INT,                            /* [한국어] 정수 타입(0/1) — FIO_OPT_BOOL 대신 INT 사용(역사적 이유). */
+		.off1	= offsetof(struct mmap_options, thp),     /* [한국어] mmap_options.thp 필드의 바이트 오프셋 — pad 덕에 non-zero. */
+		.help	= "Memory Advise Huge Page",               /* [한국어] --enghelp 출력 문구. */
+		.category = FIO_OPT_C_ENGINE,                      /* [한국어] 엔진 전용 옵션 카테고리. */
+		.group	= FIO_OPT_G_MMAP,                         /* [한국어] mmap 엔진 옵션 그룹(optgroup.h 정의). */
 	},
 	{
-		.name = NULL,
+		.name = NULL,                                      /* [한국어] 배열 종료 센티널 — 파서가 여기서 루프 종료. */
 	},
 };
 #endif
@@ -484,31 +499,71 @@ static int fio_mmapio_close_file(struct thread_data *td, struct fio_file *f)
 	return generic_close_file(td, f);
 }
 
-/* [한국어] FIO_SYNCIO: 동기 엔진, FIO_NOEXTEND: 파일 자동 확장 금지.
- * CONFIG_HAVE_THP 빌드에선 thp 옵션 테이블도 등록. */
+/*
+ * [한국어] mmap 엔진의 ioengine_ops 테이블.
+ * ioengines.c::register_ioengine()이 이 포인터를 engine_list에 등록하고,
+ * load_ioengine("mmap")이 여기서 .init/.prep/.queue/.open_file 등을 찾아 td->io_ops에 바인딩.
+ * 각 필드는 jobdata의 생명주기 훅이며, 코어는 이 구조체의 NULL 여부로 지원 여부를 판단한다.
+ */
 static struct ioengine_ops ioengine = {
 	.name		= "mmap",
+	/* [한국어] --ioengine=mmap에서 선택되는 엔진 식별자. engine_list 검색 키. */
+
 	.version	= FIO_IOOPS_VERSION,
+	/* [한국어] fio 코어와 엔진 간 ABI 버전. check_engine_ops()가 불일치 시 로드 거부. */
+
 	.init		= fio_mmapio_init,
+	/* [한국어] 잡 시작 시 1회 — bs/페이지 크기 정합성 검증과 파일당 매핑 상한 산출.
+	 * 호출자: ioengines.c::td_io_init. cleanup 쌍은 없음(init이 전역만 수정). */
+
 	.prep		= fio_mmapio_prep,
+	/* [한국어] 각 io_u에 대해 queue() 직전 호출. 현재 매핑 범위 체크 후 필요 시 재매핑하고
+	 *          io_u->mmap_data에 memcpy 대상 주소를 기록.
+	 * 호출자: ioengines.c::td_io_prep. */
+
 	.queue		= fio_mmapio_queue,
+	/* [한국어] 엔진의 핵심 — memcpy(READ/WRITE) / msync(SYNC) / do_io_u_trim(TRIM) 발행.
+	 * FIO_SYNCIO이므로 반환값은 항상 FIO_Q_COMPLETED. */
+
 	.open_file	= fio_mmapio_open_file,
+	/* [한국어] generic_open_file로 FD 획득 + fio_mmap_data calloc하여 FILE_SET_ENG_DATA. */
+
 	.close_file	= fio_mmapio_close_file,
+	/* [한국어] open_file의 역 — fmd 해제 + partial 플래그 리셋 + generic_close_file. */
+
 	.get_file_size	= generic_get_file_size,
+	/* [한국어] stat(2) 기반 파일 크기 질의 기본 구현 위임 — mmap 엔진 고유 로직 불필요. */
+
 	.flags		= FIO_SYNCIO | FIO_NOEXTEND,
+	/* [한국어] 엔진 속성 비트:
+	 *   FIO_SYNCIO    — queue()에서 즉시 완료되는 동기 엔진 (io_u_mark_submit+complete를
+	 *                   코어가 자동 처리, getevents/event 훅 없어도 됨).
+	 *   FIO_NOEXTEND  — 파일 자동 확장 금지. mmap은 사전 매핑된 범위만 다루므로 잡 수행 중
+	 *                   파일 크기 변화를 허용하지 않음(SIGBUS 위험 회피). */
+
 #ifdef CONFIG_HAVE_THP
 	.options	= options,
+	/* [한국어] CONFIG_HAVE_THP 빌드 시 thp 옵션 테이블을 코어에 노출. */
+
 	.option_struct_size = sizeof(struct mmap_options),
+	/* [한국어] 옵션 저장용 per-job 메모리 크기. 코어가 calloc하여 파서가 off1로 채움. */
 #endif
 };
 
-/* [한국어] 생성자/소멸자 — 엔진 등록/해제 */
+/*
+ * [한국어] fio 바이너리 링크 시 constructor 속성으로 자동 호출되어 mmap 엔진을
+ * ioengines.c의 engine_list에 삽입한다. 이후 --ioengine=mmap이 find_ioengine으로 조회 가능.
+ */
 static void fio_init fio_mmapio_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine); /* [한국어] engine_list flist_add_tail — 단일 스레드 초기화 경로라 락 불필요. */
 }
 
+/*
+ * [한국어] destructor 속성 — fio 프로세스 종료 직전 호출되어 engine_list에서 제거.
+ * 정적 빌드에서도 릭리스트 정리 목적.
+ */
 static void fio_exit fio_mmapio_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine); /* [한국어] flist_del_init로 해제. */
 }

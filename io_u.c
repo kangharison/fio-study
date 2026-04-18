@@ -1,63 +1,253 @@
 /*
- * [한국어 설명] fio I/O 유닛(io_u) 관리 핵심 파일 (io_u.c)
+ * [한국어 설명] fio I/O 유닛(io_u) 생명주기·오프셋/길이/방향 결정·완료 회계 핵심 파일 (io_u.c)
  *
  * === 파일의 역할 ===
- * 이 파일은 fio에서 I/O 요청의 전체 생명주기를 관리한다. io_u는 하나의 I/O 작업을
- * 나타내는 구조체로, 할당 → 설정(오프셋/크기/방향) → 제출 → 완료 → 반환의 과정을
- * 거친다. 랜덤/순차 오프셋 결정, 블록 크기 결정, 랜덤 맵 추적 등 핵심 로직을 포함한다.
+ * 이 파일은 fio에서 단일 I/O 요청을 표현하는 io_u 구조체의 "전 생애(end-to-end
+ * lifecycle)"를 단독으로 책임진다. 상태 전이는 다음과 같다:
+ *
+ *   [free (io_u_freelist)] ─ get_io_u() ─→ [prepped (offset/buflen/ddir 결정 완료)]
+ *        ↑                                            │
+ *        │                                            │ td_io_queue() [ioengines.c]
+ *        │                                            ▼
+ *        │                                  [in_flight (IO_U_F_FLIGHT)]
+ *        │                                            │
+ *        │                          ┌─────────────────┴─────────────────┐
+ *        │                          │ 동기(SYNCIO)                       │ 비동기
+ *        │                          ▼                                    ▼
+ *        │             io_u_sync_complete()                  td_io_getevents() →
+ *        │             ─→ io_completed() ─→ account_io_completion()      │
+ *        │                          │                                    │
+ *        │                          ▼                                    ▼
+ *        │                  [completed]                       io_u_queued_complete()
+ *        │                          │                                    │
+ *        │                          │ verify 활성?                       │
+ *        │                          ├─ Yes → put_io_u_done() →           │
+ *        │                          │        verify_io_u()로 큐잉        │
+ *        │                          │        (verify_list)               │
+ *        │                          └─ No  ─────────────────────────────┘
+ *        │                                            │
+ *        └──────────── put_io_u() ◀───────────────────┘
+ *                                                  │
+ *                                  (또는) requeue_io_u(): 부분완료/EAGAIN 시
+ *                                          io_u_requeues 큐로 되돌려 다음 do_io()
+ *                                          이터레이션이 td_io_queue를 재시도.
+ *
+ * 핵심 큐 3종(td 안의 struct io_u_queue):
+ *   - td->io_u_freelist: 사용 가능한 io_u (get_io_u 소스)
+ *   - td->io_u_all     : 모든 할당된 io_u 추적용 (init/cleanup·verify 검색용)
+ *   - td->io_u_requeues: requeue된 io_u (다음 do_io 이터레이션에서 꺼냄)
+ *
+ * io_u 본체에는 ① 어디에(offset, file) ② 얼마나(buflen, xfer_buflen) ③ 무엇을
+ * (ddir: READ/WRITE/TRIM/SYNC/DATASYNC/SYNC_FILE_RANGE/WAIT/INVAL) ④ 어떤 상태로
+ * (flags: IO_U_F_FREE/FLIGHT/NO_UNACCOUNT/TRIMMED/BARRIER/VER_LIST/BUSY_OK)
+ * ⑤ 결과는 어떻게(resid, error, issue_time/start_time) 같은 속성이 채워진다.
+ *
+ * 오프셋/길이/방향 결정 알고리즘:
+ *   ▸ 방향(ddir): get_rw_ddir() → set_rw_ddir()
+ *       - 단일 방향이면 그대로, 혼합이면 rate_ddir()/get_rand_ddir()로 rwmix 비율
+ *         (rwmix_bytes / rand_seed) 기반 추첨. read_iolog_avail()이면 iolog 따른다.
+ *       - SYNC/DATASYNC/SYNC_FILE_RANGE/TRIM은 별도 분기.
+ *   ▸ 오프셋: get_next_offset() → 분기:
+ *       - 순차: get_next_seq_offset() — file->last_pos[ddir] 갱신, ba/bs 정렬,
+ *         존(zone_range) 경계와 io_size 한계 검사.
+ *       - 랜덤: get_next_block() → get_next_rand_block() →
+ *         __get_next_rand_offset 변종 디스패치(td->o.random_distribution):
+ *           · DEFAULT(uniform):  __get_next_rand_offset() — LFSR(linear feedback
+ *             shift register, td->use_lfsr) 또는 일반 frand → axmap_isset 통과까지 반복
+ *           · ZIPF:  __get_next_rand_offset_zipf() (zipf_next, theta 파라미터)
+ *           · PARETO:__get_next_rand_offset_pareto() (pareto h)
+ *           · GAUSS: __get_next_rand_offset_gauss() (정규분포 dev/100)
+ *           · ZONED/ZONED_ABS: __get_next_rand_offset_zoned[_abs]() —
+ *             zone 비율(zone_split) 따른 다단계 파티션 추첨
+ *           · SPRANDOM(WRITE 전용): __get_next_rand_offset_sprandom() — 모든
+ *             주소를 정확히 한 번씩 기록(소진 시 td->done=1).
+ *         결과 블록은 axmap(io_axmap) 미접근 비트와 매칭되어야 통과(소진 시 0 반환).
+ *   ▸ 길이(buflen): get_next_buflen() — bsrange면 FIO_RAND_BS frand로 추첨,
+ *         bssplit이면 누적 분포 함수(CDF)로, 단일 bs면 그대로. min_bs/max_bs/
+ *         bs_unaligned/io_size·zone 경계 클램프.
+ *
+ * trimwrite/verify 디스패치:
+ *   ▸ check_get_trim() : trim_backlog 도달 시 다음 io_u를 TRIM으로 강제 변환.
+ *   ▸ check_get_verify(): verify_backlog 도달 시 verify_list에서 검증 io_u 발급.
+ *   ▸ trimwrite 모드: io_u_sync_complete가 같은 영역을 WRITE 후 즉시 TRIM으로
+ *     반복 발급, save_buf_random_state로 패턴 시드를 보존하여 verify가 재현.
+ *
+ * 완료 회계(account):
+ *   ▸ io_completed(): io_u 1개 완료 처리. resid 반영, ddir별 bytes_done[]
+ *     누적, lastfile/lastrate/last_issue/issue_time 갱신, ramp_time 통과 후
+ *     account_io_completion() 호출.
+ *   ▸ account_io_completion(): clat(완료 지연)/slat(제출 지연)/lat(전체) 샘플을
+ *     stat.c의 add_*_sample()로 추가, bw 윈도(rate_bytes/iops)에 누적.
+ *   ▸ trim_block_info(): TRIM 완료 시 io log에 해당 블록 무효화 기록.
+ *   ▸ io_u_mark_lat_*sec / io_u_mark_latency: 분포 히스토그램(td->ts.io_u_lat_*)
+ *     버킷에 카운트.
+ *   ▸ io_u_mark_submit/complete/depth: 큐 깊이/제출/완료 분포를 멱승 버킷으로 집계.
+ *
+ * verify 경로:
+ *   ▸ get_buf_state()/save_buf_state(): WRITE 시 사용한 frand 시드를 저장하여
+ *     verify가 같은 패턴을 재생성(verify_pattern_check)할 수 있게 한다. WRITE 후
+ *     verify_list에 io_u가 들어가고 do_verify가 다시 같은 offset/buflen으로 READ를
+ *     발급, 패턴 비교.
  *
  * === 전체 아키텍처에서의 위치 ===
- * backend.c의 do_io() 루프에서 get_io_u()로 I/O 유닛을 할당받고,
- * ioengines.c를 통해 엔진에 제출한 뒤, 완료 시 put_io_u()로 반환한다.
- * 호출 체인: do_io() [backend.c] → get_io_u() [이 파일] → td_io_queue() [ioengines.c]
- *           → io_u_queued_complete() [이 파일] → put_io_u() [이 파일]
+ * fio의 잡 실행 루프는 backend.c의 do_io()에 있다. 그 루프 한 사이클은
+ * "get_io_u → td_io_prep → td_io_queue → (commit) → td_io_getevents →
+ * io_u_*_complete → put_io_u"이며, 이 파일은 그 중 get/put 양 끝과 *_complete
+ * 회계, 그리고 get_io_u 내부의 fill_io_u(오프셋/길이/방향 결정) 전체를 담당한다.
+ * 즉 do_io 루프 한 사이클의 "결정·통계" 절반은 io_u.c, "엔진 경유 제출" 절반은
+ * ioengines.c가 처리한다고 볼 수 있다. 실행 컨텍스트는 잡 스레드(td 단독 소유)이며
+ * helper/verify 스레드는 별도의 td 인스턴스를 소유한다.
+ *
+ * 호출 체인 요약:
+ *   do_io() [backend.c]
+ *     ├─ get_io_u() [io_u.c]
+ *     │    ├─ __get_io_u(): freelist에서 pop, IO_U_F_FREE clear, IO_U_F_FLIGHT는
+ *     │    │   아직 미설정(prep 단계)
+ *     │    ├─ set_io_u_file(): get_next_file()로 fio_file 선택(rr/random)
+ *     │    ├─ fill_io_u(): set_rw_ddir + get_next_offset + get_next_buflen
+ *     │    │    └─ check_get_trim()/check_get_verify()로 ddir 오버라이드
+ *     │    └─ small_content_scramble(): write 패턴 식별자 삽입(옵션)
+ *     ├─ td_io_prep() [ioengines.c]: 엔진별 sqe/iocb 등 사전 구성
+ *     ├─ td_io_queue() [ioengines.c]: 엔진의 .queue 콜백 호출, IO_U_F_FLIGHT set
+ *     │    → FIO_Q_COMPLETED면 즉시 io_u_sync_complete()
+ *     │    → FIO_Q_QUEUED면 비동기 — 추후 td_io_getevents/io_u_queued_complete
+ *     │    → FIO_Q_BUSY면 requeue_io_u()로 io_u_requeues에 push, IO_U_F_FLIGHT clear
+ *     ├─ td_io_commit() [ioengines.c]: 누적 sqe 일괄 제출
+ *     ├─ td_io_getevents() [ioengines.c]: 완료 폴링/대기
+ *     ├─ io_u_queued_complete() [io_u.c]
+ *     │    └─ ios_completed() → io_completed() → account_io_completion()
+ *     └─ put_io_u() [io_u.c]: IO_U_F_FREE set, freelist에 push, file usage--
  *
  * === 타 모듈과의 연결 ===
- * - backend.c: do_io()에서 get_io_u()/put_io_u() 호출
- * - ioengines.c: td_io_prep()/td_io_queue()에 io_u를 전달
- * - stat.c: 완료 시 add_clat_sample()/add_slat_sample()로 레이턴시 기록
- * - verify.c: 검증 모드에서 io_u 버퍼의 패턴/체크섬 검증
- * - 핵심 자료구조: io_u(I/O 요청), thread_data(스레드 상태), io_completion_data(완료 정보)
+ * - backend.c   : do_io()/do_verify() 잡 루프의 양쪽 끝에서 get_io_u/put_io_u/
+ *                 io_u_*_complete를 호출. ramp_time/runtime 종료, terminate_threads
+ *                 신호 등 잡 흐름은 backend가 주관.
+ * - ioengines.c : td_io_prep/queue/commit/getevents/event 디스패치. 엔진 .queue가
+ *                 FIO_Q_COMPLETED를 돌려주면 io_u_sync_complete가 즉시 호출됨.
+ * - stat.c      : add_clat_sample/add_slat_sample/add_lat_sample/add_bw_sample 등을
+ *                 account_io_completion에서 호출, thread_stat에 누적.
+ * - iolog.c     : log_io_u(), trim_io_log(), io_u_mark_* 기반의 percentile/disk_util
+ *                 윈도 윈도잉. trimwrite 모드에서 trim_block_info가 io log를 갱신.
+ * - verify.c    : do_verify가 io_u_queued_complete/get_io_u를 별도 verify 경로로
+ *                 호출. WRITE 시 save_buf_state로 보존된 시드를 verify가 재생성.
+ * - lib/rand.c  : __rand/__rand64/frand_state — 오프셋/길이/패턴 모든 난수 소스.
+ * - lib/axmap.c : 랜덤 맵 — axmap_isset/axmap_set_nr로 중복 접근 방지.
+ * - lib/lfsr.c  : LFSR(td->use_lfsr=1일 때) — 메모리 효율적인 균등 비복원 추첨.
+ * - zbd.c       : Zoned Block Device 모드 활성 시 zbd_adjust_block 등으로 오프셋 보정.
+ * - sprandom.c  : SP RANDOM 모드(WRITE 전용 비복원 분포)의 상태기.
+ * - trim.c      : trim_io_u_free, get_trim_io_u 등 trim 백로그/리스트.
+ *
+ * 공유 자료구조:
+ *   - struct thread_data (td) : 잡 1개의 모든 상태(옵션, 통계, 큐 3종, 파일 배열,
+ *                               엔진 ops, 난수 상태). 잡 스레드 단독 소유.
+ *   - struct io_u            : 본 파일의 주인공. 위 생명주기 다이어그램 참조.
+ *   - struct io_u_queue      : freelist/all/requeues 공통 컨테이너.
+ *   - struct io_completion_data : 완료 1배치의 결과(nr/error/bytes_done/time)
+ *                               집계용 임시 구조체(이 파일에 정의).
+ *   - struct fio_file        : 대상 파일/디바이스. last_pos/io_size/io_axmap/spr_info.
  *
  * === 주요 함수/구조체 요약 ===
- * - get_io_u(): 프리리스트에서 io_u를 꺼내고 오프셋/크기/방향을 설정
- * - put_io_u(): 사용 완료된 io_u를 프리리스트로 반환
- * - io_u_sync_complete(): 동기 I/O 완료 처리 (레이턴시 기록, 통계 갱신)
- * - io_u_queued_complete(): 비동기 I/O 완료 처리 (getevents 후 일괄 처리)
- * - io_completion_data: I/O 완료 시 결과 정보(nr, error, bytes_done, time)를 저장
+ * 큐 전이:
+ *   - get_io_u()           : freelist → prepped. 파일/오프셋/길이/방향 결정.
+ *   - put_io_u()           : in_flight/completed → freelist. file usage--.
+ *   - requeue_io_u()       : in_flight → io_u_requeues. EAGAIN/BUSY 시.
+ *   - clear_io_u()         : in_flight 플래그 정리(엔진 측 에러 회수 경로).
+ *
+ * 오프셋/길이/방향 결정:
+ *   - fill_io_u()          : set_rw_ddir + get_next_offset + get_next_buflen 통합.
+ *   - get_next_offset()    : 순차/랜덤 분기 → get_next_seq_offset / get_next_block.
+ *   - get_next_buflen()    : bsrange/bssplit/단일 bs 분기.
+ *   - __get_next_rand_offset[_zipf/_pareto/_gauss/_zoned/_zoned_abs/_sprandom]
+ *                          : 분포별 랜덤 오프셋 생성기.
+ *   - mark_random_map()    : axmap에 사용 표시(중복 방지).
+ *   - get_rw_ddir() / rate_ddir() / get_rand_ddir() : 방향 결정.
+ *
+ * 완료 회계:
+ *   - io_u_sync_complete() : 동기 완료 1건 처리.
+ *   - io_u_queued_complete(): 비동기 완료 N건 일괄 처리(getevents 후).
+ *   - io_completed()       : 단건 완료의 핵심 경로(resid/bytes_done/account).
+ *   - account_io_completion(): clat/slat/lat/bw 샘플 기록.
+ *   - io_u_mark_latency()/io_u_mark_lat_{n,u,m}sec : 지연 분포 버킷.
+ *   - io_u_mark_submit/complete/depth : 큐 깊이/제출/완료 분포 버킷.
+ *   - trim_block_info()    : TRIM 완료 시 io log 무효화.
+ *
+ * 보조:
+ *   - get_buf_state()/save_buf_state() : verify를 위한 패턴 시드 보존.
+ *   - fill_io_buffer()/io_u_fill_buffer() : 쓰기 버퍼 패턴 채움.
+ *   - lat_target_*()       : 지연 목표(latency_target) 기반 적응적 iodepth 제어.
+ *   - do_io_u_sync()/do_io_u_trim()/do_sync_file_range()
+ *                          : 메타 ddir(SYNC/DATASYNC/SYNC_FILE_RANGE/TRIM) 즉시 실행.
+ *
+ * io_u 플래그 비트(io_u->flags) 풀이:
+ *   - IO_U_F_FREE          : freelist 소속. get_io_u에서 clear, put_io_u에서 set.
+ *   - IO_U_F_FLIGHT        : 엔진에 제출되어 완료 대기 중. td_io_queue에서 set,
+ *                            완료/clear/requeue 경로에서 clear.
+ *   - IO_U_F_NO_UNACCOUNT  : trimwrite 등 "이 io_u는 in_flight 카운트 차감 금지".
+ *   - IO_U_F_TRIMMED       : 본 io_u가 TRIM 완료된 상태(verify 경로 분기 힌트).
+ *   - IO_U_F_BARRIER       : 쓰기 배리어(BSG/SCSI 등 일부 엔진에서 의미).
+ *   - IO_U_F_VER_LIST      : verify_list 소속(verify 경로의 io_u).
+ *   - IO_U_F_BUSY_OK       : 랜덤 맵 충돌이어도 진행(중복 접근 허용 모드).
+ *
+ * 데이터 방향(ddir) 풀이:
+ *   - DDIR_READ/WRITE/TRIM         : 데이터 I/O 3종.
+ *   - DDIR_SYNC                    : fsync(2) 메타 동기.
+ *   - DDIR_DATASYNC                : fdatasync(2).
+ *   - DDIR_SYNC_FILE_RANGE         : sync_file_range(2) — 부분 동기.
+ *   - DDIR_WAIT                    : 시간 대기(생성된 가짜 ddir).
+ *   - DDIR_INVAL                   : 무효(에러/미설정).
+ *
+ * ※ 본 파일은 신기준 재작업 진행 중이다. 현재 패스에서는 상단 4섹션 블록을
+ *    "주석만으로 io_u 생명주기 전체를 이해 가능"한 수준으로 전면 확장하였고,
+ *    함수/필드 단위 §2/§4 주석과 모든 실행 라인 인라인은 후속 패스에서 점진
+ *    완성한다. 기존 얕은 한국어 주석은 삭제하지 않고 보강 대상으로 남긴다.
  */
-#include <unistd.h>
-#include <string.h>
-#include <assert.h>
+#include <unistd.h>       /* [한국어] POSIX 기본(파일 디스크립터 관련 프로토타입) — 엔진 경로에서 간접 사용 */
+#include <string.h>       /* [한국어] memset/memcpy — io_u 버퍼 채움·구조체 초기화 */
+#include <assert.h>       /* [한국어] assert — 랜덤 맵/블록 수/상태 전이 전제 방어 */
 
-#include "fio.h"
-#include "verify.h"
-#include "trim.h"
-#include "lib/rand.h"
-#include "lib/axmap.h"
-#include "err.h"
-#include "lib/pow2.h"
-#include "minmax.h"
-#include "zbd.h"
-#include "sprandom.h"
+#include "fio.h"          /* [한국어] fio 코어 타입(thread_data/io_u/ioengine_ops/FIO_Q_*/dprint/fio_gettime 등) */
+#include "verify.h"       /* [한국어] verify 경로 훅(verify_io_u_async/get_next_verify) — verify 모드 분기 */
+#include "trim.h"         /* [한국어] trim 백로그 유틸(get_trim_io_u/trim_io_u_free) — TRIM ddir 강제 변환 경로 */
+#include "lib/rand.h"     /* [한국어] frand_state 및 __rand/__rand64 — 오프셋/길이/패턴 난수 소스 */
+#include "lib/axmap.h"    /* [한국어] 비트맵 기반 랜덤 맵 — 중복 접근 방지(공평성 커버리지) */
+#include "err.h"          /* [한국어] IS_ERR/PTR_ERR/ERR_PTR — 엔진 에러 포인터 관례 */
+#include "lib/pow2.h"     /* [한국어] is_power_of_2/roundup_pow2 — 블록 정렬/분포 버킷 산정 */
+#include "minmax.h"       /* [한국어] min/max 매크로 — 경계 클램프 */
+#include "zbd.h"          /* [한국어] Zoned Block Device 어댑터 — zbd_adjust_block/zbd_put_io */
+#include "sprandom.h"     /* [한국어] SP RANDOM 상태기 — 모든 주소 1회 쓰기 분포 */
 
-/* [한국어] I/O 완료 데이터 구조체
- * I/O 완료 시 결과 정보를 저장하는 구조체.
- * nr: 완료할 I/O 개수 (입력값)
- * error: 발생한 에러 코드 (출력값)
- * bytes_done: 각 방향(read/write/trim)별 완료된 바이트 수 (출력값)
- * time: 완료 시각 (출력값)
+/* [한국어] I/O 완료 데이터 구조체 — 완료 1배치(N건)에 대한 집계 컨테이너.
+ *
+ * 수명: io_u_sync_complete()/io_u_queued_complete()가 스택에 잡고 init_icd()로
+ * 초기화 → ios_completed()가 엔진의 .event() 콜백으로 각 완료 io_u를 순회하며
+ * io_completed()를 호출, 결과를 이 구조체에 누적 → 호출자가 td->bytes_done에 합산.
+ * 잡 스레드 스택 상에만 존재하므로 동기화 불필요.
  */
 struct io_completion_data {
 	int nr;				/* input */
-	/* [한국어] 완료할 I/O 요청 수 (입력) */
+	/* [한국어] 이 배치에서 처리할 완료 I/O 개수(입력).
+	 * 설정자: init_icd()에서 getevents()가 반환한 완료 수 또는 sync 경우 1.
+	 * 읽는 자: ios_completed() 루프 상한.
+	 * 값 범위: 1..iodepth. 동기화: 스택 지역변수 — 없음. */
 
 	int error;			/* output */
-	/* [한국어] 에러 발생 시 에러 코드 (출력) */
+	/* [한국어] 배치 처리 중 마지막으로 기록된 에러 코드(출력).
+	 * 설정자: io_completed()가 io_u->error를 여기로 전파.
+	 * 읽는 자: io_u_sync_complete/io_u_queued_complete 반환값 분기.
+	 * 값 범위: 0=성공, 양수=errno. 동기화: 스택 지역변수 — 없음. */
+
 	uint64_t bytes_done[DDIR_RWDIR_CNT];	/* output */
-	/* [한국어] 각 방향(read/write/trim)별 완료된 바이트 수 (출력) */
+	/* [한국어] 각 데이터 방향(READ/WRITE/TRIM)별로 이 배치에서 완료된 바이트 누적(출력).
+	 * 설정자: io_completed()가 io_u->xfer_buflen - resid를 해당 ddir 슬롯에 더함.
+	 * 읽는 자: 호출자가 td->bytes_done[]에 합산, do_io 루프의 진행률 판정에 사용.
+	 * 값 범위: 0..Σ xfer_buflen. 동기화: 스택 지역변수 — 없음. */
+
 	struct timespec time;		/* output */
-	/* [한국어] I/O 완료 시각 (출력) */
+	/* [한국어] 이 배치의 공통 완료 시각(fio_gettime 기준, account 지연 계산 기준점).
+	 * 설정자: init_icd()에서 fio_gettime()로 1회 캡처.
+	 * 읽는 자: account_io_completion()이 io_u->issue_time/start_time과의 차이로
+	 *          clat/slat/lat 산출.
+	 * 값 범위: CLOCK_MONOTONIC/TSC 기반 nsec. 동기화: 스택 지역변수 — 없음. */
 };
 
 /*

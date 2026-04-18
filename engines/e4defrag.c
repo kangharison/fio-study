@@ -127,29 +127,51 @@ struct e4defrag_options {
 	 * 값 범위: NUL 종료 문자열. NULL/빈 문자열이면 init 실패. */
 };
 
+/*
+ * [한국어] fio 옵션 테이블 — 잡 파일/CLI에서 "donorname=..." / "inplace=..." 형태로
+ * 지정되며, fio 옵션 파서가 이 테이블을 따라 e4defrag_options 구조체의 해당 오프셋에
+ * 값을 채워 준다. 엔트리는 마지막의 NULL 센티널까지 순서대로 해석된다.
+ * 설정자: parse.c (options.c 경로에서 init 시점에 파싱).
+ * 읽는 자: fio_e4defrag_init/queue가 td->eo로 읽음.
+ */
 static struct fio_option options[] = {
 	{
 		.name	= "donorname",
+		/* [한국어] 잡 파일 키 이름. fio 파서가 key=value의 key를 이 문자열과 비교. */
 		.lname	= "Donor Name",
+		/* [한국어] long name — --cmdhelp/에러 메시지/도움말에 노출되는 사람 친화 이름. */
 		.type	= FIO_OPT_STR_STORE,
+		/* [한국어] 값 타입: 문자열을 strdup하여 구조체 포인터 필드에 저장. */
 		.off1	= offsetof(struct e4defrag_options, donor_name),
+		/* [한국어] 파서가 값을 저장할 위치. struct 시작부터의 바이트 오프셋. */
 		.help	= "File used as a block donor",
+		/* [한국어] --cmdhelp 출력에 쓰이는 설명 문자열. */
 		.category = FIO_OPT_C_ENGINE,
+		/* [한국어] 최상위 카테고리: 엔진 옵션 그룹. */
 		.group	= FIO_OPT_G_E4DEFRAG,
+		/* [한국어] 하위 그룹: e4defrag 전용 옵션임을 표시. */
 	},
 	{
 		.name	= "inplace",
+		/* [한국어] 잡 파일 키 이름. */
 		.lname	= "In Place",
+		/* [한국어] 사람 친화 이름. */
 		.type	= FIO_OPT_INT,
+		/* [한국어] 값 타입: 부호 없는 정수로 파싱 후 저장. */
 		.off1	= offsetof(struct e4defrag_options, inplace),
+		/* [한국어] 저장 위치. */
 		.minval	= 0,
+		/* [한국어] 허용 최솟값 — 0(비활성). 범위 밖은 파서가 거절. */
 		.maxval	= 1,
+		/* [한국어] 허용 최댓값 — 1(활성). 토글 플래그. */
 		.help	= "Alloc and free space inside defrag event",
+		/* [한국어] --cmdhelp 설명. */
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_E4DEFRAG,
 	},
 	{
 		.name	= NULL,
+		/* [한국어] 테이블 종료 센티널 — 파서가 여기서 순회 중단. */
 	},
 };
 
@@ -320,27 +342,73 @@ out:
 	return FIO_Q_COMPLETED;                         /* [한국어] 동기 완료 신호. */
 }
 
+/*
+ * [한국어] ioengine_ops — 이 엔진이 fio 코어에 노출하는 콜백 vtable + 메타데이터.
+ * 이 구조체가 엔진 "계약"의 본체이며, 각 필드는 아래에서 개별 설명한다.
+ */
 static struct ioengine_ops ioengine = {
 	.name			= "e4defrag",
+	/* [한국어] 엔진 식별자. 잡 파일/CLI의 ioengine=e4defrag와 매칭되는 문자열.
+	 * 설정자: 정적 초기화. 읽는 자: load_ioengine()의 find_ioengine(). */
+
 	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] 엔진 ABI 버전. fio 코어가 빌드 시 FIO_IOOPS_VERSION과
+	 * 불일치하면 로드 거부 — dlopen 외부 엔진 호환성 가드. */
+
 	.init			= fio_e4defrag_init,
+	/* [한국어] 잡 시작 1회 초기화 콜백(도너 오픈/fallocate/blksize 취득). */
+
 	.queue			= fio_e4defrag_queue,
+	/* [한국어] I/O 1건 제출 콜백. 동기 엔진이므로 반환 시 이미 완료(FIO_Q_COMPLETED). */
+
 	.open_file		= generic_open_file,
+	/* [한국어] open(2) 기반 공통 구현 재사용 — orig 파일을 O_RDWR로 연다.
+	 * 이 엔진은 파일별 특수 처리가 필요 없어 fio가 제공하는 generic을 그대로 사용. */
+
 	.close_file		= generic_close_file,
+	/* [한국어] close(2) 공통 구현. */
+
 	.get_file_size		= generic_get_file_size,
+	/* [한국어] stat(2)로 실제 파일 크기 측정. fio 코어가 잡 범위 결정에 사용. */
+
 	.flags			= FIO_SYNCIO,
+	/* [한국어] 플래그 비트: FIO_SYNCIO — 동기 엔진. queue() 반환 시 완료로 간주되고
+	 * fio 코어가 commit/getevents를 건너뛴다. 다른 비트(DISKLESSIO/MEMALIGN 등) 미설정. */
+
 	.cleanup		= fio_e4defrag_cleanup,
+	/* [한국어] 잡 종료 1회 정리 콜백(도너 fd close + 상태 free). */
+
 	.options		= options,
+	/* [한국어] 위에서 정의한 옵션 테이블. fio 파서에게 donorname/inplace를 알린다. */
+
 	.option_struct_size	= sizeof(struct e4defrag_options),
+	/* [한국어] 옵션 구조체 크기. fio 코어가 td->eo = calloc(1, size)로 할당 시 사용. */
 
 };
 
+/*
+ * [한국어]
+ * fio_syncio_register - 엔진 등록 생성자(constructor).
+ *
+ * fio 바이너리 로드 시 ELF .init_array를 통해 자동 호출되어, 이 파일의 ioengine을
+ * fio 코어의 전역 엔진 리스트(engine_list)에 추가한다. 이후 load_ioengine("e4defrag")
+ * 가 find_ioengine으로 이 vtable을 찾을 수 있게 된다.
+ *
+ * 실행 컨텍스트: 프로세스 시작 시 단일 스레드. main() 진입 이전에 실행됨.
+ */
 static void fio_init fio_syncio_register(void)
 {
-	register_ioengine(&ioengine);
+	register_ioengine(&ioengine);   /* [한국어] 전역 엔진 리스트에 등록 — flist_add_tail. */
 }
 
+/*
+ * [한국어]
+ * fio_syncio_unregister - 엔진 등록 해제 소멸자(destructor).
+ *
+ * 프로세스 종료 시 .fini_array로 자동 호출되어 엔진 리스트에서 제거한다.
+ * 외부 .so로 빌드된 경우 dlclose 이전에 호출되어 댕글링 참조를 방지한다.
+ */
 static void fio_exit fio_syncio_unregister(void)
 {
-	unregister_ioengine(&ioengine);
+	unregister_ioengine(&ioengine); /* [한국어] 전역 엔진 리스트에서 제거. */
 }

@@ -228,21 +228,44 @@ struct rbd_options {
 
 /* [한국어] fio의 옵션 테이블 — 이름/유형/오프셋/카테고리 메타데이터를 선언해
  * 공통 옵션 파서가 rbd_options의 필드를 자동으로 채울 수 있게 한다. 마지막
- * 엔트리는 .name=NULL 센티널로 종료된다. */
+ * 엔트리는 .name=NULL 센티널로 종료된다.
+ *
+ * 공통 규약:
+ *   .name         CLI/잡파일에서 사용자가 입력하는 키(예: "pool=rbd").
+ *   .lname        사람이 읽기 좋은 긴 이름(HTML 도움말·gfio 툴팁 등에 사용).
+ *   .type         FIO_OPT_STR_STORE(문자열 복사), FIO_OPT_BOOL(0/1) 등 — 파서가
+ *                 이 값으로 값 변환 및 off1 위치에 주입할 형식을 결정.
+ *   .off1         struct rbd_options 내 타겟 필드 오프셋(offsetof로 계산).
+ *                 파서가 td->eo + off1 위치에 파싱 결과를 기록.
+ *   .help         --cmdhelp, --enghelp 출력에 표시되는 한 줄 설명.
+ *   .def          값이 지정되지 않은 경우 기본값(문자열로 제공).
+ *   .category     옵션 카탈로그 분류 — FIO_OPT_C_ENGINE = "엔진 고유".
+ *   .group        세부 그룹 — FIO_OPT_G_RBD = "RBD 엔진". 그룹 단위로 help 출력을
+ *                 묶어 보여 주는 데 사용. */
 static struct fio_option options[] = {
         {
 		.name		= "clustername",
+		/* [한국어] CLI 키: "clustername=<ceph 클러스터명>". 미지정 시 rados_create 경로,
+		 * 지정 시 rados_create2 경로로 분기. */
 		.lname		= "ceph cluster name",
+		/* [한국어] 도움말 용 긴 이름. */
 		.type		= FIO_OPT_STR_STORE,
+		/* [한국어] 문자열 복사 저장(strdup 성격) — cluster_name 포인터로 할당된 문자열 소유권 이전. */
 		.help		= "Cluster name for ceph",
+		/* [한국어] --enghelp rbd 시 표시. */
 		.off1		= offsetof(struct rbd_options, cluster_name),
+		/* [한국어] 파서가 cluster_name 필드 위치에 결과 포인터 저장. */
 		.category	= FIO_OPT_C_ENGINE,
+		/* [한국어] 엔진 전용 옵션 분류. */
 		.group		= FIO_OPT_G_RBD,
+		/* [한국어] RBD 엔진 하위 그룹 — help 그룹핑. */
         },
 	{
 		.name		= "rbdname",
+		/* [한국어] CLI 키: "rbdname=<image 이름>". 필수(미지정 시 _fio_rbd_connect에서 실패). */
 		.lname		= "rbd engine rbdname",
 		.type		= FIO_OPT_STR_STORE,
+		/* [한국어] RBD 이미지 이름을 rbd_name 필드에 문자열로 저장 — rbd_open 인자로 사용. */
 		.help		= "RBD name for RBD engine",
 		.off1		= offsetof(struct rbd_options, rbd_name),
 		.category	= FIO_OPT_C_ENGINE,
@@ -250,8 +273,10 @@ static struct fio_option options[] = {
 	},
 	{
 		.name		= "pool",
+		/* [한국어] CLI 키: "pool=<RADOS pool 이름>". 필수 — 이미지가 속한 pool. */
 		.lname		= "rbd engine pool",
 		.type		= FIO_OPT_STR_STORE,
+		/* [한국어] rados_ioctx_create의 pool 인자로 전달. */
 		.help		= "Name of the pool hosting the RBD for the RBD engine",
 		.off1		= offsetof(struct rbd_options, pool_name),
 		.category	= FIO_OPT_C_ENGINE,
@@ -259,8 +284,11 @@ static struct fio_option options[] = {
 	},
 	{
 		.name		= "clientname",
+		/* [한국어] CLI 키: "clientname=admin" 또는 "clientname=client.admin".
+		 * '.' 미포함 시 _fio_rbd_connect에서 "client." 접두 자동 부여. */
 		.lname		= "rbd engine clientname",
 		.type		= FIO_OPT_STR_STORE,
+		/* [한국어] CephX 인증 주체 — keyring 파일 검색 키로도 사용됨. */
 		.help		= "Name of the ceph client to access the RBD for the RBD engine",
 		.off1		= offsetof(struct rbd_options, client_name),
 		.category	= FIO_OPT_C_ENGINE,
@@ -268,18 +296,24 @@ static struct fio_option options[] = {
 	},
 	{
 		.name		= "busy_poll",
+		/* [한국어] CLI 키: "busy_poll=1" — 완료 대기 시 sleep 대신 CPU 폴링 사용. */
 		.lname		= "Busy poll",
 		.type		= FIO_OPT_BOOL,
+		/* [한국어] 0/1 파서. */
 		.help		= "Busy poll for completions instead of sleeping",
 		.off1		= offsetof(struct rbd_options, busy_poll),
 		.def		= "0",
+		/* [한국어] 기본값 off — 지정되지 않으면 블로킹 대기로 진입. */
 		.category	= FIO_OPT_C_ENGINE,
 		.group		= FIO_OPT_G_RBD,
 	},
 	{
         .name     = "rbd_encryption_format",
+        /* [한국어] CLI 키: "rbd_encryption_format=luks1|luks2" — 암호화 이미지 복호화 포맷.
+         * CONFIG_RBD_ENCRYPTION 빌드에서만 의미가 있으며, 그 외에는 경고 후 실패. */
         .lname    = "RBD Encryption Format",
         .type     = FIO_OPT_STR_STORE,
+        /* [한국어] 문자열로 저장하여 _fio_rbd_setup_encryption에서 strcmp로 분기. */
         .off1     = offsetof(struct rbd_options, encryption_format),
         .help     = "RBD Encryption Format (luks1, luks2)",
         .category = FIO_OPT_C_ENGINE,
@@ -287,8 +321,11 @@ static struct fio_option options[] = {
     },
     {
         .name     = "rbd_encryption_passphrase",
+        /* [한국어] CLI 키: "rbd_encryption_passphrase=<LUKS passphrase>".
+         * encryption_format이 있는데 이 값이 없으면 즉시 에러 반환. */
         .lname    = "RBD Encryption Passphrase",
         .type     = FIO_OPT_STR_STORE,
+        /* [한국어] 민감 정보 — 프로세스 메모리에 상주. 테스트 목적으로만 사용 권고. */
         .off1     = offsetof(struct rbd_options, encryption_passphrase),
         .help     = "Passphrase for unlocking the RBD image",
         .category = FIO_OPT_C_ENGINE,
@@ -296,6 +333,7 @@ static struct fio_option options[] = {
     },
 	{
 		.name = NULL,
+		/* [한국어] 센티널: 옵션 파서의 순회 종료 조건. 이 항목을 제거하면 UB. */
 	},
 };
 
@@ -1221,40 +1259,117 @@ static int fio_rbd_io_u_init(struct thread_data *td, struct io_u *io_u)
 	return 0;
 }
 
-/* [한국어] 엔진 vtable — fio 코어가 각 콜백을 이 테이블에서 찾아 호출한다.
- * FIO_STATIC은 공유 라이브러리 빌드 시 심볼 가시성을 조절하는 매크로. */
+/* [한국어] 엔진 vtable — fio 코어(ioengines.c)가 각 콜백을 이 테이블에서 찾아 호출한다.
+ * FIO_STATIC은 공유 라이브러리 빌드(.so로 빌드될 때)에서 심볼을 static으로, 내부
+ * 빌드에서는 extern 가시성으로 전환하는 매크로로, 외부 로딩과 내장 로딩을 하나의
+ * 소스로 지원하기 위한 장치이다.
+ *
+ * 이 vtable의 각 필드는 아래 단위 §4 주석에서 계약(언제 호출되는지, 반환값의
+ * 의미, 스레드 컨텍스트)을 설명한다. FIO_Q_COMPLETED/FIO_Q_QUEUED/FIO_Q_BUSY의
+ * 세 반환 코드 중 이 엔진은 QUEUED/COMPLETED만 사용한다(BUSY 없음). */
 FIO_STATIC struct ioengine_ops ioengine = {
 	.name			= "rbd",
+	/* [한국어] 엔진 이름 — fio CLI에서 `--ioengine=rbd` 로 선택되는 키.
+	 * 설정자: 이 정적 초기화. 읽는 자: register_ioengine/load_ioengine가 dlsym
+	 *         또는 engine_list 탐색 키로 사용.
+	 * 값 범위: "rbd" 상수 — 다른 엔진과 충돌해선 안 됨.
+	 * 동기화: read-only 전역. */
+
 	.version		= FIO_IOOPS_VERSION,
+	/* [한국어] ioengine_ops ABI 버전. fio 코어와 버전 불일치 시 load 단계에서 거부.
+	 * 설정자: fio.h의 현재 버전 매크로. 읽는 자: register_ioengine의 check_engine_ops.
+	 * 동기화: 컴파일 타임 상수. */
+
 	.setup			= fio_rbd_setup,
+	/* [한국어] 잡 초기화 전(메인 프로세스 컨텍스트) 1회 호출되는 훅.
+	 * 설정자: 이 초기화. 읽는 자: td_io_setup(backend.c 초기 단계).
+	 * 역할: use_thread=1 강제, RBD 이미지 크기 조회 후 fio_file에 주입.
+	 * 동기화: 메인 스레드 단독 실행 시점이므로 잡 스레드와 경쟁 없음. */
+
 	.init			= fio_rbd_init,
+	/* [한국어] 잡 스레드가 시작된 후 I/O 시작 전에 호출(스레드 컨텍스트 최초 훅).
+	 * 역할: setup이 이미 connected=true이면 스킵, 아니면 _fio_rbd_connect 재실행.
+	 * librbd는 fork 금지이므로 setup에서의 연결은 메인에만, 잡 스레드에서는
+	 * use_thread=1 pthread이므로 동일 연결을 재활용할 수 있다. */
+
 	.queue			= fio_rbd_queue,
+	/* [한국어] io_u 한 개를 비동기 제출. 반환: FIO_Q_QUEUED(대부분) / FIO_Q_COMPLETED(에러).
+	 * 호출자: td_io_queue → ioengines.c. 호출 시점: get_io_u 후 do_io 루프. */
+
 	.getevents		= fio_rbd_getevents,
+	/* [한국어] 제출된 I/O의 완료 이벤트를 수집(min..max). rbd_iter_events를 루프 호출.
+	 * 반환: 실제 수집된 이벤트 수(>=min 보장 for wait 경로). */
+
 	.event			= fio_rbd_event,
+	/* [한국어] getevents가 N을 반환한 뒤, 인덱스 0..N-1로 호출되어 io_u*를 반환.
+	 * aio_events[event]를 그대로 반환하는 경량 조회 함수. */
+
 	.cleanup		= fio_rbd_cleanup,
+	/* [한국어] 잡 종료 시 disconnect + free. getevents 완료 후에만 호출됨을 코어가 보장. */
+
 	.open_file		= fio_rbd_open,
+	/* [한국어] 파일 단위 open(기본 구현은 no-op). RBD 이미지는 _fio_rbd_connect에서 이미 열려 있음.
+	 * fio 코어가 "파일 객체"를 관리하기 위해 형식적으로 요구하는 콜백. */
+
 	.invalidate		= fio_rbd_invalidate,
+	/* [한국어] 호스트 캐시 무효화(선택). CONFIG_RBD_INVAL 빌드에서만 rbd_invalidate_cache 호출. */
+
 	.options		= options,
+	/* [한국어] 엔진 전용 CLI 옵션 테이블 포인터. NULL 센티널 종료.
+	 * 파서가 이 배열을 순회하며 FIO_OPT_C_ENGINE/FIO_OPT_G_RBD 그룹으로 등록. */
+
 	.io_u_init		= fio_rbd_io_u_init,
+	/* [한국어] io_u가 처음 생성될 때(io_u 배열 초기화 시) 호출 — per-io_u fri 할당.
+	 * 동기화: 각 io_u는 단일 잡 스레드 소유. */
+
 	.io_u_free		= fio_rbd_io_u_free,
+	/* [한국어] io_u 파괴 시 fri 해제. cleanup 전에 코어가 전부 호출함을 보장. */
+
 	.option_struct_size	= sizeof(struct rbd_options),
+	/* [한국어] td->eo를 할당할 크기 힌트. 옵션 구조체를 잡별로 복제할 때 사용됨.
+	 * 설정자: 컴파일 시 sizeof. 읽는 자: init 단계의 옵션 복제 루틴. */
 };
 
 /*
  * [한국어]
  * fio_rbd_register - fio_init 생성자 — 프로그램 시작 시 엔진을 등록한다.
- * fio_init 속성은 __attribute__((constructor)) 매크로로 확장된다.
+ *
+ * @return: 없음.
+ *
+ * 이 함수는 main() 진입 이전(libc 동적 로더가 .init_array를 실행하는 시점)에
+ * 자동 호출되어 "rbd" 이름의 엔진을 전역 engine_list에 등록한다. fio_init 속성은
+ * compiler/compiler.h에서 __attribute__((constructor))로 확장되며, 같은 기법을
+ * 쓰는 모든 엔진은 main 시작 전에 register_ioengine을 완료하므로 load_ioengine이
+ * "rbd" 키워드로 곧바로 이 vtable을 찾을 수 있다.
+ *
+ * 실행 컨텍스트: 프로세스의 _start → __libc_start_main의 초기화 단계. 아직 잡
+ * 스레드는 생성되지 않았으며, ld.so가 단일 스레드로 생성자를 순차 호출한다.
+ *
+ * 호출 체인: ld.so(.init_array) → [이 함수] → register_ioengine() → flist_add_tail
  */
 static void fio_init fio_rbd_register(void)
 {
 	register_ioengine(&ioengine);
+	/* [한국어] fio 코어의 engine_list(링크드 리스트)에 이 ioengine vtable을 등록.
+	 * load_ioengine("rbd")가 이 리스트를 순회해 name == "rbd"를 찾는다. */
 }
 
 /*
  * [한국어]
  * fio_rbd_unregister - fio_exit 소멸자 — 프로세스 종료 시 엔진 등록 해제.
+ *
+ * @return: 없음.
+ *
+ * fio_exit 속성은 __attribute__((destructor))로 확장되어 libc의 atexit 체인을
+ * 통해 main 종료 후 자동 호출된다. engine_list에서 이 vtable을 안전하게 분리해
+ * 이후 접근 시 dangling을 방지한다.
+ *
+ * 실행 컨텍스트: 모든 잡 스레드가 join된 후의 단일 스레드. exit()의 atexit 호출.
+ *
+ * 호출 체인: libc(atexit/.fini_array) → [이 함수] → unregister_ioengine() → flist_del
  */
 static void fio_exit fio_rbd_unregister(void)
 {
 	unregister_ioengine(&ioengine);
+	/* [한국어] 전역 engine_list에서 이 엔트리를 제거 — 이후 load_ioengine("rbd")는 실패. */
 }
