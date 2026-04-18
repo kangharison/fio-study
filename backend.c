@@ -25,145 +25,440 @@
  * [한국어 설명] fio 백엔드 실행 엔진 (backend.c)
  *
  * === 파일의 역할 ===
- * 이 파일은 fio의 핵심 I/O 실행 엔진을 구현한다. 로컬 모드에서 워커 스레드/프로세스를
- * 생성하고, 각 워커가 I/O 루프를 수행하며, 완료 후 통계를 집계하는 전체 백엔드
- * 흐름을 담당한다. fio_backend()가 이 파일의 최상위 진입점이다.
+ * 이 파일은 fio 로컬 백엔드의 "실행 오케스트레이터"이다. 사용자가 CLI/잡 파일로
+ * 선언한 모든 잡(job)을 스레드 또는 프로세스로 물리화(spawn)하고, 각 워커가
+ * 준비→I/O 루프→검증→정리의 전체 생명주기를 따라가도록 조율한다. 또한 잡 간의
+ * 순서 제약(stonewall / wait_for / start_delay), runstate 전이(TD_NOT_CREATED →
+ * CREATED → INITIALIZED → RAMP → RUNNING → VERIFYING → FSYNCING → FINISHING →
+ * EXITED → REAPED) 추적, 시그널 처리(SIGINT/SIGTERM/SIGUSR1/SIGBREAK), 드라이런,
+ * 트리거 파일 폴링, 정기 통계/디스크 유틸 헬퍼 스레드 감시까지 포괄한다. 서버
+ * 모드에서는 fio.c가 fio_handle_clients()로 분기하지만, 로컬 모드와 `--server`
+ * 내부 잡 실행은 모두 fio_backend()를 진입점으로 이 파일을 통과한다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * main() [fio.c] → fio_backend() [이 파일] → run_threads() → thread_main()
- *   → do_io() → get_io_u() [io_u.c] → td_io_queue() [ioengines.c]
- * fio의 I/O 실행에서 가장 핵심적인 위치에 있으며, I/O 엔진과 통계 시스템을
- * 연결하는 중간 계층이다.
+ * 호출 체인:
+ *   main() [fio.c]
+ *     → parse_options() [init.c] : 옵션 파싱, thread_data[] 배열 구성
+ *     → fio_backend(sk_out) [이 파일]   ★ 최상위 진입점
+ *         → helper_thread_create() [helper_thread.c] : 통계/디스크유틸 주기 갱신
+ *         → run_threads() [이 파일]
+ *             → for each td: pthread_create(thread_main, td) 또는 fork()→thread_main
+ *                 → thread_main() [이 파일]
+ *                     → td_io_init() [ioengines.c] : 엔진 플러그인 .init 호출
+ *                     → init_io_u()/init_io_u_buffers() : iodepth 개 io_u 풀 할당
+ *                     → setup_files()/pre_read_files() [filesetup.c]
+ *                     → do_io() [이 파일]  ★ 실제 I/O 루프
+ *                         → get_io_u() [io_u.c] → 오프셋/크기/방향 결정
+ *                         → io_u_submit() → td_io_queue() [ioengines.c]
+ *                         → wait_for_completions() → io_u_queued_complete()
+ *                     → do_verify() (verify 옵션 시)
+ *                     → close_and_free_files()/close_ioengine()
+ *             → reap_threads() : TD_EXITED → TD_REAPED 전이, waitpid(2)
+ *         → __show_run_stats() [stat.c]
+ *   실행 컨텍스트: 로컬 유저스페이스. `run_threads()`는 메인 스레드, 각 잡은
+ *   별도 pthread(use_thread=1) 또는 별도 프로세스(fork). 시그널은 메인 스레드가
+ *   받고 fio_terminate_threads()가 공유 메모리의 td->terminate를 세팅해 전파.
  *
  * === 타 모듈과의 연결 ===
- * - fio.c: main()에서 fio_backend()를 호출하여 로컬 실행을 시작
- * - io_u.c: get_io_u()/put_io_u()로 I/O 유닛의 할당/반환을 처리
- * - ioengines.c: td_io_prep()/td_io_queue()/td_io_commit()/td_io_getevents()로 엔진 호출
- * - stat.c: show_run_stats()로 최종 통계를 출력, add_*_sample()로 샘플 기록
- * - verify.c: do_verify()로 데이터 무결성 검증 수행
- * - 핵심 자료구조: thread_data(스레드 상태), io_u(I/O 요청 단위)
+ * - fio.c        : main() → fio_backend() 진입. nr_clients 분기로 로컬/서버 선택.
+ * - init.c       : parse_options()가 thread_number/thread_data[]를 채워 전달.
+ * - ioengines.c  : td_io_{init,prep,queue,commit,getevents,close_file,open_file}
+ *                  모든 엔진 콜백의 진입은 do_io()/do_verify()/thread_main()에서만.
+ * - io_u.c       : get_io_u()/put_io_u()/io_u_queued_complete()/io_u_sync_complete()
+ *                  io_u 생명주기(free → prepped → in_flight → completed → free)
+ *                  는 전적으로 이 파일의 do_io()/do_verify() 루프가 구동한다.
+ * - stat.c       : show_run_stats/update_rusage_stat/stat_init/stat_exit, 통계
+ *                  세마포어 stat_sem 이 thread_main()의 런타임 갱신을 직렬화.
+ * - verify.c     : fio_verify_init/do_verify 에서 verify_io_u(sync/async), CRC/
+ *                  MD5/PATTERN 등 VERIFY_* 헤더 검증 콜백 체인을 구동.
+ * - iolog.c      : read_iolog/log_io_piece/prune_io_piece_log/init_iolog/
+ *                  iolog_compress_init 압축 스레드를 CPU affinity 설정 전에 생성.
+ * - diskutil.c   : init_disk_util/disk_util_prune_entries — 블록 디바이스 I/O 통계.
+ * - helper_thread.c : helper_thread_create(startup_sem, sk_out) — 주기 I/O tick,
+ *                  status line, steadystate 등 잡과 독립적인 주기 태스크를 수행.
+ * - server.c     : is_backend 플래그 분기. fio_server_got_signal/send_start/
+ *                  fio_server_get_verify_state로 서버-클라이언트 동기화.
+ * - smalloc.c    : smalloc/sfree — 공유 메모리 할당기. td->sem, stat_sem,
+ *                  cgroup_list, agg_io_log 등 프로세스 간 공유 객체에 사용.
+ * - pshared.c    : mutex_cond_init_pshared/cond_init_pshared — fork 모드에서
+ *                  뮤텍스/조건변수를 프로세스 간 공유(PTHREAD_PROCESS_SHARED).
+ * - 공유 전역자료구조: thread_data 배열(thread_number개), agg_io_log[DDIR_RWDIR_CNT],
+ *                  startup_sem(초기화 동기화), stat_sem(통계 직렬화), overlap_check
+ *                  (serialize_overlap 경합), cgroup_list/cgroup_mnt.
  *
  * === 주요 함수/구조체 요약 ===
- * - fio_backend(): 최상위 진입점. 프로파일 로드 → run_threads → 통계 출력
- * - run_threads(): 모든 작업(job)을 생성하고 시작하고 종료까지 관리
- * - thread_main(): 각 워커 스레드/프로세스의 진입점. 초기화 → do_io → do_verify → 정리
- * - do_io(): 메인 I/O 루프. get_io_u → prep → queue → commit → getevents → put_io_u
+ * - fio_backend(sk_out)     : 최상위 진입점. 프로파일 로드 → stat_init →
+ *                              helper_thread_create → run_threads → 통계 → 해제.
+ * - run_threads(sk_out)     : 잡 스폰/감시 컨트롤러. todo 루프로 TD_NOT_CREATED
+ *                              를 생성하고 startup_sem/td->sem 으로 단계 동기화,
+ *                              reap_threads 로 TD_EXITED → TD_REAPED 진행.
+ * - thread_main(data)       : 각 잡 워커의 엔트리. fork_data 수령 → runstate
+ *                              전이(INITIALIZED→RAMP|RUNNING→VERIFYING→FINISHING
+ *                              →EXITED) → do_io/do_verify 반복 → cleanup.
+ * - do_io(td, bytes_done)   : 메인 I/O 루프. get_io_u→io_u_submit→commit→
+ *                              getevents→put_io_u 파이프라인. time_based/loops/
+ *                              number_ios/fill_device/rate/latency_target 종료조건.
+ * - do_verify(td, bytes)    : 검증 루프. get_next_verify + fsync+invalidate +
+ *                              verify_io_u/verify_io_u_async 콜백 체인.
+ * - io_queue_event(...)     : td_io_queue 반환(COMPLETED/QUEUED/BUSY) 분기,
+ *                              short I/O(resid) 재큐잉, 완료 회계, 에러 처리.
+ * - wait_for_completions()  : io_u_queued_complete를 iodepth_low 까지 반복 호출.
+ * - reap_threads(nr,t,m)    : use_thread=waitpid 무관/대신 runstate 확인,
+ *                              use_fork=waitpid(2)로 WIFEXITED/WIFSIGNALED 확인.
+ * - set_sig_handlers()      : sigaction(SA_RESTART) 로 SIGINT/TERM/USR1/PIPE 등록.
+ * - fork_data {td, sk_out}  : pthread_create/fork 후 thread_main 인자로 전달.
+ *
+ * === td->runstate 전이 다이어그램 (전체 잡 생명주기) ===
+ *   TD_NOT_CREATED
+ *        │  run_threads(): pthread_create 또는 fork() 성공
+ *        ▼
+ *   TD_CREATED                   ← 부모 스레드가 startup_sem 대기
+ *        │  thread_main(): 초기 setup 완료
+ *        ▼
+ *   TD_INITIALIZED               ← 자식이 fio_sem_up(startup_sem),
+ *        │                        그 후 fio_sem_down(td->sem) 블록
+ *        │  run_threads(): 모든 초기화 완료 확인 후 fio_sem_up(td->sem)
+ *        ▼
+ *   TD_RAMP  ←→  TD_RUNNING      ← ramp_time 동안 TD_RAMP, 이후 TD_RUNNING
+ *        │           │  do_io() 메인 루프 + 검증 루프 진입 시 TD_VERIFYING 전이
+ *        │           ▼
+ *        │      TD_VERIFYING      ← do_verify() 중
+ *        │           │  복귀하면 다시 TD_RUNNING
+ *        ▼           ▼
+ *   TD_FSYNCING                  ← end_fsync/end_syncfs 플러시 중
+ *        │
+ *        ▼
+ *   TD_FINISHING                 ← thread_main: 런타임 통계 최종 기록
+ *        │  cleanup: close_files/close_ioengine/fio_unpin_memory
+ *        ▼
+ *   TD_EXITED                    ← thread_main 반환 직전. 부모가 감지.
+ *        │  reap_threads(): use_thread=즉시 / use_fork=waitpid 후
+ *        ▼
+ *   TD_REAPED                    ← 부모가 회수 완료. nr_running-- 처리.
+ *
+ *   전이 함수: td_set_runstate(td, TD_XXX) (fio.h). TD_EXITED 이후에는
+ *   자식이 더 이상 td->sem/stat_sem 을 건드리면 안된다. reap_threads()가
+ *   TD_REAPED 를 set 후 done_secs 를 누적하고 group rate 합계를 감산.
  */
 
 /* 표준 라이브러리 및 시스템 헤더 */
-#include <unistd.h>
-#include <string.h>
-#include <signal.h>
-#include <assert.h>
-#include <inttypes.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <math.h>
-#include <pthread.h>
+#include <unistd.h>     /* [한국어] fork(2), getpid/gettid, setsid, _exit, unlink,
+                         *  usleep, read/write. 프로세스 모드에서 fork/setsid/_exit
+                         *  를 사용하고, 모든 모드에서 getpid/gettid로 td->pid 기록. */
+#include <string.h>     /* [한국어] memset/memcpy/strerror/strcmp/strcpy/strsep.
+                         *  타임스탬프 구조체 복사, sysfs 파일 파싱(set_ioscheduler),
+                         *  에러 메시지 구성에 사용. */
+#include <signal.h>     /* [한국어] sigaction(2)/struct sigaction/SA_RESTART/
+                         *  SIGINT/SIGTERM/SIGUSR1/SIGPIPE/SIGBREAK(Win)/kill(2)/
+                         *  SIGTERM. set_sig_handlers()와 reap_threads()의
+                         *  kill(td->pid, SIGTERM) 경로에서 필수. */
+#include <assert.h>     /* [한국어] assert() — ddir_rw(ddir), file->du 유효성,
+                         *  !(td->flags & TD_F_CHILD) 등 invariant 검증. 릴리즈
+                         *  빌드에서는 NDEBUG 로 컴파일 아웃. */
+#include <inttypes.h>   /* [한국어] PRIu64/PRIu32 포맷 매크로 — log_err/dprint
+                         *  에서 uint64_t numberio/inflight_idx 를 안전하게 출력. */
+#include <sys/stat.h>   /* [한국어] stat(2)/struct stat — __check_trigger_file()
+                         *  에서 trigger_file 존재 확인, 이후 unlink(2). */
+#include <sys/wait.h>   /* [한국어] waitpid(2)/WNOHANG/WIFEXITED/WEXITSTATUS/
+                         *  WIFSIGNALED/WTERMSIG — reap_threads()에서 fork 자식의
+                         *  종료 상태를 비블로킹으로 확인(ECHILD 처리 포함). */
+#include <math.h>       /* [한국어] logf() — usec_for_io()의 포아송 프로세스
+                         *  (RATE_PROCESS_POISSON)에서 지수분포 샘플링용
+                         *  -ln(U)/lambda 계산. -lm 링크 필요. */
+#include <pthread.h>    /* [한국어] pthread_create/detach/mutex_lock/unlock — 스레드
+                         *  모드 잡 생성, overlap_check 뮤텍스(서로 다른 잡 간 io_u
+                         *  겹침 검사 직렬화), PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
+                         *  폴백, verify_async 스레드 소유. */
 
 #ifdef CONFIG_LINUX
-#include <linux/prctl.h>  /* 프로세스 제어 (예: PR_SET_NAME으로 스레드 이름 설정) */
-#include <sys/prctl.h>
+#include <linux/prctl.h>  /* [한국어] PR_SET_NAME 등 prctl 옵션 상수. Linux 전용
+                           *  헤더. thread_main()이 PR_SET_NAME 으로 /proc/<pid>/comm
+                           *  에 o->comm 을 기록해 top/ps 등에서 잡 이름을 보이게 함. */
+#include <sys/prctl.h>    /* [한국어] prctl(2) 시스템 콜 프로토타입. PR_SET_NAME
+                           *  인자 1(op), 인자 2(new-name) 로 스레드 이름 설정. */
 #endif
 
 /* fio 내부 헤더 파일들 */
-#include "fio.h"           /* fio 핵심 구조체 및 매크로 */
-#include "smalloc.h"       /* 공유 메모리 할당기 */
-#include "verify.h"        /* 데이터 무결성 검증 */
-#include "diskutil.h"      /* 디스크 유틸리티 (I/O 통계) */
-#include "cgroup.h"        /* cgroup 지원 */
-#include "profile.h"       /* 프로파일 지원 */
-#include "lib/rand.h"      /* 난수 생성기 */
-#include "lib/memalign.h"  /* 메모리 정렬 할당 */
-#include "server.h"        /* 서버 모드 지원 */
-#include "lib/getrusage.h" /* 리소스 사용량 조회 */
-#include "idletime.h"      /* 유휴 시간 프로파일링 */
-#include "err.h"           /* 에러 처리 매크로 (IS_ERR, PTR_ERR 등) */
-#include "workqueue.h"     /* 오프로드 모드 작업 큐 */
-#include "lib/mountcheck.h"/* 마운트 확인 유틸리티 */
-#include "rate-submit.h"   /* 속도 제한 제출 */
-#include "helper_thread.h" /* 헬퍼 스레드 (통계, 디스크 유틸 등) */
-#include "pshared.h"       /* 프로세스 간 공유 뮤텍스/조건변수 */
-#include "zone-dist.h"     /* 존(zone) 분배 */
-#include "fio_time.h"      /* 시간 유틸리티 */
+#include "fio.h"            /* [한국어] fio 핵심 타입: struct thread_data, thread_options,
+                             *  io_u, ioengine_ops, fio_sem, enum td_runstate(TD_NOT_CREATED
+                             *  ~ TD_REAPED), enum fio_ddir/fio_q_status, TD_F_* 플래그,
+                             *  IO_U_F_* 플래그, td_set_runstate/for_each_td/end_for_each,
+                             *  td_io_queue/commit/getevents 프로토타입. 이 파일의
+                             *  모든 핵심 심볼의 본원. */
+#include "smalloc.h"        /* [한국어] smalloc/sfree/scalloc — 프로세스 간 공유
+                             *  메모리(mmap MAP_SHARED) 할당기. cgroup_list,
+                             *  inflight_numberio 배열 등 fork 자식이 접근해야 하는
+                             *  데이터 전용. 일반 malloc 은 fork 후 COW 로 분리됨. */
+#include "verify.h"         /* [한국어] VERIFY_NONE/CRC*/MD5/META/PATTERN/SHA* 열거,
+                             *  verify_io_u/verify_io_u_async/populate_verify_io_u/
+                             *  fill_verify_pattern/verify_save_state/verify_load_state/
+                             *  verify_state_should_stop. do_verify() 및 do_io()의
+                             *  TD_F_DO_VERIFY 분기가 사용. */
+#include "diskutil.h"       /* [한국어] init_disk_util/update_io_ticks/
+                             *  disk_util_prune_entries — /proc/diskstats 기반
+                             *  블록 디바이스 I/O 통계 집계. 헬퍼 스레드가 주기 갱신. */
+#include "cgroup.h"         /* [한국어] cgroup_setup/cgroup_kill/cgroup_shutdown —
+                             *  o->cgroup 지정 시 /sys/fs/cgroup 밑에 잡 cgroup 생성
+                             *  후 자식 PID 를 tasks 파일에 기록, 종료 시 정리. */
+#include "profile.h"        /* [한국어] load_profile/profile_td_exit — tiobench,
+                             *  act 등 미리 정의된 워크로드 프로파일 로드. fio_backend
+                             *  선두에서 exec_profile 을 처리. */
+#include "lib/rand.h"       /* [한국어] 난수 생성: __rand/__rand_0_1/frand_copy.
+                             *  verify_state, poisson_state 시드 관리에 사용. */
+#include "lib/memalign.h"   /* [한국어] fio_memalign/fio_memfree — 캐시라인 정렬된
+                             *  메모리 할당. init_io_u()가 io_u 구조체를 64B/128B
+                             *  정렬로 할당해 false-sharing 회피. */
+#include "server.h"         /* [한국어] 서버 모드(fio --server) 관련: is_backend,
+                             *  fio_server_got_signal/send_start/get_verify_state/
+                             *  fio_clients_send_trigger. 백엔드 모드에서 SIGINT 등
+                             *  을 네트워크로 클라이언트에 알림. */
+#include "lib/getrusage.h"  /* [한국어] fio_getrusage — rusage_self 포함한 CPU
+                             *  user/sys time 측정. update_rusage_stat/ts 에 반영. */
+#include "idletime.h"       /* [한국어] fio_idle_prof_init/start/stop/cleanup —
+                             *  I/O 잡 실행 전에 idle CPU 프로파일링 스레드를 띄워
+                             *  백그라운드 간섭 없는 baseline을 측정하는 옵션 경로. */
+#include "err.h"            /* [한국어] ERR_PTR/IS_ERR/IS_ERR_OR_NULL/PTR_ERR —
+                             *  리눅스 커널 스타일의 에러 포인터 이디엄. get_io_u()가
+                             *  에러 코드를 포인터 하위 비트에 인코딩해 반환할 때 사용. */
+#include "workqueue.h"      /* [한국어] workqueue_init/enqueue/flush/exit —
+                             *  io_submit_mode=IO_MODE_OFFLOAD 시 I/O 를 전용
+                             *  스레드 풀에 위임해 잡 스레드는 get_io_u/put_io_u 만
+                             *  수행하도록 분리. */
+#include "lib/mountcheck.h" /* [한국어] device_is_mounted — check_mount_writes()
+                             *  가 쓰기 워크로드에 마운트된 블록 디바이스를 대상으로
+                             *  할 경우 실행 중단(FS 손상 방지). */
+#include "rate-submit.h"    /* [한국어] rate_submit_init/exit — rate 또는 rate_iops
+                             *  옵션 시 엄격한 속도 제어를 위해 별도 submit 스레드를
+                             *  띄워 잡 스레드의 스케줄링 지터로부터 격리. */
+#include "helper_thread.h"  /* [한국어] helper_thread_create/exit/destroy —
+                             *  통계 라인 출력, 디스크 유틸 업데이트, steadystate
+                             *  체크 등을 주기적으로 수행하는 글로벌 보조 스레드. */
+#include "pshared.h"        /* [한국어] mutex_cond_init_pshared/cond_init_pshared —
+                             *  PTHREAD_PROCESS_SHARED 속성 뮤텍스/조건변수 초기화.
+                             *  use_thread=0(fork) 모드에서 부모-자식 공유 메모리에
+                             *  배치된 동기화 객체는 반드시 pshared 여야 함. */
+#include "zone-dist.h"      /* [한국어] td_zone_gen_index/td_zone_free_index —
+                             *  zonemode=zbd 또는 존 분포(random_distribution=zoned) 시
+                             *  잡이 사용할 존 인덱스 테이블 생성/해제. */
+#include "fio_time.h"       /* [한국어] fio_gettime/fio_local_clock_init/mtime_since/
+                             *  utime_since/utime_since_now/mtime_since_now/
+                             *  usec_spin/usec_sleep/time_since_now/time_since_genesis.
+                             *  이 파일의 모든 시간 측정 및 속도 제어의 근간. */
 
-/* [한국어] 전역 변수들 - 스레드 동기화 및 상태 관리 */
-static struct fio_sem *startup_sem;   /* 스레드 시작 동기화용 세마포어 */
-static struct flist_head *cgroup_list;/* cgroup 목록 */
-static struct cgroup_mnt *cgroup_mnt; /* cgroup 마운트 정보 */
-static int exit_value;                /* 프로그램 종료 코드 */
-static volatile bool fio_abort;       /* 강제 중단 플래그 (시그널 등으로 설정) */
-static unsigned int nr_process = 0;   /* fork 기반 작업(job) 수 */
-static unsigned int nr_thread = 0;    /* pthread 기반 작업(job) 수 */
+/* [한국어] ===== 전역 변수들 - 스레드 동기화 및 상태 관리 =====
+ *
+ * 이 파일의 static/전역은 대부분 run_threads()와 thread_main() 간의
+ * 동기화를 위한 것이다. use_thread=0(fork) 모드에서는 fio_backend가
+ * 호출되기 전(parse_options에서) smalloc 으로 thread_data 배열을 공유
+ * 메모리에 생성해두므로, fork 된 자식 프로세스도 동일 변수를 본다.
+ * extern 으로 선언된 thread_number/groupid 는 init.c 가 옵션 파싱 중에 세팅. */
+
+static struct fio_sem *startup_sem;
+/* [한국어] 모든 잡 스레드가 초기화 완료를 신호하는 공용 세마포어.
+ * 설정자: fio_backend()가 fio_sem_init(FIO_SEM_LOCKED)로 생성.
+ * 읽는 자: run_threads()가 fio_sem_down_timeout(startup_sem, 10000)으로 대기;
+ *          thread_main()이 초기화 후 fio_sem_up(startup_sem)으로 알림.
+ * 값 범위: LOCKED(0) ↔ UNLOCKED. 여러 잡이 순차 up 하므로 값>0 가능.
+ * 동기화: 공유 메모리(smalloc)에 상주, fork 자식도 동일 세마포어를 만짐.
+ * 생명주기: fio_backend() 선두에서 alloc, 후미 fio_sem_remove 로 해제. */
+
+static struct flist_head *cgroup_list;
+/* [한국어] 생성된 cgroup 엔트리 연결 리스트 헤드.
+ * 설정자: fio_backend()가 smalloc 으로 할당 후 INIT_FLIST_HEAD.
+ * 읽는 자: cgroup_setup()이 엔트리 추가, cgroup_kill()이 일괄 정리.
+ * 값 범위: NULL(smalloc 실패 시) 또는 유효 flist_head.
+ * 동기화: 리스트 조작은 cgroup 모듈 내부 뮤텍스로 보호. */
+
+static struct cgroup_mnt *cgroup_mnt;
+/* [한국어] cgroup 파일시스템 마운트 지점 정보 (예: /sys/fs/cgroup/blkio).
+ * 설정자: 첫 cgroup_setup 호출 시 실제 마운트 지점을 탐지해 저장.
+ * 읽는 자: 이후 cgroup_setup/cgroup_shutdown 호출이 재사용.
+ * 값 범위: NULL(아직 탐지 전) 또는 {path, ver, ...} 구조체. */
+
+static int exit_value;
+/* [한국어] fio 프로세스 최종 종료 코드(main() 의 반환값으로 흘러감).
+ * 설정자: sig_int()가 SIGINT 시 128 설정; 각 잡의 td->error 가 있으면
+ *          reap_threads()가 ++exit_value; setup_files 실패 시에도 ++.
+ * 읽는 자: fio_backend 리턴 시 이 값을 그대로 반환.
+ * 값 범위: 0(성공) / 128(시그널) / 1+N(실패 잡 수 누적).
+ * 동기화: reap_threads 는 메인 스레드에서만 접근하므로 락 불필요. */
+
+static volatile bool fio_abort;
+/* [한국어] 심각한 에러 시 통계 출력을 건너뛰도록 지시하는 플래그.
+ * 설정자: run_threads()에서 startup_sem 타임아웃(10초) 또는 잡 시작 실패 시 true.
+ * 읽는 자: fio_backend 후반에서 !fio_abort 인 경우에만 __show_run_stats 호출.
+ * 값 범위: false(정상) / true(중단). volatile 인 이유는 시그널 핸들러가 읽을 수도 있기 때문. */
+
+static unsigned int nr_process = 0;
+/* [한국어] fork 기반으로 생성할 잡의 개수(use_thread=0 이 지정된 잡의 합).
+ * 설정자: run_threads() 초반 for_each_td 루프에서 td->o.use_thread==0 카운트.
+ * 읽는 자: "Starting N processes" 시작 메시지 출력에만 사용. */
+
+static unsigned int nr_thread = 0;
+/* [한국어] pthread 기반으로 생성할 잡의 개수(use_thread=1 이 지정된 잡의 합).
+ * 설정자: run_threads() 초반 for_each_td 루프에서 td->o.use_thread==1 카운트.
+ * 읽는 자: "Starting N threads" 시작 메시지 출력. */
 
 /* [한국어] 집계된 I/O 로그 (읽기/쓰기/트림 방향별) */
 struct io_log *agg_io_log[DDIR_RWDIR_CNT];
+/* [한국어] write_bw_log 옵션 시 모든 잡의 BW/IOPS/lat 샘플을 합쳐 저장.
+ * 설정자: fio_backend()가 write_bw_log 지정 시 setup_log()로 3개(R/W/T) 생성.
+ * 읽는 자: 잡 스레드들이 add_agg_sample()로 기록, 종료 시 flush_log/free_log.
+ * 인덱스: DDIR_READ=0, DDIR_WRITE=1, DDIR_TRIM=2 (DDIR_RWDIR_CNT=3).
+ * 동기화: smalloc 공유 메모리 + 내부 뮤텍스로 잡 간 동시 append 안전. */
 
-/* [한국어] 전역 상태 변수들 */
-int groupid = 0;                /* 현재 그룹 ID */
-unsigned int thread_number = 0; /* 전체 스레드(작업) 수 */
-unsigned int nr_segments = 0;   /* 세그먼트 수 */
-unsigned int cur_segment = 0;   /* 현재 세그먼트 인덱스 */
-unsigned int stat_number = 0;   /* 통계 번호 */
-int temp_stall_ts;              /* 일시 정지 타임스탬프 */
-unsigned long done_secs = 0;    /* 완료된 작업의 총 실행 시간(초) */
+/* [한국어] 전역 상태 변수들 — 이 파일 바깥(init.c, stat.c 등)에서도 참조됨 */
+int groupid = 0;
+/* [한국어] 현재 잡에 할당할 그룹 ID. stonewall 또는 new_group 옵션을 만나면 ++.
+ * 설정자: init.c 의 add_job/parse_jobs 가 옵션 해석 중 증가.
+ * 읽는 자: 통계 출력(group reporting), reap_threads의 rate 합산. */
 
-/* [한국어] 오버랩 체크용 뮤텍스 - 오프로드 모드에서 io_u 영역 겹침 검사 시 사용 */
+unsigned int thread_number = 0;
+/* [한국어] 전체 잡 수 (use_thread 와 fork 모두 포함). thread_data 배열의 유효 길이.
+ * 설정자: init.c 의 add_job 이 parse 중 ++. parse_options 완료 시 최종값.
+ * 읽는 자: fio_backend/run_threads가 todo 초기값, for_each_td 순회 상한으로 사용.
+ * 값 범위: 0(잡 없음) ~ REAL_MAX_JOBS. 0 이면 fio_backend 즉시 반환. */
+
+unsigned int nr_segments = 0;
+/* [한국어] 전체 thread_data 세그먼트 수(대용량 서버 모드에서 배열을 여러 블록으로 나눔).
+ * 설정자: init.c 의 fio_init_options 가 smalloc 블록마다 ++.
+ * 읽는 자: sig_int 는 nr_segments>0 인지만 확인(잡 파싱이 끝났는지 판단). */
+
+unsigned int cur_segment = 0;
+/* [한국어] 현재 기록 중인 세그먼트의 인덱스. 잡 추가 중 증가. */
+
+unsigned int stat_number = 0;
+/* [한국어] 통계 그룹 번호 — 여러 fio 실행이 합쳐질 때(예: 서버가 누적) 구분자. */
+
+int temp_stall_ts;
+/* [한국어] 출력 일시 정지 플래그 (print_status_init/process 가 사용).
+ * true 이면 주기적 상태 라인 출력을 일시 억제(verbose 요청 직후 등). */
+
+unsigned long done_secs = 0;
+/* [한국어] 지금까지 완료된 잡들의 실행 시간 합계(초). reap_threads가 각 잡 회수 시
+ *          mtime_since_now(&td->epoch)/1000 을 더해 누적. 통계 라인 ETA 계산에 사용. */
+
+/* [한국어] 오버랩 체크용 뮤텍스 - 오프로드 모드에서 잡 간 io_u 영역 겹침 검사 시 사용.
+ * 설정자: 정적 초기화자(에러체크 가능 시 NP 버전, 아니면 표준).
+ * 읽는 자: thread_main()이 td_offload_overlap(td) 시 cleanup 직전 lock/unlock
+ *          하여 다른 잡이 우리 io_u 를 in_flight_overlap 검사 중에 정리하지 않게 함.
+ * 값 범위: PTHREAD_MUTEX_INITIALIZER로 초기화된 프로세스 공유 아닌 mutex.
+ * 동기화: 동일 프로세스 내 스레드 간에서만 유의미(fork 자식 공유 X). */
 #ifdef PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
 pthread_mutex_t overlap_check = PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP;
+/* [한국어] glibc 비표준 확장: 재귀 lock 등 에러를 즉시 EDEADLK 로 반환 — 디버깅 용이. */
 #else
 pthread_mutex_t overlap_check = PTHREAD_MUTEX_INITIALIZER;
+/* [한국어] POSIX 표준 폴백: 에러 체크 없음. 동일 스레드 재진입 시 UB. */
 #endif
 
 extern char *write_bw_log_name;
+/* [한국어] --write_bw_log=<name> 옵션에 지정된 로그 파일명 접두사.
+ * 정의 위치: init.c. 사용 위치: fio_backend의 agg_io_log 파일명 구성
+ *            (<name>-read_bw.log / -write_bw.log / -trim_bw.log). */
 
-/* [한국어] 작업 시작 대기 타임아웃: 5초 (밀리초 단위) */
+/* [한국어] 작업 시작 대기 타임아웃: 5초 (밀리초 단위).
+ * 의미: run_threads가 한 배치의 잡들이 TD_INITIALIZED 로 올라올 때까지 기다리는 시간.
+ *       초과 시 해당 배치의 잡에 SIGTERM 을 보내 실패 처리. */
 #define JOB_START_TIMEOUT	(5 * 1000)
 
 /*
- * [한국어] sig_int - SIGINT/SIGTERM 시그널 핸들러
+ * [한국어]
+ * sig_int - SIGINT(Ctrl+C) 및 SIGTERM(kill), 백엔드 모드에서는 SIGPIPE 까지 처리
  *
- * @sig: 수신된 시그널 번호
+ * @sig: 수신된 시그널 번호 (SIGINT/SIGTERM/SIGPIPE).
+ * @return: 없음 (시그널 핸들러).
  *
- * 역할: 사용자가 Ctrl+C를 누르거나 SIGTERM을 받으면 모든 스레드를 종료시킨다.
- *       nr_segments가 0보다 큰 경우에만 동작한다.
+ * 왜 필요한가: 사용자가 실행 중 종료하고 싶을 때, 진행 중인 I/O 를 우아하게
+ *   중단하면서도 지금까지의 통계를 잃지 않고 보여주기 위해 필요하다. 그냥
+ *   프로세스가 SIGINT 로 죽으면 커널이 열린 파일만 닫을 뿐, fio 의 통계/로그
+ *   flush/엔진 cleanup 은 건너뛰게 되어 사용자는 결과를 보지 못한다.
+ *
+ * 동작: nr_segments>0 (즉, 잡 파싱이 끝나 thread_data 가 유효한 상태) 에만
+ *   동작한다. 파싱 도중 SIGINT 이면 호출되어도 아무 일 하지 않고 main() 이
+ *   정상 경로로 0 종료한다(백엔드 기본 exit_value=0 유지).
+ *   1) 백엔드(서버) 모드: fio_server_got_signal() 으로 네트워크 피어에게 알림.
+ *      서버가 TCP 로 연결된 클라이언트에 "종료 중" 을 전달.
+ *   2) 로컬 모드: 표준 에러(실제로는 log_info=stdout) 에 이유 출력, 버퍼
+ *      플러시, exit_value=128(POSIX 관례: 128+SIGNUM 근접)을 지정.
+ *   3) fio_terminate_threads(TERMINATE_ALL, TERMINATE_ALL) 로 모든 잡의
+ *      td->terminate 플래그를 세움(공유 메모리). 각 잡 스레드는 I/O 루프의
+ *      매 반복에서 이 플래그를 체크하여 탈출한다.
+ *
+ * 실행 컨텍스트: 메인 스레드가 등록한 시그널 핸들러지만, 리눅스에서는 임의
+ *   스레드가 받을 수 있다. async-signal-safe 하지 않은 함수(log_info 등)를
+ *   호출한다 — 엄격하게는 위험하지만 fio 는 "종료 수순을 돕는" 용도로 용인.
+ *
+ * 호출 체인:
+ *   사용자 Ctrl+C / kill <pid> → 커널 → sigaction 등록된 sig_int →
+ *     [서버?] fio_server_got_signal() [server.c]
+ *     [로컬?] log_info/log_info_flush
+ *     공통: fio_terminate_threads() → 각 td->terminate=1 세팅
+ *       → do_io()/do_verify() 루프가 다음 반복에서 break
  */
 static void sig_int(int sig)
 {
+	/* [한국어] 잡이 아직 파싱되지 않은 극초반 시그널은 무시. */
 	if (nr_segments) {
-		/* 백엔드(서버) 모드인 경우 서버에 시그널 전달 */
+		/* [한국어] 백엔드(서버) 모드: 연결된 클라이언트에게 시그널 수신을 알림.
+		 * fio_server_got_signal 은 서버 측 pipe/socket에 특정 바이트를 보내
+		 * 이벤트 루프를 깨운다. */
 		if (is_backend)
 			fio_server_got_signal(sig);
 		else {
-			/* 로컬 모드: 종료 메시지 출력 */
+			/* [한국어] 로컬 모드: stderr 성 출력(log_info 는 stdout 이지만
+			 * 잡 완료 전 종료는 예외 상황으로 명시). */
 			log_info("\nfio: terminating on signal %d\n", sig);
+			/* [한국어] 출력 버퍼를 강제로 내보냄 — 비정상 종료로 버퍼가
+			 * 유실되는 것을 방지. */
 			log_info_flush();
+			/* [한국어] exit 코드 128 — POSIX 관례상 "시그널에 의한 종료" 를
+			 * 의미. 쉘 $? 로 확인 가능. */
 			exit_value = 128;
 		}
 
-		/* 모든 스레드에 종료 신호 전달 */
+		/* [한국어] 모든 잡 스레드에 종료 전파: TERMINATE_ALL 은 그룹/잡을
+		 * 특정하지 않고 전체 thread_data[]의 td->terminate 를 세팅.
+		 * 각 잡은 do_io/do_verify 루프에서 이를 체크해 빠져나와 cleanup 수행. */
 		fio_terminate_threads(TERMINATE_ALL, TERMINATE_ALL);
 	}
 }
 
 #ifdef WIN32
 /*
- * [한국어] sig_break - Windows SIGBREAK 시그널 핸들러
+ * [한국어]
+ * sig_break - Windows SIGBREAK(Ctrl+Break 또는 console close) 핸들러
  *
- * @sig: 수신된 시그널 번호
+ * @sig: 수신된 시그널 번호 (SIGBREAK).
+ * @return: 없음.
  *
- * 역할: Windows에서는 SIGBREAK 후 핸들러 리턴 시 모든 자식 프로세스가
- *       즉시 종료되므로, 각 스레드가 통계를 출력하고 정상 종료할 시간을 준다.
+ * 왜 필요한가: Windows 런타임은 SIGBREAK 핸들러가 리턴하는 "즉시" 모든 자식
+ *   프로세스를 강제 종료해 버린다(POSIX 의 SIGHUP 수준 강제성). 따라서
+ *   sig_int 만 호출하고 리턴하면 잡 스레드들이 cleanup 을 마치기도 전에
+ *   사라져 통계/로그가 소실된다. 이를 방지하기 위해 이 핸들러는 모든 잡이
+ *   TD_EXITED 상태가 될 때까지 1초 폴링으로 기다린 후에야 리턴한다.
+ *
+ * 동작:
+ *   1) sig_int(sig) 호출 — 공통 로직: 종료 메시지, terminate 플래그 전파.
+ *   2) for_each_td 로 모든 잡을 순회하며 td->runstate >= TD_EXITED 가
+ *      될 때까지 sleep(1) 반복.
+ *
+ * 호출 체인: Windows 콘솔 close / Ctrl+Break → sig_break → sig_int →
+ *   fio_terminate_threads → (polling) → return → Windows 가 프로세스 종료.
+ *
+ * 플랫폼: #ifdef WIN32 로 감싸져 Linux 빌드에서는 컴파일되지 않음.
  */
 static void sig_break(int sig)
 {
-	sig_int(sig);
+	sig_int(sig);  /* [한국어] 공통 종료 처리 수행 */
 
 	/**
 	 * Windows terminates all job processes on SIGBREAK after the handler
 	 * returns, so give them time to wrap-up and give stats
 	 */
-	/* [한국어] 모든 스레드가 TD_EXITED 상태가 될 때까지 대기 */
+	/* [한국어] 핸들러 리턴 전에 모든 잡이 자체 정리를 마칠 때까지 폴링.
+	 * sleep(1) 은 1초 단위라 잡 수가 많거나 flush 가 느리면 전체 대기가
+	 * 길어질 수 있으나, 사용자 눈에는 Ctrl+Break 후 잠깐 멈췄다가 정상 종료. */
 	for_each_td(td) {
 		while (td->runstate < TD_EXITED)
 			sleep(1);
@@ -172,35 +467,67 @@ static void sig_break(int sig)
 #endif
 
 /*
- * [한국어] sig_show_status - SIGUSR1 시그널 핸들러
+ * [한국어]
+ * sig_show_status - SIGUSR1 핸들러 (실시간 통계 덤프 트리거)
  *
- * @sig: 수신된 시그널 번호
+ * @sig: 수신된 시그널 번호(실제로는 미사용 — 핸들러 시그니처 호환용).
+ * @return: 없음.
  *
- * 역할: 실행 중인 작업의 현재 통계를 화면에 출력한다.
- *       kill -USR1 <pid>로 트리거할 수 있다.
+ * 왜 필요한가: 장시간 실행 중에 "현재까지의 BW/IOPS" 를 보고 싶을 때
+ *   Ctrl+C 로 중단하지 않고도 kill -USR1 <pid> 로 즉시 상태를 덤프받기
+ *   위함. show_running_run_stats()는 현재 thread_data[] 를 스냅샷해 출력.
+ *
+ * 호출 체인: kill -USR1 → 커널 → 메인 스레드 인터럽트 → sig_show_status →
+ *   show_running_run_stats [stat.c] → log_info 로 BW/IOPS 라인 덤프.
+ *
+ * 주의: show_running_run_stats 내부에서 뮤텍스를 잡을 수 있어 strictly
+ *   async-signal-safe 하지 않으나, 실용적 관점에서 허용.
  */
 void sig_show_status(int sig)
 {
-	show_running_run_stats();
+	show_running_run_stats();  /* [한국어] stat.c 로 위임 — 모든 잡 스냅샷 후 출력 */
 }
 
 /*
- * [한국어] set_sig_handlers - 시그널 핸들러 등록
+ * [한국어]
+ * set_sig_handlers - 시그널 핸들러 일괄 등록
  *
- * 역할: SIGINT, SIGTERM, SIGUSR1 등 시그널 핸들러를 설정한다.
- *       백엔드 모드에서는 SIGPIPE도 처리한다.
+ * @return: 없음.
+ *
+ * 왜 필요한가: fio 는 I/O 를 수행하는 긴 실행 프로세스이므로 사용자 제어
+ *   (Ctrl+C, kill), 상태 조회(USR1), 그리고 서버 모드의 broken pipe (SIGPIPE)
+ *   에 대응해야 한다. 이 함수는 run_threads() 선두에서 한 번만 호출되어
+ *   모든 시그널을 sigaction(2) 으로 등록한다.
+ *
+ * 동작: struct sigaction act 를 재사용하며(재설정 전 memset 필수), 각
+ *   시그널마다 다음을 지정:
+ *     - sa_handler : 호출될 함수 포인터
+ *     - sa_flags=SA_RESTART : 시그널 수신으로 인터럽트된 "재시작 가능" 시스템
+ *       콜(예: read/write/nanosleep)을 커널이 자동 재시도하게 함. 없으면
+ *       do_io 루프의 syscall 이 EINTR 로 빠져 에러로 오해될 수 있음.
+ *
+ * 등록 목록:
+ *   SIGINT   → sig_int          (Ctrl+C)
+ *   SIGTERM  → sig_int          (kill)
+ *   SIGBREAK → sig_break        (Windows 전용)
+ *   SIGUSR1  → sig_show_status  (kill -USR1)
+ *   SIGPIPE  → sig_int          (is_backend 일 때만. 서버 소켓 상대측이
+ *              끊기면 write 가 SIGPIPE 를 유발 — 기본 행동은 프로세스
+ *              종료이지만, 우리는 우아하게 잡을 정리하고 exit 하고 싶음.)
+ *
+ * 호출 체인: run_threads() 초반 → set_sig_handlers().
  */
 static void set_sig_handlers(void)
 {
 	struct sigaction act;
 
-	/* SIGINT (Ctrl+C) 핸들러 설정 */
-	memset(&act, 0, sizeof(act));
+	/* [한국어] ---- SIGINT (Ctrl+C) ---- */
+	memset(&act, 0, sizeof(act));  /* [한국어] sa_mask 등 모든 필드 0 클리어 */
 	act.sa_handler = sig_int;
-	act.sa_flags = SA_RESTART;  /* 시스템 콜이 시그널에 의해 중단되지 않도록 재시작 */
-	sigaction(SIGINT, &act, NULL);
+	act.sa_flags = SA_RESTART;     /* [한국어] 인터럽트된 syscall 자동 재시작 */
+	sigaction(SIGINT, &act, NULL); /* [한국어] NULL=oldact 저장 안 함 */
 
-	/* SIGTERM (종료 요청) 핸들러 설정 */
+	/* [한국어] ---- SIGTERM (kill 기본 시그널) ---- */
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = sig_int;
 	act.sa_flags = SA_RESTART;
@@ -208,20 +535,23 @@ static void set_sig_handlers(void)
 
 /* Windows uses SIGBREAK as a quit signal from other applications */
 #ifdef WIN32
-	/* [한국어] Windows 전용: SIGBREAK 핸들러 설정 */
+	/* [한국어] ---- Windows SIGBREAK ----
+	 * Ctrl+Break 또는 cmd 창 닫기에 의해 발생. 핸들러가 완료 대기를 수행. */
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = sig_break;
 	act.sa_flags = SA_RESTART;
 	sigaction(SIGBREAK, &act, NULL);
 #endif
 
-	/* SIGUSR1: 실행 중 통계 출력 트리거 */
+	/* [한국어] ---- SIGUSR1: 실행 중 통계 덤프 ---- */
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = sig_show_status;
 	act.sa_flags = SA_RESTART;
 	sigaction(SIGUSR1, &act, NULL);
 
-	/* 백엔드(서버) 모드에서는 SIGPIPE를 무시하지 않고 종료 처리 */
+	/* [한국어] ---- 서버 모드: SIGPIPE ----
+	 * 기본 동작은 프로세스 강제 종료이지만, fio 서버는 클라이언트 연결이
+	 * 끊겼을 때도 이미 시작된 로컬 잡들을 우아하게 마무리해야 한다. */
 	if (is_backend) {
 		memset(&act, 0, sizeof(act));
 		act.sa_handler = sig_int;
@@ -234,17 +564,35 @@ static void set_sig_handlers(void)
  * Check if we are above the minimum rate given.
  */
 /*
- * [한국어] __check_min_rate - 특정 방향(ddir)의 최소 속도 충족 여부 검사
+ * [한국어]
+ * __check_min_rate - 단일 방향(ddir)의 최소 처리량 조건 검사
  *
- * @td:   스레드 데이터 구조체
- * @now:  현재 시각
- * @ddir: I/O 방향 (READ, WRITE, TRIM)
+ * @td:     잡의 thread_data. ratemin/rate_iops_min/ratecycle 옵션 참조,
+ *          this_io_bytes/this_io_blocks 통계와 last_rate_check_* 상태 갱신.
+ * @now:    현재 시각(fio_gettime 으로 채운 timespec).
+ * @ddir:   READ/WRITE/TRIM 중 하나. assert(ddir_rw(ddir)) — SYNC 류 금지.
+ * @return: true=미달(에러로 처리) / false=정상 또는 검사 불필요.
  *
- * 반환값: true = 최소 속도 미달 (에러), false = 정상
+ * 왜 필요한가: 최소 성능 SLA 가 있는 벤치마크(예: "쓰기 50MB/s 이상 유지")
+ *   에서 fio 가 조건 위반 시 즉시 중단하도록. 일시적 지연은 ratecycle (기본
+ *   1초) 주기로 평균화.
  *
- * 역할: ratemin 또는 rate_iops_min 옵션이 설정된 경우,
- *       ratecycle 주기마다 실제 처리량을 확인하여 최소 속도에 미달하면 true를 반환한다.
- *       시작 후 2초간은 안정화 기간으로 검사를 건너뛴다.
+ * 동작:
+ *   1) ratemin/rate_iops_min 둘 다 0 이면 검사 OFF → false.
+ *   2) 시작(td->start) 후 2초 미만이면 워밍업 — 검사 생략 → false.
+ *   3) last_rate_check_* 가 세팅되어 있으면(두 번째 이상 검사):
+ *      경과시간 spent=mtime_since(last, now). spent<ratecycle 이면 false.
+ *      - ratemin 모드: current_rate_bytes=(delta_bytes*1000)/spent.
+ *        < option_rate_bytes_min 이면 log_err + true.
+ *      - rate_iops_min 모드: delta_blocks*1000/spent 로 IOPS 계산 후 비교.
+ *   4) 스냅샷 갱신: last_rate_check_bytes/blocks/time ← 현재값, false 반환.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io 루프 후반 check_min_rate 에서 한 방향씩 호출.
+ *
+ * 호출 체인: do_io() → check_min_rate() → __check_min_rate().
+ *
+ * 에러 경로: 미달 판정 시 상위 check_min_rate 가 td_verror(EIO, "check_min_rate")
+ *   를 호출해 루프를 종료시킴. exitall_on_terminate 면 fio_terminate_threads 도.
  */
 static bool __check_min_rate(struct thread_data *td, struct timespec *now,
 			     enum fio_ddir ddir)
@@ -319,14 +667,18 @@ static bool __check_min_rate(struct thread_data *td, struct timespec *now,
 }
 
 /*
- * [한국어] check_min_rate - 모든 I/O 방향의 최소 속도 검사
+ * [한국어]
+ * check_min_rate - 모든 활성 방향에 대해 __check_min_rate 일괄 검사
  *
- * @td:  스레드 데이터
- * @now: 현재 시각
+ * @td:  잡의 thread_data.
+ * @now: 현재 시각.
+ * @return: true=하나라도 미달(루프 종료 필요) / false=모두 정상.
  *
- * 반환값: true = 하나라도 최소 속도 미달, false = 모두 정상
+ * 왜 필요한가: 잡은 read+write 혼합이 가능하며 각 방향별로 ratemin 이 다를
+ *   수 있다. 이 함수가 for_each_rw_ddir 로 모든 방향을 검사하여 전체 SLA 판정.
  *
- * 역할: READ, WRITE, TRIM 각 방향에 대해 __check_min_rate()를 호출한다.
+ * 동작: bytes_done[ddir]>0 인 방향만 __check_min_rate 수행(아직 I/O 없는
+ *   방향은 체크 불가). OR 로 누적.
  */
 static bool check_min_rate(struct thread_data *td, struct timespec *now)
 {
@@ -346,17 +698,36 @@ static bool check_min_rate(struct thread_data *td, struct timespec *now)
  * io path, just does everything sync.
  */
 /*
- * [한국어] fio_io_sync - 파일의 동기화(sync) I/O를 수행하는 헬퍼 함수
+ * [한국어]
+ * fio_io_sync - 엔진에 DDIR_SYNC/DDIR_SYNCFS 를 동기(blocking) 발행
  *
- * @td:   스레드 데이터
- * @f:    대상 파일
- * @ddir: 동기화 방향 (DDIR_SYNC 또는 DDIR_SYNCFS)
+ * @td:    잡의 thread_data.
+ * @f:     동기화 대상 파일(열려 있어야 함. 호출자가 보장).
+ * @ddir:  DDIR_SYNC (파일 fsync) 또는 DDIR_SYNCFS (파일시스템 syncfs).
+ * @return: true=에러(io_u 할당 실패 / prep 실패 / queue 에러 / 완료 에러),
+ *          false=성공.
  *
- * 반환값: true = 에러 발생, false = 성공
+ * 왜 필요한가: end_fsync/fsync_on_close/do_verify 등에서 "직전까지의 쓰기를
+ *   디스크에 확실히 내리는" 작업이 필요하다. 이를 엔진의 정식 queue 경로로
+ *   수행하면 엔진 특화 sync 구현(예: io_uring 의 IORING_OP_FSYNC, libaio 의
+ *   sync 폴백)이 그대로 사용되고 통계/로그도 일관되게 기록된다.
  *
- * 역할: 일반 I/O 경로와 동일한 방식으로 동기화를 수행한다.
- *       io_u를 할당 -> prep -> queue -> 완료 대기 순서로 진행한다.
- *       이 함수는 do_io() 루프 종료 후 end_fsync에서 호출된다.
+ * 동작:
+ *   1) __get_io_u 로 freelist 에서 io_u 하나 할당.
+ *   2) io_u->ddir=ddir, io_u->file=f, IO_U_F_NO_FILE_PUT (f 의 참조 카운트
+ *      을 이 io_u 가 해제하지 않도록) 설정.
+ *   3) td_io_prep → 실패 시 put_io_u + true.
+ *   4) requeue 레이블에서 td_io_queue.
+ *      - FIO_Q_QUEUED: td_io_commit + io_u_queued_complete(1).
+ *      - FIO_Q_COMPLETED: io_u->error 검사 후 io_u_sync_complete.
+ *      - FIO_Q_BUSY: commit 후 goto requeue (엔진이 수락할 때까지).
+ *
+ * 실행 컨텍스트: 잡 스레드. do_verify/do_io(end_fsync) 로부터 동기 호출 —
+ *   완료 전까지 리턴하지 않음.
+ *
+ * 호출 체인:
+ *   fio_file_fsync / do_io(end_fsync) / fio_syncfs / do_verify
+ *     → fio_io_sync(td, f, ddir) → td_io_queue → 엔진 .queue (DDIR_SYNC 경로).
  */
 static bool fio_io_sync(struct thread_data *td, struct fio_file *f,
 			enum fio_ddir ddir)
@@ -410,14 +781,27 @@ requeue:
 }
 
 /*
- * [한국어] fio_file_fsync - 특정 파일에 대해 fsync를 수행
+ * [한국어]
+ * fio_file_fsync - 개별 파일에 DDIR_SYNC 수행(열기/닫기까지 책임)
  *
- * @td: 스레드 데이터
- * @f:  대상 파일
+ * @td: 잡의 thread_data.
+ * @f:  대상 파일. 열려 있지 않아도 됨.
+ * @return: 0=성공, 1=실패(열기/sync/닫기 중 하나라도 실패).
  *
- * 반환값: 0 = 성공, 1 = 실패
+ * 왜 필요한가: do_io 의 end_fsync 경로에서 모든 파일을 순회하며 fsync 하려
+ *   할 때, 어떤 파일은 닫혀 있을 수 있다(예: open/close 가 io_u 단위로 반복).
+ *   이 함수는 상태에 관계없이 "열고, sync 하고, 닫는" 삼단계를 보장.
  *
- * 역할: 파일이 열려 있으면 바로 sync, 아니면 열고 sync 후 닫는다.
+ * 동작: fio_file_open(f) 이면 바로 fio_io_sync(td, f, DDIR_SYNC). 아니면
+ *   td_io_open_file → fio_io_sync → td_io_close_file 순. ret, ret2 로 두
+ *   에러를 결합해 반환.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io 의 end_fsync 루프, do_verify 의 pre-sync 루프.
+ *
+ * 호출 체인: do_io()/do_verify() → for_each_file → fio_file_fsync
+ *   → td_io_open_file/fio_io_sync/td_io_close_file.
+ *
+ * 에러 경로: open 실패 → 즉시 1 반환. sync 또는 close 실패 → 각 ret 비트합.
  */
 static int fio_file_fsync(struct thread_data *td, struct fio_file *f)
 {
@@ -441,14 +825,27 @@ static int fio_file_fsync(struct thread_data *td, struct fio_file *f)
 }
 
 /*
- * [한국어] fio_syncfs - 파일 시스템 전체를 동기화 (syncfs)
+ * [한국어]
+ * fio_syncfs - 잡이 접근한 모든 파일시스템에 syncfs(2) 발행
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data. td->fs_list (struct fio_mount 리스트) 를 순회.
+ * @return: 0=성공 / -1=일부 실패(하지만 루프 계속) / -ENOSYS=CONFIG_SYNCFS
+ *          미지원 플랫폼(예: Windows/Solaris 일부).
  *
- * 반환값: 0 = 성공, 음수 = 에러
+ * 왜 필요한가: end_syncfs 옵션 사용 시 개별 파일 fsync 가 아닌 파일시스템
+ *   전체 메타+데이터를 한 번에 디스크에 내리고 싶을 때. 수많은 파일에 대한
+ *   fsync 를 반복하는 것보다 빠를 수 있다.
  *
- * 역할: td->fs_list에 등록된 모든 파일 시스템 마운트 포인트에 대해
- *       syncfs를 호출하여 전체 파일 시스템 버퍼를 디스크에 플러시한다.
+ * 동작: td->fs_list 순회 — 각 fio_mount 에 대해 fio_open_fs → fio_io_sync
+ *   (DDIR_SYNCFS) → fio_close_fs. 내부적으로 엔진의 queue 콜백이
+ *   DDIR_SYNCFS 를 받아 syncfs(2) 시스템콜을 실행.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io end_fsync 경로.
+ *
+ * 호출 체인: do_io(end_syncfs) → fio_syncfs → fio_open_fs + fio_io_sync +
+ *   fio_close_fs. 내부: td_io_queue → 엔진 .queue 에서 syncfs(2).
+ *
+ * 에러 경로: 중간 실패 시 err=-1 설정 후 continue — 나머지 FS 도 시도.
  */
 static int fio_syncfs(struct thread_data *td)
 {
@@ -489,12 +886,22 @@ static int fio_syncfs(struct thread_data *td)
 }
 
 /*
- * [한국어] __update_ts_cache - 타임스탬프 캐시를 현재 시각으로 갱신
+ * [한국어]
+ * __update_ts_cache - td->ts_cache 를 무조건 현재 시각으로 갱신
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: 없음.
  *
- * 역할: fio_gettime()으로 현재 시각을 가져와 td->ts_cache에 저장한다.
- *       매번 시스템 콜을 호출하면 느리므로, 캐시를 사용하여 주기적으로만 갱신한다.
+ * 왜 필요한가: do_io 루프의 각 반복에서 fio_gettime(clock_gettime/rdtsc) 을
+ *   직접 호출하면 고 IOPS 워크로드에서 무시할 수 없는 오버헤드가 된다.
+ *   대신 반복마다 update_ts_cache(마스크 기반) 로 "가끔" 갱신하고,
+ *   정확성이 필요한 경로(runtime_exceeded 재확인 등)에서 이 __ 접두 버전을
+ *   강제 호출해 즉시 갱신한다.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io/do_verify 의 시간 검사 지점.
+ *
+ * 호출 체인: do_io/do_verify → update_ts_cache(마스크 합격 시) / 또는
+ *   runtime_exceeded 분기에서 __update_ts_cache 직접.
  */
 static inline void __update_ts_cache(struct thread_data *td)
 {
@@ -502,12 +909,16 @@ static inline void __update_ts_cache(struct thread_data *td)
 }
 
 /*
- * [한국어] update_ts_cache - 주기적으로 타임스탬프 캐시를 갱신
+ * [한국어]
+ * update_ts_cache - ts_cache_mask 주기로 가벼운 시각 갱신
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data. ts_cache_nr(카운터) 증가, ts_cache_mask 로 샘플링.
  *
- * 역할: ts_cache_mask에 따라 N번째 호출마다 실제 시각을 갱신한다.
- *       매 I/O마다 시스템 콜을 호출하는 오버헤드를 줄이기 위한 최적화이다.
+ * 왜 필요한가: 위 __update_ts_cache 의 주석 참조. 매 I/O 의 fio_gettime 오버헤드
+ *   를 피하기 위해 "약 N 회에 1 번" 만 실제 시각을 갱신한다.
+ *
+ * 동작: ++ts_cache_nr & mask == mask 일 때만 __update_ts_cache 호출.
+ *   mask 는 2^k - 1 형태의 비트마스크로 샘플링 주기 N=2^k.
  */
 static inline void update_ts_cache(struct thread_data *td)
 {
@@ -516,15 +927,18 @@ static inline void update_ts_cache(struct thread_data *td)
 }
 
 /*
- * [한국어] runtime_exceeded - 실행 시간 제한 초과 여부 확인
+ * [한국어]
+ * runtime_exceeded - runtime 옵션 경과 여부 판정
  *
- * @td: 스레드 데이터
- * @t:  현재 시각
+ * @td: 잡의 thread_data. in_ramp_period / o.timeout / epoch 참조.
+ * @t:  비교용 시각(ts_cache 또는 실제 fio_gettime 값).
+ * @return: true=timeout 초과 / false=램프 구간이거나 아직 남음.
  *
- * 반환값: true = 시간 초과, false = 아직 시간 남음
+ * 왜 필요한가: time_based / runtime 옵션 지원. 주의: ramp_time(워밍업) 동안은
+ *   무조건 false 를 반환해 실제 측정 이전에는 루프가 끝나지 않도록 한다.
+ *   에폭(td->epoch)은 set_epoch_time 에서 설정되며 workload 시작점.
  *
- * 역할: timeout 옵션이 설정된 경우, epoch(시작 시각)부터 경과 시간이
- *       timeout을 초과했는지 확인한다. ramp 구간에서는 항상 false를 반환한다.
+ * 실행 컨텍스트: 잡 스레드 do_io/do_verify 매 반복.
  */
 static inline bool runtime_exceeded(struct thread_data *td, struct timespec *t)
 {
@@ -547,15 +961,25 @@ static inline bool runtime_exceeded(struct thread_data *td, struct timespec *t)
  * updates.
  */
 /*
- * [한국어] update_runtime - 런타임 통계를 갱신
+ * [한국어]
+ * update_runtime - 방향별 누적 런타임을 μs 단위로 추적해 ms 로 보고
  *
- * @td:         스레드 데이터
- * @elapsed_us: 방향별 누적 경과 시간(마이크로초) 배열
- * @ddir:       I/O 방향
+ * @td:         잡의 thread_data. ts.runtime[ddir] (ms) 갱신.
+ * @elapsed_us: [in/out] 호출자 로컬 배열. 이전 μs 값을 기억해두고 델타 계산.
+ * @ddir:       READ/WRITE/TRIM.
  *
- * 역할: 밀리초 단위의 런타임 통계를 정확하게 유지하기 위해,
- *       마이크로초 단위의 누적 경과 시간을 추적하여 밀리초로 변환한다.
- *       verify_only 모드에서 쓰기 방향은 갱신하지 않는다.
+ * 왜 필요한가: ts.runtime 은 최종 통계 라인에서 ms 로 표기되지만, 잡이 매우
+ *   짧으면 ms 해상도로는 부정확하다. 내부 추적은 μs 해상도로 유지하고,
+ *   ms 로 변환할 때 (x + 999) / 1000 반올림을 적용해 누적 오차를 줄인다.
+ *   또한 루프를 여러 번 도는 경우 이전 μs 값을 빼고 새 값을 더해 누적 오차 방지.
+ *
+ * 동작:
+ *   - verify_only 모드에서는 write 방향 런타임 갱신 생략 (실제 write 안 함).
+ *   - runtime[ddir] -= round_up(old_elapsed_us, 1000).
+ *   - elapsed_us[ddir] += utime_since_now(&td->start).
+ *   - runtime[ddir] += round_up(new_elapsed_us, 1000).
+ *
+ * 실행 컨텍스트: 잡 스레드 thread_main 외부 루프에서 stat_sem 보호 구간.
  */
 static inline void update_runtime(struct thread_data *td,
 				  unsigned long long *elapsed_us,
@@ -572,17 +996,34 @@ static inline void update_runtime(struct thread_data *td,
 }
 
 /*
- * [한국어] break_on_this_error - 에러 발생 시 I/O 루프를 중단할지 결정
+ * [한국어]
+ * break_on_this_error - 에러 발생 시 I/O 루프를 중단할지 결정
  *
- * @td:     스레드 데이터
- * @ddir:   I/O 방향
- * @retptr: 반환 코드 포인터 (에러 시 음수)
+ * @td:     잡의 thread_data. td->error/o.continue_on_error/o.fill_device 참조.
+ * @ddir:   방금 수행한 I/O 의 방향(READ/WRITE/TRIM). td_error_type 인자로 사용.
+ * @retptr: [in/out] *retptr 은 td_io_queue 의 음수(-errno) 또는 0 이상.
+ *          비치명적 에러로 판정되면 이 함수가 *retptr=0 으로 클리어해 호출자
+ *          가 루프를 계속하도록 만든다.
+ * @return: true = 루프 중단 필요(치명적 에러 또는 fill_device 종료 조건),
+ *          false = 계속 진행(정상 / 비치명적 에러 후 복구).
  *
- * 반환값: true = 루프 중단 필요, false = 계속 진행
+ * 왜 필요한가: 실제 대규모 스토리지에서는 일시적 에러(EAGAIN/EBUSY 등)나
+ *   기대된 에러(fill_device 중 ENOSPC)가 발생할 수 있다. 사용자가
+ *   continue_on_error 옵션으로 어떤 에러 유형을 "무시하고 계속" 할지 지정할
+ *   수 있으며, 이 함수는 해당 분기를 한곳에서 수행한다.
  *
- * 역할: 에러 유형에 따라 continue_on_error 옵션을 확인하고,
- *       치명적 에러인지 비치명적 에러인지 판단한다.
- *       fill_device 모드에서 ENOSPC/EDQUOT는 정상 종료로 처리한다.
+ * 동작:
+ *   - ret<0 또는 td->error 면 에러 유형(eb) 을 td_error_type 으로 분류.
+ *   - continue_on_error 비트(1<<eb) 가 없으면 바로 true(치명적) 반환.
+ *   - td_non_fatal_error: update_error_count, td_clear_error, *retptr=0, false.
+ *   - fill_device + ENOSPC/EDQUOT: 정상 종료로 처리 — td_clear_error +
+ *     fio_mark_td_terminate, true 반환.
+ *   - 그 외: update_error_count 후 true(치명적 에러, 루프 종료).
+ *
+ * 호출 체인: do_io/do_verify → io_queue_event → break_on_this_error.
+ *
+ * 에러 경로: td_verror 는 이 함수가 부르지 않는다(호출자가 이미 했거나
+ *   td->error 에 기록됨). 여기서는 분류/클리어 만 수행.
  */
 static bool break_on_this_error(struct thread_data *td, enum fio_ddir ddir,
 				int *retptr)
@@ -636,12 +1077,21 @@ static bool break_on_this_error(struct thread_data *td, enum fio_ddir ddir,
 }
 
 /*
- * [한국어] check_update_rusage - 리소스 사용량(rusage) 업데이트 요청 처리
+ * [한국어]
+ * check_update_rusage - 부모가 요청한 CPU usage 스냅샷을 응답
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
  *
- * 역할: 메인 스레드가 rusage 업데이트를 요청했으면(update_rusage 플래그),
- *       현재 리소스 사용량을 갱신하고 세마포어로 완료를 알린다.
+ * 왜 필요한가: helper_thread 나 stat.c 가 주기적으로 잡의 rusage (user/system
+ *   CPU time) 를 읽고 싶지만, fork 모드에서는 부모가 자식의 rusage 를 직접
+ *   읽을 방법이 제한적이다. 이에 td->update_rusage=1 플래그로 "측정해 달라"
+ *   요청하고, 잡 스레드가 do_io 루프에서 이를 감지해 update_rusage_stat 후
+ *   rusage_sem 을 up 하여 응답하는 반동기(poll) 프로토콜을 사용한다.
+ *
+ * 동작: td->update_rusage=0 으로 클리어 → update_rusage_stat(td) → fio_sem_up(rusage_sem).
+ *
+ * 실행 컨텍스트: 잡 스레드 do_io/do_verify 루프 안. rusage_sem 기다리는 쪽은
+ *   별도 스레드(통계 수집측).
  */
 static void check_update_rusage(struct thread_data *td)
 {
@@ -653,17 +1103,34 @@ static void check_update_rusage(struct thread_data *td)
 }
 
 /*
- * [한국어] wait_for_completions - 큐에 있는 I/O 완료를 대기
+ * [한국어]
+ * wait_for_completions - 인플라이트 I/O 완료 수거를 iodepth_low 까지 반복
  *
- * @td:   스레드 데이터
- * @time: 속도 체크용 시간 저장 (NULL 가능)
+ * @td:    잡의 thread_data. cur_depth 가 변화한다.
+ * @time:  완료 시점 기록용 timespec 포인터(NULL 가능). should_check_rate 일 때만 기록.
+ * @return: 마지막 io_u_queued_complete 반환값. 양수=수거한 이벤트 수, 음수=에러.
  *
- * 반환값: 완료된 I/O 수 (음수 = 에러)
+ * 왜 필요한가: 비동기 엔진(libaio/io_uring)에서는 iodepth 까지 I/O 를 쌓은
+ *   뒤에도 계속 새 I/O 를 추가하면 커널 큐가 넘친다. 큐가 full 이면 반드시
+ *   최소 1 개 이상의 완료를 수거하여 공간을 확보해야 한다. 또한 로그 확장
+ *   (TD_F_REGROW_LOGS) 이 필요하면 모든 in-flight 를 잠시 quiesce 해야 한다.
  *
- * 역할: 큐가 가득 찼거나 로그 확장이 필요할 때 호출된다.
- *       iodepth_batch_complete_min 만큼의 I/O 완료를 대기하며,
- *       큐 깊이가 iodepth_low 이하로 떨어질 때까지 반복한다.
- *       이 함수는 do_io()의 메인 루프에서 큐가 가득 찬 경우 호출된다.
+ * 동작:
+ *   1) TD_F_REGROW_LOGS 면 io_u_quiesce 로 모든 in-flight 완료 후 리턴.
+ *   2) min_evts = min(iodepth_batch_complete_min, cur_depth). full 이면
+ *      최소 1 보장. should_check_rate 이면 time 기록.
+ *   3) while (full && cur_depth > iodepth_low):
+ *        io_u_queued_complete(td, min_evts) 호출 — td_io_getevents + 각 io_u
+ *        에 대해 io_completed/put_io_u 수행 — 실패 시 즉시 리턴.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io/do_verify 의 reap 경로에서만 호출.
+ *
+ * 호출 체인:
+ *   do_io()/do_verify() → wait_for_completions(td, time)
+ *     → io_u_quiesce [io_u.c] (regrow 경로)
+ *     → io_u_queued_complete [io_u.c] → td_io_getevents [ioengines.c]
+ *
+ * 에러 경로: io_u_queued_complete 음수 반환 시 do 루프 탈출, 그 값이 호출자에게.
  */
 static int wait_for_completions(struct thread_data *td, struct timespec *time)
 {
@@ -699,22 +1166,54 @@ static int wait_for_completions(struct thread_data *td, struct timespec *time)
 }
 
 /*
- * [한국어] io_queue_event - I/O 큐잉 결과를 처리하는 이벤트 핸들러
+ * [한국어]
+ * io_queue_event - td_io_queue() 반환값에 따른 후처리 허브
  *
- * @td:           스레드 데이터
- * @io_u:         I/O 유닛 구조체
- * @ret:          td_io_queue()의 반환값 포인터 (FIO_Q_COMPLETED/QUEUED/BUSY)
- * @ddir:         I/O 방향
- * @bytes_issued: 발행된 바이트 수 추적 포인터
- * @from_verify:  검증(verify) 경로에서 호출되었는지 여부
- * @comp_time:    완료 시간 저장용 timespec
+ * @td:           잡의 thread_data.
+ * @io_u:         td_io_queue 에 넘긴 I/O 유닛. in_flight 상태이거나, COMPLETED
+ *                에서 에러/resid 면 재큐잉/무효화 대상.
+ * @ret:          [in/out] td_io_queue 반환값 포인터. FIO_Q_COMPLETED(0),
+ *                FIO_Q_QUEUED(1), FIO_Q_BUSY(2), 또는 음수(-errno). 에러 분기
+ *                후 break_on_this_error 에서 *retptr 을 0 으로 재설정할 수 있음.
+ * @ddir:         회계 목적의 방향(read/write/trim). acct_ddir() 결과.
+ * @bytes_issued: [in/out] do_io 에서 누적하는 "발행 바이트". QUEUED 경로와
+ *                COMPLETED 의 resid 부분 완료에서 증가. NULL 가능(do_verify).
+ * @from_verify:  1 이면 do_verify 에서 호출 — trim_io_piece 호출 억제, error
+ *                계속 조건 생략(검증은 한 번의 read 실패가 곧 실패 알림이므로).
+ * @comp_time:    완료 시각 저장소(NULL 가능). should_check_rate 일 때만 기록.
+ * @return:       0 = 호출자 루프 계속, 1 = 에러로 인해 호출자가 루프 중단해야 함.
  *
- * 반환값: 0 = 정상 계속, 1 = 루프 중단 필요
+ * 왜 필요한가: I/O 엔진들은 queue 콜백에서 서로 다른 "반환 의미" 를 가진다:
+ *   sync 엔진은 즉시 완료(FIO_Q_COMPLETED), libaio/io_uring 은 큐잉만
+ *   (FIO_Q_QUEUED), 자원 부족 시 FIO_Q_BUSY 로 백프레셔를 준다. 이 반환을
+ *   추상화해 회계(bytes_issued/resid/short I/O/trim 로그), 재큐잉, 에러
+ *   분기를 한곳에서 처리하는 것이 이 함수의 목적.
  *
- * 역할: td_io_queue()의 반환값에 따라 적절한 후처리를 수행한다.
- *       - COMPLETED: 동기적으로 완료됨. 잔여 데이터(resid) 처리 포함.
- *       - QUEUED: 비동기로 큐에 들어감. commit 훅이 없으면 queued 처리.
- *       - BUSY: 엔진이 바쁨. io_u를 재큐잉하고 commit 시도.
+ * 동작 상세:
+ *   - FIO_Q_COMPLETED:
+ *       * io_u->error 있으면: *ret = -errno, invalidate_inflight, clear_io_u.
+ *       * io_u->resid 있으면(short I/O): xfer_buflen-resid 만큼만 완료.
+ *         - resid 전체가 0 이면 "zero read" 로 간주 → EIO 로 실패 처리.
+ *         - 일부 전송이면 버퍼/offset 을 진행시키고 requeue_io_u 로 재제출.
+ *         - 파일 끝 도달 시 sync_done 라벨로 점프해 정상 완료 처리.
+ *       * 정상: io_u_sync_complete 로 통계 누적 + freelist 반환.
+ *       * TD_F_REGROW_LOGS: 로그 확장 필요 시 regrow_logs 호출.
+ *   - FIO_Q_QUEUED:
+ *       * 엔진에 commit 훅이 없으면(sync 계열) io_u_queued 직접 호출.
+ *       * bytes_issued 에 xfer_buflen 누적.
+ *   - FIO_Q_BUSY:
+ *       * unlog_io_piece 로 write iolog 에서 미전송 항목 제거 (verify 제외).
+ *       * requeue_io_u 후 td_io_commit 로 엔진에 밀어넣기 힌트.
+ *   - default (음수 = 에러):
+ *       * assert(*ret < 0), td_verror 로 에러 코드 전파.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io/do_verify 메인 루프에서 매 I/O 제출 후 호출.
+ *
+ * 호출 체인:
+ *   do_io()/do_verify()
+ *     → td_io_queue → io_queue_event(이 함수)
+ *         → io_u_sync_complete / requeue_io_u / td_io_commit / td_verror
+ *         → break_on_this_error 로 최종 판정
  *
  * I/O 흐름에서의 위치:
  *   get_io_u -> prep -> queue -> [io_queue_event] -> commit -> getevents
@@ -830,14 +1329,15 @@ sync_done:
 }
 
 /*
- * [한국어] io_in_polling - 폴링 모드 여부 확인
+ * [한국어]
+ * io_in_polling - 폴링(pollmode) 모드 여부
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: true=폴링(매 반복 완료 수거), false=배치 모드.
  *
- * 반환값: true = 폴링 모드 (batch_complete_min과 max 모두 0)
- *
- * 역할: iodepth_batch_complete_min/max가 모두 0이면 폴링 모드이다.
- *       폴링 모드에서는 I/O를 제출할 때마다 완료를 확인한다.
+ * 왜 필요한가: iodepth_batch_complete_min/max 둘 다 0 이면 "가능한 즉시 완료
+ *   수거" 모드이다. 이 경우 full 여부와 관계없이 매번 완료를 확인한다
+ *   (do_io 의 "full || io_in_polling" 분기).
  */
 static inline bool io_in_polling(struct thread_data *td)
 {
@@ -848,14 +1348,23 @@ static inline bool io_in_polling(struct thread_data *td)
  * Unlinks files from thread data fio_file structure
  */
 /*
- * [한국어] unlink_all_files - 스레드가 사용하는 모든 파일을 삭제
+ * [한국어]
+ * unlink_all_files - 잡 소유 파일(FIO_TYPE_FILE)을 모두 unlink(2)
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: 0=성공, 양수=에러(td_io_unlink_file 실패).
  *
- * 반환값: 0 = 성공, 양수 = 에러
+ * 왜 필요한가: unlink_each_loop 옵션은 루프마다 파일을 삭제 후 재생성하도록
+ *   하여 "매번 새 파일에 쓰는" 시나리오를 시뮬레이션한다. 블록 디바이스
+ *   (FIO_TYPE_BLOCK/CHAR/PIPE) 는 삭제 대상이 아니므로 건너뜀.
  *
- * 역할: unlink_each_loop 옵션이 설정된 경우, 각 루프 반복 시작 시
- *       이전 루프의 파일을 삭제하기 위해 호출된다.
+ * 동작: for_each_file: filetype 확인 후 td_io_unlink_file 호출. 실패 시
+ *   즉시 break + td_verror 로 에러 기록 후 반환.
+ *
+ * 실행 컨텍스트: 잡 스레드. thread_main 루프 반복 시작부.
+ *
+ * 호출 체인: thread_main → unlink_all_files → td_io_unlink_file [ioengines.c]
+ *   (엔진 .unlink_file 콜백, 보통 generic_unlink_file → unlink(2)).
  */
 static int unlink_all_files(struct thread_data *td)
 {
@@ -882,16 +1391,25 @@ static int unlink_all_files(struct thread_data *td)
  * Check if io_u will overlap an in-flight IO in the queue
  */
 /*
- * [한국어] in_flight_overlap - 새 io_u가 진행 중인 I/O와 겹치는지 검사
+ * [한국어]
+ * in_flight_overlap - 새 io_u 와 현재 in-flight io_u 간 오프셋 구간 겹침 검사
  *
- * @q:    I/O 유닛 큐 (전체 io_u 목록)
- * @io_u: 검사할 새 io_u
+ * @q:    td->io_u_all 큐(잡 소유 모든 io_u 배열).
+ * @io_u: 검사 대상 신규 io_u (아직 큐잉 전).
+ * @return: true=겹침 발견, false=충돌 없음.
  *
- * 반환값: true = 겹침 발생, false = 겹치지 않음
+ * 왜 필요한가: serialize_overlap=1 일 때, 같은 영역을 동시에 read/write 하면
+ *   저장계층/verify 결과가 비결정적이 된다. 이 함수가 io_u_all 을 선형 스캔
+ *   하여 IO_U_F_FLIGHT 비트가 켜진 io_u 를 걸러 범위 교차[x1,x2)∩[y1,y2)≠∅
+ *   조건을 검사한다.
  *
- * 역할: serialize_overlap 옵션이 설정된 경우, 같은 영역에 대한
- *       동시 I/O를 방지하기 위해 오프셋 범위가 겹치는지 확인한다.
- *       겹침이 발견되면 FIO_Q_BUSY를 반환하여 재시도하게 한다.
+ * 복잡도: O(iodepth). iodepth 가 크면 비용이 증가하므로 serialize_overlap 은
+ *   기본 비활성화.
+ *
+ * 호출 체인: io_u_submit → in_flight_overlap. true 면 FIO_Q_BUSY 반환 경로.
+ *
+ * 동기화: td_offload_overlap 가 켜지면 io_u_all 조작 전후에 overlap_check
+ *   뮤텍스로 보호 — 오프로드 워커 스레드와의 경합 방지.
  */
 bool in_flight_overlap(struct io_u_queue *q, struct io_u *io_u)
 {
@@ -926,16 +1444,26 @@ bool in_flight_overlap(struct io_u_queue *q, struct io_u *io_u)
 }
 
 /*
- * [한국어] io_u_submit - io_u를 I/O 엔진에 제출
+ * [한국어]
+ * io_u_submit - overlap 검사 후 엔진 queue 콜백에 io_u 전달
  *
- * @td:   스레드 데이터
- * @io_u: 제출할 io_u
+ * @td:     잡의 thread_data.
+ * @io_u:   제출할 I/O 유닛. get_io_u + prep 완료 상태.
+ * @return: FIO_Q_COMPLETED(즉시 완료) / FIO_Q_QUEUED(비동기 큐잉) /
+ *          FIO_Q_BUSY(엔진 바쁨 or overlap 충돌). td_io_queue 가 결정.
  *
- * 반환값: FIO_Q_COMPLETED, FIO_Q_QUEUED, 또는 FIO_Q_BUSY
+ * 왜 필요한가: serialize_overlap=1 일 때, 동일 오프셋 영역에 대한 동시 I/O
+ *   는 정의되지 않은 동작을 유발하므로 in-flight 큐를 훑어 충돌을 감지해야
+ *   한다. 순수 io_u 제출은 td_io_queue 에 위임하고, 이 함수는 그 앞단에서
+ *   overlap 필터만 추가한다.
  *
- * 역할: serialize_overlap 옵션이 설정되어 있고 진행 중인 I/O가 있을 때,
- *       겹침 검사를 수행한 후 td_io_queue()를 호출하여 실제 제출한다.
- *       겹침이 발견되면 FIO_Q_BUSY를 반환한다.
+ * 동작: serialize_overlap && cur_depth>1 && in_flight_overlap(...) 이면
+ *   FIO_Q_BUSY 반환 → 호출자(io_queue_event)가 재큐잉하여 기존 I/O 완료 후 재시도.
+ *   그 외에는 td_io_queue 로 위임.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io/do_verify 메인 루프에서만 호출.
+ *
+ * 호출 체인: do_io/do_verify → io_u_submit → td_io_queue → 엔진 .queue.
  *
  * I/O 흐름에서의 위치:
  *   get_io_u -> prep -> [io_u_submit(=queue)] -> commit -> getevents
@@ -960,19 +1488,49 @@ static enum fio_q_status io_u_submit(struct thread_data *td, struct io_u *io_u)
  * reads the blocks back in, and checks the crc/md5 of the data.
  */
 /*
- * [한국어] do_verify - 메인 검증 엔진
+ * [한국어]
+ * do_verify - 메인 검증(verify) 엔진
  *
- * @td:           스레드 데이터
- * @verify_bytes: 검증할 총 바이트 수
+ * @td:           검증할 잡의 thread_data. verify 옵션(VERIFY_CRC32/MD5/META/
+ *                PATTERN/SHA1/...) 과 verify_pattern_bytes, do_verify,
+ *                experimental_verify, verify_backlog, verify_async 등이
+ *                포함된 상태로 진입. verify_state 시드는 do_io 직전에 백업됨.
+ * @verify_bytes: 검증 대상 총 바이트(thread_main 에서 do_io 후의 write+trim
+ *                바이트 합). experimental_verify 에서 진행 제한으로 사용.
+ * @return:       없음. 에러는 td->error 에 기록. 해시 불일치는 verify_io_u
+ *                콜백이 td_verror 를 호출해 td->terminate 로 전파.
  *
- * 역할: do_io()에서 수행한 쓰기 I/O를 다시 읽어들여
- *       CRC/MD5 등의 체크섬으로 데이터 무결성을 검증한다.
+ * 왜 필요한가: 쓰기 워크로드의 정확성(저장 계층이 사용자 데이터를 그대로
+ *   돌려주는지)을 확인하기 위함. fio 는 쓰기 시 verify_header(CRC + seed +
+ *   rand_seed) 를 payload 앞에 삽입하고, 이후 동일 영역을 읽어 header 를
+ *   복구/검증한다.
+ *
+ * 실행 컨텍스트: 잡 스레드. thread_main 루프 내부에서 do_io 완료 후 호출.
+ *   verify_async 가 설정되면 실제 체크섬 계산은 별도 검증 스레드 풀에서
+ *   수행(verify_async_init). 이 함수는 io_u 제출/수거만 담당.
  *
  * 동작 흐름:
- *   1) 모든 파일에 대해 sync + 캐시 무효화 (디스크에서 직접 읽기 보장)
- *   2) TD_VERIFYING 상태로 전환
- *   3) 루프: io_u 할당 -> verify 핸들러 설정 -> 제출 -> 완료 대기
- *   4) 완료된 io_u의 데이터를 체크섬으로 검증
+ *   1) 모든 열린 파일에 대해 fio_io_sync(DDIR_SYNC) 후 file_invalidate_cache —
+ *      페이지 캐시를 비워 "디스크에서 실제로 읽힌 값" 을 검증하도록 보장.
+ *   2) td_set_runstate(td, TD_VERIFYING).
+ *   3) while (!terminate):
+ *        - 일반 모드: __get_io_u + get_next_verify (이전에 기록한 쓰기 위치)
+ *        - experimental 모드: get_io_u 로 쓰기/트림을 읽기로 변환
+ *        - io_u->end_io = verify_io_u_async | verify_io_u
+ *        - io_u_submit → io_queue_event → 필요 시 wait_for_completions
+ *   4) 완료 콜백 verify_io_u 가 header 를 읽어 체크섬 검증. 불일치면 td_verror.
+ *   5) 남은 in-flight 를 io_u_queued_complete 로 수거하고 runstate 복귀.
+ *
+ * 호출 체인:
+ *   thread_main() → do_verify(td, verify_bytes)
+ *     → fio_io_sync → td_io_queue (DDIR_SYNC)
+ *     → file_invalidate_cache [filesetup.c]
+ *     → get_next_verify [verify.c]
+ *     → io_u_submit → td_io_queue → 엔진 .queue
+ *     → io_u_queued_complete → verify_io_u [verify.c]
+ *
+ * 에러 경로: 해시 불일치는 verify_io_u 에서 td_verror + td->terminate.
+ *   io_u 할당 실패, prep 실패 시에는 put_io_u 후 루프 탈출.
  */
 static void do_verify(struct thread_data *td, uint64_t verify_bytes)
 {
@@ -1159,14 +1717,17 @@ reap:
 }
 
 /*
- * [한국어] exceeds_number_ios - I/O 횟수 제한 초과 여부 확인
+ * [한국어]
+ * exceeds_number_ios - number_ios (IOPS × 총 I/O 개수) 제한 초과 여부
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: true=제한 도달/초과 / false=아직 남음 or 옵션 미설정.
  *
- * 반환값: true = number_ios 제한 초과, false = 아직 남음
+ * 왜 필요한가: 바이트 기반(size)/시간 기반(runtime)이 아닌 "정확히 N 개의
+ *   I/O 만 수행" 하는 워크로드를 위해. 예: "1000 회 랜덤 읽기로 응답시간 분포 측정".
  *
- * 역할: number_ios 옵션이 설정된 경우, 발행된 I/O 블록 수 +
- *       큐에 있는 수 + 진행 중인 수가 제한을 초과했는지 확인한다.
+ * 계산: 완료 블록 수(io_blocks 합) + 큐 대기(io_u_queued) + 진행중(io_u_in_flight)
+ *   >= (number_ios × loops). 진행 중도 포함해 약간 early-break 경향.
  */
 static bool exceeds_number_ios(struct thread_data *td)
 {
@@ -1183,15 +1744,24 @@ static bool exceeds_number_ios(struct thread_data *td)
 }
 
 /*
- * [한국어] io_bytes_exceeded - 바이트 수 제한 초과 여부 확인
+ * [한국어]
+ * io_bytes_exceeded - 바이트 한도(size 또는 io_size) 도달 여부 + number_ios 통합
  *
- * @td:         스레드 데이터
- * @this_bytes: 방향별 바이트 수 배열 (io_issue_bytes 또는 this_io_bytes)
+ * @td:         잡의 thread_data. o.size/o.io_size/loops 참조.
+ * @this_bytes: 방향별 바이트 수 배열. issue 경로면 io_issue_bytes, 완료 경로면
+ *              this_io_bytes. 두 가지 모두 이 함수를 재사용.
+ * @return: true=한도 도달(종료) / false=계속.
  *
- * 반환값: true = 바이트 제한 초과 또는 I/O 횟수 초과, false = 아직 남음
+ * 왜 필요한가: "몇 바이트/loop 수행" 제한을 walltime 과 독립적으로 표현.
+ *   이 함수가 "issue vs complete" 두 경로의 종료 판정을 통합한다.
  *
- * 역할: I/O 루프의 종료 조건을 판단한다.
- *       혼합 읽기/쓰기인 경우 양쪽 합산, 단일 방향이면 해당 방향만 확인.
+ * 계산:
+ *   - td_rw(td) → read+write 합.
+ *   - td_write → write 만.
+ *   - td_read → read 만.
+ *   - else → trim 만.
+ *   - limit = (io_size 설정되면 io_size else size) × loops.
+ *   - return bytes >= limit || exceeds_number_ios(td).
  */
 static bool io_bytes_exceeded(struct thread_data *td, uint64_t *this_bytes)
 {
@@ -1219,11 +1789,14 @@ static bool io_bytes_exceeded(struct thread_data *td, uint64_t *this_bytes)
 }
 
 /*
- * [한국어] io_issue_bytes_exceeded - 발행된 바이트 기준 제한 초과 확인
+ * [한국어]
+ * io_issue_bytes_exceeded - "발행한" 바이트 합이 한도 초과인가
  *
- * 역할: do_io()의 메인 루프 종료 조건으로 사용.
- *       I/O를 "발행"한 바이트가 제한을 초과했는지 확인한다.
- *       (완료 여부와 무관하게 제출한 양 기준)
+ * @td: 잡의 thread_data.
+ * @return: io_bytes_exceeded(td, td->io_issue_bytes).
+ *
+ * 왜 필요한가: do_io 메인 루프는 완료 대기 전에 계속 I/O 를 발행한다. 이미
+ *   한도만큼 발행했으면 더 이상 새 I/O 를 추가하지 않고 기존 완료 대기로 전환.
  */
 static bool io_issue_bytes_exceeded(struct thread_data *td)
 {
@@ -1231,9 +1804,13 @@ static bool io_issue_bytes_exceeded(struct thread_data *td)
 }
 
 /*
- * [한국어] io_complete_bytes_exceeded - 완료된 바이트 기준 제한 초과 확인
+ * [한국어]
+ * io_complete_bytes_exceeded - "완료한" 바이트 합이 한도 초과인가
  *
- * 역할: do_dry_run()에서 사용. 실제 완료된 바이트가 제한을 초과했는지 확인.
+ * @td: 잡의 thread_data.
+ * @return: io_bytes_exceeded(td, td->this_io_bytes).
+ *
+ * 용도: do_dry_run() 에서 사용. 드라이런은 발행=완료 이므로 this_io_bytes 기준.
  */
 static bool io_complete_bytes_exceeded(struct thread_data *td)
 {
@@ -1245,16 +1822,32 @@ static bool io_complete_bytes_exceeded(struct thread_data *td)
  *
  */
 /*
- * [한국어] usec_for_io - 속도 제한을 위한 다음 I/O 시각 계산
+ * [한국어]
+ * usec_for_io - 다음 I/O 를 발행해야 할 "목표 시각" 계산 (rate control 핵심)
  *
- * @td:   스레드 데이터
- * @ddir: I/O 방향
+ * @td:   잡의 thread_data. rate_bps[], rate_process, bssplit_nr, min_bs,
+ *        rate_io_issue_bytes, last_usec, poisson_state 참조/갱신.
+ * @ddir: I/O 방향. 방향별 독립적인 rate 를 지원하기 위함.
+ * @return: epoch 기준 마이크로초. do_io 의 should_check_rate 분기가 이 값을
+ *          td->rate_next_io_time[ddir] 에 저장해 실제 발행 시각과 비교.
  *
- * 반환값: 다음 I/O를 수행해야 할 시각 (마이크로초, epoch 기준)
+ * 왜 필요한가: rate=N[MB/s] 또는 rate_iops=N 옵션을 정확히 구현하려면
+ *   "다음 I/O 를 언제 내보낼지" 를 수식으로 계산해 나노/마이크로 단위로
+ *   준수해야 한다. fio 는 busy-wait + usleep 조합으로 이를 수행한다.
  *
- * 역할: rate 옵션에 따라 I/O 간 간격을 계산하여 속도를 제한한다.
- *       - RATE_PROCESS_POISSON: 포아송 분포를 따르는 랜덤 간격
- *       - 일반 모드: 일정한 속도를 유지하기 위한 시간 계산
+ * 동작 분기:
+ *   - RATE_PROCESS_POISSON (포아송): 지수분포 샘플링
+ *       val = (1e6/iops) × -ln(U) ; U ∈ (0,1)
+ *     last_usec[ddir] += val 로 누적 시각 반환. 버스티한 트래픽 시뮬레이션.
+ *   - bps=0 → 0 리턴 (rate 없음).
+ *   - rate_iops + bssplit 조합 : iops=bps/min_bs 로 "유저가 의도한 IOPS"
+ *     복원해 간격 계산.
+ *   - 일반 rate: rate_io_issue_bytes[ddir] 의 누적 바이트로 경과 예상 시간 계산.
+ *
+ * 주의: assert(!(td->flags & TD_F_CHILD)) — 자식 잡(verify async 스레드 등)
+ *   에서는 호출되지 않음.
+ *
+ * 실행 컨텍스트: 잡 스레드. do_io 루프 후반 should_check_rate 분기.
  */
 static long long usec_for_io(struct thread_data *td, enum fio_ddir ddir)
 {
@@ -1307,12 +1900,17 @@ static long long usec_for_io(struct thread_data *td, enum fio_ddir ddir)
 }
 
 /*
- * [한국어] init_thinktime - 씽크타임(thinktime) 초기화
+ * [한국어]
+ * init_thinktime - thinktime 카운터 초기 세팅
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
  *
- * 역할: thinktime_blocks_type에 따라 씽크타임 카운터를 초기화한다.
- *       COMPLETE 타입이면 완료된 블록, ISSUE 타입이면 발행된 블록 기준.
+ * 왜 필요한가: thinktime 은 N 블록 처리마다 일정 시간 "생각하는" 모방. 기준
+ *   카운터가 완료(complete) 블록인지 발행(issue) 블록인지에 따라
+ *   thinktime_blocks_counter 를 서로 다른 배열에 가리키게 한다.
+ *
+ * 동작: thinktime_blocks_type==COMPLETE 면 io_blocks 배열, 아니면
+ *   io_issues 배열을 카운터로 등록. last_thinktime=epoch, last_thinktime_blocks=0.
  */
 static void init_thinktime(struct thread_data *td)
 {
@@ -1325,19 +1923,28 @@ static void init_thinktime(struct thread_data *td)
 }
 
 /*
- * [한국어] handle_thinktime - I/O 간 사고 시간(thinktime) 처리
+ * [한국어]
+ * handle_thinktime - thinktime_blocks/iotime 조건 충족 시 실제 대기 수행
  *
- * @td:   스레드 데이터
- * @ddir: I/O 방향
- * @time: 속도 체크용 시간 저장
+ * @td:   잡의 thread_data.
+ * @ddir: 방금 수행한 I/O 방향. rate_ign_think 보정 시 방향별 계산에 사용.
+ * @time: 속도 체크용 timespec 포인터(NULL 가능). 대기 후 갱신.
  *
- * 역할: thinktime 옵션이 설정된 경우, 일정 블록 수마다 또는
- *       일정 I/O 시간마다 의도적으로 대기한다.
- *       실제 애플리케이션의 사고 시간(think time)을 시뮬레이션한다.
+ * 왜 필요한가: 실제 애플리케이션은 I/O 사이에 CPU 작업/사용자 입력 등
+ *   "생각 시간" 이 있다. 이 함수가 thinktime_blocks (N 블록마다) 또는
+ *   thinktime_iotime (N μs 의 I/O 후) 기준으로 의도적 대기를 삽입해
+ *   실제 워크로드 패턴을 재현한다.
  *
- *       대기 시간은 두 부분으로 나뉜다:
- *       1) thinktime_spin: CPU 바쁜 대기 (spin)
- *       2) 나머지: usleep으로 슬립
+ * 동작:
+ *   - thinktime_iotime 경과 시 또는 thinktime_blocks 초과 시 stall=true.
+ *   - stall 이면 io_u_quiesce 로 현재 in-flight 를 모두 완료시킴(깨끗한 대기 보장).
+ *   - thinktime_spin μs 만큼 usec_spin (VM 에서 usec_spin 이 약간 오버할 수 있어
+ *     남은 시간 재계산).
+ *   - 남은 (thinktime - spent) 는 usec_sleep 으로 커널 수면.
+ *   - rate_ign_think 옵션: 생각 시간 동안 "발행됐을" 바이트를 보정(생각 시간을
+ *     속도 계산에서 제외) — last_usec/rate_io_issue_bytes 보정.
+ *
+ * 실행 컨텍스트: 잡 스레드 do_io 루프 후반.
  */
 static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 			     struct timespec *time)
@@ -1453,15 +2060,29 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
  * Add numberio from io_u to the inflight log.
  */
 /*
- * [한국어] log_inflight - 진행 중인 쓰기 I/O의 번호를 인플라이트 로그에 기록
+ * [한국어]
+ * log_inflight - 쓰기 io_u 의 numberio 를 인플라이트 슬롯에 기록
  *
- * @td:   스레드 데이터
- * @io_u: I/O 유닛
+ * @td:   잡의 thread_data. inflight_numberio 배열 소유자.
+ * @io_u: 쓰기 방향 io_u (DDIR_WRITE). numberio 는 이미 설정되어 있음.
  *
- * 역할: verify_state_save가 활성화된 경우, 쓰기 I/O의 순번(numberio)을
- *       인플라이트 배열에 기록한다. 이를 통해 검증 시 어떤 쓰기가
- *       완료되었고 어떤 것이 진행 중이었는지 추적할 수 있다.
- *       원자적 저장(atomic_store_release)으로 순서를 보장한다.
+ * 왜 필요한가: verify_state_save 는 "어디까지 쓰여졌는가" 를 재시작 후에도
+ *   알기 위해 인플라이트 쓰기 numberio 를 슬롯에 기록한다. 이후 완료 시
+ *   invalidate_inflight 로 슬롯을 해제한다. 이 배열 스냅샷이 verify 상태
+ *   파일에 저장되어, 재실행의 do_verify 가 "확실히 완료된 영역만" 검증하게.
+ *
+ * 동작:
+ *   - 인플라이트 로깅 비활성 또는 WRITE 아님 → 리턴.
+ *   - io_u->inflight_idx != -1 (이미 슬롯 보유) → abort (버그).
+ *   - td->inflight_issued != io_u->numberio → abort (순서 불일치).
+ *   - next_inflight_numberio_idx 부터 원형 탐색으로 빈 슬롯(INVALID_NUMBERIO) 찾기.
+ *   - atomic_store_release 로 slot := numberio 기록 후 inflight_issued := numberio+1.
+ *     두 저장의 순서(프리 슬롯 기록 → issued 갱신)가 중요 — 다른 스레드가
+ *     issued 를 읽은 뒤 해당 번호의 슬롯을 검색했을 때 보이도록 release 필요.
+ *
+ * 실행 컨텍스트: 잡 스레드 do_io 쓰기 분기에서 io_u 발행 직전.
+ *
+ * 에러 경로: 슬롯을 찾지 못함 = iodepth 초과로 오버플로 → abort (복구 불가 버그).
  */
 void log_inflight(struct thread_data *td, struct io_u *io_u)
 {
@@ -1518,13 +2139,20 @@ void log_inflight(struct thread_data *td, struct io_u *io_u)
  * Invalidate inflight log entry.
  */
 /*
- * [한국어] invalidate_inflight - 인플라이트 로그 항목 무효화
+ * [한국어]
+ * invalidate_inflight - 완료/취소된 쓰기 io_u 의 인플라이트 슬롯 해제
  *
- * @td:   스레드 데이터
- * @io_u: I/O 유닛
+ * @td:   잡의 thread_data.
+ * @io_u: 완료된 또는 실패된 쓰기 io_u. inflight_idx 가 세팅되어 있어야 함.
  *
- * 역할: I/O가 완료되거나 에러로 취소될 때, 해당 io_u의 인플라이트
- *       로그 항목을 INVALID_NUMBERIO로 설정하여 슬롯을 해제한다.
+ * 왜 필요한가: log_inflight 가 할당한 슬롯을 해제하지 않으면 다음 쓰기가
+ *   빈 슬롯을 찾지 못해 abort. 또한 verify_state 저장 시 유령 쓰기로 오염.
+ *
+ * 동작:
+ *   - 로깅 비활성 / 쓰기 아님 / 슬롯 없음(inflight_idx=-1) → 리턴.
+ *   - 이미 INVALID_NUMBERIO → abort (이중 무효화는 버그).
+ *   - 슬롯의 numberio 와 io_u 의 numberio 불일치 → abort (교차 오염).
+ *   - atomic_store_release 로 slot := INVALID_NUMBERIO. io_u->inflight_idx=-1.
  */
 void invalidate_inflight(struct thread_data *td, struct io_u *io_u)
 {
@@ -1558,13 +2186,18 @@ void invalidate_inflight(struct thread_data *td, struct io_u *io_u)
  * Clear inflight log.
  */
 /*
- * [한국어] clear_inflight - 인플라이트 로그 전체 초기화
+ * [한국어]
+ * clear_inflight - 루프 반복 사이 인플라이트 배열 전면 초기화
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
  *
- * 역할: 모든 인플라이트 슬롯을 INVALID_NUMBERIO로 초기화하고,
- *       인덱스와 발행 카운터를 리셋한다.
- *       루프 반복 사이에 호출되어 이전 루프의 상태를 정리한다.
+ * 왜 필요한가: loops>1 또는 time_based 에서 외부 루프를 반복할 때, 이전 루프에서
+ *   남아있을 수 있는 슬롯 잔존 상태를 지워 다음 루프가 깨끗한 배열로 시작하도록.
+ *   또한 실험적 verify 는 io_issues[WRITE] 를 외부에서 증가시킬 수 있어
+ *   inflight_issued 를 동기화해야 함.
+ *
+ * 동작: 모든 슬롯 = INVALID_NUMBERIO, next_inflight_numberio_idx=0,
+ *   inflight_issued := io_issues[DDIR_WRITE] 로 재동기화.
  */
 void clear_inflight(struct thread_data *td)
 {
@@ -1598,10 +2231,37 @@ void clear_inflight(struct thread_data *td)
  * [한국어] do_io - fio의 핵심 메인 I/O 루프 (가장 중요한 함수)
  * ============================================================================
  *
- * @td:         스레드 데이터
- * @bytes_done: 방향별 완료 바이트 수를 반환하는 배열 [DDIR_RWDIR_CNT]
+ * @td:         잡의 thread_data. 옵션/상태/io_u 풀/통계/엔진 ops 전체를 포함.
+ * @bytes_done: 출력 파라미터. 이 do_io 호출 "한 번" 동안 새로 완료된 바이트 수를
+ *              읽기/쓰기/트림(DDIR_RWDIR_CNT=3) 방향별로 채워준다. 내부에서
+ *              진입 시 td->bytes_done 스냅샷을 저장하고, 종료 시 차이를 계산.
+ *              호출자(thread_main)는 verify 단계에서 검증할 양을 결정하는 데 사용.
  *
- * 역할: fio의 실제 I/O 워크로드를 실행하는 핵심 함수이다.
+ * @return: 없음 (bytes_done[] 으로 간접 반환). 에러는 td->error 에 기록.
+ *
+ * 왜 필요한가: 사용자가 지정한 워크로드(read/write/rw/randread/trim + iodepth +
+ *   bs + rate + runtime 등)를 실제로 I/O 엔진에 전달해 수행하는 유일한 경로이다.
+ *   fio 가 "측정" 하려는 BW/IOPS/lat 숫자는 결국 이 루프의 각 반복마다 io_u 를
+ *   할당→제출→완료 처리하는 지점에서 수집된다.
+ *
+ * 실행 컨텍스트: 잡 스레드(thread_main)에서 단일 호출. 재진입하지 않음.
+ *   verify 단계는 별도 do_verify() 가 동일 로직을 변형해 수행한다.
+ *   SIGINT 등으로 td->terminate 가 세팅되면 다음 반복에서 break.
+ *
+ * 호출 체인:
+ *   thread_main() → do_io(td, bytes_done)
+ *     → get_io_u() / put_io_u() [io_u.c]
+ *     → io_u_submit() [이 파일] → td_io_queue() [ioengines.c] → 엔진 .queue
+ *     → wait_for_completions() [이 파일] → io_u_queued_complete [io_u.c]
+ *        → td_io_getevents [ioengines.c] → 엔진 .getevents / .event
+ *     → fio_io_sync() (end_fsync/fsync_on_close 경로)
+ *     → workqueue_enqueue()/workqueue_flush() (IO_MODE_OFFLOAD)
+ *
+ * 에러 경로: td->error != 0 이면 break_on_this_error 분기 → 루프 탈출 →
+ *   정상 정리 경로로 통합 (workqueue_flush, 인플라이트 완료 수거, end_fsync).
+ *   io_u 할당 실패는 -EBUSY 일 때는 reap 재시도, 일반 에러는 즉시 탈출.
+ *
+ * 루프 수행 내용:
  *       아래의 I/O 파이프라인을 반복 실행한다:
  *
  *   ┌─────────────────────────────────────────────────────────┐
@@ -2009,15 +2669,19 @@ reap:
 }
 
 /*
- * [한국어] init_inflight_logging - 인플라이트 로깅 초기화
+ * [한국어]
+ * init_inflight_logging - verify_state_save 용 인플라이트 쓰기 추적 배열 할당
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data. o.verify, o.verify_state_save, o.iodepth 참조.
+ * @return: 0=성공(검사 OFF 포함) / 1=scalloc 실패.
  *
- * 반환값: 0 = 성공, 1 = 메모리 할당 실패
+ * 왜 필요한가: 검증 상태를 저장/복원하려면 "어떤 쓰기가 commit 된 시점에
+ *   완료되어 있었는가" 를 알아야 한다. 이 배열은 iodepth 크기의 슬롯 배열로
+ *   각 슬롯에 진행 중인 쓰기의 numberio 를 기록한다. verify_save_state 가
+ *   이 배열을 디스크에 저장하고, 재실행 시 이를 로드해 재검증할 영역 결정.
  *
- * 역할: 검증(verify) + verify_state_save가 활성화된 경우,
- *       인플라이트 쓰기 추적을 위한 배열을 공유 메모리로 할당한다.
- *       배열 크기는 iodepth와 동일하다.
+ * 동작: scalloc(iodepth, sizeof(uint64_t)) — 공유 메모리로 할당(fork 자식
+ *   공유). 모든 슬롯을 INVALID_NUMBERIO 로 초기화.
  */
 static int init_inflight_logging(struct thread_data *td)
 {
@@ -2042,9 +2706,13 @@ static int init_inflight_logging(struct thread_data *td)
 }
 
 /*
- * [한국어] free_inflight_logging - 인플라이트 로깅 메모리 해제
+ * [한국어]
+ * free_inflight_logging - 인플라이트 추적 배열 해제
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ *
+ * 호출 체인: cleanup_io_u → free_inflight_logging → sfree(공유 메모리).
+ * 안전성: NULL 포인터 확인 후 sfree — 두 번 해제 방지.
  */
 static void free_inflight_logging(struct thread_data *td)
 {
@@ -2053,12 +2721,25 @@ static void free_inflight_logging(struct thread_data *td)
 }
 
 /*
- * [한국어] cleanup_io_u - I/O 유닛 자원 정리
+ * [한국어]
+ * cleanup_io_u - io_u 풀 및 버퍼 메모리 해제
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
  *
- * 역할: 모든 io_u를 해제하고, I/O 메모리 버퍼와 큐를 정리한다.
- *       thread_main()의 종료 경로(err 레이블)에서 호출된다.
+ * 왜 필요한가: thread_main 이 정상/에러 모두 err 라벨을 거치므로, 각 경로에서
+ *   할당한 io_u/버퍼/큐/엔진 per-io_u 데이터/인플라이트 로그 배열을
+ *   일관되게 되돌려야 한다. 순서를 잘못 맞추면 use-after-free 가 발생.
+ *
+ * 해제 순서(중요):
+ *   1) freelist 의 모든 io_u 에 대해 엔진의 io_u_free 콜백 호출(엔진별
+ *      per-io_u 상태 정리) → fio_memfree 로 구조체 반환.
+ *   2) io_u_requeues 의 io_u 들을 put_io_u 로 freelist 통과시켜 정리.
+ *      (주의: 순환 참조 방지를 위해 freelist 정리 전에 이미 drain 된 상태)
+ *   3) free_io_mem(td) — 데이터 버퍼 블록 해제.
+ *   4) io_u_rexit/io_u_qexit — 큐 자료구조 자체 해제.
+ *   5) free_inflight_logging — verify 추적 배열 해제.
+ *
+ * 실행 컨텍스트: 잡 스레드 thread_main err 라벨.
  */
 static void cleanup_io_u(struct thread_data *td)
 {
@@ -2093,23 +2774,30 @@ static void cleanup_io_u(struct thread_data *td)
 }
 
 /*
- * [한국어] init_io_u - I/O 유닛(io_u) 풀 초기화
+ * [한국어]
+ * init_io_u - iodepth 개의 io_u 구조체 풀 할당 및 엔진 훅 호출
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data. o.iodepth, io_ops, io_offload_overlap 플래그 참조.
+ * @return: 0=성공, 1=에러(메모리 부족 / 엔진 io_u_init 실패 / 터미네이트).
  *
- * 반환값: 0 = 성공, 1 = 에러
- *
- * 역할: iodepth 개수만큼의 io_u 구조체를 할당하고 초기화한다.
- *       io_u는 fio의 I/O 요청 단위이며, freelist에서 할당하여 사용 후 반환한다.
- *       각 io_u에는 데이터 버퍼, 오프셋, 크기, 방향 등이 포함된다.
+ * 왜 필요한가: fio 의 I/O 단위 객체 io_u 는 잡 시작 시 풀(iodepth 개)로 미리
+ *   할당되어 do_io 루프에서 freelist↔in-flight 간 이동하며 재사용된다.
+ *   이 함수는 그 풀 구축과 엔진별 per-io_u 초기화(예: libaio 의 struct iocb,
+ *   io_uring 의 io_uring_sqe 포인터, DAOS 의 daos_iou 등)를 책임진다.
  *
  * 초기화 순서:
- *   1) 재큐잉 링, freelist 큐, 전체 목록 큐 생성
- *   2) iodepth 개수만큼 io_u 할당 (캐시라인 정렬)
- *   3) 각 io_u를 freelist와 전체 목록에 추가
- *   4) I/O 엔진의 io_u_init 콜백 호출
- *   5) I/O 버퍼 초기화 (init_io_u_buffers)
- *   6) 인플라이트 로깅 초기화
+ *   1) io_u_rinit(requeues) + io_u_qinit(freelist) + io_u_qinit(io_u_all).
+ *   2) os_cache_line_size() 정렬로 iodepth 회 fio_memalign.
+ *   3) 각 io_u: 필드 초기화(flags=IO_U_F_FREE, index=i, inflight_idx=-1),
+ *      freelist/io_u_all 양쪽에 push.
+ *   4) 엔진 io_u_init 콜백(있으면) — 실패 시 에러.
+ *   5) init_io_u_buffers — 데이터 버퍼 할당 + 쓰기 버퍼 패턴 초기화.
+ *   6) init_inflight_logging — verify_state 추적 배열.
+ *
+ * 실행 컨텍스트: 잡 스레드 thread_main 초기화 단계. td_io_init 뒤에 호출.
+ *
+ * 에러 경로: 중간 실패 시 호출자가 err 라벨로 점프 → cleanup_io_u 가 이미
+ *   추가된 일부를 정리. init_io_u 내부에서 롤백하지 않음.
  */
 static int init_io_u(struct thread_data *td)
 {
@@ -2187,15 +2875,34 @@ static int init_io_u(struct thread_data *td)
 }
 
 /*
- * [한국어] init_io_u_buffers - I/O 데이터 버퍼 할당 및 초기화
+ * [한국어]
+ * init_io_u_buffers - 모든 io_u 를 위한 데이터 버퍼 풀 할당
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data. o.odirect/mem_align/hugepage_size/num_range 등 참조.
+ * @return: 0=성공, 1=에러(size 오버플로 / 메모리 할당 실패).
  *
- * 반환값: 0 = 성공, 1 = 에러
+ * 왜 필요한가: fio 는 I/O 성능을 측정하므로 버퍼 할당 오버헤드가 측정에 섞이면
+ *   안 된다. 따라서 잡 시작 전에 iodepth × max_bs 크기의 단일 블록을 미리
+ *   할당하고, 각 io_u 에 max_bs 슬라이스를 미리 배정한다. 런타임에는 포인터
+ *   산술로만 버퍼 위치를 찾아간다.
  *
- * 역할: 모든 io_u가 공유하는 대규모 연속 메모리 버퍼를 할당하고,
- *       각 io_u에 max_bs 크기의 슬라이스를 할당한다.
- *       쓰기 워크로드의 경우 초기 데이터 패턴으로 버퍼를 채운다.
+ * 메모리 레이아웃:
+ *   [io_u[0].buf | io_u[1].buf | ... | io_u[iodepth-1].buf]
+ *   각 슬라이스 크기 = max_bs (multi-range trim 이면 trim_bs=num_range×sizeof(trim_range)).
+ *
+ * 정렬 처리:
+ *   - O_DIRECT 또는 mem_align 요구: page_mask+mem_align 만큼 여유 추가 후
+ *     PTR_ALIGN 으로 정렬된 시작점 계산.
+ *   - HUGE 메모리(MEM_SHMHUGE/MMAPHUGE): hugepage_size 배수로 올림.
+ *
+ * 쓰기 버퍼 초기화: td_write 이면 io_u_fill_buffer 로 워크로드 패턴(dedupe
+ *   ratio/compressibility) 에 맞춰 초기 데이터 채움. verify_pattern_bytes 설정
+ *   시 fill_verify_pattern 으로 검증 패턴 덮어씀.
+ *
+ * 실행 컨텍스트: 잡 스레드 init_io_u → init_io_u_buffers.
+ *
+ * 호출 체인: init_io_u → init_io_u_buffers → allocate_io_mem [io_u.c] +
+ *   io_u_fill_buffer/fill_verify_pattern.
  *
  * 메모리 레이아웃:
  *   [io_u[0].buf | io_u[1].buf | ... | io_u[iodepth-1].buf]
@@ -2305,17 +3012,32 @@ int init_io_u_buffers(struct thread_data *td)
  * FIO_HAVE_IOSCHED_SWITCH enabled currently means it's Linux.
  */
 /*
- * [한국어] set_ioscheduler - 특정 파일의 블록 디바이스에 I/O 스케줄러를 설정
+ * [한국어]
+ * set_ioscheduler - 블록 디바이스의 I/O 스케줄러를 sysfs 로 변경
  *
- * @td:   스레드 데이터
- * @file: 대상 파일
+ * @td:   잡의 thread_data. o.ioscheduler 옵션값 사용.
+ * @file: 대상 파일(블록 디바이스). file->du->sysfs_root 가 /sys/block/<dev>/
+ *        형태여야 함 (diskutil.c 가 탐지).
+ * @return: 0=성공 또는 기능 미지원, 1=치명적 오류(파일 open 실패/write 실패/검증 실패).
  *
- * 반환값: 0 = 성공, 1 = 에러
+ * 왜 필요한가: 벤치마크 재현성을 위해 mq-deadline/none/bfq/kyber 등 스케줄러를
+ *   명시적으로 선택해야 할 때. sysfs /sys/block/<dev>/queue/scheduler 에 이름을
+ *   쓰면 커널이 런타임 전환을 수행.
  *
- * 역할: sysfs를 통해 블록 디바이스의 I/O 스케줄러를 변경한다.
- *       ioscheduler 옵션으로 지정된 스케줄러를 설정하고,
- *       다시 읽어서 실제로 변경되었는지 확인한다.
- *       Linux 전용 기능이다.
+ * 동작:
+ *   1) /sys/block/<dev>/queue/scheduler 를 r+ 로 open. ENOENT 면 커널/OS 가
+ *      이 기능을 제공하지 않음 → 경고 후 성공 리턴.
+ *   2) o.ioscheduler 문자열 fwrite.
+ *   3) rewind 후 다시 fread — 커널은 "옵션1 [선택된옵션] 옵션2" 형식으로
+ *      반환. "[<name>]" 부분문자열 매칭으로 선택 확인.
+ *   4) "none\n" 반환은 "스케줄러 변경 불가(queue 타입이 mq-none 등)" 을
+ *      의미 — 경고 후 성공(0) 리턴.
+ *
+ * 실행 컨텍스트: 잡 스레드 thread_main 초기화 단계(td_io_init 이후).
+ *
+ * 호출 체인: thread_main → switch_ioscheduler → set_ioscheduler.
+ *
+ * 플랫폼: Linux 전용 (FIO_HAVE_IOSCHED_SWITCH). else 빌드에서는 no-op 스텁.
  */
 static int set_ioscheduler(struct thread_data *td, struct fio_file *file)
 {
@@ -2394,14 +3116,17 @@ static int set_ioscheduler(struct thread_data *td, struct fio_file *file)
 }
 
 /*
- * [한국어] switch_ioscheduler - 모든 대상 파일의 I/O 스케줄러를 변경
+ * [한국어]
+ * switch_ioscheduler - 잡의 모든 파일에 대해 set_ioscheduler 순회 호출
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: 0=성공, 양수=첫 set_ioscheduler 실패 시 그 값.
  *
- * 반환값: 0 = 성공, 양수 = 에러
+ * 동작: FIO_DISKLESSIO 엔진(예: null/net/cpu) 은 스케줄러 개념 없음 → 0 리턴.
+ *   for_each_file: FIO_TYPE_FILE/BLOCK 만 처리, du 가 없으면(탐지 실패) skip.
+ *   캐릭터/파이프는 skip. 각 파일에 set_ioscheduler 적용.
  *
- * 역할: 일반 파일과 블록 디바이스 파일에 대해 set_ioscheduler()를 호출한다.
- *       diskless I/O 엔진이나 캐릭터 디바이스/파이프는 건너뛴다.
+ * 호출 체인: thread_main → switch_ioscheduler → set_ioscheduler × N 파일.
  */
 static int switch_ioscheduler(struct thread_data *td)
 {
@@ -2446,7 +3171,13 @@ static int switch_ioscheduler(struct thread_data *td)
 
 #else
 
-/* [한국어] FIO_HAVE_IOSCHED_SWITCH 미지원 플랫폼: 아무것도 하지 않음 */
+/*
+ * [한국어]
+ * switch_ioscheduler (스텁) - 비 Linux 플랫폼에서의 no-op 구현
+ *
+ * 왜 존재: /sys/block 사용 불가한 플랫폼(macOS/BSD/Windows) 에서 link 오류 방지.
+ * 동작: 아무 것도 하지 않고 0 반환.
+ */
 static int switch_ioscheduler(struct thread_data *td)
 {
 	return 0;
@@ -2455,20 +3186,26 @@ static int switch_ioscheduler(struct thread_data *td)
 #endif /* FIO_HAVE_IOSCHED_SWITCH */
 
 /*
- * [한국어] keep_running - 작업을 계속 실행할지 결정
+ * [한국어]
+ * keep_running - thread_main 외부 루프의 지속 여부 결정
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: true=다음 루프 반복 실행 / false=thread_main 외부 while 탈출.
  *
- * 반환값: true = 계속 실행, false = 종료
+ * 왜 필요한가: fio 의 한 잡은 loops 옵션으로 동일 워크로드를 N 회 반복할 수
+ *   있고, time_based 옵션으로 "지정 시간만큼 반복" 할 수도 있다. 이 함수가
+ *   thread_main 의 외부 while 조건을 담당해 루프 지속/종료를 결정한다.
+ *   do_io 내부의 "하나의 루프 반복" 종료 조건과는 구분된다.
  *
- * 역할: thread_main()의 메인 루프(while (keep_running(td)))에서 호출된다.
- *       다음 조건을 순서대로 확인한다:
- *       1) done 플래그가 설정되었으면 종료
- *       2) terminate 플래그가 설정되었으면 종료
- *       3) time_based 모드이면 계속 (시간이 다 될 때까지)
- *       4) loops 카운터가 남아있으면 감소시키고 계속
- *       5) number_ios 초과했으면 종료
- *       6) 아직 전송할 바이트가 남아있으면 계속
+ * 판정 순서(위→아래, 먼저 true/false 결정되면 즉시 반환):
+ *   1) td->done → false.
+ *   2) td->terminate → false.
+ *   3) time_based=1 → true (시간으로만 종료 결정).
+ *   4) loops>0 → loops-- 후 true.
+ *   5) exceeds_number_ios → false.
+ *   6) limit(io_size 또는 size) 남았으면 true, 아니면 false.
+ *
+ * 실행 컨텍스트: 잡 스레드. thread_main 매 외부 루프 반복 전 호출.
  */
 static bool keep_running(struct thread_data *td)
 {
@@ -2516,16 +3253,23 @@ static bool keep_running(struct thread_data *td)
 }
 
 /*
- * [한국어] exec_string - 외부 명령어 실행
+ * [한국어]
+ * exec_string - exec_prerun/exec_postrun 외부 명령 실행
  *
- * @o:      스레드 옵션
- * @string: 실행할 명령어 문자열
- * @mode:   모드 이름 (출력 파일명에 사용, "prerun" 또는 "postrun")
+ * @o:      thread_options 포인터(잡 이름 사용).
+ * @string: 실행할 shell 명령 문자열(exec_prerun 또는 exec_postrun 옵션값).
+ * @mode:   "prerun" 또는 "postrun" — 로그 파일명과 로그 메시지에 사용.
+ * @return: system(3) 의 반환값. -1 이면 shell 시작 실패, 그 외는 셸의 exit 상태.
  *
- * 반환값: system()의 반환값
+ * 왜 필요한가: 벤치마크 전후로 환경 정비(캐시 drop, 디바이스 초기화, 결과 수집)
+ *   가 필요한 경우가 많다. "fio 실행 파일만으로" 사전/사후 스크립트까지
+ *   엮을 수 있게 하는 편의 기능.
  *
- * 역할: exec_prerun/exec_postrun 옵션으로 지정된 외부 명령을 실행하고,
- *       출력을 <jobname>.<mode>.txt 파일에 저장한다.
+ * 동작: asprintf 로 "<cmd> > <name>.<mode>.txt 2>&1" 을 구성해 system(3) 호출.
+ *   stdout/stderr 모두 파일로 저장해 잡 출력과 섞이지 않게 함.
+ *
+ * 보안 주의: system(3) 은 /bin/sh 로 해석되므로 셸 injection 가능. 신뢰할
+ *   수 있는 잡 파일에서만 사용할 것.
  */
 static int exec_string(struct thread_options *o, const char *string,
 		       const char *mode)
@@ -2550,16 +3294,28 @@ static int exec_string(struct thread_options *o, const char *string,
  * Dry run to compute correct state of numberio for verification.
  */
 /*
- * [한국어] do_dry_run - 검증을 위한 드라이 런 (실제 I/O 없이 상태만 시뮬레이션)
+ * [한국어]
+ * do_dry_run - verify_only 경로의 "가짜 I/O" 실행 (numberio 동기화 전용)
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: 이번 드라이런에서 "완료됐다고 가정" 한 write+trim 바이트 합.
+ *          이 값이 thread_main 에서 do_verify 의 verify_bytes 인자로 전달됨.
  *
- * 반환값: 쓰기 + 트림 바이트 수
+ * 왜 필요한가: verify_only=1 모드는 "이미 과거에 쓴 데이터를 검증만" 하므로
+ *   실제 쓰기를 수행하지 않는다. 하지만 검증 시 각 io_u 의 numberio/시드
+ *   상태는 쓰기 시와 동일하게 진행되어야 한다. 이 함수가 get_io_u →
+ *   io_u_sync_complete 경로를 실제 I/O 없이 돌려 numberio/io_issues/io_blocks
+ *   상태를 "쓰기 잡과 동일하게" 맞춰준다.
  *
- * 역할: verify_only 모드에서 실제 I/O를 수행하지 않고,
- *       get_io_u() -> io_u_sync_complete() 경로를 실행하여
- *       numberio 상태를 올바르게 설정한다.
- *       이후 do_verify()에서 이 상태를 사용하여 검증을 수행한다.
+ * 동작: runstate=TD_RUNNING. 루프:
+ *   - get_io_u → IO_U_F_FLIGHT 플래그 + resid=0/error=0 세팅.
+ *   - io_issues[ddir]++ 갱신.
+ *   - 쓰기면 log_io_piece 로 iolog 기록(실험적 verify 모드 제외).
+ *   - io_u_sync_complete(td, io_u) — 통계 반영 + freelist 반환.
+ *
+ * 실행 컨텍스트: 잡 스레드. thread_main 에서 verify_only 분기.
+ *
+ * 호출 체인: thread_main → do_dry_run → get_io_u + log_io_piece + io_u_sync_complete.
  */
 static uint64_t do_dry_run(struct thread_data *td)
 {
@@ -2610,13 +3366,33 @@ static uint64_t do_dry_run(struct thread_data *td)
 }
 
 /*
- * [한국어] fork_data - fork/pthread_create에 전달되는 데이터 구조체
+ * [한국어]
+ * fork_data - pthread_create/fork 에서 thread_main 으로 넘기는 2-인자 번들
  *
- * 역할: thread_main()에 스레드 데이터와 소켓 출력 컨텍스트를 전달한다.
+ * pthread_create 의 start_routine 은 void*(void*) 시그니처라 "여러 값" 을 넘기
+ * 려면 구조체 포인터로 묶어 전달해야 한다. 이 구조체는 run_threads 에서
+ * calloc 으로 할당되고, thread_main 초반 sk_out_assign + free(fd) 로 소비된다.
+ *
+ * 생성자: run_threads()가 calloc 후 td/sk_out 세팅.
+ * 소비자: thread_main()이 sk_out_assign(sk_out_drop는 종료 시) 후 free(fd).
+ * 수명  : 잡 하나당 1개. thread_main 진입 직후 free.
+ * 공유  : 각 잡 단독 소유 — 스레드 간 공유 X, 동기화 불필요.
  */
 struct fork_data {
-	struct thread_data *td;   /* 이 스레드의 작업 데이터 */
-	struct sk_out *sk_out;    /* 서버 모드 소켓 출력 컨텍스트 */
+	struct thread_data *td;
+	/* [한국어] 이 잡의 thread_data 포인터.
+	 * 설정자: run_threads() 가 해당 td 를 채움.
+	 * 읽는 자: thread_main() 의 전 라이프사이클에서 사용.
+	 * 값 범위: smalloc 으로 할당된 공유 메모리의 유효 포인터 (NULL 불가).
+	 * 동기화: td 자체는 공유 메모리이므로 여러 스레드가 읽을 수 있으나,
+	 *          이 포인터 필드는 해당 잡 스레드만 소유. */
+
+	struct sk_out *sk_out;
+	/* [한국어] 서버 모드의 소켓 출력 컨텍스트. 로컬 모드에서는 NULL.
+	 * 설정자: run_threads() 가 자기 인자의 sk_out 을 그대로 대입.
+	 * 읽는 자: thread_main() 이 sk_out_assign(TLS 등록) 후 사용.
+	 * 값 범위: NULL(로컬) 또는 유효 sk_out. 서버 모드에서 log_info 등이
+	 *          이 컨텍스트로 TCP 소켓에 기록. */
 };
 
 /*
@@ -2628,9 +3404,44 @@ struct fork_data {
  * [한국어] thread_main - 워커 스레드/프로세스의 메인 진입점
  * ============================================================================
  *
- * @data: fork_data 구조체 포인터 (td + sk_out)
+ * @data: struct fork_data *. td(thread_data*)와 sk_out(sk_out*)을 담은
+ *        heap-alloc 구조체. 호출자(run_threads)가 calloc 후 소유권을 넘김.
+ *        이 함수가 sk_out_assign 으로 TLS 등록 후 free(fd) 로 해제.
  *
- * 반환값: (void*) 에러 코드 (0 = 성공)
+ * @return: (void *)(uintptr_t) td->error. 0 이면 성공, 비0이면 해당 errno.
+ *          pthread 모드: pthread_join 은 안 하고 detach. 부모는 runstate 로 감지.
+ *          fork 모드: return 값이 main() 의 _exit(ret) 코드로 전달 — waitpid
+ *          에서 WEXITSTATUS 로 관찰. errno 가 256을 초과하면 8비트 잘림.
+ *
+ * 왜 필요한가: run_threads()는 "N 개의 잡을 병렬 실행" 이라는 추상적 컨트롤만
+ *   담당하고, 각 잡의 실제 수행(엔진 초기화→I/O→검증→정리)은 이 함수가 진행한다.
+ *   pthread/fork 두 모드 모두 여기를 지나가므로 이 파일의 실질적 중심이다.
+ *
+ * 실행 컨텍스트: 매 잡마다 하나의 인스턴스. pthread_create 된 경우 현재
+ *   프로세스 내 새 스레드(공유 주소공간), fork 된 경우 독립 프로세스(COW
+ *   복제 후 공유 메모리 영역만 실제 공유). 동일 프로세스/스레드 내 재진입 없음.
+ *
+ * runstate 전이 (파일 상단 다이어그램 참조):
+ *   진입 직후        TD_CREATED  (부모가 이미 설정)
+ *   초기화 후        TD_INITIALIZED   ← startup_sem up
+ *   ── 부모가 td->sem up 까지 대기 ──
+ *   I/O 루프 진입    TD_RAMP / TD_RUNNING
+ *   검증 루프 진입   TD_VERIFYING
+ *   end_fsync 중     TD_FSYNCING
+ *   통계 마무리      TD_FINISHING
+ *   함수 return 직전 TD_EXITED
+ *
+ * 에러 경로: goto err. 어느 단계에서 실패하든 err 라벨로 점프해 공통
+ *   cleanup(파일 close, io_u 풀 해제, 엔진 close, cgroup/NUMA/cpuset 해제) 수행.
+ *
+ * 호출 체인:
+ *   run_threads() → pthread_create(thread_main, fd) OR fork()→thread_main(fd)
+ *     → td_io_init [ioengines.c]
+ *     → init_io_u/init_io_u_buffers [이 파일]
+ *     → setup_files [filesetup.c]
+ *     → do_io [이 파일] (loops/time_based 만큼 반복)
+ *     → do_verify [이 파일] (verify 옵션 시)
+ *     → close_and_free_files/close_ioengine [filesetup.c/ioengines.c]
  *
  * 역할: 각 fio 작업(job)의 전체 생명주기를 관리한다.
  *       pthread_create() 또는 fork()로 생성되어 아래 단계를 실행한다:
@@ -2676,16 +3487,20 @@ static void *thread_main(void *data)
 	bool clear_state;
 	int ret;
 
-	/* 소켓 출력 컨텍스트 설정 (서버 모드용) */
+	/* [한국어] sk_out 을 TLS 에 등록 — 이후 log_info/log_err 가 TCP 소켓으로 전송.
+	 * 로컬 모드에서는 sk_out=NULL 이며 일반 stdout/stderr 로 감 */
 	sk_out_assign(sk_out);
-	free(fd);
+	free(fd);  /* [한국어] fork_data 번들은 여기서 소비 완료, 즉시 해제 */
 
-	/* [한국어] PID 설정: 프로세스 모드면 getpid(), 스레드 모드면 gettid() */
+	/* [한국어] PID 기록: fork 모드는 getpid(2)(자식 프로세스 PID), pthread 모드는
+	 * gettid(2)(LWP tid). reap_threads 의 waitpid 는 프로세스 모드에서만 의미.
+	 * setsid(2) 로 새 세션 리더가 되어 부모의 제어 터미널에서 분리 — Ctrl+C 가
+	 * 자식 fio 프로세스에 직접 전달되지 않도록 (fio 부모가 sig_int 로 대신 전파). */
 	if (!o->use_thread) {
-		setsid();            /* 새 세션 생성 (프로세스 모드) */
-		td->pid = getpid();
+		setsid();            /* [한국어] 새 세션 리더, 터미널 분리 (프로세스 모드 전용) */
+		td->pid = getpid();  /* [한국어] 자식 프로세스 PID */
 	} else
-		td->pid = gettid();
+		td->pid = gettid();  /* [한국어] pthread 의 커널 LWP tid */
 
 	/* 로컬 시계 초기화 */
 	fio_local_clock_init();
@@ -2709,26 +3524,35 @@ static void *thread_main(void *data)
 	INIT_FLIST_HEAD(&td->trim_list);
 	td->io_hist_tree = RB_ROOT;
 
-	/* 뮤텍스와 조건변수 초기화 (프로세스 간 공유 가능) */
+	/* [한국어] io_u_lock(뮤텍스) + free_cond(조건변수) 초기화.
+	 * fork 모드에서는 부모와 자식이 같은 객체를 봐야 하므로 pshared 속성 필수.
+	 * pthread_mutexattr_setpshared(PTHREAD_PROCESS_SHARED) 내부 호출.
+	 * io_u_lock 은 io_u 큐 조작 직렬화, free_cond 는 freelist 가 비었을 때 블록. */
 	ret = mutex_cond_init_pshared(&td->io_u_lock, &td->free_cond);
 	if (ret) {
 		td_verror(td, ret, "mutex_cond_init_pshared");
 		goto err;
 	}
+	/* [한국어] verify_cond: 검증 스레드 풀이 대기하는 조건변수(verify_async 시). */
 	ret = cond_init_pshared(&td->verify_cond);
 	if (ret) {
 		td_verror(td, ret, "mutex_cond_pshared");
 		goto err;
 	}
 
-	/* [한국어] TD_INITIALIZED 상태로 전환하고, 부모에게 초기화 완료를 알림.
-	 * 부모(run_threads)가 td->sem을 올릴 때까지 대기. */
+	/* [한국어] ===== runstate 전이: TD_CREATED → TD_INITIALIZED =====
+	 * 이 지점이 "파일/엔진/io_u 이전의 기초 초기화 완료" 시점. 이후 부모가
+	 * 모든 잡이 TD_INITIALIZED 가 되었는지 확인 후 td->sem up 으로 "동시 시작"
+	 * 신호를 보낸다. startup_sem 은 여러 잡이 공유하는 세마포어 — up/down
+	 * 횟수로 부모가 초기화 완료 수를 카운트. */
 	td_set_runstate(td, TD_INITIALIZED);
 	dprint(FD_MUTEX, "up startup_sem\n");
-	fio_sem_up(startup_sem);       /* 부모에게 "초기화 완료" 신호 */
+	fio_sem_up(startup_sem);       /* [한국어] 부모에게 "초기화 완료" 신호 — 카운팅 세마포어 +1 */
 	dprint(FD_MUTEX, "wait on td->sem\n");
-	fio_sem_down(td->sem);         /* 부모가 "실행 시작" 신호를 줄 때까지 대기 */
+	fio_sem_down(td->sem);         /* [한국어] 부모가 "실행 시작" 신호를 줄 때까지 블록 */
 	dprint(FD_MUTEX, "done waiting on td->sem\n");
+	/* [한국어] 여기 이후 runstate 는 run_threads 의 전이에 의해 TD_RAMP
+	 * (ramp_time 구간) 또는 TD_RUNNING 으로 설정된 상태. */
 
 	/*
 	 * A new gid requires privilege, so we need to do this before setting
@@ -3210,16 +4034,48 @@ err:
  * Run over the job map and reap the threads that have exited, if any.
  */
 /*
- * [한국어] reap_threads - 종료된 스레드/프로세스를 수거(reap)
+ * [한국어]
+ * reap_threads - 종료된 잡 스레드/프로세스를 수거(TD_EXITED → TD_REAPED)
  *
- * @nr_running: 실행 중인 스레드 수 포인터 (감소됨)
- * @t_rate:     목표 속도 합계 포인터 (감소됨)
- * @m_rate:     최소 속도 합계 포인터 (감소됨)
+ * @nr_running: [in/out] 현재 실행 중 잡 수 포인터. 회수된 개수만큼 감소.
+ *              run_threads 의 메인 루프 종료 조건에 사용됨.
+ * @t_rate:     [in/out] 전체 잡의 목표(rate) 바이트/초 합계. 회수 시 해당
+ *              잡 몫을 감산. (디버그/로깅용 — 실제 제어에는 미사용)
+ * @m_rate:     [in/out] 전체 잡의 최소(ratemin) 바이트/초 합계. 동일.
+ * @return:     없음.
  *
- * 역할: run_threads()의 메인 루프에서 주기적으로 호출되어,
- *       TD_EXITED 상태의 스레드를 TD_REAPED로 전환한다.
- *       프로세스 모드에서는 waitpid()로 자식 프로세스 상태를 확인한다.
- *       스레드가 오래 멈춰 있으면 FIO_REAP_TIMEOUT 후 강제 종료한다.
+ * 왜 필요한가: 잡 스레드/프로세스가 do_io 를 마치고 thread_main 에서
+ *   TD_EXITED 로 자신을 표시해도, 부모가 그 사실을 감지하고 자원을
+ *   정리(use_fork 경우 waitpid) 해야 프로세스 테이블 엔트리가 해제되고
+ *   nr_running 카운트가 정확해진다. 또한 멈춘(stuck) 잡을 FIO_REAP_TIMEOUT
+ *   후 강제 회수하여 run_threads 가 무한 대기하지 않게 한다.
+ *
+ * 동작:
+ *   - for_each_td 순회:
+ *       * cpuio 엔진 카운트(마지막 경우 모두 종료 판정에 사용).
+ *       * td->pid==0 (아직 시작 안 된 잡): pending++.
+ *       * 이미 TD_REAPED 면 skip.
+ *       * use_thread=1 모드: runstate==TD_EXITED 이면 바로 TD_REAPED 전이.
+ *         pthread_detach 해 놨기에 join 불필요.
+ *       * use_fork=0(default) 모드: waitpid(td->pid, &status,
+ *         TD_EXITED 면 0=블로킹 else WNOHANG).
+ *           ECHILD → td->sig=ECHILD, TD_REAPED.
+ *           WIFSIGNALED → td->sig=WTERMSIG, TD_REAPED.
+ *           WIFEXITED → td->error=WEXITSTATUS, TD_REAPED.
+ *       * 멈춤 감지: terminate=1 이면서 TD_FSYNCING 미도달 + FIO_REAP_TIMEOUT
+ *         초과 → 강제 TD_REAPED 로 마킹 후 경고 로그.
+ *   - 회수된 잡: nr_running--, m_rate/t_rate 감산, exit_value 누적,
+ *     done_secs 누적, profile_td_exit/flow_exit_job.
+ *   - nr_running==cputhreads && !pending && realthreads : cpuio 잡만 남음 →
+ *     fio_terminate_threads 전체 호출(원래 I/O 잡이 모두 끝났는데 cpuio 만
+ *     남아있는 상황 — 무한 실행 방지).
+ *
+ * 실행 컨텍스트: run_threads 메인 스레드에서 100ms/10ms 간격으로 호출.
+ *
+ * 호출 체인: run_threads() → reap_threads(&nr_running, &t_rate, &m_rate).
+ *
+ * 에러 경로: waitpid 가 -1/ECHILD 이면 이미 시그널 핸들러 등이 수거했거나
+ *   kernel 이 자식을 알 수 없는 상태 — 경고 후 TD_REAPED 로 마킹.
  */
 static void reap_threads(unsigned int *nr_running, uint64_t *t_rate,
 			 uint64_t *m_rate)
@@ -3346,12 +4202,17 @@ reaped:
 }
 
 /*
- * [한국어] __check_trigger_file - 트리거 파일 존재 여부 확인
+ * [한국어]
+ * __check_trigger_file - 트리거 파일 존재 시 삭제 + true, 없으면 false
  *
- * 반환값: true = 트리거 파일이 존재함 (삭제 후), false = 없음
+ * @return: true=트리거 감지 / false=미감지 또는 trigger_file 미설정.
  *
- * 역할: trigger_file 경로에 파일이 있으면 삭제하고 true를 반환한다.
- *       외부 프로그램이 파일을 생성하여 fio에 이벤트를 알릴 수 있다.
+ * 왜 필요한가: 외부 프로세스가 fio 에 "특정 이벤트" 를 신호하기 위한 인밴드
+ *   메커니즘. 시그널 대신 파일 존재로 시그널링하면 여러 프로세스에 대한
+ *   방송성, 원자성(unlink vs rename)을 활용할 수 있다.
+ *
+ * 동작: stat(trigger_file) 성공이면 unlink(2) + true. unlink 실패는
+ *   경고만 로그하고 true 를 유지 — 조건이 이미 소비되었음을 표현.
  */
 static bool __check_trigger_file(void)
 {
@@ -3371,11 +4232,13 @@ static bool __check_trigger_file(void)
 }
 
 /*
- * [한국어] trigger_timedout - 트리거 타임아웃 확인
+ * [한국어]
+ * trigger_timedout - --trigger-timeout 옵션 경과 여부 (1회성)
  *
- * 반환값: true = 타임아웃 발생, false = 아직 아님
+ * @return: true=방금 경과 확인(이후 호출은 false) / false=미경과 또는 미설정.
  *
- * 역할: 설정된 trigger_timeout 시간이 경과했는지 확인한다.
+ * 부수효과: true 반환 시 trigger_timeout=0 으로 리셋해 다시는 true 반환 안 함.
+ * 호출 체인: check_trigger_file → trigger_timedout.
  */
 static bool trigger_timedout(void)
 {
@@ -3389,11 +4252,14 @@ static bool trigger_timedout(void)
 }
 
 /*
- * [한국어] exec_trigger - 트리거 명령 실행
+ * [한국어]
+ * exec_trigger - 외부 트리거 커맨드 실행(system(3))
  *
- * @cmd: 실행할 명령어 문자열
+ * @cmd: 실행할 shell 커맨드. NULL/빈 문자열이면 no-op.
  *
- * 역할: system()으로 트리거 명령을 실행한다.
+ * 왜 필요한가: 트리거 감지 시 사용자 정의 스크립트(예: IO 중단, 로그 수집)를
+ *   실행하여 fio 를 외부 이벤트에 반응시키기 위함.
+ * 보안 주의: shell injection 여지 — 신뢰 옵션에서만 사용.
  */
 void exec_trigger(const char *cmd)
 {
@@ -3408,11 +4274,21 @@ void exec_trigger(const char *cmd)
 }
 
 /*
- * [한국어] check_trigger_file - 트리거 파일/타임아웃 확인 및 처리
+ * [한국어]
+ * check_trigger_file - 메인 스레드 폴링 루프의 트리거 훅
  *
- * 역할: 트리거 파일이 존재하거나 타임아웃이 발생하면,
- *       클라이언트 모드에서는 원격 명령을 전송하고,
- *       로컬 모드에서는 검증 상태 저장 후 종료 및 트리거 명령을 실행한다.
+ * 왜 필요한가: 장기 실행 중 외부에서 "지금 상태 저장하고 종료 + 재개 가능
+ *   스크립트 실행" 을 요청받는 메커니즘. 파일 존재 또는 시간 경과 두 트리거
+ *   중 하나라도 만족 시 아래 동작 수행.
+ *
+ * 동작:
+ *   - 감지 시:
+ *     a) 클라이언트 다수 연결(nr_clients): fio_clients_send_trigger 로
+ *        원격 fio 서버들에게도 트리거 전파.
+ *     b) 로컬: verify_save_state(IO_LIST_ALL) 로 모든 잡의 검증 상태 저장,
+ *        fio_terminate_threads 로 종료, 마지막으로 exec_trigger 로 커맨드 실행.
+ *
+ * 호출 체인: run_threads 의 do_usleep 폴링 루프 → check_trigger_file.
  */
 void check_trigger_file(void)
 {
@@ -3428,14 +4304,20 @@ void check_trigger_file(void)
 }
 
 /*
- * [한국어] fio_verify_load_state - 검증 상태 로드
+ * [한국어]
+ * fio_verify_load_state - 이전 run 의 검증 상태 파일 로드
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data. o.verify_state 옵션이 true 일 때만 의미.
+ * @return: 0=성공 또는 옵션 미설정, 양수=에러(파일 없음/포맷 오류/서버 통신 실패).
  *
- * 반환값: 0 = 성공, 양수 = 에러
+ * 왜 필요한가: fio 를 중단 후 다시 시작할 때, 이미 성공 검증한 영역은
+ *   건너뛰고 싶다. 이 함수가 저장된 상태(verify_save_state 로 기록)를 읽어
+ *   td 의 검증 진행점을 복원한다.
  *
- * 역할: 이전 실행의 검증 상태를 로드하여 이어서 검증할 수 있게 한다.
- *       서버 모드에서는 서버로부터, 로컬 모드에서는 파일에서 로드한다.
+ * 동작 분기:
+ *   - is_backend (서버 모드): fio_server_get_verify_state 로 네트워크로 수신
+ *     후 verify_assign_state 로 td 에 반영.
+ *   - 로컬: aux_path/ local / <jobname> 경로에서 파일 로드(verify_load_state).
  */
 static int fio_verify_load_state(struct thread_data *td)
 {
@@ -3468,12 +4350,16 @@ static int fio_verify_load_state(struct thread_data *td)
 }
 
 /*
- * [한국어] do_usleep - 트리거 파일과 통계를 확인하면서 대기
+ * [한국어]
+ * do_usleep - run_threads 폴링 슬립(훅을 처리하는 wrapper usleep)
  *
- * @usecs: 대기 시간 (마이크로초)
+ * @usecs: 대기 시간(마이크로초).
  *
- * 역할: 단순 usleep 전에 실행 중인 통계 요청과 트리거 파일을 확인한다.
- *       run_threads()에서 폴링 대기 시 사용된다.
+ * 왜 필요한가: run_threads 의 메인 루프는 잡 상태를 짧게 폴링하며 진행한다.
+ *   단순 usleep 이전에 "실행 중 통계 요청" 과 "트리거 파일" 을 먼저
+ *   처리해야 응답성이 유지된다. 이 wrapper 가 그 두 훅을 보장.
+ *
+ * 동작: check_for_running_stats → check_trigger_file → usleep(usecs).
  */
 static void do_usleep(unsigned int usecs)
 {
@@ -3483,15 +4369,26 @@ static void do_usleep(unsigned int usecs)
 }
 
 /*
- * [한국어] check_mount_writes - 마운트된 디바이스에 쓰기 방지
+ * [한국어]
+ * check_mount_writes - 쓰기 워크로드 대상이 마운트된 블록 디바이스인지 검증
  *
- * @td: 스레드 데이터
+ * @td: 잡의 thread_data.
+ * @return: true=마운트된 디바이스 발견(실행 중단 필요), false=안전.
  *
- * 반환값: true = 마운트된 디바이스 감지 (중단 필요), false = 안전
+ * 왜 필요한가: /dev/sdX 등 블록 디바이스에 fio 가 쓰기를 하면 해당 디바이스에
+ *   마운트된 파일시스템의 메타데이터/저널을 덮어써 FS 손상을 유발한다.
+ *   치명적 실수를 방지하기 위해 이 검사를 기본 수행하고, 사용자가 의도한
+ *   경우 allow_mounted_write=1 로 우회.
  *
- * 역할: 블록 디바이스에 쓰기 작업 시, 해당 디바이스가 마운트되어 있으면
- *       파일 시스템 손상 방지를 위해 실행을 중단한다.
- *       allow_mounted_write 옵션으로 이 검사를 무시할 수 있다.
+ * 동작: for_each_file:
+ *   FIO_HAVE_CHARDEV_SIZE 가 켜지면 캐릭터 디바이스도 검사(일부 디바이스가
+ *   chrdev 형태로 노출되는 경우 대비). device_is_mounted(f->file_name) 로
+ *   /proc/self/mountinfo 조회.
+ *
+ * 호출 체인: run_threads → check_mount_writes → device_is_mounted [lib/mountcheck.c].
+ *
+ * 에러 경로: 감지 시 log_err 로 경로 출력 후 true 반환 — run_threads 가
+ *   run_threads 자체를 즉시 return 하여 어떤 잡도 시작하지 않는다.
  */
 static bool check_mount_writes(struct thread_data *td)
 {
@@ -3525,15 +4422,20 @@ mounted:
 }
 
 /*
- * [한국어] waitee_running - wait_for 옵션의 대상 작업이 아직 실행 중인지 확인
+ * [한국어]
+ * waitee_running - wait_for 의존 잡이 아직 종료되지 않았는지 검사
  *
- * @me: 현재 스레드 데이터
+ * @me: 현재 잡의 thread_data(시작 대기자).
+ * @return: true=의존 잡이 아직 TD_EXITED 미만 → 시작 지연 / false=시작 가능.
  *
- * 반환값: true = 대기 대상이 아직 실행 중, false = 완료됨 또는 대기 없음
+ * 왜 필요한가: wait_for=<name> 옵션은 "<name> 잡이 완전히 끝난 뒤 시작" 이라는
+ *   단방향 의존을 표현한다. run_threads 가 매 todo 순회에서 이 함수를 호출해
+ *   의존 잡이 끝날 때까지 해당 잡 생성을 보류한다.
  *
- * 역할: wait_for 옵션이 설정된 경우, 지정된 작업 이름을 가진
- *       다른 스레드가 TD_EXITED 이전 상태이면 true를 반환하여
- *       현재 스레드의 시작을 지연시킨다.
+ * 동작: for_each_td 순회 — 자기 자신이나 다른 이름이면 skip. waitee 이름
+ *   일치하는 td 중 runstate<TD_EXITED 가 있으면 true.
+ *
+ * 한계: wait_for 그래프에 순환이 있으면 무한 대기. init 단계에서 체크 필요.
  */
 static bool waitee_running(struct thread_data *me)
 {
@@ -3569,7 +4471,41 @@ static bool waitee_running(struct thread_data *me)
  * [한국어] run_threads - 모든 작업(job)의 생성, 시작, 수거를 관리하는 메인 컨트롤러
  * ============================================================================
  *
- * @sk_out: 서버 모드 소켓 출력 컨텍스트
+ * @sk_out: 서버 모드 소켓 출력 컨텍스트. 로컬 모드에서는 NULL. 각 잡 스레드에
+ *          TLS 로 전달되어 log_info/__log_buf 출력이 서버 소켓으로 직렬화.
+ *
+ * @return: 없음. 에러 집계는 전역 exit_value, fio_abort 로. 마지막에 모든
+ *          잡이 TD_REAPED 가 되면 정상 리턴.
+ *
+ * 왜 필요한가: fio 의 잡은 서로 다른 시작 조건(start_delay, stonewall,
+ *   wait_for)을 가질 수 있고, 각기 다른 엔진/파일을 초기화하며, 병렬 혹은
+ *   직렬로 실행되어야 한다. 또한 startup_sem 을 통한 초기화 rendezvous 와
+ *   td->sem 을 통한 "동시 시작" 동기화를 관리해야 한다. 이 모든 오케스트레이션
+ *   을 담는 단일 함수가 run_threads 이다.
+ *
+ * 실행 컨텍스트: fio_backend()가 메인 스레드에서 호출. 이 함수 자체는 새
+ *   스레드를 만들지 않고, pthread_create/fork 로 잡 워커만 띄운다.
+ *   시그널 핸들러가 등록된 후(set_sig_handlers) 의 메인 스레드가 여기 머물며
+ *   잡을 감시하므로, SIGINT 가 오면 즉시 감지해 td->terminate 전파.
+ *
+ * 동기화 핵심: 각 잡 생성 후 startup_sem 으로 "초기화 완료" 를 기다리고,
+ *   그 후 td->sem 을 up 하여 잡이 실제 I/O 루프를 시작하게 함. 이 2단계
+ *   핸드셰이크로 "모든 잡이 준비되지 않은 상태에서 일부만 I/O 를 시작하는"
+ *   경쟁을 방지하여 통계(start time 등)의 의미를 일관되게 유지.
+ *
+ * 호출 체인:
+ *   fio_backend() → run_threads(sk_out)
+ *     → set_sig_handlers() [이 파일]
+ *     → setup_files() [filesetup.c] (create_serialize 시)
+ *     → pthread_create/fork → thread_main [이 파일]
+ *     → reap_threads() [이 파일] → waitpid(2) (fork 모드)
+ *     → update_io_ticks() [diskutil.c]
+ *
+ * 에러 경로:
+ *   - check_mount_writes 실패 → 즉시 return (어떤 잡도 시작 전).
+ *   - pthread_create 실패 → for_each_td 루프 내 break, nr_started--.
+ *   - 초기화 타임아웃(10초) → fio_terminate_threads + fio_abort=true → 탈출.
+ *   - 잡 시작(5초 TD_INITIALIZED 대기) 타임아웃 → kill(td->pid, SIGTERM).
  *
  * 역할: fio의 전체 작업 실행 흐름을 제어하는 함수이다.
  *       모든 작업을 순서대로 생성하고, 초기화가 완료될 때까지 대기한 후,
@@ -3937,9 +4873,11 @@ reap:
 }
 
 /*
- * [한국어] free_disk_util - 디스크 유틸리티 자원 해제
+ * [한국어]
+ * free_disk_util - 디스크 유틸 엔트리 정리 + 헬퍼 스레드 종료
  *
- * 역할: 디스크 유틸리티 항목을 정리하고 헬퍼 스레드를 종료한다.
+ * 호출자: fio_backend 후미 cleanup.
+ * 동작: disk_util_prune_entries [diskutil.c] + helper_thread_destroy [helper_thread.c].
  */
 static void free_disk_util(void)
 {
@@ -3952,9 +4890,41 @@ static void free_disk_util(void)
  * [한국어] fio_backend - fio 백엔드의 최상위 진입점
  * ============================================================================
  *
- * @sk_out: 서버 모드 소켓 출력 컨텍스트 (로컬 모드에서는 NULL)
+ * @sk_out: 서버 모드 소켓 출력 컨텍스트. NULL 이면 is_local_backend=true 로
+ *          설정되어 CLI/로컬 잡 파일 실행 경로. 서버 모드에서 클라이언트가
+ *          잡을 전달하면 server.c 가 sk_out 을 채워 이 함수를 호출.
  *
- * 반환값: 종료 코드 (0 = 성공)
+ * @return: fio 프로세스 종료 코드(main() 반환값 → 쉘 $?).
+ *          - 0 = 모든 잡 성공
+ *          - 128 = SIGINT 등 시그널로 중단
+ *          - 1+N = 실패한 잡 수 누적 (exit_value)
+ *
+ * 왜 필요한가: fio.c 의 main() 은 argc/argv 파싱과 서버/클라이언트 분기만 담당
+ *   하고, "실제로 잡을 수행" 하는 오케스트레이션을 이 함수로 위임한다. 따라서
+ *   fio_backend 는 parse_options 이후 모든 백엔드 자원(세마포어/통계/헬퍼
+ *   스레드/cgroup 리스트)을 준비하고, run_threads 를 거쳐 통계를 출력한 뒤
+ *   자원을 정리하는 "잡 실행의 진정한 문" 역할을 한다.
+ *
+ * 실행 컨텍스트: main() 스레드에서 호출. 이 함수 자체는 직접 I/O 를 하지 않지만,
+ *   run_threads 가 생성한 잡 스레드/프로세스와 helper 스레드가 동시 실행됨.
+ *
+ * 호출 체인:
+ *   main() [fio.c] → fio_backend(sk_out)
+ *     → load_profile [profile.c] (exec_profile 지정 시)
+ *     → setup_log × 3 [iolog.c] (write_bw_log 시)
+ *     → stat_init [stat.c]
+ *     → helper_thread_create [helper_thread.c]
+ *     → run_threads [이 파일]  ← 실제 잡 실행
+ *     → helper_thread_exit [helper_thread.c]
+ *     → __show_run_stats [stat.c]
+ *     → fio_options_free / free_disk_util / cgroup_kill / stat_exit (cleanup)
+ *
+ * 에러 경로:
+ *   - load_profile 실패 → return 1.
+ *   - thread_number==0 (잡 없음) → return 0 (정상, 아무것도 할 일 없음).
+ *   - startup_sem 할당 실패 → return 1.
+ *   - init_global_dedupe_working_set_seeds 실패 → return 1.
+ *   - 그 외 실패는 run_threads 내부에서 처리되어 exit_value 에 누적.
  *
  * 역할: fio의 전체 실행 흐름을 제어하는 최상위 함수이다.
  *

@@ -5,176 +5,553 @@
  * [한국어 설명] fio 잡 초기화 및 설정 (init.c)
  *
  * === 파일의 역할 ===
- * 이 파일은 fio의 job 초기화 및 설정 함수들을 포함한다.
- * 명령줄 인수와 잡 파일(.fio)을 파싱하여 thread_data 구조체를 구성하고,
- * I/O 엔진을 로드하며, 옵션 간 의존성/충돌을 해결한 뒤 최종 잡을 등록한다.
- * parse_options()가 이 파일의 주요 진입점이다.
+ * 이 파일은 fio의 **잡(job) 초기화와 옵션 파싱**을 총괄한다. main()이
+ * 호출하는 parse_options()를 최상위 진입점으로 하여, 아래 네 가지
+ * 대주제를 한 파일에서 처리한다:
+ *   (1) 명령줄 인자 파싱 (--name/--rw/--ioengine/--output-format/
+ *       --section/--server/--client 등) — getopt_long_only(3) + FIO_OPT_*
+ *       플래그 + l_opts[] 테이블을 조합하여 long/short 옵션을 단일 스위치로
+ *       처리한다.
+ *   (2) 잡 파일(.fio) INI 파서 — `[global]` 과 `[jobname]` 섹션 헤더를
+ *       sscanf("[%255[^\\n]]") 로 인식하고, 섹션 몸체의 "key=value" 줄을
+ *       수집해 fio_options_parse() 에 넘겨 thread_options 필드에 기입한다.
+ *       `include filename` 지시어를 재귀적으로 __parse_jobs_ini()로 처리한다.
+ *   (3) thread_data 공유 메모리 할당 체인 — JOBS_PER_SEG 단위로 shmget(2)/
+ *       shmat(2) 으로 POSIX 공유 메모리 세그먼트(struct thread_segment)를
+ *       만들고, get_new_job()이 부모 td 를 얕은 복사한 뒤 dup_files/
+ *       fio_options_mem_dupe/profile_add_hooks 로 깊은 복사 보강을 수행한다.
+ *       공유 메모리를 쓰는 이유는 --thread=0 기본 모드에서 job 이 fork(2)
+ *       로 분리된 프로세스로 실행되어 부모-자식 간 통계 공유가 필요하기
+ *       때문이다.
+ *   (4) 옵션 의존성 해결(fixup_options) 및 최종 잡 등록(add_job) —
+ *       readonly/trimwrite/zone_mode/verify_interval/rate vs rate_iops/
+ *       압축 vs refill_buffers/thinktime_spin/iodepth_low·batch/sprandom
+ *       전제조건 등 200+ 검증 지점을 일괄 처리하고, init_flags()로
+ *       TD_F_VER_BACKLOG/TRIM_BACKLOG/READ_IOLOG/REFILL_BUFFERS/
+ *       SCRAMBLE_BUFFERS/DO_VERIFY/NEED_LOCK/CHECK_RATE 비트를 세팅한 뒤
+ *       setup_log() 으로 lat/slat/clat/bw/iops/hist 로그 스트림을 연다.
+ *
+ * 또한 부수적으로 signal 관련 처리(atexit(free_shm))와 dlopen 된 I/O 엔진
+ * 해제(free_ioengine), 난수 시드 파생(td_fill_rand_seeds/init_rand_seed),
+ * blktrace 병합 훅(merge_blktrace_iologs), steady-state 초기화
+ * (td_steadystate_init), flow control 초기화(flow_init_job) 등
+ * 런타임 직전 모든 pre-flight 훅을 여기에서 호출한다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * main() [fio.c] → parse_options() [이 파일] → fio_backend() [backend.c]
- * 초기화 흐름:
- *   parse_options() → parse_cmd_line() → parse_jobs_ini()
- *     → get_new_job() → ioengine_load() → fixup_options() → add_job()
+ * 호출 체인:
+ *   _start → __libc_start_main → main() [fio.c]
+ *     → initialize_fio() [fio.c]
+ *     → parse_options(argc, argv) [이 파일]
+ *         → fio_init_options() [이 파일]
+ *             → fio_options_fill_optstring() [이 파일]
+ *             → fio_options_dup_and_init(l_opts) [options.c]
+ *             → atexit(free_shm) [glibc: exit 시 역순 호출]
+ *             → fill_def_thread() [이 파일]
+ *                 → fio_fill_default_options() [options.c]
+ *         → fio_test_cconv(&def_thread.o) [cconv.c]
+ *         → parse_cmd_line(argc, argv, FIO_CLIENT_TYPE_CLI) [이 파일]
+ *             → getopt_long_only(3) 루프
+ *                 → add_job() / get_new_job() / ioengine_load() / ...
+ *             → (서버 모드) fio_start_server() [server.c]
+ *             → (클라이언트 모드) fio_client_add() [client.c]
+ *         → (잡 파일 있으면) parse_jobs_ini(ini_file[i], ...) [이 파일]
+ *             → __parse_jobs_ini() [이 파일 재귀]
+ *                 → get_new_job() → ioengine_load()
+ *                 → fio_options_parse() [parse.c]
+ *                 → add_job() [이 파일]
+ *                     → init_flags() / ioengine_load()
+ *                     → setup_random_seeds() / fixup_options()
+ *                     → flow_init_job() / setup_log() × 5
+ *                     → td_steadystate_init() / setup_rate()
+ *                     → numjobs>1 이면 재귀적으로 add_job()
+ *     → (이후 main 에서) fio_backend() 또는 fio_handle_clients() [backend.c]
+ *
+ * 실행 컨텍스트:
+ *   - 이 파일의 모든 함수는 **메인 프로세스의 단일 스레드**에서 실행된다.
+ *     잡이 spawn 되기 이전 단계이므로 thread_data 들 간 동기화가 필요
+ *     없다. 유일한 예외는 fio_debug_jobp/fio_warned 가 공유 메모리에
+ *     위치해 이후 자식 프로세스에서도 참조된다는 점이다.
+ *   - 서버 모드(-S) 에서는 parse_cmd_line 이 fio_start_server() 로
+ *     분기해 클라이언트 요청 루프에 진입하고, 이후 클라이언트 요청마다
+ *     parse_options 가 다시 호출될 수 있다(optind=1 초기화 참조).
  *
  * === 타 모듈과의 연결 ===
- * - fio.c: main()에서 parse_options()를 호출
- * - parse.c: 옵션 파싱 엔진 (parse_option(), fill_default_options())
- * - ioengines.c: load_ioengine()으로 I/O 엔진 동적 로드
- * - options.c: fio_options[] 배열에서 옵션 정의 참조
- * - smalloc.c: 공유 메모리에서 thread_data 할당
- * - 핵심 자료구조: thread_data, thread_options
+ * - fio.c: main()에서 parse_options() 호출. did_arg/is_backend/nr_clients
+ *   등 전역을 공유해 이후 분기를 결정.
+ * - parse.c: fio_options_parse(), fill_default_options(), check_str_time()
+ *   등 옵션 엔진을 제공. 본 파일은 이를 호출만 하고 자체 파싱 로직은
+ *   INI 섹션 감지 수준에 그친다.
+ * - options.c: fio_options[] 테이블의 엔트리 정의와 fio_check_options/
+ *   fio_options_dup_and_init/fio_option_is_set/fio_options_mem_dupe/
+ *   fio_fill_default_options/fio_options_set_ioengine_opts/
+ *   fio_cmd_option_parse/fio_show_option_help 를 공급.
+ * - ioengines.c: load_ioengine/free_ioengine/td_set_ioengine_flags/
+ *   td_ioengine_flagged — IO 엔진 dlopen(3) 기반 로드/해제/플래그 확인.
+ * - smalloc.c: sinit()/scleanup() — 공유 메모리 풀 초기화/정리.
+ * - filesetup.c: add_file/dup_files/for_each_file/fio_file_free —
+ *   잡 당 파일 목록 관리.
+ * - filehash.c: file_hash_exit — 중복 파일 감지 해시 테이블 해제.
+ * - verify.c: verify_header 구조체 크기 참조(verify_offset 검증).
+ * - iolog.c: setup_log/iolog_file_inflate — 로그 스트림 개방, gz 해제.
+ * - stat.c: init_thread_stat_min_vals — 통계 최소값 초기화.
+ * - steadystate.c: td_steadystate_init — 정상상태 감지 훅.
+ * - flow.c: flow_init/flow_exit/flow_init_job/flow_exit_job — job 간
+ *   IO rate 동기화용 flow control.
+ * - filelock.c: fio_filelock_exit — 파일 잠금 해제.
+ * - profile.c: profile_add_hooks/profile_td_init/profile_td_exit —
+ *   프로파일 훅 연결.
+ * - blktrace.c: merge_blktrace_iologs — blktrace 병합.
+ * - server.c/client.c: fio_server_*, fio_client_* — 백엔드/클라이언트
+ *   모드 처리, fio_clients_send_ini 로 원격 파싱 위임.
+ *
+ * 데이터 흐름:
+ *   argv[] / .fio 파일 → [본 파일 파서] → thread_options 필드
+ *     → fixup_options 로 필드 간 정합 보정 → thread_data.flags 비트
+ *     → 공유 메모리 세그먼트에 기록 → backend.c 가 fork/pthread_create
+ *     로 잡 spawn → 잡 스레드가 읽기 전용으로 thread_options 참조.
+ *
+ * 공유하는 핵심 자료구조:
+ *   - struct thread_data — 잡 하나당 1개, 공유 메모리 segments[] 에 배치.
+ *   - struct thread_options — td->o 에 임베딩. 옵션 파서의 최종 산출물.
+ *   - struct ioengine_ops — td->io_ops 에 포인터로 연결, dlopen 핸들을
+ *     ops->dlhandle 로 간접 소유.
+ *   - segments[REAL_MAX_SEG] — thread_segment 배열, nr_segments/cur_segment
+ *     로 인덱싱.
+ *   - def_thread — "[global]" 섹션을 받는 템플릿 thread_data.
+ *   - l_opts[FIO_NR_OPTIONS] — getopt_long_only(3) 의 struct option 테이블.
+ *   - fio_debug / fio_debug_jobp / fio_warned — 공유 메모리의 디버그 플래그.
  *
  * === 주요 함수/구조체 요약 ===
- * - parse_options(): 명령줄 인수 파싱 및 옵션 초기화 (최상위 진입점)
- * - parse_cmd_line(): CLI 옵션 파싱 (--name, --ioengine 등)
- * - parse_jobs_ini(): job 파일(.fio) 파싱 ([global], [jobname] 섹션)
- * - get_new_job(): thread_data 구조체 할당 (공유 메모리 세그먼트에서)
- * - add_job(): 최종 job 등록 (로그 설정, 난수 시드, rate 설정 등)
+ * - parse_options(argc,argv): 최상위 진입점. fio_init_options → parse_cmd_line
+ *   → (ini 파일들에 대해) parse_jobs_ini → 정리.
+ * - parse_cmd_line(): getopt_long_only(3) 루프. 약 50개 옵션을 단일 switch
+ *   로 디스패치. --name 을 만나면 get_new_job → ioengine_load → ... →
+ *   add_job 을 내부적으로 수행.
+ * - parse_jobs_ini() / __parse_jobs_ini(): INI 파서. 섹션 헤더 [...] 를
+ *   sscanf 로 인식하고 include 지시자를 재귀 처리. 섹션 몸체 옵션을
+ *   문자열 배열에 모아 fio_options_parse() 로 일괄 파싱.
+ * - get_new_job(): 공유 메모리에서 td 한 칸을 확보하고 부모 td 복사,
+ *   opt_list/fs_list 깊은 복사, fio_options_mem_dupe 수행.
+ * - add_job(): 최종 잡 등록. init_flags, ioengine_load, add_file,
+ *   setup_random_seeds, fixup_options, flow_init_job, setup_log × 5,
+ *   init_thread_stat_min_vals, td_steadystate_init, setup_rate, 그리고
+ *   numjobs 재귀 확장을 모두 수행.
+ * - fixup_options(): 200+ 옵션 간 의존성 해결. 가장 복잡한 정적 검증기.
+ * - ioengine_load(): dlopen(3) 으로 .so 로드 또는 내장 엔진 참조,
+ *   td->io_ops 와 td->eo 를 초기화.
+ * - setup_random_seeds() / td_fill_rand_seeds() / init_rand_offset_seed():
+ *   FIO_RAND_NR_OFFS 개의 시드 슬롯을 파생하고 frand_state 들을 초기화.
+ * - free_shm() / free_threads_shm() / add_thread_segment() /
+ *   expand_thread_area(): POSIX shmget/shmat/shmdt/shmctl 기반 세그먼트
+ *   수명 관리.
+ * - set_debug(): --debug 비트마스크 해석 (debug_levels[] 테이블 사용).
+ * - struct fpre_keyword[]: $jobname/$jobnum/$filenum/$clientuid 치환
+ *   키워드 테이블. make_filename() 이 사용.
+ * - struct option l_opts[]: getopt_long_only(3) 의 long option 테이블.
+ *   FIO_CLIENT_FLAG 비트를 val 상위에 OR 하여 클라이언트 전달 여부 표시.
+ *
+ * === 왜 이 파일이 fio 전체에서 가장 복잡한가 ===
+ * fio 는 "하나의 바이너리가 수백 가지 옵션을 받아 I/O 워크로드를 표현"
+ * 하는 설계라서, 옵션 간 조합은 조합 폭발이 발생한다. fixup_options()
+ * 한 함수만 보면 zone_mode / sprandom / verify / compress / rate /
+ * iodepth / dedupe / ss / fdp 등 서로 독립적인 기능 도메인이 모두 여기서
+ * 교차 검증된다. 이 파일의 얕은 주석을 보완하는 이유는, 다른 모듈로
+ * 점프하지 않고도 옵션 파이프라인 전체를 이해할 수 있게 하기 위함이다.
  */
 
-/* 표준 C 라이브러리 헤더 파일들 */
+/* ============================================================
+ * [한국어] 헤더 포함 사유 카탈로그
+ * 아래 각 #include 는 본 파일에서 어떤 심볼/매크로를 공급하는지,
+ * 그리고 왜 없으면 컴파일이나 런타임이 무너지는지를 개별로 명시한다.
+ * ============================================================ */
+
 #include <stdio.h>
+/* [한국어] FILE 포인터 타입, fopen/fclose/fgets/fscanf/printf/snprintf/
+ * sprintf/stdin/stdout/stderr 공급. 본 파일은 INI 파일을 fopen("r") 로
+ * 읽고, usage() 가 printf 로 도움말을 출력하며, --output 옵션이
+ * stdout/stderr 을 파일로 리다이렉트한다. strsep 기반 버퍼 파싱
+ * 시에도 snprintf 로 파일명을 조립한다. */
+
 #include <stdlib.h>
+/* [한국어] malloc/calloc/realloc/free/atoi/strdup(일부 libc) 및 exit(3)
+ * 공급. 옵션 문자열 복제(strdup), 옵션 배열 동적 확장(realloc), 전역
+ * 트리거 버퍼 할당, 그리고 parse_cmd_line() 말미의 exit(exit_val) 용도. */
+
 #include <unistd.h>
+/* [한국어] getpid(2)/access(2) 공급. fill_def_thread() 가 현재
+ * 프로세스의 CPU 친화도를 getpid() 로 조회하고, --client 가 파일
+ * 경로인지 access(F_OK) 로 판별하며, include 지시자의 상대 경로
+ * 존재 확인도 access 로 수행한다. */
+
 #include <ctype.h>
+/* [한국어] isspace(3)/iscntrl(3) 공급. is_empty_or_comment() 가 줄의
+ * 전 문자가 공백/제어문자인지 확인해 INI 빈 줄을 판별한다. */
+
 #include <string.h>
+/* [한국어] strcmp/strncmp/strcpy/strdup/strlen/strchr/strrchr/strstr/
+ * strsep/memset/memcpy/strerror(3) 공급. 섹션 이름 비교, include
+ * 지시자 접두 확인, 키워드 치환(make_filename), 옵션 수집, thread_data
+ * 얕은 복사, 에러 메시지 생성에 전반 사용. */
+
 #include <errno.h>
-#include <sys/ipc.h>      /* IPC(프로세스 간 통신) 관련 - 공유 메모리 키 생성에 사용 */
+/* [한국어] errno 변수와 EINVAL/ENOMEM/ENOSPC 매크로 공급. shmget(2) 실패
+ * 시 errno 를 확인해 EINVAL/ENOMEM/ENOSPC 면 사용자 자원 한계로 간주해
+ * 조용히 실패하고, 그 외에는 perror 로 진단. INI fopen 실패 역시
+ * errno 를 td_verror 로 기록. */
+
+#include <sys/ipc.h>
+/* [한국어] System V IPC 의 IPC_CREAT/IPC_RMID 매크로와 key_t 타입 공급.
+ * shmget/shmctl 의 첫 인자가 key_t 이고, 세그먼트 생성 플래그
+ * (IPC_CREAT|0600)과 삭제 플래그(IPC_RMID)가 여기서 온다. */
+
 #include <sys/types.h>
-#include <dlfcn.h>         /* 동적 라이브러리 로딩 (dlopen, dlclose) - IO 엔진 플러그인 로드에 사용 */
+/* [한국어] pid_t/size_t/off_t 등 POSIX 기본 타입 정의 공급. getpid 의
+ * 반환 타입, shm_id 관련 타입 호환성, 파일 읽기 버퍼 크기 계산 등에
+ * 암묵적으로 의존. 일부 시스템에서는 sys/shm.h 보다 먼저 포함해야
+ * 한다. */
+
+#include <dlfcn.h>
+/* [한국어] dlopen(3)/dlclose(3)/dlsym(3)/dlerror(3) 공급. ioengine_load()
+ * 경로에서 본 파일은 dlclose 만 직접 사용하지만(엔진 교체 시 이전
+ * 핸들 정리), load_ioengine()/free_ioengine() 쪽에서 dlopen/dlsym 을
+ * 공유하므로 선언이 필요하다. .so 엔진 플러그인 로드의 핵심. */
+
 #ifdef CONFIG_VALGRIND_DEV
-#include <valgrind/drd.h>  /* Valgrind DRD(Data Race Detector) - 스레드 경쟁 상태 감지 도구 */
+#include <valgrind/drd.h>
+/* [한국어] Valgrind DRD(Data Race Detector) 클라이언트 요청 매크로 공급.
+ * DRD_IGNORE_VAR(x) 는 해당 변수를 DRD 의 경쟁 감지 대상에서 제외한다.
+ * 공유 메모리의 thread_data 는 정상 경로상 부모가 초기화한 뒤 자식이
+ * 읽기만 하지만, DRD 는 이를 경쟁으로 오탐할 수 있어 명시적으로
+ * suppress 해야 한다. configure 단계에서 valgrind-dev 가 발견되면
+ * CONFIG_VALGRIND_DEV 가 켜진다. */
 #else
-/* Valgrind가 없으면 DRD_IGNORE_VAR를 빈 매크로로 정의 */
+/* [한국어] Valgrind 가 없으면 매크로를 no-op 로 정의해 호출부를 그대로
+ * 유지한다. do{}while(0) 은 매크로 치환 시 세미콜론 문제를 피하는
+ * 관용 패턴. */
 #define DRD_IGNORE_VAR(x) do { } while (0)
 #endif
 
-#include "fio.h"           /* fio 핵심 헤더 - thread_data, fio_file 등 주요 구조체 정의 */
+#include "fio.h"
+/* [한국어] fio 의 중앙 헤더. struct thread_data, thread_options,
+ * fio_file, ioengine_ops, enum fio_ddir, TD_F_* 플래그, FIO_*
+ * 매크로 대부분, log_info/log_err, td_verror, dprint(FD_*), for_each_td,
+ * for_each_file, td_read/td_write/td_trim/td_random/td_trimwrite,
+ * td_ioengine_flagged, fio_option_is_set, add_file, dup_files,
+ * frand_state 관련 API, flow_init/init_rand_seed 등 거의 모든 fio
+ * 코어 심볼을 공급한다. */
+
 #ifndef FIO_NO_HAVE_SHM_H
-#include <sys/shm.h>       /* POSIX 공유 메모리 API (shmget, shmat, shmdt, shmctl) */
+#include <sys/shm.h>
+/* [한국어] System V 공유 메모리 API 공급: shmget(2)/shmat(2)/shmdt(2)/
+ * shmctl(2), struct shmid_ds, SHM_RDONLY 등. thread_segment 1개 =
+ * 하나의 shm 세그먼트. FIO_NO_HAVE_SHM_H 는 Windows/Android 등 SHM
+ * 미지원 플랫폼 대응이며, 그 경우 CONFIG_NO_SHM 분기로 malloc 폴백. */
 #endif
 
-#include "parse.h"         /* 옵션 파싱 관련 함수들 */
-#include "smalloc.h"       /* fio 전용 소규모 메모리 할당기 (공유 메모리 기반) */
-#include "filehash.h"      /* 파일 해시 테이블 - 중복 파일 감지에 사용 */
-#include "verify.h"        /* 데이터 검증(verify) 관련 함수 및 구조체 */
-#include "profile.h"       /* 프로파일링 관련 함수들 */
-#include "server.h"        /* 클라이언트/서버 모드 관련 함수들 */
-#include "idletime.h"      /* CPU 유휴 시간 측정 관련 */
-#include "filelock.h"      /* 파일 잠금 관련 함수들 */
-#include "steadystate.h"   /* 정상 상태(steady state) 감지 관련 */
-#include "blktrace.h"      /* blktrace 로그 병합/재생 관련 */
+#include "parse.h"
+/* [한국어] fio 옵션 파서 엔진. fio_options_parse(), fio_cmd_option_parse(),
+ * fio_cmd_ioengine_option_parse(), fio_options_dup_and_init(),
+ * fio_options_set_ioengine_opts(), fio_fill_default_options(),
+ * strip_blank_front(), strip_blank_end(), check_str_time(), options_init(),
+ * options_mem_dupe(), FIO_GETOPT_JOB, FIO_GETOPT_IOENGINE 등 공급. */
 
-#include "oslib/asprintf.h"  /* OS 독립적 asprintf 구현 */
-#include "oslib/getopt.h"    /* OS 독립적 getopt_long 구현 */
-#include "oslib/strcasestr.h" /* OS 독립적 strcasestr(대소문자 무시 문자열 검색) */
+#include "smalloc.h"
+/* [한국어] fio 전용 공유 메모리 풀 할당기. sinit()/scleanup()/
+ * smalloc_pool_size 전역 공급. --alloc-size 옵션이 smalloc_pool_size 를
+ * 조정해 sinit() 으로 풀을 재초기화한다. */
 
-#include "crc/test.h"      /* CRC/체크섬 성능 테스트 */
-#include "lib/pow2.h"      /* 2의 거듭제곱 관련 유틸리티 */
-#include "lib/memcpy.h"    /* memcpy 성능 테스트 */
+#include "filehash.h"
+/* [한국어] 파일 해시 테이블 API. file_hash_exit() 공급. fio 는 같은
+ * 파일을 여러 잡이 공유할 때 fio_file 객체를 재사용하도록 해시에
+ * 등록하며, 본 파일은 종료 시 이를 해제한다. */
 
-/* fio 버전 문자열 - FIO_VERSION 매크로에서 설정됨 */
+#include "verify.h"
+/* [한국어] struct verify_header 정의 공급. fixup_options() 가
+ * verify_offset + sizeof(struct verify_header) 가 verify_interval 을
+ * 초과하지 않는지 검증한다. */
+
+#include "profile.h"
+/* [한국어] 실행 프로파일 API. profile_add_hooks/profile_td_init/
+ * profile_td_exit 공급. --profile 옵션으로 사전 정의된 워크로드 템플릿
+ * (tiobench, act 등)을 덮어쓸 수 있다. */
+
+#include "server.h"
+/* [한국어] 클라이언트/서버 분산 모드 API. fio_server_send_add_job,
+ * fio_start_server, fio_server_set_arg, fio_server_internal_set,
+ * fio_client_add, fio_client_add_ini_file, fio_client_add_cmd_option,
+ * fio_clients_connect, fio_clients_send_ini, fio_client_ops,
+ * client_sockaddr_str, nr_clients 공급. */
+
+#include "idletime.h"
+/* [한국어] CPU 유휴시간 측정 API. fio_idle_prof_parse_opt 공급. --idle-prof
+ * 옵션이 인자("system"/"percpu"/"calibrate")를 여기서 해석. */
+
+#include "filelock.h"
+/* [한국어] 파일 잠금 API. fio_filelock_exit() 공급. 잡이 verify_state
+ * 파일 등을 락으로 보호할 때 사용하며 본 파일은 종료 시 해제만. */
+
+#include "steadystate.h"
+/* [한국어] 정상상태(steady state) 감지 API. td_steadystate_init 공급.
+ * 잡이 일정 윈도우 동안 수렴(iops/bw 분산 작음)하면 조기 종료. */
+
+#include "blktrace.h"
+/* [한국어] blktrace 재생/병합 API. merge_blktrace_iologs 공급. --read_iolog
+ * 과 --merge-blktrace-only 분기에서 사용. */
+
+#include "oslib/asprintf.h"
+/* [한국어] asprintf(3) 의 OS 독립 구현. include 지시자의 상대 경로를
+ * 현재 파일 디렉토리와 결합할 때 full_fn 을 동적 할당한다. */
+
+#include "oslib/getopt.h"
+/* [한국어] getopt_long_only(3) 와 struct option 의 OS 독립 구현.
+ * parse_cmd_line 의 핵심 파서. required_argument/optional_argument/
+ * no_argument 매크로도 여기서 온다. */
+
+#include "oslib/strcasestr.h"
+/* [한국어] strcasestr(3) 의 OS 독립 구현. make_filename() 이 $jobname
+ * 등 키워드를 대소문자 무시로 탐색할 때 사용. */
+
+#include "crc/test.h"
+/* [한국어] CRC/체크섬 벤치마크 함수 fio_crctest 공급. --crctest
+ * 옵션에서 호출. */
+
+#include "lib/pow2.h"
+/* [한국어] is_power_of_2(n) 판별 함수 공급. add_job() 이 kb_base (1000 vs
+ * 1024) 를 파워-오브-2 여부로 구분해 num2str 표시 단위 결정. */
+
+#include "lib/memcpy.h"
+/* [한국어] fio_memcpy_test() 벤치마크 공급. --memcpytest 옵션에서 호출. */
+
 const char fio_version_string[] = FIO_VERSION;
+/* [한국어] fio 버전 문자열.
+ * 설정자: 컴파일 시 FIO_VERSION 매크로(예: "fio-3.42")가 치환되어 결정된다.
+ * 읽는 자: fio.c main() 의 version 출력, usage() 의 헤더, --version 처리,
+ *   그리고 parse_options() 말미의 일반 출력 헤더에서 참조.
+ * 값 범위: null-terminated C 문자열. 링커 타임에 고정되며 읽기 전용.
+ * 동기화: const 이고 초기화 후 변경되지 않으므로 동기화 불필요. */
 
-/* 난수 생성기의 기본 시드값 */
 #define FIO_RANDSEED		(0xb1899bedUL)
+/* [한국어] 난수 생성기의 역사적 기본 시드.
+ * 현재 이 매크로는 본 파일 내에서 직접 참조되지 않지만, 과거 rand_seed
+ * 옵션의 디폴트로 쓰였고 하위 호환성과 문서화를 위해 유지된다. 새로
+ * 추가되는 난수 코드는 td->rand_seeds[] 배열에서 시드를 뽑아야 한다. */
 
-/* ini 파일(job 파일) 경로 배열 - 명령줄에서 지정된 job 파일들의 목록 */
 static char **ini_file;
-/* --showcmd 옵션: job 파일 내용을 명령줄 형식으로 출력만 하고 실행하지 않음 */
+/* [한국어] 명령줄에서 수집된 잡 파일(.fio) 경로 배열.
+ * 설정자: parse_cmd_line() 의 말미 루프에서 남은 positional 인자를
+ *   strdup 하여 realloc 확장된 포인터 배열에 축적.
+ * 읽는 자: parse_options() 가 각 파일마다 parse_jobs_ini(ini_file[i], ...)
+ *   호출 뒤 free(ini_file[i]) 하고 최종적으로 free(ini_file).
+ * 값 범위: NULL(초기) 또는 realloc 된 char* 배열 포인터. 각 엔트리는
+ *   strdup 결과라 소유권 이관된 힙 포인터.
+ * 동기화: 메인 스레드 단독 소유라 락 불필요. */
+
 static bool dump_cmdline;
-/* --parse-only 옵션: 옵션을 파싱만 하고 IO를 실행하지 않음 */
+/* [한국어] --showcmd 옵션 플래그.
+ * 설정자: parse_cmd_line() 의 case 's'.
+ * 읽는 자: parse_dryrun(), __parse_jobs_ini() 내 dump 분기, add_job() 의
+ *   dryrun 체크.
+ * 값 범위: false(기본) / true. 일단 true 가 되면 실제 I/O 는 수행되지 않고
+ *   잡 정의를 명령줄 형태로만 출력한다.
+ * 동기화: 메인 스레드에서만 변경. */
+
 static bool parse_only;
-/* --merge-blktrace-only 옵션: blktrace 로그만 병합하고 IO를 실행하지 않음 */
+/* [한국어] --parse-only 옵션 플래그. 옵션 구문 검증만 수행하고 I/O 는
+ * 실행하지 않는다. 설정자: case 'P'. 읽는 자: parse_dryrun(). */
+
 static bool merge_blktrace_only;
+/* [한국어] --merge-blktrace-only 옵션 플래그. blktrace 로그를 병합만 하고
+ * 잡을 실행하지 않는다. 설정자: case 'A'. 읽는 자: add_job() 이 병합 완료
+ * 후 put_job 으로 잡을 버리는 조건. */
 
-/* 기본 스레드 데이터 - [global] 섹션의 옵션을 저장하며, 새 job의 템플릿으로 사용됨 */
 static struct thread_data def_thread;
-/* 스레드 세그먼트 배열 - 공유 메모리 세그먼트별로 thread_data 배열을 관리
- * 각 세그먼트는 JOBS_PER_SEG개의 job을 저장할 수 있음 */
+/* [한국어] 기본(글로벌) 스레드 데이터 = "[global]" 섹션의 값을 담는
+ * 템플릿. 실제 잡으로는 실행되지 않고, get_new_job() 이 이 구조체를
+ * 부모로 삼아 자식 td 를 복사 생성한다.
+ * 설정자: fill_def_thread() 가 fio_getaffinity + fio_fill_default_options
+ *   로 초기화. 이후 --name=global 이나 [global] 섹션에서 fio_options_parse
+ *   가 필드를 채워넣는다.
+ * 읽는 자: get_new_job(), ioengine_load(origeo 분기), add_job, parse_options
+ *   말미의 options_free.
+ * 값 범위: 정적 0-초기화 후 runtime 에 채워짐.
+ * 동기화: 메인 스레드 단독 접근. */
+
 struct thread_segment segments[REAL_MAX_SEG];
-/* --section 옵션으로 지정된 job 섹션 이름 배열 */
+/* [한국어] thread_data 들을 담는 공유 메모리 세그먼트 배열.
+ * 설정자: add_thread_segment() 가 shmget+shmat 으로 한 세그먼트당
+ *   JOBS_PER_SEG(보통 16) 개 td 와 2개의 디버그 포인터를 담는 chunk 를 할당.
+ * 읽는 자: get_new_job / for_each_td / free_threads_shm / add_job /
+ *   backend.c 의 잡 스폰 루프 (자식 프로세스도 attach).
+ * 값 범위: segments[0..nr_segments-1] 만 유효. REAL_MAX_SEG 는 최대 세그먼트 수.
+ * 동기화: 메인 프로세스가 초기화하고, 자식은 fork(2) 이후 read-mostly.
+ *   thread_data 필드별로는 원자적 업데이트(잡 상태, 통계 등)를 가정. */
+
 static char **job_sections;
-/* job_sections 배열의 요소 수 */
+/* [한국어] --section 옵션으로 지정된 섹션 이름 문자열 배열.
+ * 설정자: parse_cmd_line() 의 case 'x' 가 realloc + strdup 로 append.
+ * 읽는 자: skip_this_section() 이 섹션 헤더 파싱 시 검사.
+ * 값 범위: NULL(기본 - 모든 섹션 실행) 또는 strdup 한 문자열 배열.
+ * 소유권: 각 엔트리는 free(job_sections[i]) 로 회수. __parse_jobs_ini 의
+ *   말미 정리 루프에서 해제되고 nr_job_sections 도 0 으로 리셋. */
+
 static int nr_job_sections;
+/* [한국어] job_sections 배열 원소 수. 0 이면 "모든 섹션 실행". */
 
-/* 하나의 job이 에러로 종료되면 모든 job을 종료할지 여부 */
 bool exitall_on_terminate = false;
-/* 출력 형식: normal, terse(간결), json, json+ 중 선택 */
+/* [한국어] 한 잡이라도 에러로 끝나면 모든 잡을 종료할지 여부.
+ * fio.h 에 선언되어 있고 옵션 --exitall 에서 켤 수 있다. backend.c 의 잡
+ * 종료 핸들러에서 참조. */
+
 int output_format = FIO_OUTPUT_NORMAL;
-/* ETA(예상 완료 시간) 출력 모드: auto, always, never */
+/* [한국어] 출력 형식 비트마스크. FIO_OUTPUT_NORMAL/TERSE/JSON/JSON_PLUS
+ * 를 OR 로 조합 가능. --output-format/--minimal/--append-terse 로 변경.
+ * stat.c 의 show_run_stats, client.c 의 결과 출력 경로에서 분기. */
+
 int eta_print = FIO_ETA_AUTO;
-/* ETA 갱신 간격 (밀리초 단위, 기본값 1000ms = 1초) */
+/* [한국어] ETA 표시 모드. FIO_ETA_AUTO(tty 이면 ON)/ALWAYS/NEVER.
+ * --eta 옵션으로 제어되고 eta.c 의 disk_util_print 가 참조. */
+
 unsigned int eta_interval_msec = 1000;
-/* ETA 새 줄 출력 간격 (초 단위) */
+/* [한국어] ETA 갱신 간격(ms). --eta-interval 로 변경. 최소 DISK_UTIL_MSEC
+ * 이상이어야 함(디스크 유틸리티 측정 간격과 정합). */
+
 int eta_new_line = 0;
-/* 표준 출력 파일 포인터 (--output 옵션으로 리다이렉트 가능) */
+/* [한국어] ETA 출력에 줄바꿈을 강제할 주기(초). --eta-newline 으로 설정.
+ * 0 은 줄바꿈 없음(carriage return 으로 in-place 갱신). */
+
 FILE *f_out = NULL;
-/* 표준 에러 파일 포인터 */
+/* [한국어] 일반 출력 파일 포인터. 초기값 stdout(fio_init_options 에서
+ * 설정). --output=FILE 이 지정되면 fopen("w+") 결과로 대체된다. */
+
 FILE *f_err = NULL;
-/* --profile 옵션으로 지정된 실행 프로파일 이름 */
+/* [한국어] 에러 출력 파일 포인터. 초기 stderr, --output 시 f_out 과 동일
+ * 파일로 지정된다(로그 혼합 출력). */
+
 char *exec_profile = NULL;
-/* --warnings-fatal: 경고를 치명적 오류로 처리할지 여부 */
+/* [한국어] --profile=NAME 으로 지정된 실행 프로파일 이름.
+ * profiles/ 디렉토리의 .c 가 load_profile 로 등록된 이름과 일치해야 한다. */
+
 int warnings_fatal = 0;
-/* terse 출력 형식의 버전 (2~5, 기본값 3) */
+/* [한국어] --warnings-fatal: 경고를 치명적으로 처리할지 여부.
+ * fixup_options 와 옵션 파서에서 `ret |= warnings_fatal` 패턴으로 사용되어,
+ * 값이 1 이면 경고가 즉시 리턴 코드를 오염시킨다. */
+
 int terse_version = 3;
-/* 현재 프로세스가 백엔드(서버) 모드인지 여부 */
+/* [한국어] terse 출력의 스키마 버전(2..5). --terse-version. stat.c 의
+ * terse 출력 경로에서 분기하여 호환 포맷을 고른다. */
+
 bool is_backend = false;
-/* 로컬 백엔드 모드인지 여부 */
+/* [한국어] 현재 프로세스가 fio --server 로 기동된 백엔드인지 여부.
+ * 설정자: parse_cmd_line case 'S'. 읽는 자: backend.c 및 server.c 곳곳. */
+
 bool is_local_backend = false;
-/* 연결된 원격 클라이언트 수 */
+/* [한국어] 로컬 백엔드 모드(fio 클라이언트가 내부 스폰한 동일 호스트
+ * 서버)인지 여부. client.c 에서 설정한다. */
+
 int nr_clients = 0;
-/* syslog로 로그를 출력할지 여부 */
+/* [한국어] 연결된 원격 클라이언트 수. --client 로 증가. 이후 main() 가
+ * nr_clients>0 이면 fio_handle_clients 로 분기, 아니면 fio_backend. */
+
 bool log_syslog = false;
+/* [한국어] syslog 로 로그를 보내는 모드 여부. 서버 모드에서 활성화. */
 
-/* 대역폭(bandwidth) 로그 기록 활성화 여부 */
 bool write_bw_log = false;
-/* 대역폭 로그 파일 이름 */
+/* [한국어] --bandwidth-log 활성 플래그. aggregate bw 로그 파일을 생성할지
+ * 여부. write_bw_log_name 과 쌍으로 사용. */
+
 const char *write_bw_log_name;
-/* --readonly: 읽기 전용 모드 - 쓰기/트림 작업 금지 */
+/* [한국어] 집계 bw 로그의 기본 이름. --bandwidth-log=NAME 으로 지정되거나
+ * 기본값 "agg" 가 된다. */
+
 bool read_only = false;
-/* --status-interval: 상태 전체 덤프 출력 간격 */
+/* [한국어] --readonly: 전역 읽기 전용 모드. fixup_options() 와 fio_ro_check
+ * 가 참조해 쓰기/트림을 거부한다. 안전장치로만 사용된다. */
+
 int status_interval = 0;
+/* [한국어] --status-interval: 상태 전체 덤프 주기(초). 0 이면 비활성. */
 
-/* 트리거 파일 경로 - 이 파일이 존재하면 트리거 명령 실행 */
 char *trigger_file = NULL;
-/* 트리거 타임아웃 (이 시간 후 트리거 명령 실행) */
+/* [한국어] --trigger-file: 파일이 생성되면 로컬/원격 trigger 명령을 실행. */
+
 long long trigger_timeout = 0;
-/* 로컬에서 실행할 트리거 명령 */
+/* [한국어] --trigger-timeout: 지정 시각(초) 후 trigger 를 자동 발사. */
+
 char *trigger_cmd = NULL;
-/* 원격에서 실행할 트리거 명령 */
+/* [한국어] --trigger: 로컬에서 실행할 trigger 명령. system(3) 으로 실행. */
+
 char *trigger_remote_cmd = NULL;
+/* [한국어] --trigger-remote: 원격 서버가 실행할 trigger 명령 문자열. */
 
-/* fio 상태 파일들의 보조 경로 (로그 파일 등) */
 char *aux_path = NULL;
+/* [한국어] --aux-path: fio 가 생성하는 보조 파일(verify state, log 등)
+ * 의 기본 디렉토리. */
 
-/* 이전 그룹의 job 수 - stonewall/new_group 처리에 사용 */
 static int prev_group_jobs;
+/* [한국어] 직전 그룹에 속한 잡 수 누적기. stonewall 이나 new_group 이
+ * 설정될 때 groupid 를 bump 할지 결정하는 데 사용. add_job() 이 증감. */
 
-/* 디버그 출력 비트마스크 - 각 비트가 특정 디버그 카테고리를 나타냄 */
 unsigned long fio_debug = 0;
-/* 특정 job 번호에 대해서만 디버그 출력 */
+/* [한국어] 디버그 카테고리 비트마스크. 각 비트는 FD_* enum 값에 대응
+ * (fio.h). set_debug() 가 --debug=list 를 파싱하고 dprint(FD_X, ...) 매크로가
+ * (fio_debug & (1 << FD_X)) 로 로그 게이팅. */
+
 unsigned int fio_debug_jobno = -1;
-/* 디버그 대상 job 번호 포인터 (공유 메모리에 위치) */
+/* [한국어] --debug=job:NR 로 지정된 특정 잡 번호에만 디버그 출력.
+ * -1 은 필터링 없음(모든 잡). */
+
 unsigned int *fio_debug_jobp = NULL;
-/* 경고 플래그 포인터 (공유 메모리에 위치) - 중복 경고 방지용 */
+/* [한국어] 공유 메모리에 배치된 fio_debug_jobno 의 미러.
+ * 설정자: add_thread_segment() 가 첫 세그먼트 끝에 fio_debug_jobno 용
+ *   슬롯을 잡아 지정.
+ * 읽는 자: 자식 잡 프로세스도 attach 이후 이 주소를 참조해 필터링.
+ * 동기화: 단일 쓰기(메인), 다중 읽기(자식)라 atomic 읽기 가정. */
+
 unsigned int *fio_warned = NULL;
+/* [한국어] 중복 경고 방지 비트마스크의 공유 메모리 포인터. 같은 경고가
+ * 자식들 사이에서 한 번만 출력되도록 atomic bit set 으로 게이팅. */
 
-/* 명령줄 옵션 문자열 - getopt용 */
 static char cmd_optstr[256];
-/* 유효한 명령줄 인수가 하나라도 처리되었는지 여부 */
-static bool did_arg;
+/* [한국어] getopt_long_only(3) 에 넘기는 짧은 옵션 문자열 버퍼.
+ * fio_options_fill_optstring() 이 l_opts[] 의 val 필드와 has_arg 필드를
+ * 보고 자동 생성. 예: "o:l:b::m..." */
 
-/* 클라이언트 전용 플래그 - 클라이언트/서버 모드에서 클라이언트에게 전달해야 할 옵션 표시 */
+static bool did_arg;
+/* [한국어] 실질적 인자가 처리됐는지 여부. --help, --version 같이 exit 로
+ * 빠지는 옵션에서도 true 가 되어, 나중에 잡이 0개일 때 에러로 안내하지
+ * 않도록 한다. */
+
 #define FIO_CLIENT_FLAG		(1 << 16)
+/* [한국어] l_opts 의 val 필드 상위 비트에 OR 하여 "이 옵션은 원격 클라이언트
+ * 에도 전달해야 한다"고 표시하는 마커. parse_cmd_line 이 수신 직후
+ * parse_cmd_client 로 forward 하고, 하위 8비트만 실제 옵션 값으로 사용.
+ * 16번째 비트를 고른 이유는 ASCII 옵션 문자(하위 8비트)와 겹치지 않는
+ * 넉넉한 상위 공간을 확보하기 위함. */
 
 /*
  * Command line options. These will contain the above, plus a few
  * extra that only pertain to fio itself and not jobs.
  */
-/* 명령줄 옵션 정의 배열. fio 자체의 옵션들(job 옵션이 아닌)을 정의합니다.
- * getopt_long_only()에서 사용되며, FIO_CLIENT_FLAG가 설정된 옵션은
- * 클라이언트/서버 모드에서 클라이언트에게도 전달됩니다. */
+/* [한국어] fio 자체(잡 옵션이 아닌) 명령줄 옵션의 struct option 배열.
+ *
+ * struct option 의 각 필드 의미 (getopt(3) 스펙):
+ *   .name     - "--long-name" 의 long 문자열.
+ *   .has_arg  - no_argument / required_argument / optional_argument.
+ *               required_argument 는 "="과 인자 필수(예: --output=FILE).
+ *               optional_argument 는 "=" 뒤에 인자가 있을 수도 있다.
+ *   .flag     - NULL 로 두면 val 값이 그대로 반환된다(본 코드는 전부 NULL).
+ *   .val      - 매칭되었을 때 getopt 가 반환하는 int 값. fio 는 이 값의
+ *               상위 비트에 FIO_CLIENT_FLAG 를 OR 해 "클라이언트에 전달
+ *               해야 하는 옵션"을 한 워드로 표현한다. 하위 8비트는 단일
+ *               ASCII 문자(예: 'o') 로 parse_cmd_line 의 switch 에서
+ *               디스패치된다.
+ *
+ * FIO_CLIENT_FLAG 가 켜진 옵션: 원격 fio 클라이언트에게도 전달해
+ *   서버와 동일한 동작을 하게 한다. parse_cmd_line 의 초입에서
+ *   parse_cmd_client(cur_client, argv[optind-1]) 로 forward 한 뒤
+ *   플래그를 지우고 로컬에서도 해석한다.
+ *
+ * 배열 말미는 {.name = NULL} 로 종료한다 - getopt(3) 계약.
+ */
 static struct option l_opts[FIO_NR_OPTIONS] = {
 	{
 		.name		= (char *) "output",       /* 출력을 파일로 리다이렉트 */
@@ -385,15 +762,32 @@ static struct option l_opts[FIO_NR_OPTIONS] = {
 };
 
 /*
- * free_threads_shm() - 스레드 공유 메모리 해제 함수
+ * [한국어]
+ * free_threads_shm() - thread_data 를 담는 모든 공유 메모리 세그먼트를
+ *                      해제한다.
  *
- * 역할: 모든 세그먼트의 thread_data 공유 메모리를 해제합니다.
- * 파라미터: 없음
- * 반환값: 없음
+ * @return: 없음 (void).
  *
- * 각 세그먼트에 대해:
- *   - CONFIG_NO_SHM이 아닌 경우: shmdt()로 분리 후 shmctl()로 삭제
- *   - CONFIG_NO_SHM인 경우: free()로 단순 해제
+ * 왜 필요한가: add_thread_segment() 가 shmget(2)+shmat(2) 로 만든 System V
+ *   IPC 세그먼트는 커널이 자동 회수하지 않으며, shmctl(IPC_RMID) 가
+ *   호출되어야 "마지막 detach 시 삭제" 마크가 붙는다. 프로세스 종료
+ *   시에도 남아있는 IPC 세그먼트는 `ipcs` 에 누적되므로 반드시 명시적
+ *   해제가 필요하다.
+ *
+ * 동작 단계:
+ *   1. 세그먼트 배열을 0..nr_segments 로 순회.
+ *   2. CONFIG_NO_SHM 이 꺼진 경우: shmdt(ptr) 로 현 프로세스에서 detach
+ *      → shmctl(shm_id, IPC_RMID, &sbuf) 로 커널 측 세그먼트 삭제.
+ *   3. CONFIG_NO_SHM (Windows 등) 인 경우: 단순 malloc 대체이므로
+ *      free() 만 호출.
+ *   4. nr_segments 와 cur_segment 를 0 으로 리셋해 재사용 가능 상태 복원.
+ *
+ * 실행 컨텍스트: 메인 프로세스 종료 경로(free_shm → atexit) 또는 에러
+ *   회복 경로. 자식 잡이 detach 하기 전에 부모가 RMID 만 찍어두면 자식
+ *   종료 시 자동 회수되지만, fio 는 자식도 실행 중에 shmctl 결과를 공유
+ *   하므로 메인이 최종적으로 한번 더 청소한다.
+ *
+ * 호출 체인: free_shm() → [이 함수] → shmdt(2)/shmctl(2).
  */
 void free_threads_shm(void)
 {
@@ -428,19 +822,33 @@ void free_threads_shm(void)
 }
 
 /*
- * free_shm() - 전체 공유 자원 정리 함수
+ * [한국어]
+ * free_shm() - fio 종료 시 atexit(3) 훅으로 호출되어 모든 프로세스 공유
+ *              자원을 정리하는 marshalling 함수.
  *
- * 역할: fio 종료 시 atexit()에 의해 호출되어 모든 공유 자원을 정리합니다.
- * 파라미터: 없음
- * 반환값: 없음
+ * @return: 없음.
+ *
+ * 왜 필요한가: fio 는 공유 메모리, smalloc 풀, 파일 잠금, 파일 해시 등
+ *   여러 OS 자원을 선점하므로 한 곳에서 해제를 모아 둬야 leak 가
+ *   없다. atexit(3) 에 등록되어 있어 exit(3) 경로뿐 아니라 main() 의
+ *   정상 return 경로에서도 자동 실행된다.
  *
  * 정리 순서:
- *   1. flow 제어 종료
- *   2. 스레드 공유 메모리 해제
- *   3. 트리거 관련 메모리 해제
- *   4. 기본 스레드 옵션 해제
- *   5. 파일 잠금 및 해시 종료
- *   6. smalloc 정리
+ *   1. flow_exit() - flow 카운터/lock 해제.
+ *   2. fio_debug_jobp/fio_warned = NULL - 곧 해제될 공유 메모리 슬롯에
+ *      매달린 포인터를 무효화.
+ *   3. free_threads_shm() - segments[] 에 있는 thread_data 들을 detach/
+ *      삭제.
+ *   4. trigger_* 문자열 해제 후 NULL 리셋.
+ *   5. options_free(fio_options, &def_thread.o) - def_thread.o 의 동적
+ *      할당된 문자열 필드를 깊이 해제.
+ *   6. fio_filelock_exit - 파일 잠금 테이블 정리.
+ *   7. file_hash_exit - 중복 파일 해시 정리.
+ *   8. scleanup - smalloc 풀 munmap/해제.
+ *
+ * 실행 컨텍스트: 프로세스 종료 직전, 단일 스레드. 다른 잡은 이미 join 된
+ *   상태. FUZZING_BUILD 에서는 oss-fuzz 가 매 iteration 마다 free_shm 을
+ *   호출하면 상태가 파괴되어 잘못된 crash 로 보고될 수 있어 완전 no-op.
  */
 static void free_shm(void)
 {
@@ -471,17 +879,34 @@ static void free_shm(void)
 }
 
 /*
- * add_thread_segment() - 새로운 스레드 세그먼트 추가 함수
+ * [한국어]
+ * add_thread_segment() - thread_data 를 담을 새 공유 메모리 세그먼트를
+ *                        할당·초기화한다.
  *
- * 역할: thread_data를 저장할 새로운 공유 메모리 세그먼트를 할당합니다.
- *       각 세그먼트는 JOBS_PER_SEG개의 job을 저장할 수 있습니다.
- * 파라미터: 없음
- * 반환값: 성공 시 0, 실패 시 -1 또는 1
+ * @return: 성공 시 0. 세그먼트 수 상한 초과 시 -1, shmat 실패 시 1.
  *
- * 첫 번째 세그먼트를 생성할 때는 추가로:
- *   - fio_debug_jobp (디버그 job 번호 포인터) 설정
- *   - fio_warned (경고 플래그 포인터) 설정
- *   - flow_init() (flow 제어 초기화) 호출
+ * 왜 필요한가: thread_data 구조체는 큰 편(수 KB)이고, 한 번에 수천 개
+ *   잡을 허용해야 하므로 단일 shmget 으로 전체를 할당하면 공유 메모리
+ *   상한(SHMMAX)을 초과한다. JOBS_PER_SEG(보통 16) 잡 단위의 청크를
+ *   여러 개 만들어 필요할 때마다 추가한다.
+ *
+ * 동작 단계:
+ *   1. nr_segments 상한(REAL_MAX_SEG) 검사.
+ *   2. JOBS_PER_SEG * sizeof(thread_data) + 2 * sizeof(uint) 크기로 shmget
+ *      (뒤의 2 uint 는 fio_debug_jobp/fio_warned 공간).
+ *   3. shmat 으로 프로세스 주소공간에 붙임.
+ *   4. shm_attach_to_open_removed() 가 참이면 즉시 shmctl(IPC_RMID)
+ *      하여 마지막 detach 시 자동 삭제되도록 함(Linux 지원 동작).
+ *   5. memset 으로 0 초기화, DRD_IGNORE_VAR 로 Valgrind 경쟁 감지 제외.
+ *   6. 첫 세그먼트이면 디버그 포인터 슬롯을 세그먼트 끝에 배치하고
+ *      flow_init() 으로 flow 제어 초기화.
+ *
+ * 실행 컨텍스트: 메인 스레드. 공유 메모리 생성은 커널 자원 할당이므로
+ *   실패 시 errno 가 EINVAL(잘못된 크기)/ENOMEM(메모리 부족)/ENOSPC
+ *   (세그먼트 한계 초과) 를 줄 수 있다. fio 는 이 3 가지는 "자원 한계"
+ *   로 판단해 조용히 실패(perror 생략).
+ *
+ * 호출 체인: expand_thread_area() → [이 함수] → shmget(2)/shmat(2).
  */
 static int add_thread_segment(void)
 {
@@ -561,13 +986,13 @@ static int add_thread_segment(void)
  * segment has no more room, add a new chunk.
  */
 /*
- * expand_thread_area() - 스레드 영역 확장 함수
+ * [한국어]
+ * expand_thread_area() - 현재 세그먼트에 여유가 있으면 그대로 반환,
+ *                        없으면 add_thread_segment 로 새 세그먼트 할당.
  *
- * 역할: 현재 세그먼트에 여유 공간이 없으면 새 세그먼트를 추가합니다.
- *       스레드 영역은 메인 프로세스와 job 스레드/프로세스 간에 공유되며,
- *       JOBS_PER_SEG 크기의 청크로 분할됩니다.
- * 파라미터: 없음
- * 반환값: 성공 시 0, 실패 시 add_thread_segment()의 반환값
+ * @return: 0 성공(또는 확장 불필요), 비-0 할당 실패.
+ *
+ * 호출자: get_new_job() 이 슬롯 확보 직전에 호출.
  */
 static int expand_thread_area(void)
 {
@@ -582,12 +1007,19 @@ static int expand_thread_area(void)
 }
 
 /*
- * dump_print_option() - 단일 출력 옵션을 로그에 출력하는 함수
+ * [한국어]
+ * dump_print_option() - --showcmd 모드에서 잡의 단일 옵션을 "--key=value"
+ *                       꼴의 명령줄 한 토큰으로 stdout 에 출력한다.
  *
- * 역할: --showcmd 모드에서 옵션을 명령줄 형식으로 출력합니다.
- * 파라미터:
- *   p - 출력할 print_option 구조체
- * 반환값: 없음
+ * @param p: print_option 구조체. 파서가 수집한 (name, value) 페어.
+ * @return: 없음.
+ *
+ * 특이 처리: "description" 옵션은 값에 쉼표/공백이 흔하므로 큰따옴표로
+ *   감싼다. 값이 NULL 이면 --key 뒤에 공백만 찍어(인자 없음 옵션) 가시성
+ *   유지.
+ *
+ * 사용 컨텍스트: fio --showcmd job.fio 가 INI 파일을 "동등한 명령줄" 로
+ *   바꿔보기 위해 호출하는 경로. 실제 I/O 는 수행하지 않는다.
  */
 static void dump_print_option(struct print_option *p)
 {
@@ -606,12 +1038,10 @@ static void dump_print_option(struct print_option *p)
 }
 
 /*
- * dump_opt_list() - thread_data의 옵션 목록을 모두 출력하는 함수
- *
- * 역할: --showcmd 모드에서 job의 모든 옵션을 출력합니다.
- * 파라미터:
- *   td - 옵션 목록을 가진 thread_data
- * 반환값: 없음
+ * [한국어]
+ * dump_opt_list() - td->opt_list 에 모아둔 print_option 링크드 리스트를
+ *                   순회하면서 dump_print_option 으로 한 엔트리씩 CLI 토큰
+ *                   출력. --showcmd 의 본체.
  */
 static void dump_opt_list(struct thread_data *td)
 {
@@ -630,13 +1060,13 @@ static void dump_opt_list(struct thread_data *td)
 }
 
 /*
- * copy_opt_list() - 옵션 목록을 복사하는 함수
+ * [한국어]
+ * copy_opt_list() - src->opt_list 의 print_option 엔트리들을 dst->opt_list
+ *                   로 깊이 복사. 각 name/value 문자열은 strdup 으로 독립
+ *                   할당하여 부모-자식 간 쓰기 경쟁 없음.
  *
- * 역할: 부모 thread_data의 옵션 목록을 자식에게 깊은 복사(deep copy)합니다.
- * 파라미터:
- *   dst - 대상 thread_data (복사 받을 곳)
- *   src - 원본 thread_data (복사할 곳)
- * 반환값: 없음
+ * 호출자: get_new_job() 이 def_thread 이외의 부모에서 옵션 히스토리를
+ *   승계할 때 사용.
  */
 static void copy_opt_list(struct thread_data *dst, struct thread_data *src)
 {
@@ -667,26 +1097,41 @@ static void copy_opt_list(struct thread_data *dst, struct thread_data *src)
  * Return a free job structure.
  */
 /*
- * get_new_job() - 새로운 job 구조체(thread_data) 할당 함수
+ * [한국어]
+ * get_new_job() - 공유 메모리 세그먼트에서 빈 thread_data 슬롯을 하나
+ *                 확보하고, 부모 td 를 얕은 복사 + 리스트/파일 깊은 복사로
+ *                 초기화해 돌려준다. global=true 이면 별도 할당 없이
+ *                 def_thread 포인터를 반환.
  *
- * 역할: 새로운 job을 위한 thread_data를 할당하고 부모로부터 초기값을 복사합니다.
- *       global=true이면 def_thread(글로벌 기본 설정)를 반환합니다.
+ * @param global     : true 면 "[global]" 용 템플릿 td(def_thread) 반환.
+ * @param parent     : 복사 원본. 옵션 기본값 상속 원천. 최상위 호출에서는
+ *                    보통 &def_thread, numjobs 재귀에서는 원본 잡.
+ * @param preserve_eo: true 면 엔진 옵션 포인터(td->eo) 를 유지해 NULL 로
+ *                    덮어쓰지 않음. add_job 가 numjobs 복제 시 사용.
+ * @param jobname    : 섹션 이름. NULL 이면 이름 설정 skip(CLI 의 익명 잡).
+ * @return: 새 td 포인터 또는 NULL(세그먼트 확장 실패).
  *
- * 파라미터:
- *   global       - true이면 글로벌 thread_data(def_thread) 반환
- *   parent       - 부모 thread_data (옵션 기본값의 원본)
- *   preserve_eo  - true이면 IO 엔진 옵션(eo)을 유지
- *   jobname      - job 이름 문자열
+ * 처리 단계:
+ *   1. global → 즉시 def_thread 반환(슬롯 소모 없음).
+ *   2. expand_thread_area → 필요 시 새 세그먼트 할당.
+ *   3. 현재 세그먼트에서 nr_threads++ 슬롯을 잡고, 전역 thread_number++.
+ *   4. *td = *parent 로 얕은 복사(옵션 포인터 포함).
+ *   5. opt_list 는 새로 초기화하고 부모가 def_thread 가 아니면 깊이 복사
+ *      (copy_opt_list 가 strdup 로 print_option 문자열 복제).
+ *   6. td->io_ops/io_ops_init = NULL/0 - 엔진은 반드시 후속 ioengine_load
+ *      에서 재바인딩.
+ *   7. preserve_eo 가 false 면 td->eo 도 NULL 리셋.
+ *   8. uid/gid = -1U (미설정 센티넬).
+ *   9. fs_list 초기화 + dup_files 로 부모의 fio_file[] 복제.
+ *   10. fio_options_mem_dupe - thread_options 내 동적 문자열 필드 깊은
+ *       복사(strdup) 로 부모와 쓰기 경합 차단.
+ *   11. profile_add_hooks - 프로파일 훅 연결.
+ *   12. thread_number/subjob_number 설정.
+ *   13. jobname 주어지면 td->o.name = strdup(jobname).
+ *   14. 그룹 리포팅 비활성 또는 첫 잡이면 stat_number++.
  *
- * 반환값: 새로 할당된 thread_data 포인터, 실패 시 NULL
- *
- * 처리 과정:
- *   1. global이면 def_thread 반환
- *   2. expand_thread_area()로 공유 메모리 확보
- *   3. 부모의 thread_data를 복사
- *   4. IO 엔진 포인터 초기화
- *   5. 파일 목록 복제
- *   6. 프로파일 훅 추가
+ * 실행 컨텍스트: 메인 스레드. 여러 번 호출되며 각 호출이 세그먼트 상 한
+ *   칸을 소비. 실패 시 에러 로그 후 NULL.
  */
 static struct thread_data *get_new_job(bool global, struct thread_data *parent,
 				       bool preserve_eo, const char *jobname)
@@ -750,13 +1195,26 @@ static struct thread_data *get_new_job(bool global, struct thread_data *parent,
 }
 
 /*
- * put_job() - job 구조체 반환(해제) 함수
+ * [한국어]
+ * put_job() - get_new_job 의 역연산. 잡 폐기 시 관련 자원을 반납하고
+ *             세그먼트 슬롯을 0 으로 밀어 재사용 가능 상태로 복원한다.
  *
- * 역할: 사용이 끝난 thread_data를 정리하고 해제합니다.
- *       에러가 있으면 에러 메시지를 출력합니다.
- * 파라미터:
- *   td - 해제할 thread_data
- * 반환값: 없음
+ * @param td: 해제할 thread_data. def_thread 는 템플릿이므로 호출해도 NOP.
+ * @return: 없음.
+ *
+ * 해제 순서:
+ *   1. def_thread 는 무조건 skip.
+ *   2. profile_td_exit - 프로파일 훅 종료.
+ *   3. flow_exit_job - flow 제어에서 leave.
+ *   4. error 가 있으면 td->verror 문자열을 로그 출력.
+ *   5. fio_options_free / fio_dump_options_free - 옵션 문자열 해제.
+ *   6. io_ops 가 있으면 free_ioengine - dlclose/ eo free.
+ *   7. name strdup 해제.
+ *   8. memset(td, 0) - 슬롯 내용 소거.
+ *   9. 세그먼트 nr_threads-- 와 전역 thread_number-- 로 카운터 감소.
+ *
+ * 실행 컨텍스트: 메인 스레드. 보통 add_job 에러 경로나 --showcmd 이후,
+ *   또는 parse 에러 회복 경로에서 호출.
  */
 static void put_job(struct thread_data *td)
 {
@@ -793,13 +1251,24 @@ static void put_job(struct thread_data *td)
 }
 
 /*
- * __setup_rate() - 특정 방향(읽기/쓰기/트림)의 속도 제한 설정 함수
+ * [한국어]
+ * __setup_rate() - 주어진 ddir(READ/WRITE/TRIM) 의 bps(바이트/초) rate 를
+ *                  계산·저장하고 관련 타이머 상태를 초기화.
  *
- * 역할: 지정된 IO 방향에 대해 초당 바이트 속도를 계산하고 설정합니다.
- * 파라미터:
- *   td   - 대상 thread_data
- *   ddir - IO 방향 (DDIR_READ, DDIR_WRITE, DDIR_TRIM)
- * 반환값: 성공 시 0, 실패 시 -1
+ * @param td  : 대상 thread_data.
+ * @param ddir: 0=READ / 1=WRITE / 2=TRIM.
+ * @return: 0 성공, -1 bps 가 0(너무 낮음).
+ *
+ * 계산 규칙:
+ *   - o->rate[ddir] 이 직접 지정되었으면 그대로 rate_bps 에 저장.
+ *   - 아니면 rate_iops[ddir] * min_bs[ddir] 로 환산.
+ *
+ * 이후 backend 의 레이트 리미터(check_min_rate/rate 관련 sleep)가
+ * rate_next_io_time[ddir] 을 기준으로 IO 간 delay 를 계산하며,
+ * rate_io_issue_bytes 누계와 last_usec 타임스탬프를 쌍으로 사용한다.
+ *
+ * 실행 컨텍스트: add_job() 의 setup_rate() 단계에서 호출. 잡 스폰 전이라
+ *   동기화 불필요.
  */
 static int __setup_rate(struct thread_data *td, enum fio_ddir ddir)
 {
@@ -830,13 +1299,12 @@ static int __setup_rate(struct thread_data *td, enum fio_ddir ddir)
 }
 
 /*
- * setup_rate() - 모든 IO 방향의 속도 제한 설정 함수
+ * [한국어]
+ * setup_rate() - 3 개의 ddir 에 대해 rate/rate_iops 가 지정된 경우
+ *                __setup_rate 로 위임하고, 에러는 비트 OR 로 집계.
  *
- * 역할: 읽기/쓰기/트림 각 방향에 대해 속도 제한이 설정되어 있으면
- *       __setup_rate()를 호출하여 초기화합니다.
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 성공 시 0, 실패 시 비트 OR된 에러 코드
+ * @param td: 대상 thread_data.
+ * @return: 0 성공, 비-0 한 방향이라도 실패.
  */
 static int setup_rate(struct thread_data *td)
 {
@@ -853,13 +1321,13 @@ static int setup_rate(struct thread_data *td)
 }
 
 /*
- * fixed_block_size() - 블록 크기가 고정인지 확인하는 함수
+ * [한국어]
+ * fixed_block_size() - 3 ddir 모두 min_bs==max_bs 이고 서로 동일한지 판정.
+ *                      verify 와 randommap 이 가변 bs 에서 제약되므로
+ *                      fixup_options 가 이 플래그로 분기.
  *
- * 역할: 읽기/쓰기/트림의 최소/최대 블록 크기가 모두 같은지 확인합니다.
- *       가변 블록 크기 vs 고정 블록 크기에 따라 verify 동작이 달라집니다.
- * 파라미터:
- *   o - thread_options 포인터
- * 반환값: 모든 블록 크기가 동일하면 1(true), 아니면 0(false)
+ * @param o: thread_options.
+ * @return: 전부 같으면 1, 하나라도 다르면 0.
  */
 static int fixed_block_size(struct thread_options *o)
 {
@@ -873,7 +1341,12 @@ static int fixed_block_size(struct thread_options *o)
 /*
  * <3 Johannes
  */
-/* 유클리드 호제법을 이용한 최대공약수(GCD) 계산 - verify 간격 계산에 사용 */
+/*
+ * [한국어]
+ * gcd() - 유클리드 호제법 기반 최대공약수. verify_interval 이 min_bs/max_bs
+ *         의 공약수여야 한다는 제약을 만족시키기 위해 fixup_options 가 두
+ *         값의 gcd 를 자동 계산하는 용도. 재귀 구현(O(log min(m,n))).
+ */
 static unsigned int gcd(unsigned int m, unsigned int n)
 {
 	if (!n)
@@ -887,24 +1360,53 @@ static unsigned int gcd(unsigned int m, unsigned int n)
  * define option callback handlers, but this is easier.
  */
 /*
- * fixup_options() - 옵션 간 의존성 및 충돌 해결 함수
+ * [한국어]
+ * fixup_options() - thread_options 의 필드 간 의존성을 검증·보정하는 거대
+ *                   정적 체커. fio 전체에서 가장 복잡한 "옵션 규칙 집합"이다.
  *
- * 역할: 상호 의존적인 옵션들을 검증하고 보정합니다.
- *       옵션 콜백 핸들러를 정의할 수도 있지만, 이 방식이 더 간단합니다.
+ * @param td: 대상 thread_data (o = &td->o 에 접근).
+ * @return: 비트 OR 된 에러 코드(0 = 정상, 1 = 치명, warnings_fatal = 경고를
+ *          치명으로 격상한 경우). 비-0 반환 시 add_job 은 goto err 로 잡을
+ *          폐기한다.
  *
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 에러가 있으면 비트 OR된 에러 코드, 정상이면 0
+ * 왜 필요한가: fio 는 수백 개 옵션이 있으며 대부분 직교하지 않고 서로 조건
+ *   관계를 가진다. 예) `verify` 가 켜져 있으면 `refill_buffers` 가 암시적
+ *   으로 켜져야 하고, `norandommap` 과 `verify` 가 동시에 켜지면 가변 bs 에서
+ *   오프셋 충돌이 날 수 있다. 이 함수는 그런 조건을 한 곳에 모아 파서 뒤에서
+ *   일괄 처리한다. 콜백 기반 대안도 있지만 규칙이 타 옵션을 여러 개 참조해
+ *   대상 옵션 하나에 붙이기 어려워 "lazy" 한 중앙 집중식으로 구현.
  *
- * 주요 검증/보정 항목:
- *   - trim verify 설정 확인
- *   - readonly 모드에서 쓰기/트림 금지
- *   - zone 모드 관련 검증
- *   - verify 관련 옵션 정합성 확인
- *   - IO depth, batch 크기 보정
- *   - rate/rate_iops 상호 배타 확인
- *   - 압축, 난수 분포 관련 보정
- *   - steady state 관련 검증
+ * 검증·보정 카테고리(대표):
+ *   [readonly] --readonly 에서 write/trim 거부.
+ *   [trimwrite/멀티레인지] num_range>1 + trimwrite/비지원 엔진 조합 거부.
+ *   [PSHARED] 프로세스 공유 뮤텍스가 없으면 use_thread 강제.
+ *   [iolog] write_iolog 와 read_iolog 동시 지정 시 read 우선.
+ *   [zone_mode] ZBD vs STRIDED vs NOT_SPECIFIED vs NONE 의 상호 교정 및
+ *               create_serialize / write_zone_remainder / norandommap 정합.
+ *   [SPRandom] random + write + LFSR + norandommap=1 을 요구.
+ *   [block sizes] min_bs/max_bs 기본값, rw_min_bs 산출, blockalign vs
+ *                 randommap, size<bs 거부.
+ *   [verify] multi-writer 경고, time_based-only 쓰기 경고, refill_buffers
+ *            암시 세팅, verify_interval 보정(최소 bs 와 공약수), verify_offset
+ *            + verify_header 크기 검사, write_sequence/header_seed 기본값.
+ *   [oatomic] 엔진의 FIO_ATOMICWRITES 지원 여부 검증.
+ *   [pre_read] invalidate_cache 와의 교차, PIPEIO 거부.
+ *   [단위] FIO_BIT_BASED 엔진은 기본 단위 N2S_BITPERSEC 으로 전환.
+ *   [fdatasync 폴백] CONFIG_FDATASYNC 미지원 시 fsync 로 전환.
+ *   [Windows] 동기 엔진 + O_DIRECT/O_SYNC 조합 거부.
+ *   [compress] 100% 압축이면 zero_buffers 로 최적화, 부분 압축이면 refill
+ *              비트 세트.
+ *   [random_distribution] 비균일이면 norandommap 강제.
+ *   [rand_seed] 명시 시 rand_repeatable 비활성.
+ *   [gtod_cpu] 설정 시 gtod 오프로드 스레드 기동.
+ *   [latency/iops] disable_lat/clat/slat 으로 percentiles 비활성.
+ *   [ms→ns] max_latency/latency_target 을 내부 ns 단위로 변환.
+ *   [dedupe working set] size 미지정/nr_files>1 거부.
+ *   [steady state] ss_check_interval 일관성과 ss_dur 배수 검사.
+ *   [FDP] dp_type 와의 충돌 체크.
+ *
+ * 실행 컨텍스트: add_job() 가 잡 스폰 직전 호출. 메인 스레드 단독. 실패는
+ *   잡 폐기로 이어진다. 경고는 warnings_fatal 에 따라 오염 여부 결정.
  */
 static int fixup_options(struct thread_data *td)
 {
@@ -1516,13 +2018,20 @@ static int fixup_options(struct thread_data *td)
 }
 
 /*
- * init_rand_file_service() - 랜덤 파일 서비스 분포 초기화 함수
+ * [한국어]
+ * init_rand_file_service() - 파일 선택 정책이 비균일 분포(ZIPF/PARETO/GAUSS)
+ *                            일 때 해당 생성기를 초기화.
  *
- * 역할: 파일 선택에 비균일 분포(zipf, pareto, gauss)를 사용할 때
- *       해당 분포 생성기를 초기화합니다.
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 없음
+ * @param td: 대상 thread_data.
+ * @return: 없음.
+ *
+ * 동작: nranges = nr_files << FIO_FSERVICE_SHIFT 로 유효 샘플 공간 확장
+ *   (shift 로 세분화해 작은 nr_files 에서도 분포가 잘 그려지도록).
+ *   각 분포별로 zipf_init/pareto_init/gauss_init 호출 후 zipf_disable_hash
+ *   /gauss_disable_hash 로 해시 최적화 경로 비활성(결정적 재현성 유지).
+ *
+ * 실행 컨텍스트: td_fill_rand_seeds() 에서 file_service_type 이 NONUNIFORM
+ *   마스크를 가질 때만 호출.
  */
 static void init_rand_file_service(struct thread_data *td)
 {
@@ -1549,14 +2058,16 @@ static void init_rand_file_service(struct thread_data *td)
  * and block size exceeds the limits of the default random generator.
  */
 /*
- * init_rand_offset_seed() - 오프셋용 난수 생성기 초기화 함수
+ * [한국어]
+ * init_rand_offset_seed() - 오프셋용 frand_state(td->offset_state) 를 시드.
  *
- * 역할: IO 오프셋 계산에 사용되는 난수 생성기를 초기화합니다.
- *       파일 크기와 블록 크기 조합이 기본 생성기의 한계를 초과할 경우
- *       나중에 재초기화될 수 있어 별도 함수로 분리되어 있습니다.
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 없음
+ * @param td: 대상 thread_data.
+ * @return: 없음.
+ *
+ * 왜 별도 함수인가: 파일 크기 / 블록 크기 조합이 32 비트 범위를 초과하면
+ *   (get_next_offset 경로에서) 64 비트 생성기가 필요해지며, 이 때 런타임에
+ *   오프셋 RNG 만 재초기화해야 한다. 이를 외부에서 호출할 수 있도록
+ *   public 심볼로 분리되었다.
  */
 void init_rand_offset_seed(struct thread_data *td)
 {
@@ -1572,17 +2083,44 @@ void init_rand_offset_seed(struct thread_data *td)
 }
 
 /*
- * td_fill_rand_seeds() - 모든 난수 생성기를 시드로 초기화하는 함수
+ * [한국어]
+ * td_fill_rand_seeds() - td->rand_seeds[FIO_RAND_*_OFF] 슬롯을 토대로
+ *                        잡이 사용하는 모든 frand_state 생성기를 시드·초기화.
  *
- * 역할: thread_data의 모든 난수 생성기(블록 크기, verify, 파일 선택,
- *       지연, 중복 제거, 우선순위 등)를 각각의 시드로 초기화합니다.
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 없음
+ * @param td: 대상 thread_data.
+ * @return: 없음.
  *
- * 특수 처리:
- *   - verify 사용 시: 쓰기 시드 = 읽기 시드 (동일 오프셋 보장)
- *   - trimwrite 시: 트림 시드 = 쓰기 시드 (트림 후 같은 위치에 쓰기)
+ * 왜 이렇게 많은 RNG 인가: fio 는 여러 독립적인 축(블록 크기/오프셋/파일/
+ *   지연/버퍼/트림/dedupe/prio/zone/FDP/SPRandom/verify/rwmix/poisson)을
+ *   각각 독립 생성기로 다뤄야 한다. 시드를 분리해야 예를 들어 "오프셋은
+ *   같은데 bs 만 바꾸기" 같은 재현성 모델링이 가능하다.
+ *
+ * 특수 대응 규칙:
+ *   - verify != NONE: write_seed = read_seed. 쓰기와 읽기 단계가 같은
+ *     오프셋 시퀀스를 재생해야 검증이 성립.
+ *   - trimwrite: trim_seed = write_seed. 트림 후 동일 LBA 에 쓰기.
+ *   - 64 비트 난수(Tausworthe64) 요청 시 use64=true 로 각 init_rand_seed
+ *     호출에 전달.
+ *
+ * 초기화 슬롯(모두 td->rand_seeds[FIO_RAND_*_OFF] 에서 유래):
+ *   bsrange_state[3]       - READ/WRITE/TRIM 블록 크기 생성기.
+ *   verify_state            - 검증용 데이터 패턴 생성기.
+ *   rwmix_state             - read/write 혼합비 추첨.
+ *   next_file_state         - 파일 선택 RNG (균일 분포일 때).
+ *   next_file_zipf/gauss    - init_rand_file_service() 가 초기화.
+ *   file_size_state         - file_size_low..high 랜덤 크기.
+ *   trim_state              - 트림 확률 추첨.
+ *   delay_state             - start_delay_orig..high 랜덤 지연.
+ *   poisson_state[3]        - rate_process=poisson 시 IO 간 간격 생성.
+ *   dedupe_state            - 중복 블록 추첨.
+ *   zone_state              - 존 선택.
+ *   prio_state              - cmdprio 확률 추첨.
+ *   dedupe_working_set_index_state - dedupe 워킹셋 인덱싱.
+ *   offset_state            - init_rand_offset_seed (오프셋).
+ *   seq_rand_state[DDIR_RWDIR_CNT] - 순차/랜덤 전환 추첨.
+ *   buf_state/buf_state_prev - 버퍼 내용 랜덤화 및 백업.
+ *   fdp_state               - FDP RUHID 선택.
+ *   sprandom_state          - SPRandom LFSR 전환.
  */
 void td_fill_rand_seeds(struct thread_data *td)
 {
@@ -1670,14 +2208,28 @@ void td_fill_rand_seeds(struct thread_data *td)
 }
 
 /*
- * setup_random_seeds() - 난수 시드 배열 설정 함수
+ * [한국어]
+ * setup_random_seeds() - td->rand_seeds[FIO_RAND_NR_OFFS] 슬롯을 채우고,
+ *                        td_fill_rand_seeds() 로 모든 frand_state 를 시드한다.
  *
- * 역할: 모든 난수 생성기의 시드를 설정합니다.
- *       rand_repeatable이 아니고 rand_seed가 설정되지 않으면 시스템 RNG 사용,
- *       그렇지 않으면 결정적(deterministic) 시드 생성.
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 성공 시 0, 실패 시 에러 코드
+ * @param td: 대상 thread_data (잡 당 하나).
+ * @return: 성공 시 0, 시스템 RNG 초기화 실패 시 해당 errno 반환 값.
+ *
+ * 모드 분기:
+ *   - rand_repeatable=0 && 사용자가 rand_seed 를 명시 안 함 → 시스템 RNG
+ *     (init_random_seeds: /dev/urandom 또는 getrandom(2)) 으로 실제 랜덤.
+ *   - 그 외 → rand_seed(없으면 컴파일 기본) 에서 해시 곱 0x9e370001UL 을
+ *     4 회 적용해 파생 시드 base 를 만들고, 각 슬롯 i 에 대해
+ *     seeds[i] = base * td->thread_number + i 를 기록. 그 다음 base 를 다시
+ *     해시 곱으로 전진시켜 슬롯 간 상관을 줄인다. 이 결정적 파생이
+ *     "재현 가능한 워크로드" 목표의 핵심.
+ *
+ * 이후 td_fill_rand_seeds(td) 가 각 슬롯을 frand_state 로 변환(init_rand_seed)
+ * 하여 블록 크기/verify/파일선택/지연/포아송/트림/dedupe/존/prio/오프셋/
+ * 순차-랜덤 전환/버퍼내용/FDP/sprandom 등 개별 RNG 를 준비한다.
+ *
+ * 실행 컨텍스트: add_job() 전반부 – 잡 스폰 직전, 단일 스레드. 시스템 RNG
+ *   실패 시 td_verror 를 통해 에러가 add_job 으로 전파된다.
  */
 static int setup_random_seeds(struct thread_data *td)
 {
@@ -1719,20 +2271,48 @@ static int setup_random_seeds(struct thread_data *td)
  * already.
  */
 /*
- * ioengine_load() - IO 엔진 로드 함수
+ * [한국어]
+ * ioengine_load() - td 에 설정된 IO 엔진(td->o.ioengine 문자열)을 dlopen 또는
+ *                   내장 engine_list 에서 찾아 td->io_ops 에 연결하고,
+ *                   엔진 전용 옵션(td->eo) 구조체를 준비한다.
  *
- * 역할: job에 설정된 IO 엔진을 동적으로 로드합니다.
- *       이미 같은 엔진이 로드되어 있으면 건너뜁니다.
- *       다른 엔진이 로드되어 있으면 기존 엔진을 해제하고 새 엔진을 로드합니다.
+ * @param td: 대상 thread_data.
+ * @return: 성공 0, 실패 1(로드 불가).
  *
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 성공 시 0, 실패 시 1
+ * 왜 필요한가: fio 는 엔진을 plugin 형태로 설계했고, 잡마다 다른 엔진
+ *   (sync/libaio/io_uring/net/nvme/rbd …)을 쓸 수 있다. 엔진별 내부 상태는
+ *   td->eo 라는 thread_options 와 유사한 전용 구조체에 보관되며, 엔진의
+ *   options[] 테이블을 기반으로 해당 구조체 크기(option_struct_size)가
+ *   정의된다.
  *
- * IO 엔진 로드 후 처리:
- *   1. 엔진 전용 옵션 구조체 할당 및 초기화
- *   2. odirect 플래그에 따라 FIO_RAWIO 설정
- *   3. 엔진 플래그 설정
+ * 동작 단계:
+ *   1. td->o.ioengine 이 있어야 함(없으면 내부 버그).
+ *   2. 이미 td->io_ops 가 있다 =  이전에 로드된 엔진이 있다는 뜻.
+ *      - 이름이 같으면 즉시 0 반환(재사용).
+ *      - 다르면 load_ioengine 으로 새 ops 를 받아 비교. 실제로 같은
+ *        dlhandle/ops 로 판명되면 0 반환(해시 이름만 다른 alias).
+ *      - 다른 dlhandle 이면 이전 dlclose + free_ioengine.
+ *   3. load_ioengine(td) 호출로 실제 ops 를 받아 td->io_ops 에 대입.
+ *      load_ioengine 내부에서 engine_list(정적 등록) 또는 dlopen(".so"
+ *      확장명) 으로 동적 로드하고 ops->dlhandle 에 핸들 저장.
+ *   4. option_struct_size != 0 이면 td->eo = malloc(size). 부모의 eo 가
+ *      있고 엔진 옵션 정의가 같으면 memcpy + options_mem_dupe 로 깊은
+ *      복사, 아니면 0-초기화 + fill_default_options. eo 의 첫 필드 자리에
+ *      td 포인터를 저장해 엔진 콜백에서 container_of 대신 간편 역참조
+ *      가능하게 한다.
+ *   5. odirect=1 이면 엔진에 FIO_RAWIO 플래그를 강제 추가(일부 엔진이
+ *      direct I/O 인 경우에 raw I/O 로 간주되는 경로 공유).
+ *   6. td_set_ioengine_flags(td) 로 엔진 플래그(FIO_SYNCIO/ASYNCIO/
+ *      DISKLESSIO 등) 를 td->flags 에 축적.
+ *
+ * 실행 컨텍스트: 메인 스레드. parse_cmd_line 의 --ioengine 처리, 잡 파일
+ *   parser, add_job 재귀 확장에서 반복 호출 가능. 첫 로드 이후 동일
+ *   엔진이면 no-op.
+ *
+ * 호출 체인:
+ *   parse_cmd_line/parse_jobs_ini → add_job → [ioengine_load]
+ *     → load_ioengine (ioengines.c)
+ *     → dlopen(3)/dlsym(3) (.so 엔진 시)
  */
 int ioengine_load(struct thread_data *td)
 {
@@ -1839,13 +2419,30 @@ fail:
 }
 
 /*
- * init_flags() - thread_data 플래그 초기화 함수
+ * [한국어]
+ * init_flags() - thread_options 의 설정값을 읽어 td->flags 비트를 세팅.
+ *                핫 패스에서 "if(o->옵션_중첩_조회)" 대신 단일 비트 체크로
+ *                분기하도록 만드는 캐시 역할.
  *
- * 역할: thread_options의 설정값에 따라 thread_data의 flags 비트를 설정합니다.
- *       이 플래그들은 런타임에 빠른 조건 확인을 위해 사용됩니다.
- * 파라미터:
- *   td - 대상 thread_data
- * 반환값: 없음
+ * @param td: 대상 thread_data.
+ * @return: 없음.
+ *
+ * 대응하는 TD_F_* 비트 풀이:
+ *   TD_F_VER_BACKLOG      - verify_backlog 사용. 쓰기 중간중간 읽어서 검증.
+ *   TD_F_TRIM_BACKLOG     - trim_backlog 사용. 주기적 트림 주입.
+ *   TD_F_READ_IOLOG       - read_iolog_file 사용(replay 모드).
+ *   TD_F_REFILL_BUFFERS   - refill_buffers. 매 IO 마다 버퍼 재생성.
+ *   TD_F_SCRAMBLE_BUFFERS - scramble_buffers. 단순 repeat 패턴이 아닌 랜덤 채움.
+ *                           명시적으로 요청됐거나, zero_buffers 가 명시 설정
+ *                           되지 않은 경우 기본값으로 활성.
+ *   TD_F_DO_VERIFY        - verify != NONE.
+ *   TD_F_NEED_LOCK        - verify_async 또는 offload 모드. io_u 공유 자원
+ *                           경합 보호.
+ *   TD_F_CHECK_RATE       - rate/rate_iops/ratemin/rate_iops_min 중 하나라도
+ *                           설정. backend 핫 루프가 sleep 제어를 수행해야 함.
+ *
+ * CUDA 메모리: mem_type==MEM_CUDA_MALLOC 이면 device memory 에서 CPU 스크램블
+ *   못하므로 TD_F_SCRAMBLE_BUFFERS 비활성.
  */
 static void init_flags(struct thread_data *td)
 {
@@ -1899,41 +2496,66 @@ static void init_flags(struct thread_data *td)
 	}
 }
 
-/* 파일 이름 포맷 문자열에서 사용되는 키워드 타입 열거형 */
+/* [한국어] 파일명 포맷 치환 키워드 enum.
+ * 설정자: make_filename() 이 fpre_keywords[] 를 순회하며 key 필드로 switch.
+ * 값 범위: 배열 엔트리와 1:1 대응. FPRE_NONE=0 은 현재 미사용(미래 예약). */
 enum {
-	FPRE_NONE = 0,        /* 없음 */
-	FPRE_JOBNAME,         /* $jobname - job 이름으로 치환 */
-	FPRE_JOBNUM,          /* $jobnum - job 번호로 치환 */
-	FPRE_FILENUM,         /* $filenum - 파일 번호로 치환 */
-	FPRE_CLIENTUID        /* $clientuid - 클라이언트 소켓 주소로 치환 */
+	FPRE_NONE = 0,
+	FPRE_JOBNAME,    /* [한국어] $jobname → 잡 이름 문자열 치환. */
+	FPRE_JOBNUM,     /* [한국어] $jobnum → numjobs 의 subjob 인덱스 치환. */
+	FPRE_FILENUM,    /* [한국어] $filenum → 같은 잡의 파일 인덱스 치환. */
+	FPRE_CLIENTUID   /* [한국어] $clientuid → 클라이언트 소켓 주소 문자열. */
 };
 
-/* 파일 이름 포맷 키워드 구조체 및 배열 */
+/* [한국어] 파일명 포맷 치환 규칙 테이블.
+ * 설정자: 컴파일 시점 정적 초기화(불변).
+ * 읽는 자: make_filename() 이 strcasestr 로 각 키워드 검색.
+ * 값 범위: strlen 은 첫 사용 시 계산되어 캐시되며, keyword 는 불변 리터럴.
+ * 배열은 {.keyword=NULL} 센티넬로 종료. */
 static struct fpre_keyword {
-	const char *keyword;  /* 키워드 문자열 (예: "$jobname") */
-	size_t strlen;        /* 키워드 길이 (캐시됨) */
-	int key;              /* 키워드 타입 (FPRE_* 열거형) */
+	const char *keyword;
+	/* [한국어] 치환 대상 리터럴. 예: "$jobname".
+	 * 설정자: 컴파일 타임. 읽는 자: make_filename (strcasestr). */
+
+	size_t strlen;
+	/* [한국어] keyword 의 바이트 길이. 첫 호출 때 0→실제 값으로 메모이즈.
+	 * 캐시하는 이유는 strlen 은 O(n) 이라 여러 번 반복하는 make_filename
+	 * 루프에서 낭비이기 때문. */
+
+	int key;
+	/* [한국어] FPRE_* 라벨. switch 분기에 사용. */
 } fpre_keywords[] = {
 	{ .keyword = "$jobname",	.key = FPRE_JOBNAME, },
 	{ .keyword = "$jobnum",		.key = FPRE_JOBNUM, },
 	{ .keyword = "$filenum",	.key = FPRE_FILENUM, },
 	{ .keyword = "$clientuid",	.key = FPRE_CLIENTUID, },
-	{ .keyword = NULL, },  /* 배열 종료 표시 */
+	{ .keyword = NULL, },  /* [한국어] NULL 센티넬 - 순회 종료 표시. */
 	};
 
 /*
- * make_filename() - 파일 이름 생성 함수
+ * [한국어]
+ * make_filename() - filename_format 옵션 문자열의 키워드들을 실제 값으로
+ *                   치환해 최종 파일명을 생성.
  *
- * 역할: filename_format 옵션에 따라 파일 이름을 생성합니다.
- *       $jobname, $jobnum, $filenum, $clientuid 키워드를 실제 값으로 치환합니다.
- * 파라미터:
- *   buf      - 결과 파일 이름을 저장할 버퍼
- *   buf_size - 버퍼 크기
- *   o        - thread_options (filename_format 포함)
- *   jobname  - job 이름
- *   jobnum   - job 번호
- *   filenum  - 파일 번호
- * 반환값: 생성된 파일 이름 문자열(buf) 포인터
+ * @param buf     : 결과 저장 버퍼.
+ * @param buf_size: buf 용량.
+ * @param o       : thread_options. filename_format 필드 참조.
+ * @param jobname : 잡 섹션 이름.
+ * @param jobnum  : numjobs 의 subjob 인덱스.
+ * @param filenum : 같은 잡의 nr_files 중 현재 파일 인덱스.
+ * @return: buf 자체(호출자 편의).
+ *
+ * 치환 가능 키워드: $jobname / $jobnum / $filenum / $clientuid.
+ *   각 키워드는 fpre_keywords[] 배열에 정의되어 있고, strcasestr 로 대소문자
+ *   무시로 찾아 copy 버퍼에 prefix + 치환값 + suffix 를 재조립 → 다시 buf 에
+ *   복사하는 2-buffer ping-pong 방식. 같은 키워드가 여러 번 나오면 while(1)
+ *   루프로 반복 치환.
+ *
+ * 형식 미지정 기본값: "$jobname.$jobnum.$filenum" 대신 sprintf("%s.%d.%d", ...)
+ *   의 즉석 포맷으로 축약(과거 호환).
+ *
+ * 실행 컨텍스트: add_job() 의 파일 자동 생성 루프. client_sockaddr_str 은
+ *   원격 실행 환경의 클라이언트 주소가 주입된 전역.
  */
 static char *make_filename(char *buf, size_t buf_size,struct thread_options *o,
 			   const char *jobname, int jobnum, int filenum)
@@ -2066,10 +2688,13 @@ static char *make_filename(char *buf, size_t buf_size,struct thread_options *o,
 }
 
 /*
- * parse_dryrun() - 드라이런(실제 IO 없이 파싱만) 여부 확인 함수
+ * [한국어]
+ * parse_dryrun() - 실행 대신 파서 검사/출력만 수행하는 모드인지 반환.
  *
- * 역할: --showcmd 또는 --parse-only 옵션이 설정되었는지 확인합니다.
- * 반환값: 드라이런이면 true, 아니면 false
+ * @return: dump_cmdline(--showcmd) 또는 parse_only(--parse-only) 중 하나면 true.
+ *
+ * 호출자: add_job() 이 드라이런이면 잡 등록 대신 put_job 으로 폐기.
+ *   parse_options() 가 잡 수 0 개 상태를 허용할지 판단.
  */
 bool parse_dryrun(void)
 {
@@ -2077,19 +2702,16 @@ bool parse_dryrun(void)
 }
 
 /*
- * gen_log_name() - 로그 파일 이름 생성 함수
+ * [한국어]
+ * gen_log_name() - "{logname}_{logtype}[.threadnr].{suf}" 형태로 로그 파일
+ *                  이름 문자열을 조립.
  *
- * 역할: 로그 파일의 전체 이름을 생성합니다.
- *       per_job이면 스레드 번호가 포함됩니다.
- * 파라미터:
- *   name    - 결과 이름을 저장할 버퍼
- *   size    - 버퍼 크기
- *   logtype - 로그 타입 문자열 (lat, slat, clat, bw, iops 등)
- *   logname - 로그 기본 이름
- *   num     - 스레드 번호
- *   suf     - 파일 확장자 (log 또는 log.fz)
- *   per_job - per-job 로그 여부
- * 반환값: 없음
+ * @param name, size: 출력 버퍼.
+ * @param logtype   : "lat"/"slat"/"clat"/"bw"/"iops"/"clat_hist" 중 하나.
+ * @param logname   : 베이스 이름(잡 이름이나 사용자 지정).
+ * @param num       : 스레드 번호(잡 번호).
+ * @param suf       : "log" 또는 "log.fz"(gzip 저장 시).
+ * @param per_job   : per-job 로그 옵션. 참이면 이름에 .threadnr 삽입.
  */
 static void gen_log_name(char *name, size_t size, const char *logtype,
 			 const char *logname, unsigned int num,
@@ -2103,13 +2725,15 @@ static void gen_log_name(char *name, size_t size, const char *logtype,
 }
 
 /*
- * check_waitees() - wait_for 대상 job 존재 여부 확인 함수
+ * [한국어]
+ * check_waitees() - wait_for 옵션의 대상 잡 이름이 실제 등록된 잡 중 몇 개와
+ *                   일치하는지 카운트. subjob(numjobs>1 의 복제본)은 제외해
+ *                   원본 잡만 대상으로 한다.
  *
- * 역할: 주어진 이름의 job이 몇 개 존재하는지 세어 반환합니다.
- *       wait_for 옵션의 유효성 검증에 사용됩니다.
- * 파라미터:
- *   waitee - 대기 대상 job 이름
- * 반환값: 해당 이름의 job 수
+ * @param waitee: 찾을 잡 이름.
+ * @return: 일치하는 잡 수(0/1 이 정상, 2+ 는 중복 에러).
+ *
+ * 호출자: wait_for_ok() 가 유효성 판정에 사용.
  */
 static int check_waitees(char *waitee)
 {
@@ -2127,15 +2751,15 @@ static int check_waitees(char *waitee)
 }
 
 /*
- * wait_for_ok() - wait_for 옵션 유효성 검증 함수
+ * [한국어]
+ * wait_for_ok() - wait_for 의 3 가지 에러 조건을 검사:
+ *                 (a) 자기 자신을 기다리는 self-reference,
+ *                 (b) 존재하지 않는 잡 이름,
+ *                 (c) 같은 이름의 잡이 여러 개 있어 어느 쪽을 기다릴지 모호.
  *
- * 역할: wait_for 옵션이 설정된 경우, 대기 대상 job이 유효한지 확인합니다.
- *       자기 자신을 기다리거나, 존재하지 않는 job을 기다리거나,
- *       동일 이름의 job이 여러 개인 경우 에러를 반환합니다.
- * 파라미터:
- *   jobname - 현재 job 이름
- *   o       - thread_options
- * 반환값: 유효하면 true, 에러면 false
+ * @param jobname: 현재 잡 이름.
+ * @param o      : 현재 잡 옵션 (o->wait_for).
+ * @return: 유효/미설정이면 true, 에러면 false.
  */
 static bool wait_for_ok(const char *jobname, struct thread_options *o)
 {
@@ -2170,14 +2794,17 @@ static bool wait_for_ok(const char *jobname, struct thread_options *o)
 }
 
 /*
- * verify_per_group_options() - 그룹 내 옵션 일관성 검증 함수
+ * [한국어]
+ * verify_per_group_options() - 동일 groupid 를 공유하는 잡들의 통계 집계
+ *                               옵션(lat_percentiles)이 일관된지 확인.
+ *                               group_reporting 출력을 위해 필수.
  *
- * 역할: 같은 그룹에 속한 job들의 옵션이 일관되는지 확인합니다.
- *       현재는 lat_percentiles 옵션의 일관성만 검사합니다.
- * 파라미터:
- *   td      - 대상 thread_data
- *   jobname - job 이름 (에러 메시지 출력용)
- * 반환값: 성공 시 0, 실패 시 1
+ * @param td      : 현재 잡.
+ * @param jobname : 에러 메시지용.
+ * @return: 0 정상, 1 불일치 발견.
+ *
+ * 왜 필요한가: 그룹 집계는 백분위수 계산 파이프라인을 공유하므로 한 잡이라도
+ *   lat_percentiles 를 다르게 설정하면 버킷 크기가 어긋나 수치 의미가 붕괴.
  */
 static int verify_per_group_options(struct thread_data *td, const char *jobname)
 {
@@ -2203,13 +2830,9 @@ static int verify_per_group_options(struct thread_data *td, const char *jobname)
  * Treat an empty log file name the same as a one not given
  */
 /*
- * make_log_name() - 로그 이름 결정 함수
- *
- * 역할: 로그 파일 이름이 비어있으면 job 이름을 대신 사용합니다.
- * 파라미터:
- *   logname - 설정된 로그 파일 이름
- *   jobname - job 이름 (fallback)
- * 반환값: 유효한 로그 이름 문자열
+ * [한국어]
+ * make_log_name() - 로그 파일명이 NULL 또는 빈 문자열이면 잡 이름으로 대체.
+ *                   "빈 문자열은 미설정과 동일"로 취급하는 규약.
  */
 static const char *make_log_name(const char *logname, const char *jobname)
 {
@@ -2227,34 +2850,61 @@ static const char *make_log_name(const char *logname, const char *jobname)
  * members of td.
  */
 /*
- * add_job() - job 등록 함수 (핵심 함수)
+ * [한국어]
+ * add_job() - 잡 등록의 최종 단계. thread_data 를 런타임에 필요한 모든
+ *             런-타임 상태(엔진, 파일 리스트, 난수, flow, 로그, 통계, 그룹,
+ *             rate, steady-state) 로 마감하고, numjobs 만큼 서브잡을
+ *             재귀적으로 확장한다.
  *
- * 역할: thread_data를 최종적으로 검증하고 초기화하여 실행 대기열에 추가합니다.
- *       이 함수는 fio 초기화 과정의 핵심으로, 모든 옵션 검증과 런타임 설정이
- *       여기서 완료됩니다.
+ * @param td         : 등록할 thread_data. get_new_job 이 이미 만든 포인터.
+ * @param jobname    : 섹션 이름 또는 사용자가 준 잡 이름.
+ * @param job_add_num: numjobs 확장에서의 서브잡 인덱스. 0 = 원본 잡,
+ *                    1..numjobs-1 = 복제본.
+ * @param recursed   : 본 함수가 numjobs 재귀로 들어왔는지 플래그. 서버 모드
+ *                    send_add_job 중복 전송 방지에 사용.
+ * @param client_type: FIO_CLIENT_TYPE_CLI / GUI / ... 결과를 리모트에 전달
+ *                    할 때 태깅용.
+ * @return: 0 성공, -1 실패(중간 어디서든 goto err → put_job).
  *
- * 파라미터:
- *   td          - 등록할 thread_data
- *   jobname     - job 이름
- *   job_add_num - 현재 job의 서브잡 번호 (numjobs > 1일 때)
- *   recursed    - 재귀 호출 여부 (numjobs 처리 시)
- *   client_type - 클라이언트 타입 (CLI, GUI 등)
+ * 핵심 처리 순서(코드 블록 단위):
+ *   1. def_thread 면 즉시 반환(템플릿이라 실제 잡 없음).
+ *   2. init_flags(td) - TD_F_* 비트 세팅(verify, scramble, rate 등).
+ *   3. parse_dryrun() 이면 put_job 으로 폐기하고 종료(--showcmd/--parse-only).
+ *   4. profile_td_init / ioengine_load - 프로파일 훅 + I/O 엔진 로드.
+ *   5. 파일 자동 생성: filename 미지정 + files 0 개 + iolog 읽기 아님 이면
+ *      filename_format 에 따라 add_file 로 nr_files 개 생성.
+ *   6. setup_random_seeds - 모든 frand_state 시드.
+ *   7. fixup_options - 의존성/충돌 검증(실패 시 goto err).
+ *   8. init_dedupe_working_set_seeds (global 아닐 때).
+ *   9. wait_for_ok - wait_for 대상 잡이 유일하고 자기가 아닌지.
+ *   10. flow_init_job - job 간 flow 제어 참여.
+ *   11. diskless 엔진이면 real_file_size 를 -1ULL 로 강제.
+ *   12. fio_sem_init(LOCKED) - 잡 start 세마포어 생성(메인이 release).
+ *   13. ts.* percentiles/sig_figs 구성, init_thread_stat_min_vals.
+ *   14. ddir_seq_nr = 1 - 첫 get_next_offset 에서 랜덤 오프셋 생성되도록.
+ *   15. stonewall/new_group 처리 → groupid 증가 조건 판정.
+ *   16. verify_per_group_options - 그룹 내 lat_percentiles 일관성.
+ *   17. setup_rate - rate 또는 rate_iops 를 bps 로 환산.
+ *   18. td_ramp_period_init - ramp_time 타이머 준비.
+ *   19. lat/slat/clat/hist/bw/iops 로그 파일 스트림 개방(setup_log).
+ *       - write_lat_log + log_issue_time 조합 검증.
+ *       - hist_log 은 서버 모드에서 zlib 필수.
+ *   20. 첫 서브잡이면 콘솔에 한 줄 요약(rw/bs/ioengine/iodepth) 출력, 서버
+ *       모드면 fio_server_send_add_job.
+ *   21. td_steadystate_init - ss_dur 감지 윈도우 예약.
+ *   22. merge_blktrace_file 이 있으면 merge_blktrace_iologs. merge-only 모드
+ *       이면 잡을 버리고 0 반환.
+ *   23. numjobs > 1 이면 get_new_job 으로 템플릿 복제 후 add_job 재귀 호출.
+ *       서브잡에서는 numjobs/stonewall/new_group 을 지우고 subjob_number 설정.
+ *       filename 자동 할당인 경우 복제된 파일 리스트를 초기화해 중복 오픈을
+ *       피한다.
  *
- * 반환값: 성공 시 0, 실패 시 -1
+ * 실행 컨텍스트: 메인 스레드. 이 시점에서 잡은 아직 spawn 되지 않았으며
+ *   thread_data 는 공유 메모리 안에 있어 잡 시작 후 자식도 그대로 참조한다.
  *
- * 처리 순서:
- *   1. init_flags() - 플래그 비트 설정
- *   2. ioengine_load() - IO 엔진 로드
- *   3. 파일 추가 (filename 미설정 시 자동 생성)
- *   4. setup_random_seeds() - 난수 시드 설정
- *   5. fixup_options() - 옵션 의존성 해결
- *   6. flow_init_job() - flow 제어 초기화
- *   7. 로그 파일 설정 (lat, bw, iops, hist)
- *   8. 통계 초기화
- *   9. stonewall/그룹 처리
- *   10. rate 설정
- *   11. steady state 초기화
- *   12. numjobs > 1이면 재귀적으로 서브잡 추가
+ * 에러 경로: 단계 4~22 어디서든 실패하면 goto err 로 분기 → put_job(td)
+ *   가 세그먼트 슬롯을 반환하고 자원 정리 후 -1 리턴. numjobs 재귀 실패 시
+ *   부모도 동일 경로로 폐기.
  */
 static int add_job(struct thread_data *td, const char *jobname, int job_add_num,
 		   int recursed, int client_type)
@@ -2699,14 +3349,17 @@ err:
  * Parse as if 'o' was a command line
  */
 /*
- * add_job_opts() - 문자열 배열을 명령줄처럼 파싱하여 job 추가 함수
+ * [한국어]
+ * add_job_opts() - "key=value" 형태 문자열 배열을 CLI 토큰처럼 파싱해
+ *                  잡을 프로그래매틱하게 추가한다. profiles/ 의 내장 프로파일
+ *                  이 주로 사용.
  *
- * 역할: 명령줄 옵션 형식의 문자열 배열을 파싱하여 job을 생성합니다.
- *       "name" 옵션이 나오면 새 job 섹션으로 간주합니다.
- * 파라미터:
- *   o           - 옵션 문자열 배열 (NULL 종료)
- *   client_type - 클라이언트 타입
- * 반환값: 없음
+ * @param o          : NULL 종료 문자열 배열. 각 토큰은 "name=X" 또는 "key=V".
+ * @param client_type: add_job 에 전달.
+ *
+ * 상태 머신: name= 토큰을 만날 때마다 이전 잡(td) 을 add_job 으로 마감하고
+ *   새 td 시작. "name=" 앞 글로벌 옵션은 td_parent(def_thread) 에 누적.
+ *   in_global 플래그로 첫 "name" 이전/이후 상태 구분.
  */
 void add_job_opts(const char **o, int client_type)
 {
@@ -2750,13 +3403,14 @@ void add_job_opts(const char **o, int client_type)
 }
 
 /*
- * skip_this_section() - 지정된 섹션을 건너뛸지 확인하는 함수
+ * [한국어]
+ * skip_this_section() - --section 목록이 있을 때 주어진 섹션 이름이 실행
+ *                       대상인지 판정. global 섹션은 무조건 포함한다.
  *
- * 역할: --section 옵션으로 특정 섹션만 실행할 때,
- *       현재 섹션이 건너뛰어야 할 대상인지 확인합니다.
- * 파라미터:
- *   name - 섹션 이름
- * 반환값: 건너뛰어야 하면 1, 실행해야 하면 0
+ * @param name: 섹션 이름.
+ * @return: skip 이면 1, 실행이면 0.
+ *
+ * nr_job_sections==0 이면 --section 미사용이므로 모두 실행(0 반환).
  */
 static int skip_this_section(const char *name)
 {
@@ -2778,12 +3432,16 @@ static int skip_this_section(const char *name)
 }
 
 /*
- * is_empty_or_comment() - 빈 줄 또는 주석 줄 확인 함수
+ * [한국어]
+ * is_empty_or_comment() - INI 파서의 라인 필터. 줄이 공백/제어문자만
+ *                         포함하거나, 유효 문자 전에 ';' 또는 '#' 을 만나면
+ *                         주석으로 간주해 skip.
  *
- * 역할: 줄이 비어있거나 ';' 또는 '#'으로 시작하는 주석인지 확인합니다.
- * 파라미터:
- *   line - 확인할 줄 문자열
- * 반환값: 빈 줄이나 주석이면 1, 유효한 내용이면 0
+ * @param line: 검사할 널 종료 문자열.
+ * @return: 1 이면 무시, 0 이면 유의미한 내용.
+ *
+ * 알고리즘: 앞쪽부터 한 글자씩 보고 (1) ';' 또는 '#' 즉시 주석,
+ *   (2) 비공백/비제어 문자 발견 시 내용 존재(0 반환), (3) 끝까지 공백이면 빈 줄.
  */
 static int is_empty_or_comment(char *line)
 {
@@ -2806,34 +3464,58 @@ static int is_empty_or_comment(char *line)
  * This is our [ini] type file parser.
  */
 /*
- * __parse_jobs_ini() - INI 형식 job 파일 파서 (핵심 함수)
+ * [한국어]
+ * __parse_jobs_ini() - fio .fio 잡 파일(INI 형식)의 본체 파서.
+ *                      [global] / [jobname] 섹션, 섹션 몸체의 "key=value"
+ *                      옵션, 그리고 "include path" 지시자를 처리한다.
  *
- * 역할: INI 형식의 job 파일(.fio)을 파싱하여 job들을 생성합니다.
- *       [global] 섹션은 기본 옵션, [jobname] 섹션은 개별 job을 정의합니다.
- *       include 지시자로 다른 파일을 포함할 수 있습니다.
+ * @param td            : nested=1(include 재귀) 일 때 상위에서 이미 만든 td.
+ *                       초기 호출은 NULL. assert(td || !nested).
+ * @param file          : 파일 경로(is_buf=0) 또는 RAW 문자열 버퍼(is_buf=1).
+ *                       "-" 는 stdin 을 의미하며, stdin_occupied 로 이중 사용
+ *                       (read_iolog_file="-" 과의 충돌) 을 감지한다.
+ * @param is_buf        : true 면 file 을 버퍼 포인터로 해석하고 strsep 으로
+ *                       줄 분할. false 면 fopen 후 fgets.
+ * @param stonewall_flag: 첫 잡 앞에 stonewall 을 자동 삽입할지. 여러 파일을
+ *                       순차 실행할 때 경계를 긋기 위한 용도.
+ * @param type          : 클라이언트 타입 태그(add_job 에 전달).
+ * @param nested        : include 로 재귀 호출된 상태 여부. 1 이면 섹션 헤더
+ *                       ([...]) 을 금지하고 옵션만 이어 수집.
+ * @param name          : 섹션 이름 버퍼 포인터(280B). nested 에서는 상위로
+ *                       부터 받고, 최상위에서는 calloc 로 확보 후 out 에서
+ *                       free.
+ * @param popts,aopts,nopts: 옵션 문자열 배열과 용량·개수. include 재귀 시
+ *                       부모 섹션의 배열에 이어서 append 할 수 있도록 공유.
+ * @return: 0 성공, 1/errno 실패.
  *
- * 파라미터:
- *   td             - 중첩(nested) 호출 시 사용할 thread_data (최초 호출 시 NULL)
- *   file           - 파일 경로 또는 버퍼 포인터
- *   is_buf         - file이 메모리 버퍼인지 여부
- *   stonewall_flag - 첫 번째 job에 stonewall 설정 여부
- *   type           - 클라이언트 타입
- *   nested         - 중첩(include) 파싱 여부
- *   name           - 현재 섹션 이름 버퍼 (중첩 시 부모에서 전달)
- *   popts          - 옵션 배열 포인터의 포인터 (중첩 시 부모와 공유)
- *   aopts          - 할당된 옵션 배열 크기
- *   nopts          - 현재 옵션 수
+ * INI 문법 요약:
+ *   ; 또는 # 은 주석.
+ *   [name]               잡 섹션 시작. name == "global" 이면 def_thread 템플릿
+ *                        에 쌓이고, 그 외 이름은 get_new_job 으로 새 td 생성.
+ *   key = value          옵션 정의. 본 파서는 라인 수집만 하고 실제 파싱은
+ *                        fio_options_parse() 에 위임.
+ *   include path         path 에 적힌 다른 파일을 재귀적으로 파싱. 상대 경로는
+ *                        현재 파일의 디렉토리 기준. nested 안에서는 새 섹션이
+ *                        허용되지 않으므로 include 파일은 "옵션 조각"만 담을
+ *                        수 있다.
  *
- * 반환값: 성공 시 0, 실패 시 1
+ * 처리 흐름:
+ *   1. 파일 열기(is_buf/stdin/일반).
+ *   2. 줄 읽기 → 공백/주석 제거 → 섹션 헤더이면 이름 추출 + skip_this_section
+ *      판정 → get_new_job → stonewall 주입.
+ *   3. 섹션 내부에서 다시 줄을 읽어 include 이면 재귀, 아니면 strdup 으로
+ *      opts[num_opts++] 에 수집. 배열 포화 시 2 배 realloc.
+ *   4. 섹션 끝(새 [...] 또는 EOF) 에 도달하면 fio_options_parse(td, opts,
+ *      num_opts) 로 일괄 파싱. 성공 시 add_job, 실패 시 put_job.
+ *   5. opts 내용 free.
+ *   6. 파일 종료 후 --section 목록/섹션 이름 버퍼/opts 배열 해제.
  *
- * 파싱 흐름:
- *   1. 파일 열기 (stdin, 일반 파일, 또는 메모리 버퍼)
- *   2. 줄 단위로 읽기
- *   3. [섹션이름] 발견 시 → get_new_job()으로 새 td 생성
- *   4. 옵션 줄 수집
- *   5. include 지시자 발견 시 재귀 호출
- *   6. 섹션 끝에서 fio_options_parse()로 옵션 파싱
- *   7. add_job()으로 job 등록
+ * 실행 컨텍스트: 메인 스레드. 재귀는 include 한 번당 한 단계 깊이. opts 배열과
+ *   name 버퍼는 트리 전체에서 공유되므로 include 깊이가 커져도 O(n) 메모리.
+ *
+ * 호출 체인:
+ *   parse_options → parse_jobs_ini → [__parse_jobs_ini]
+ *     → fio_options_parse → add_job.
  */
 static int __parse_jobs_ini(struct thread_data *td,
 		char *file, int is_buf, int stonewall_flag, int type,
@@ -3151,16 +3833,10 @@ out:
 }
 
 /*
- * parse_jobs_ini() - INI 파일 파싱 공개 인터페이스 함수
- *
- * 역할: __parse_jobs_ini()의 공개 래퍼 함수입니다.
- *       중첩 관련 파라미터를 NULL/0으로 설정하여 최초 호출을 수행합니다.
- * 파라미터:
- *   file           - 파일 경로 또는 버퍼
- *   is_buf         - 버퍼 여부
- *   stonewall_flag - stonewall 설정 여부
- *   type           - 클라이언트 타입
- * 반환값: 성공 시 0, 실패 시 1
+ * [한국어]
+ * parse_jobs_ini() - __parse_jobs_ini 의 공개 thin wrapper. nested/name/popts
+ *                    등의 재귀 파라미터를 0/NULL 로 넘겨 최상위 호출을 뜻한다.
+ *                    외부(parse_options, server.c)가 진입점으로 사용.
  */
 int parse_jobs_ini(char *file, int is_buf, int stonewall_flag, int type)
 {
@@ -3169,12 +3845,17 @@ int parse_jobs_ini(char *file, int is_buf, int stonewall_flag, int type)
 }
 
 /*
- * fill_def_thread() - 기본 스레드 초기화 함수
+ * [한국어]
+ * fill_def_thread() - def_thread(글로벌 템플릿) 를 기본 상태로 리셋.
+ *                     parse_options 가 여러 잡 파일을 순차 처리할 때 각 파일
+ *                     사이에 호출해, 이전 파일의 [global] 이 다음 파일로
+ *                     전파되지 않도록 한다.
  *
- * 역할: def_thread(글로벌 기본 설정용 thread_data)를 0으로 초기화하고
- *       기본 옵션값을 채웁니다.
- * 파라미터: 없음
- * 반환값: 항상 0
+ * @return: 항상 0.
+ *
+ * 동작: memset 0 → opt_list 초기화 → fio_getaffinity 로 현재 프로세스
+ *   CPU 마스크 기록 → error_dump=1 기본값 → fio_fill_default_options 로
+ *   fio_options[] 테이블의 .def 값을 일괄 채움.
  */
 static int fill_def_thread(void)
 {
@@ -3197,11 +3878,10 @@ static int fill_def_thread(void)
 }
 
 /*
- * show_debug_categories() - 디버그 카테고리 출력 함수
- *
- * 역할: --debug=help 시 사용 가능한 디버그 카테고리 목록을 출력합니다.
- * 파라미터: 없음
- * 반환값: 없음
+ * [한국어]
+ * show_debug_categories() - usage()/--debug=help 에서 사용 가능한 디버그
+ *                           카테고리 이름 목록을 80 칼럼 폭으로 wrap 해 출력.
+ *                           FIO_INC_DEBUG 가 켜진 빌드에서만 실제 내용 있음.
  */
 static void show_debug_categories(void)
 {
@@ -3242,12 +3922,12 @@ static void show_debug_categories(void)
  * --latency-log - Deprecated option.
  */
 /*
- * usage() - 사용법 출력 함수
+ * [한국어]
+ * usage() - "--help" 출력. 옵션 참조 목록을 printf 로 나열.
  *
- * 역할: fio의 명령줄 사용법 및 옵션 설명을 출력합니다.
- * 파라미터:
- *   name - 프로그램 이름 (argv[0])
- * 반환값: 없음
+ * @param name: argv[0](바이너리 경로). "usage: foo [options]" 머리행에 사용.
+ *
+ * 표시되지 않는 옵션: --append-terse(별칭), --latency-log(deprecated).
  */
 static void usage(const char *name)
 {
@@ -3308,8 +3988,15 @@ static void usage(const char *name)
 
 #ifdef FIO_INC_DEBUG
 /*
- * 디버그 레벨 정의 배열 - 각 디버그 카테고리의 이름, 설명, 비트 시프트값
- * --debug 옵션에서 참조됩니다.
+ * [한국어] 디버그 카테고리 정적 테이블.
+ * 각 엔트리의 .shift 는 fio_debug 비트 중 해당 카테고리의 위치를 지정한다.
+ * dprint(FD_IO, ...) 는 (fio_debug & (1 << FD_IO)) 로 게이팅된다.
+ * 배열 말미의 {.name=NULL} 은 순회 종료 센티넬.
+ *
+ * 설정자: set_debug() 가 --debug=io,verify 같은 토큰을 파싱해 해당 shift
+ *   비트를 OR.
+ * 읽는 자: show_debug_categories(), set_debug(), 그리고 dprint 매크로가
+ *   런타임에 fio_debug 를 검사.
  */
 const struct debug_level debug_levels[] = {
 	{ .name = "process",
@@ -3396,15 +4083,15 @@ const struct debug_level debug_levels[] = {
 };
 
 /*
- * set_debug() - 디버그 옵션 설정 함수
+ * [한국어]
+ * set_debug() - --debug=list 인수를 파싱해 fio_debug 비트마스크를 구성.
  *
- * 역할: --debug 옵션의 인수를 파싱하여 fio_debug 비트마스크를 설정합니다.
- *       쉼표로 구분된 여러 카테고리를 지정할 수 있습니다.
- *       "all"은 모든 카테고리를 활성화합니다.
- *       "?"/"help"는 사용 가능한 카테고리를 출력합니다.
- * 파라미터:
- *   string - 디버그 옵션 문자열 (예: "io,verify,random")
- * 반환값: 성공 시 0, 도움말 출력 시 1
+ * @param string: "io,verify" 또는 "all" 또는 "?"/"help" 또는 "job:NR".
+ * @return: 0 성공, 1 help 출력 요청으로 exit 유도.
+ *
+ * 특이 처리: "job" 카테고리는 ":N" 접미사로 대상 잡 번호를 기록
+ *   (fio_debug_jobno 전역). 이 필터와 FD_* 마스크가 AND 조합되어
+ *   dprint 가 출력을 결정한다.
  */
 static int set_debug(const char *string)
 {
@@ -3479,12 +4166,16 @@ static int set_debug(const char *string)
 #endif
 
 /*
- * fio_options_fill_optstring() - getopt 옵션 문자열 생성 함수
+ * [한국어]
+ * fio_options_fill_optstring() - l_opts[] 를 순회하며 getopt(3) 용 짧은
+ *                                optstring 을 자동 생성해 cmd_optstr 에 저장.
  *
- * 역할: l_opts 배열에서 getopt용 짧은 옵션 문자열(optstring)을 생성합니다.
- *       required_argument이면 ':', optional_argument이면 '::'를 추가합니다.
- * 파라미터: 없음
- * 반환값: 없음 (결과는 전역 변수 cmd_optstr에 저장)
+ * 규약: has_arg == required_argument → ':' 한 번, optional_argument → '::' 두 번.
+ *   no_argument 는 문자만 기록.
+ *
+ * 왜 자동 생성: l_opts 에 옵션이 추가될 때마다 optstring 을 손으로 맞추면
+ *   실수 위험이 커서, 단일 진실의 소스로 l_opts 에 has_arg 를 두고 런타임에
+ *   파생한다.
  */
 static void fio_options_fill_optstring(void)
 {
@@ -3507,13 +4198,15 @@ static void fio_options_fill_optstring(void)
 }
 
 /*
- * client_flag_set() - 클라이언트 플래그 확인 함수
+ * [한국어]
+ * client_flag_set() - 주어진 하위 8비트 옵션 문자가 l_opts[] 에서
+ *                     FIO_CLIENT_FLAG 비트를 가진 옵션인지 조회.
  *
- * 역할: 주어진 옵션 문자가 FIO_CLIENT_FLAG를 가지고 있는지 확인합니다.
- *       클라이언트/서버 모드에서 옵션 전달 여부를 결정합니다.
- * 파라미터:
- *   c - 옵션 문자
- * 반환값: FIO_CLIENT_FLAG가 설정되어 있으면 해당 값, 아니면 0
+ * @param c: getopt 가 반환한 옵션 값(하위 8비트로 마스킹된 상태 가정).
+ * @return: FIO_CLIENT_FLAG 또는 0.
+ *
+ * 왜 필요한가: getopt 반환값이 이미 FIO_CLIENT_FLAG 를 뺀 형태일 때도
+ *   "이 옵션이 원격 전달 대상인지" 를 재확인하기 위해 사용.
  */
 static int client_flag_set(char c)
 {
@@ -3533,13 +4226,10 @@ static int client_flag_set(char c)
 }
 
 /*
- * parse_cmd_client() - 클라이언트에게 옵션 전달 함수
- *
- * 역할: 클라이언트/서버 모드에서 원격 클라이언트에게 명령줄 옵션을 전달합니다.
- * 파라미터:
- *   client - 클라이언트 핸들
- *   opt    - 전달할 옵션 문자열
- * 반환값: 없음
+ * [한국어]
+ * parse_cmd_client() - FIO_CLIENT_FLAG 마킹된 옵션을 원격 클라이언트에게
+ *                      포워딩. 서버가 옵션을 직접 소비하더라도 클라이언트도
+ *                      동일 옵션을 적용하도록 보장.
  */
 static void parse_cmd_client(void *client, char *opt)
 {
@@ -3547,13 +4237,10 @@ static void parse_cmd_client(void *client, char *opt)
 }
 
 /*
- * show_closest_option() - 가장 유사한 옵션 제안 함수
- *
- * 역할: 인식할 수 없는 옵션이 입력되었을 때, 편집 거리(Levenshtein distance)를
- *       기반으로 가장 유사한 옵션을 제안합니다.
- * 파라미터:
- *   name - 입력된 (잘못된) 옵션 이름
- * 반환값: 없음
+ * [한국어]
+ * show_closest_option() - 인식 불가 옵션에 대해 편집거리(string_distance,
+ *                         Levenshtein) 로 가장 가까운 l_opts 엔트리를 찾아
+ *                         "Did you mean X?" 제안. 거리가 너무 멀면 생략.
  */
 static void show_closest_option(const char *name)
 {
@@ -3583,13 +4270,15 @@ static void show_closest_option(const char *name)
 }
 
 /*
- * parse_output_format() - 출력 형식 파싱 함수
+ * [한국어]
+ * parse_output_format() - --output-format 의 쉼표 구분 리스트를 해석해
+ *                         output_format 비트마스크를 재구성.
  *
- * 역할: --output-format 옵션의 인수를 파싱하여 output_format 비트마스크를 설정합니다.
- *       쉼표로 구분된 여러 형식을 동시에 지정할 수 있습니다.
- * 파라미터:
- *   optarg - 형식 문자열 (예: "json+,normal")
- * 반환값: 성공 시 0, 실패 시 1
+ * 인식 토큰:
+ *   minimal/terse/csv → FIO_OUTPUT_TERSE
+ *   json              → FIO_OUTPUT_JSON
+ *   json+             → FIO_OUTPUT_JSON | JSON_PLUS (상세 per-sample)
+ *   normal            → FIO_OUTPUT_NORMAL
  */
 static int parse_output_format(const char *optarg)
 {
@@ -3624,29 +4313,56 @@ static int parse_output_format(const char *optarg)
 }
 
 /*
- * parse_cmd_line() - 명령줄 인수 파싱 함수
+ * [한국어]
+ * parse_cmd_line() - fio 의 CLI 파서. getopt_long_only(3) 기반으로 l_opts[]
+ *                    의 약 50+ 개 옵션을 단일 switch 로 디스패치한다. 동시에
+ *                    --name 등의 잡 옵션이 오면 get_new_job + ioengine_load
+ *                    + add_job 을 내부적으로 오케스트레이션해 잡을 즉시 등록.
  *
- * 역할: fio의 전체 명령줄 인수(argc, argv)를 파싱합니다.
- *       getopt_long_only()를 사용하여 긴 옵션과 짧은 옵션을 모두 처리합니다.
- *       이 함수에서 처리되는 옵션은 fio 자체의 동작을 제어하는 것들입니다.
- *       job 파일 경로는 ini_file 배열에 수집됩니다.
+ * @param argc        : argc(표준). main() 에서 그대로 전달.
+ * @param argv        : argv(표준). 바이너리 이름 + CLI 토큰. getopt 가 argv
+ *                     를 in-place 로 재정렬 가능.
+ * @param client_type : FIO_CLIENT_TYPE_CLI 등. 원격 클라이언트 모드에서 잡을
+ *                     등록할 때 태깅용.
+ * @return: 수집된 잡 파일(INI) 개수(ini_idx). parse_options() 가 이 개수만큼
+ *   parse_jobs_ini 를 호출한다.
  *
- * 파라미터:
- *   argc        - 인수 개수
- *   argv        - 인수 문자열 배열
- *   client_type - 클라이언트 타입
+ * 왜 함수가 크게 비대한가: fio 는 "부트스트랩 CLI + 잡 옵션 + I/O 엔진
+ *   전용 옵션" 을 한 바이너리에서 모두 받기 때문에 한 switch 에 FIO_GETOPT_JOB
+ *   (fio_options[]), FIO_GETOPT_IOENGINE (엔진 옵션), 그리고 고유 CLI 옵션을
+ *   모두 분기해야 한다.
  *
- * 반환값: 수집된 ini 파일 개수 (ini_idx)
+ * 주요 처리 경로:
+ *   - optind=1 로 매 호출 초기화(서버 모드에서 클라이언트 요청마다 파서 재진입).
+ *   - getopt_long_only 루프에서 c 를 받아 FIO_CLIENT_FLAG 가 켜졌으면 원격
+ *     클라이언트로 forward 후 플래그 제거.
+ *   - 단순 플래그: -m(minimal), -r(readonly), -w(warnings_fatal) 등은 전역 토글.
+ *   - 값 저장: -o(출력 파일), -F(출력 형식 - parse_output_format), -V(terse
+ *     version), -e(ETA 모드), -E/-O(ETA 간격), -d(디버그), -x(--section),
+ *     -X(inflate-log), -p(profile), -D(daemonize), -W(trigger 파일) 등.
+ *   - 분기성 동작: -T(cpuclock test) / -G(crctest) / -M(memcpy test) /
+ *     -I(idle-prof) 는 즉시 해당 루틴을 실행 후 do_exit=1.
+ *   - 클라이언트/서버: -S, -N(Windows), -C, -R.
+ *   - 잡 옵션(FIO_GETOPT_JOB): opt == "name" 을 만나면 이전 잡을 add_job 으로
+ *     마감하고 새 td 생성(get_new_job) + 엔진 로드. 그 외 키는 fio_cmd_option_
+ *     parse 에 위임. opt == "ioengine" 이면 엔진을 다시 로드해 옵션 세트를
+ *     교체.
+ *   - 엔진 옵션(FIO_GETOPT_IOENGINE): 현재 td 가 있으면
+ *     fio_cmd_ioengine_option_parse 로 td->eo 에 주입.
+ *   - 에러: '?' 는 show_closest_option 으로 levenshtein 제안 + fallthrough
+ *     로 exit.
+ *   - 루프 종료 후 : do_exit && !(is_backend || nr_clients) 이면 exit().
+ *     클라이언트/서버 모드이면 계속해서 fio_clients_connect 로 네트워크 연결.
+ *   - 서버 모드이면 fio_start_server 로 진입해 이벤트 루프 시작(여기서 return).
+ *   - 남은 positional 인자를 ini_file 배열에 strdup 수집.
  *
- * 주요 처리 옵션:
- *   -o: 출력 파일 지정
- *   -b: 대역폭 로그 활성화
- *   -F: 출력 형식 지정
- *   -d: 디버그 옵션
- *   -S: 서버 모드
- *   -C: 클라이언트 모드
- *   FIO_GETOPT_JOB: job 옵션 (--name, --ioengine 등)
- *   FIO_GETOPT_IOENGINE: IO 엔진 전용 옵션
+ * 실행 컨텍스트: 메인 스레드. 서버 모드에서는 클라이언트 요청마다 같은 함수가
+ *   재진입될 수 있어 optind 를 매번 리셋한다. 재진입 시에도 전역 def_thread/
+ *   segments 는 공유.
+ *
+ * 호출 체인:
+ *   parse_options → [parse_cmd_line] → (switch 내부) add_job / get_new_job /
+ *     ioengine_load / fio_options_parse / fio_client_add / fio_start_server / ...
  */
 int parse_cmd_line(int argc, char *argv[], int client_type)
 {
@@ -4208,19 +4924,19 @@ out_free:
 }
 
 /*
- * fio_init_options() - fio 옵션 시스템 초기화 함수
+ * [한국어]
+ * fio_init_options() - 옵션 파서 시스템의 bring-up 루틴.
  *
- * 역할: fio의 옵션 파싱 시스템을 초기화합니다.
- *       이 함수는 parse_options()에서 가장 먼저 호출됩니다.
- * 파라미터: 없음
- * 반환값: 성공 시 0, 실패 시 1
+ * @return: 0 성공, 1 def_thread 초기화 실패.
  *
- * 초기화 순서:
- *   1. 표준 출력/에러 파일 포인터 설정
- *   2. getopt 옵션 문자열 생성
- *   3. l_opts 배열 초기화 (job 옵션 추가)
- *   4. atexit()에 free_shm 등록 (프로그램 종료 시 정리)
- *   5. 기본 스레드(def_thread) 초기화
+ * 수행:
+ *   1. f_out=stdout, f_err=stderr.
+ *   2. fio_options_fill_optstring() 으로 cmd_optstr 생성.
+ *   3. fio_options_dup_and_init(l_opts) 가 fio_options[] 의 잡 옵션들을
+ *      l_opts 끝에 append 하며, FIO_GETOPT_JOB 값을 val 에 부여해
+ *      parse_cmd_line switch 에서 구분되도록 함.
+ *   4. atexit(free_shm) - 프로세스 종료 시 공유 자원 정리 훅.
+ *   5. fill_def_thread() - def_thread 를 기본값으로 채움.
  */
 int fio_init_options(void)
 {
@@ -4245,25 +4961,45 @@ int fio_init_options(void)
 extern int fio_check_options(struct thread_options *);
 
 /*
- * parse_options() - fio 전체 옵션 파싱 함수 (최상위 진입점)
+ * [한국어]
+ * parse_options() - fio 옵션 파싱 전체 오케스트레이터. main()이 호출하는
+ *                   최상위 진입점으로, 본 파일의 모든 하위 루틴을 한 순서로
+ *                   엮어 thread_data 배열을 구성한다.
  *
- * 역할: fio의 전체 초기화를 수행하는 최상위 함수입니다.
- *       명령줄 파싱, job 파일 파싱, 클라이언트/서버 설정을 모두 처리합니다.
+ * @param argc : argc(from main).
+ * @param argv : argv(from main).
+ * @return: 0 성공. 1 실패(옵션 시스템 초기화 실패, ini 파싱 실패,
+ *   정상 경로가 아닌데 잡이 0 개). 성공인데도 잡이 0 개가 허용되는
+ *   경우는 parse_dryrun/exec_profile/is_backend/nr_clients/did_arg 가
+ *   true 일 때.
  *
- * 파라미터:
- *   argc - 명령줄 인수 개수
- *   argv - 명령줄 인수 배열
+ * 흐름:
+ *   1. fio_init_options() - f_out/f_err 을 표준 스트림으로, optstring 생성,
+ *      l_opts 에 잡 옵션 추가, atexit(free_shm), def_thread 초기화.
+ *   2. fio_test_cconv(&def_thread.o) - thread_options <-> thread_options_pack
+ *      변환 자기검사(네트워크 전송 안정성 보증).
+ *   3. parse_cmd_line - CLI 파싱. 이 과정에서 --name 등의 잡 옵션이 있으면
+ *      내부적으로 add_job 이 호출되어 이미 잡이 생성될 수 있음. 남은
+ *      positional 인자는 ini_file[] 로 수집되어 job_files 에 개수 반환.
+ *   4. job_files > 0:
+ *      각 i 에 대해:
+ *        - i >= 1 이면 fill_def_thread 를 다시 호출해 [global] 누적 리셋.
+ *        - nr_clients (클라이언트 모드) → fio_clients_send_ini 로 원격 전송
+ *          (서버에서 파싱).
+ *        - !is_backend (로컬 모드) → parse_jobs_ini 로 로컬 파싱.
+ *      각 파일 처리 후 free(ini_file[i]).
+ *   5. job_files == 0 && nr_clients > 0 → 잡 파일 없이 클라이언트 모드: 빈
+ *      송신으로 서버가 자체 ini 로 동작하게 함.
+ *   6. 정리: free(ini_file), fio_options_free(&def_thread), filesetup_mem_free.
+ *   7. thread_number == 0 이면 유효한 동작 여부를 판정. 잡은 없지만 dryrun/
+ *      profile/backend/client/did_arg 중 하나라면 허용. 아니면 usage + 실패.
+ *   8. output_format 이 NORMAL 이면 헤더(fio 버전 문자열) 출력.
  *
- * 반환값: 성공 시 0, 실패 시 1
+ * 실행 컨텍스트: main() 의 단일 스레드. 이후 fio_backend 또는 fio_handle_clients
+ *   로 제어가 이관되어 실제 I/O 가 시작된다.
  *
- * 전체 흐름:
- *   1. fio_init_options()  → 옵션 시스템 초기화
- *   2. fio_test_cconv()    → 내부 변환 테스트
- *   3. parse_cmd_line()    → 명령줄 파싱 (job 파일 경로 수집)
- *   4. job 파일 처리:
- *      a. 클라이언트 모드 → fio_clients_send_ini()로 서버에 전송
- *      b. 로컬 모드 → parse_jobs_ini()로 직접 파싱
- *   5. 정리 및 검증 (job이 하나도 없으면 에러)
+ * 에러 경로: 어떤 단계든 실패하면 1 반환, main()에서 exit(1)에 의해 프로세스
+ *   종료. atexit(free_shm) 이 등록되어 있어 잡 자원과 SHM 은 자동 정리.
  */
 int parse_options(int argc, char *argv[])
 {
@@ -4338,12 +5074,13 @@ int parse_options(int argc, char *argv[])
 }
 
 /*
- * options_default_fill() - 기본 옵션값 복사 함수
+ * [한국어]
+ * options_default_fill() - def_thread.o 의 현재 상태를 주어진 thread_options
+ *                          에 얕은 복사로 주입. 주로 내부 옵션 프리셋 도구가
+ *                          사용.
  *
- * 역할: def_thread의 옵션을 주어진 thread_options 구조체에 복사합니다.
- * 파라미터:
- *   o - 옵션을 채울 thread_options 구조체
- * 반환값: 없음
+ * 주의: 얕은 복사이므로 문자열 필드가 공유된다. 복사본이 독립적 수명이어야
+ *   하면 이어서 fio_options_mem_dupe 를 호출해야 한다.
  */
 void options_default_fill(struct thread_options *o)
 {
@@ -4351,12 +5088,11 @@ void options_default_fill(struct thread_options *o)
 }
 
 /*
- * get_global_options() - 글로벌 옵션 접근 함수
- *
- * 역할: 글로벌 기본 설정(def_thread)에 대한 포인터를 반환합니다.
- *       외부 모듈에서 글로벌 옵션에 접근할 때 사용합니다.
- * 파라미터: 없음
- * 반환값: def_thread(글로벌 기본 thread_data) 포인터
+ * [한국어]
+ * get_global_options() - def_thread(정적 템플릿 td) 의 주소를 외부에 노출.
+ *                        server.c 가 원격 잡 추가 시 글로벌 옵션을 스냅샷
+ *                        하거나, profiles/ 가 [global] 기본값을 오버라이드할 때
+ *                        사용.
  */
 struct thread_data *get_global_options(void)
 {
