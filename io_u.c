@@ -254,71 +254,112 @@ struct io_completion_data {
  * The ->io_axmap contains a map of blocks we have or have not done io
  * to yet. Used to make sure we cover the entire range in a fair fashion.
  */
-/* [한국어] 랜덤 맵에서 특정 블록이 아직 I/O되지 않았는지(비어있는지) 확인하는 함수.
+/* [한국어]
+ * random_map_free - 랜덤 맵에서 특정 블록이 아직 I/O되지 않았는지 확인.
  *
- * @f: 파일 구조체 포인터
- * @block: 확인할 블록 번호
- * @return: 해당 블록이 비어있으면 true, 이미 I/O했으면 false
+ * @f: 파일 구조체 포인터. io_axmap 필드는 axmap_new()로 fill_io_u 첫 호출 전에
+ *     할당되며, min_bs 단위 블록 하나당 1비트를 가진다.
+ * @block: 확인할 블록 번호 (min_bs 단위의 상대 블록 인덱스, file_offset 기준).
+ * @return: 해당 블록이 비어있으면 true(=아직 I/O 안 함), 이미 접근했으면 false.
  *
- * io_axmap은 비트맵 기반의 자료구조로, 랜덤 I/O 시 전체 파일 범위를
- * 균등하게 커버하기 위해 이미 접근한 블록을 추적한다.
+ * io_axmap은 비트맵 기반의 자료구조(lib/axmap.c)로, 랜덤 I/O 시 전체 파일 범위를
+ * "공평 커버리지(fair coverage)"로 한 번씩만 접근하기 위해 이미 건드린 블록을
+ * 추적한다. norandommap=1 이면 이 맵이 비활성화되어 함수가 호출되지 않는다.
+ *
+ * 실행 컨텍스트: 잡 스레드 단독. axmap_isset은 비트 연산만 수행(락 없음) —
+ * 맵 자체가 td 단독 소유라 경쟁 조건 없음.
+ *
+ * 호출 체인:
+ *   fill_io_u → get_next_offset → get_next_block → get_next_rand_block →
+ *   get_next_rand_offset → __get_next_rand_offset → [이 함수]
  */
 static bool random_map_free(struct fio_file *f, const uint64_t block)
 {
+	/* [한국어] axmap_isset이 true이면 이미 접근함 → 여유 없음(false 반환). */
 	return !axmap_isset(f->io_axmap, block);
 }
 
 /*
  * Mark a given offset as used in the map.
  */
-/* [한국어] 주어진 오프셋을 랜덤 맵에서 사용됨으로 표시하는 함수.
+/* [한국어]
+ * mark_random_map - 주어진 I/O 영역을 랜덤 맵에서 "사용됨"으로 표시.
  *
- * @td: 스레드 데이터 (작업 설정 정보 포함)
- * @io_u: I/O 유닛 구조체
- * @offset: 표시할 오프셋 (바이트 단위)
- * @buflen: I/O 버퍼 길이
- * @return: 실제로 표시된 바이트 수 (맵에서 이미 표시된 블록이 있으면 줄어들 수 있음)
+ * @td: 잡 스레드 데이터. td->o.min_bs[ddir]로 블록 크기 스케일을 얻는다.
+ * @io_u: 방향/플래그/파일 포인터를 가진 I/O 유닛. io_u->flags의 IO_U_F_BUSY_OK가
+ *        세트면 "이미 사용 중인 블록과 충돌해도 그냥 진행" → 맵 업데이트 생략.
+ * @offset: 표시할 시작 오프셋 (바이트, file_offset 기준 절대 오프셋).
+ * @buflen: I/O 크기(바이트). 맵 제약으로 축소될 수 있으므로 반환값 중요.
+ * @return: 실제 표시·발행 가능한 바이트 수. 맵에서 연속된 빈 블록이 buflen
+ *          미만이면 이 값이 buflen보다 작다(호출자가 io_u->buflen을 축소).
  *
- * 랜덤 I/O에서 같은 위치를 중복 접근하지 않도록 맵에 기록한다.
- * min_bs 단위로 블록 번호를 계산하고, axmap_set_nr()로 해당 블록들을 표시한다.
+ * 랜덤 I/O에서 같은 위치를 중복 접근하지 않도록 맵에 기록한다(공평 커버리지).
+ * min_bs 단위 블록 번호를 계산하고 axmap_set_nr()로 해당 블록들을 **원자적으로**
+ * 비트 OR 연산 — lib/axmap.c는 level-compressed trie 기반으로 세트 실패(이미 채워진
+ * 블록)를 만나면 거기까지만 세트하고 그 개수를 돌려준다.
+ *
+ * 실행 컨텍스트: 잡 스레드(td) 단독. io_axmap은 td 소유라 락 없이 접근.
+ *
+ * 호출 체인:
+ *   fill_io_u → [이 함수] (norandommap=0 + td_random 경로)
+ *   fill_multi_range_io_u → [이 함수] (다중 범위 trim 경로)
+ *
+ * 에러 경로: assert(nr_blocks > 0)이 실패하면 0 길이 I/O 요청으로 상위 버그.
  */
 static uint64_t mark_random_map(struct thread_data *td, struct io_u *io_u,
 				uint64_t offset, uint64_t buflen)
 {
-	/* [한국어] 현재 방향(ddir)에 대한 최소 블록 크기 */
+	/* [한국어] 이 방향의 최소 블록 크기 — 랜덤 맵의 한 비트가 표현하는 바이트 수. */
 	unsigned long long min_bs = td->o.min_bs[io_u->ddir];
 	struct fio_file *f = io_u->file;
 	unsigned long long nr_blocks;
 	uint64_t block;
 
-	/* [한국어] 파일 오프셋을 기준으로 블록 번호 계산 */
+	/* [한국어] 파일 시작(file_offset) 기준 상대 오프셋을 min_bs 단위 블록 번호로 변환.
+	 * io_axmap은 파일의 상대 주소 공간(0..last_block)을 커버하므로 반드시 뺄셈. */
 	block = (offset - f->file_offset) / (uint64_t) min_bs;
-	/* [한국어] 이 I/O가 차지하는 블록 수 계산 (올림) */
+	/* [한국어] 이 I/O가 덮는 블록 수(올림). max_bs 가 min_bs의 정수배가 아닐 수도
+	 * 있어 "+min_bs-1" 천장 올림 이디엄으로 안전하게 계산. */
 	nr_blocks = (buflen + min_bs - 1) / min_bs;
+	/* [한국어] 0블록 I/O는 상위 계산 버그 → 디버그 빌드에서 즉시 중단. */
 	assert(nr_blocks > 0);
 
-	/* [한국어] BUSY_OK 플래그가 없으면 맵에 블록을 표시 */
+	/* [한국어] BUSY_OK 플래그가 없을 때만 맵에 마킹. BUSY_OK는 rw_seq 모드의
+	 * 재탐색 경로, randtrimwrite의 write 단계 등 "이미 맵에 있어도 진행" 케이스. */
 	if (!(io_u->flags & IO_U_F_BUSY_OK)) {
+		/* [한국어] axmap_set_nr: [block..block+nr_blocks) 를 1로 세트.
+		 * 중간에 이미 세트된 비트를 만나면 거기까지만 진행하고 실제 세트한 수 반환 —
+		 * 이 메커니즘이 "빈 연속 블록이 원하는 만큼 안 될 때" 부분 매칭의 근거. */
 		nr_blocks = axmap_set_nr(f->io_axmap, block, nr_blocks);
 		assert(nr_blocks > 0);
 	}
 
-	/* [한국어] 실제 표시된 블록 수에 맞춰 buflen 조정 */
+	/* [한국어] 실제 세트된 블록 수가 요청보다 적으면 buflen을 그만큼 축소 —
+	 * 호출자는 이 값으로 io_u->buflen을 덮어써 IO 범위를 실제 맵 세트 범위로 한정. */
 	if ((nr_blocks * min_bs) < buflen)
 		buflen = nr_blocks * min_bs;
 
 	return buflen;
 }
 
-/* [한국어] 특정 방향(ddir)에 대해 파일의 마지막 블록 번호를 계산하는 함수.
+/* [한국어]
+ * last_block - 특정 방향(ddir)에 대해 이 파일의 유효 블록 수(상한)를 계산.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향 (READ/WRITE/TRIM)
- * @return: 마지막 블록 번호 (ba 단위), 블록이 없으면 0
+ * @td: 잡 스레드. td->o.zone_mode/zone_range/min_bs/ba로 상한 계산 근거를 얻는다.
+ * @f: 대상 파일. f->io_size(fio 옵션 io_size) vs f->real_file_size(실제 크기) 중
+ *     작은 쪽을 사용해 오버플로 방지.
+ * @ddir: READ/WRITE/TRIM 중 하나(ddir_rw로 검증). SYNC/DATASYNC 등은 금지.
+ * @return: ba(block alignment) 단위로 측정한 접근 가능 블록 수 (0이면 파일 크기 부족).
  *
- * 파일의 io_size, real_file_size, zone_range 등을 고려하여
- * 접근 가능한 최대 블록 수를 계산한다. ba(block alignment)로 나눠 블록 수를 구한다.
+ * 파일의 io_size, real_file_size, zone_range 등을 모두 고려해 "이 방향으로 이번 잡에서
+ * 만질 수 있는 블록 수"를 산출한다. ba(블록 정렬 단위)는 기본 min_bs와 같지만
+ * ba_unaligned 시 별도 값. min_bs > ba 인 경우 마지막 블록이 파일 끝을 넘지 않도록
+ * "여유(min_bs - ba)"만큼 max_size 에서 빼준다.
+ *
+ * 실행 컨텍스트: 잡 스레드. 파라미터 모두 td 단독 소유이므로 동기화 불필요.
+ *
+ * 호출 체인:
+ *   __get_next_rand_offset[_zoned[_abs]] → [이 함수]
  */
 static uint64_t last_block(struct thread_data *td, struct fio_file *f,
 			   enum fio_ddir ddir)
@@ -355,26 +396,38 @@ static uint64_t last_block(struct thread_data *td, struct fio_file *f,
 }
 
 
-/* [한국어] SP Random(특수 랜덤) 방식으로 다음 랜덤 오프셋을 가져오는 함수.
+/* [한국어]
+ * __get_next_rand_offset_sprandom - SP RANDOM 분포(WRITE 전용 1회 커버리지)의
+ *                                   다음 오프셋 생성기.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향 (WRITE만 지원)
- * @b: 결과 블록 번호를 저장할 포인터
- * @lastb: 마지막 블록 번호 (사용되지 않음)
- * @return: 0=성공, 1=모든 주소를 한 번씩 다 기록함(완료)
+ * @td: 잡 스레드. 종료 시 td->done=1로 마킹.
+ * @f: 대상 파일. f->spr_info는 sprandom.c가 관리하는 비복원 상태 머신.
+ * @ddir: WRITE만 허용(assert). READ/TRIM은 해당 분포 의미 없음.
+ * @b: [출력] 다음 블록 번호가 저장될 포인터.
+ * @lastb: 미사용(다른 변종과 시그니처 일치용). SP RANDOM은 spr_info가 상한을 내장.
+ * @return: 0=성공, 1=모든 주소 1회 기록 완료(잡 종료 신호).
  *
- * SP RANDOM은 모든 주소를 정확히 한 번씩 기록하는 특수 랜덤 패턴이다.
+ * SP RANDOM은 "모든 주소를 정확히 한 번씩 순회하며 WRITE"하는 분포로,
+ * 균등 랜덤 + axmap 조합보다 효율적인 비복원 랜덤 패턴을 제공한다(내부는
+ * sprandom.c의 LFSR 유사 상태 머신). 소진 시 td->done=1로 잡 루프(do_io)가
+ * 자연 종료되도록 신호한다.
+ *
+ * 실행 컨텍스트: 잡 스레드. spr_info는 f 당 단독 소유.
+ *
+ * 호출 체인:
+ *   fill_io_u → get_next_offset → get_next_block → get_next_rand_block →
+ *   get_next_rand_offset → [이 함수] (td->o.sprandom && ddir==DDIR_WRITE 분기)
  */
 static int __get_next_rand_offset_sprandom(struct thread_data *td, struct fio_file *f,
 					   enum fio_ddir ddir, uint64_t *b,
 					   uint64_t lastb)
 {
-	/* [한국어] SP Random은 쓰기(WRITE) 전용 */
+	/* [한국어] SP RANDOM은 쓰기 전용 — READ/TRIM 호출은 상위 디스패처 버그. */
 	assert(ddir == DDIR_WRITE);
 
 	/* SP RANDOM writes all addresses once */
-	/* [한국어] sprandom_get_next_offset으로 다음 오프셋 획득, 실패하면 작업 완료 */
+	/* [한국어] sprandom 상태 머신에서 다음 오프셋 획득 — 실패면 전체 주소 공간 소진.
+	 * dprint로 종료 지점 로깅, td->done=1로 do_io 루프 다음 이터레이션에서 종료. */
 	if (sprandom_get_next_offset(f->spr_info, f, b)) {
 		dprint(FD_SPRANDOM, "sprandom is done\n");
 		td->done = 1;
@@ -383,17 +436,32 @@ static int __get_next_rand_offset_sprandom(struct thread_data *td, struct fio_fi
 	return 0;
 }
 
-/* [한국어] 기본 랜덤 오프셋 생성 함수.
+/* [한국어]
+ * __get_next_rand_offset - 균등(uniform) 랜덤 분포의 오프셋 생성 (기본 분포).
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @lastb: 마지막 블록 번호 (범위 상한)
- * @return: 0=성공, 1=빈 블록 없음(실패)
+ * @td: 잡 스레드. td->o.random_generator가 Tausworthe/LFSR 중 어느 경로 선택,
+ *      td->offset_state가 Tausworthe 상태 머신.
+ * @f: 대상 파일. LFSR 모드에서 f->lfsr에 잡 별 상태 저장.
+ * @ddir: 미사용(시그니처 일치). 이 분포는 방향 무관.
+ * @b: [출력] 선택된 블록 번호(min_bs 단위).
+ * @lastb: 유효 블록 수(상한). last_block() 결과.
+ * @return: 0=성공, 1=빈 블록 없음(소진).
  *
- * 난수 생성기(Tausworthe 또는 LFSR)를 사용하여 랜덤 블록 번호를 생성한다.
- * random map이 활성화된 경우 이미 사용된 블록을 건너뛰고 빈 블록을 찾는다.
+ * 알고리즘:
+ *  1) Tausworthe(기본): r = __rand(offset_state), b = lastb * (r / (rand_max+1.0))
+ *     부동소수점 곱으로 [0..lastb) 균등 사상.
+ *  2) LFSR(td->o.random_generator == FIO_RAND_GEN_LFSR): lfsr_next()가 주기 2^n-1
+ *     내에서 각 값을 정확히 한 번씩 순회 — 비복원 균등 분포의 메모리 효율적 구현
+ *     (axmap 없이도 커버리지 보장). 소진 시 1 반환.
+ *  3) 랜덤 맵(io_axmap)이 활성화되었으면 해당 블록이 비었는지(random_map_free) 확인,
+ *     점유되어 있으면 axmap_next_free로 다음 빈 블록으로 점프(포워드 탐색) →
+ *     빈 블록이 없으면(-1ULL) 실패.
+ *
+ * 실행 컨텍스트: 잡 스레드 단독. offset_state/lfsr/io_axmap 모두 td 소유.
+ *
+ * 호출 체인:
+ *   get_next_rand_offset → [이 함수] (DEFAULT uniform 분기)
+ *   __get_next_rand_offset_zoned/_zoned_abs 도 zone 내 오프셋 추첨에 재사용.
  */
 static int __get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 				  enum fio_ddir ddir, uint64_t *b,
@@ -401,24 +469,31 @@ static int __get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 {
 	uint64_t r;
 
-	/* [한국어] Tausworthe 계열 난수 생성기 사용 시 */
+	/* [한국어] Tausworthe 계열 (기본) — 32/64비트 변종 모두 __rand() 통해 추상화.
+	 * Tausworthe는 주기 > 2^88의 고품질 PRNG(lib/rand.c), 통계적 균등성 우수. */
 	if (td->o.random_generator == FIO_RAND_GEN_TAUSWORTHE ||
 	    td->o.random_generator == FIO_RAND_GEN_TAUSWORTHE64) {
 
-		/* [한국어] 난수 생성 */
+		/* [한국어] offset 전용 난수 상태에서 1회 추출 — 다른 용도(bsrange 등)와
+		 * 시드/상태가 분리되어 있어 결과 재현성 보장(random_seed 고정 시). */
 		r = __rand(&td->offset_state);
 
 		dprint(FD_RANDOM, "off rand %llu\n", (unsigned long long) r);
 
-		/* [한국어] 난수를 0~lastb 범위로 매핑하여 블록 번호 결정 */
+		/* [한국어] r/(rand_max+1.0) ∈ [0,1) 비율로 변환 후 lastb 곱 → [0,lastb).
+		 * +1.0은 상한 포함 방지, double 나눗셈으로 bias 최소화. */
 		*b = lastb * (r / (rand_max(&td->offset_state) + 1.0));
 	} else {
-		/* [한국어] LFSR(선형 피드백 시프트 레지스터) 방식 사용 */
+		/* [한국어] LFSR(선형 피드백 시프트 레지스터) — 비복원 균등 분포.
+		 * 주기 내 모든 값이 정확히 1회 나타나 axmap 없이도 파일 전 영역 커버.
+		 * 메모리 비용 O(1) vs axmap O(N/8). use_lfsr=1 옵션 시 활성화. */
 		uint64_t off = 0;
 
+		/* [한국어] lfsr_init이 성공한 파일에서만 호출되는지 검증.
+		 * 파일 크기가 너무 작아 lfsr_init 실패 시 fio가 잡 시작 전 에러. */
 		assert(fio_file_lfsr(f));
 
-		/* [한국어] LFSR에서 다음 값 획득, 실패 시 반환 */
+		/* [한국어] LFSR 상태 전진 후 다음 값 획득. 전체 공간 소진 시 non-zero 반환 — 종료 신호. */
 		if (lfsr_next(&f->lfsr, &off))
 			return 1;
 
@@ -428,94 +503,130 @@ static int __get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 	/*
 	 * if we are not maintaining a random map, we are done.
 	 */
-	/* [한국어] 랜덤 맵을 유지하지 않으면 바로 반환 */
+	/* [한국어] norandommap=1 또는 LFSR 사용 시 → 랜덤 맵 불필요, 바로 반환.
+	 * file_randommap()은 (td->o.norandommap==0 && !td->o.lfsr) 판정. */
 	if (!file_randommap(td, f))
 		goto ret;
 
 	/*
 	 * calculate map offset and check if it's free
 	 */
-	/* [한국어] 맵에서 해당 블록이 비어있는지 확인 */
+	/* [한국어] 방금 뽑은 b 블록이 axmap에서 비어있으면 그대로 사용. */
 	if (random_map_free(f, *b))
 		goto ret;
 
 	dprint(FD_RANDOM, "get_next_rand_offset: offset %llu busy\n",
 						(unsigned long long) *b);
 
-	/* [한국어] 해당 블록이 사용 중이면 다음 빈 블록을 탐색 */
+	/* [한국어] 점유된 블록이면 맵에서 다음 빈 블록 선형 탐색(forward, wrap 없음).
+	 * axmap_next_free는 level-compressed trie 로 O(log N) 점프 가능. */
 	*b = axmap_next_free(f->io_axmap, *b);
-	/* [한국어] 빈 블록이 없으면 실패 반환 */
+	/* [한국어] 전 영역 소진 시 sentinel -1ULL 반환 → 실패(1) 전파해
+	 * 상위 get_next_rand_block이 file_reset 재시도 또는 잡 종료 판단. */
 	if (*b == (uint64_t) -1ULL)
 		return 1;
 ret:
 	return 0;
 }
 
-/* [한국어] Zipf 분포를 사용하여 다음 랜덤 오프셋을 생성하는 함수.
+/* [한국어]
+ * __get_next_rand_offset_zipf - Zipf 분포 오프셋 생성기.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 항상 0 (성공)
+ * @td: 잡 스레드(미사용 — zipf 상태는 파일 단위).
+ * @f: 대상 파일. f->zipf은 init_rand_file_service에서 zipf_init(range, theta, seed)로
+ *    초기화된 Zipf 상태 머신(lib/zipf.c).
+ * @ddir: 미사용(시그니처 일치).
+ * @b: [출력] 블록 번호.
+ * @return: 항상 0 (Zipf은 분석적이라 실패 없음).
  *
- * Zipf 분포는 소수의 핫 블록에 접근이 집중되는 패턴을 시뮬레이션한다.
+ * Zipf 분포: P(k) ∝ 1/k^theta — 소수의 "핫" 블록에 접근 집중 (웹 캐시 hit,
+ * 데이터베이스 hot rows 모델). theta=1이 전통 Zipf, theta 증가할수록 더 편향.
+ * 파라미터는 td->o.zipf_theta(또는 random_distribution=zipf:<theta>).
+ *
+ * 랜덤 맵 사용 안 함 — Zipf은 중복 접근 허용(핫 블록 집중이 의도).
+ *
+ * 호출 체인: get_next_rand_offset → [이 함수] (FIO_RAND_DIST_ZIPF).
  */
 static int __get_next_rand_offset_zipf(struct thread_data *td,
 				       struct fio_file *f, enum fio_ddir ddir,
 				       uint64_t *b)
 {
+	/* [한국어] zipf_next: 내부 상태에서 역 CDF 기반으로 Zipf 샘플 1개 추출. */
 	*b = zipf_next(&f->zipf);
 	return 0;
 }
 
-/* [한국어] Pareto 분포를 사용하여 다음 랜덤 오프셋을 생성하는 함수.
+/* [한국어]
+ * __get_next_rand_offset_pareto - Pareto 분포 오프셋 생성기.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 항상 0 (성공)
+ * @td/f/ddir/b/@return: zipf 변종과 동일 인터페이스.
  *
- * Pareto 분포(80/20 법칙)를 따르는 접근 패턴을 생성한다.
+ * Pareto 분포("80/20 법칙"의 수학적 모델): 누적 CDF가 F(x) = 1 - (x_m/x)^alpha.
+ * Zipf과 유사하게 긴 꼬리를 가져 상위 일부 블록이 대부분의 접근을 차지한다.
+ * fio에서는 f->zipf 상태를 Pareto 모드로 재사용한다(pareto_next 호출).
+ * 파라미터: random_distribution=pareto:<h> (h는 형태 파라미터, 보통 0.2~1.2).
+ *
+ * 호출 체인: get_next_rand_offset → [이 함수] (FIO_RAND_DIST_PARETO).
  */
 static int __get_next_rand_offset_pareto(struct thread_data *td,
 					 struct fio_file *f, enum fio_ddir ddir,
 					 uint64_t *b)
 {
+	/* [한국어] pareto_next: f->zipf 상태(Pareto 계수 내장)에서 샘플 추출. */
 	*b = pareto_next(&f->zipf);
 	return 0;
 }
 
-/* [한국어] 가우시안(정규) 분포를 사용하여 다음 랜덤 오프셋을 생성하는 함수.
+/* [한국어]
+ * __get_next_rand_offset_gauss - 가우시안(정규) 분포 오프셋 생성기.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 항상 0 (성공)
+ * @td/f/ddir/b/@return: 다른 분포 변종과 동일.
  *
- * 가우시안 분포는 파일 중앙 부근에 접근이 집중되는 패턴을 생성한다.
+ * 정규 분포 N(mu=lastb/2, sigma=lastb*dev/100): 파일 중앙에 접근 집중 (뱅크 계좌의
+ * 최근 활동, 로그 파일의 tail 접근 모델). 파라미터:
+ *   random_distribution=normal:<dev>  — dev는 표준편차의 파일 비율(%).
+ * dev=1 → sigma = lastb*0.01 (매우 좁음), dev=100 → sigma = lastb (균등에 가까움).
+ * f->gauss는 init_rand_file_service에서 gauss_init(range, dev)로 초기화.
+ *
+ * 호출 체인: get_next_rand_offset → [이 함수] (FIO_RAND_DIST_GAUSS).
  */
 static int __get_next_rand_offset_gauss(struct thread_data *td,
 					struct fio_file *f, enum fio_ddir ddir,
 					uint64_t *b)
 {
+	/* [한국어] gauss_next: Box-Muller/polar 변형으로 정규 분포 샘플 반환. */
 	*b = gauss_next(&f->gauss);
 	return 0;
 }
 
-/* [한국어] 절대 크기 기반 존 분할(zoned_abs) 랜덤 오프셋 생성 함수.
+/* [한국어]
+ * __get_next_rand_offset_zoned_abs - 절대 바이트 경계 기반 존별 가중 랜덤 분포.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드. td->zone_state(rand_state), td->zone_state_index[ddir][0..99]
+ *      (100 버킷 사전 전개된 zone→확률 매핑).
+ * @f: 대상 파일(존 기반 접근 대상).
+ * @ddir: READ/WRITE/TRIM.
+ * @b: [출력] 선택된 블록 번호.
+ * @return: 0=성공, 1=실패(last_block=0 또는 존 범위 초과).
  *
- * 사용자가 정의한 존(zone) 영역을 절대 크기(바이트)로 지정하고,
- * 각 존에 확률적으로 접근 빈도를 할당한다.
- * 예: zone1=0-1GB(70%), zone2=1GB-2GB(30%)
+ * zoned_abs 분포: random_distribution=zoned_abs:percentage/size[,...]
+ * 예) "70/1g:30/2g" = [0,1GB) 영역에 70%, [1GB,3GB)에 30% 가중치.
+ *     zone_split_index[] 는 1~100 범위를 소진하는 누적 테이블로, v=1~100 난수를
+ *     뽑아 O(1)에 존 선택 가능.
+ *
+ * 처리 단계:
+ *   1. lastb = last_block (파일 상한).
+ *   2. zone_split_nr=0(zone 미정의) → 폴백 bail → __get_next_rand_offset (기본 균등).
+ *   3. v = rand_between(1,100) 으로 존 버킷 선택.
+ *   4. zsi = zone_state_index[ddir][v-1]; stotal(이전 존까지 누적 블록),
+ *      send(현재 존 끝 블록). 모두 ba 단위로 변환.
+ *   5. 유효성 검사(send == -1U 는 버그, send > lastb 는 사용자 지정 범위가
+ *      파일 크기 초과 → log_err 후 실패).
+ *   6. __get_next_rand_offset 으로 [0, send-stotal) 범위 추첨 → stotal 더해 절대화.
+ *
+ * 실행 컨텍스트: 잡 스레드.
+ *
+ * 호출 체인: get_next_rand_offset → [이 함수] (FIO_RAND_DIST_ZONED_ABS).
  */
 static int __get_next_rand_offset_zoned_abs(struct thread_data *td,
 					    struct fio_file *f,
@@ -584,16 +695,21 @@ bail:
 	return 0;
 }
 
-/* [한국어] 비율(퍼센트) 기반 존 분할(zoned) 랜덤 오프셋 생성 함수.
+/* [한국어]
+ * __get_next_rand_offset_zoned - 퍼센트 비율 기반 존별 가중 랜덤 분포.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 0=성공, 1=실패
+ * @td/f/ddir/b/@return: zoned_abs 변종과 동일 인터페이스.
  *
- * 존 영역을 파일 크기의 퍼센트로 지정한다.
- * 예: 파일의 0-50%(70% 확률), 50-100%(30% 확률)
+ * zoned 분포: random_distribution=zoned:percentage/size_perc[,...]
+ * 예) "70/50:30/50" = 파일의 앞 50%에 70% 접근, 뒤 50%에 30% 접근.
+ * zoned_abs 와의 차이: 존 경계를 절대 바이트가 아니라 파일 비율(%)로 지정 —
+ * 파일 크기가 달라도 같은 "상대적 hot/cold" 패턴 유지.
+ *
+ * 내부 계산: zsi->size_perc_prev/size_perc(이전 누적/현재 끝 %) 를 사용하여
+ * offset = stotal * lastb / 100, 존 크기 = lastb * (send - stotal) / 100 로
+ * 블록 수 변환.
+ *
+ * 호출 체인: get_next_rand_offset → [이 함수] (FIO_RAND_DIST_ZONED).
  */
 static int __get_next_rand_offset_zoned(struct thread_data *td,
 					struct fio_file *f, enum fio_ddir ddir,
@@ -668,16 +784,28 @@ bail:
 	return 0;
 }
 
-/* [한국어] 랜덤 오프셋 생성의 최상위 디스패처 함수.
+/* [한국어]
+ * get_next_rand_offset - 랜덤 분포 디스패처 (td->o.random_distribution 에 따라 분기).
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드.
+ * @f: 대상 파일.
+ * @ddir: READ/WRITE/TRIM.
+ * @b: [출력] 블록 번호.
+ * @return: 0=성공, 1=실패(분포 소진 또는 알 수 없는 분포).
  *
- * 설정된 랜덤 분포 종류(균일, Zipf, Pareto, 가우시안, 존 기반 등)에 따라
- * 적절한 랜덤 오프셋 생성 함수를 호출한다.
+ * 분기표:
+ *   sprandom + DDIR_WRITE → __get_next_rand_offset_sprandom (비복원 1회 커버리지)
+ *   FIO_RAND_DIST_RANDOM  → __get_next_rand_offset (기본 균등 + axmap/LFSR)
+ *   FIO_RAND_DIST_ZIPF    → __get_next_rand_offset_zipf
+ *   FIO_RAND_DIST_PARETO  → __get_next_rand_offset_pareto
+ *   FIO_RAND_DIST_GAUSS   → __get_next_rand_offset_gauss
+ *   FIO_RAND_DIST_ZONED   → __get_next_rand_offset_zoned  (퍼센트 가중)
+ *   FIO_RAND_DIST_ZONED_ABS → __get_next_rand_offset_zoned_abs (절대 가중)
+ *
+ * 실행 컨텍스트: 잡 스레드.
+ *
+ * 호출 체인:
+ *   get_next_rand_block → [이 함수] → 분포별 변종 함수.
  */
 static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 				enum fio_ddir ddir, uint64_t *b)
@@ -714,14 +842,18 @@ static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 	return 1;
 }
 
-/* [한국어] 다음 I/O를 랜덤으로 수행해야 하는지 판단하는 함수.
+/* [한국어]
+ * should_do_random - 이번 I/O 를 랜덤으로 낼지 순차로 낼지 확률적 결정.
  *
- * @td: 스레드 데이터
- * @ddir: 데이터 방향
- * @return: true=랜덤으로 수행, false=순차로 수행
+ * @td: 잡 스레드. td->seq_rand_state[ddir] 이 난수 상태(방향별 분리).
+ * @ddir: 데이터 방향(READ/WRITE/TRIM).
+ * @return: true=랜덤 오프셋 사용, false=순차 오프셋 사용.
  *
- * perc_rand[ddir]가 100이면 항상 랜덤.
- * 그렇지 않으면 확률적으로 결정 (예: perc_rand=70이면 70% 확률로 랜덤).
+ * percentage_random=<r,w,t> 옵션으로 방향별 비율 설정(예: 70,30,0 = 읽기 70%/쓰기 30%).
+ * 100이면 early-return true(rand_between 호출 생략).
+ *
+ * 호출 체인: get_next_block (rw_seq 새 시퀀스) → [이 함수] → 반환에 따라
+ * get_next_rand_block vs get_next_seq_offset 선택.
  */
 static bool should_do_random(struct thread_data *td, enum fio_ddir ddir)
 {
@@ -737,14 +869,20 @@ static bool should_do_random(struct thread_data *td, enum fio_ddir ddir)
 	return v <= td->o.perc_rand[ddir];
 }
 
-/* [한국어] 루프 반복 시 캐시를 무효화하는 함수.
+/* [한국어]
+ * loop_cache_invalidate - time_based 실행 중 파일 끝 도달 시 페이지캐시 무효화.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
+ * @td: 잡 스레드.
+ * @f: 대상 파일.
  *
- * 시간 기반(time_based) 실행에서 파일 끝에 도달하여 처음으로 되돌아갈 때,
- * 캐시를 무효화하여 실제 I/O가 발생하도록 한다.
- * direct I/O가 아니고 invalidate_cache가 설정된 경우에만 동작.
+ * time_based=1 + 랜덤 분포 소진 시 fio_file_reset으로 다시 처음부터 순회하는데,
+ * 직전 사이클에서 페이지캐시에 데이터가 남아있으면 캐시 hit으로 성능이 왜곡된다.
+ * 이를 방지하기 위해 file_invalidate_cache(→ posix_fadvise DONTNEED/drop_caches)
+ * 를 호출. odirect=1 이면 캐시 자체를 우회하므로 이 호출은 no-op.
+ *
+ * 호출 체인:
+ *   get_next_seq_offset (파일 끝 wrap) → [이 함수]
+ *   get_next_rand_block (분포 소진 후 reset) → [이 함수]
  */
 static void loop_cache_invalidate(struct thread_data *td, struct fio_file *f)
 {
@@ -758,16 +896,21 @@ static void loop_cache_invalidate(struct thread_data *td, struct fio_file *f)
 	}
 }
 
-/* [한국어] 다음 랜덤 블록을 가져오는 함수 (재시도 로직 포함).
+/* [한국어]
+ * get_next_rand_block - 랜덤 블록 선택 + 소진 시 time_based 리셋 재시도 래퍼.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @b: 결과 블록 번호를 저장할 포인터
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드.
+ * @f: 대상 파일. 소진 시 fio_file_reset(td, f) 로 axmap/LFSR/Zipf 상태 초기화.
+ * @ddir: 방향.
+ * @b: [출력] 블록 번호.
+ * @return: 0=성공, 1=실패(리셋 후에도 소진).
  *
- * 먼저 get_next_rand_offset()을 시도하고, 실패하면
- * time_based 모드에서는 파일을 리셋하고 다시 시도한다.
+ * time_based=1 또는 file_service_type에 __FIO_FSERVICE_NONUNIFORM 비트(Zipf/Pareto/
+ * Gauss) 가 설정되어 있으면 파일을 리셋하고 loop_cache_invalidate 후 1회 재시도.
+ * 그 외에는 단순히 실패 전파.
+ *
+ * 호출 체인:
+ *   get_next_block → [이 함수] → get_next_rand_offset → 분포별 변종.
  */
 static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
 			       enum fio_ddir ddir, uint64_t *b)
@@ -791,17 +934,31 @@ static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
 	return 1;
 }
 
-/* [한국어] 순차(sequential) I/O에서 다음 오프셋을 계산하는 함수.
+/* [한국어]
+ * get_next_seq_offset - 순차(sequential) I/O 의 다음 오프셋(파일 상대) 계산.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @ddir: 데이터 방향
- * @offset: 결과 오프셋을 저장할 포인터 (파일 오프셋 기준 상대 위치)
- * @return: 0=성공, 1=파일 끝 도달(실패)
+ * @td: 잡 스레드.
+ * @f: 대상 파일. f->last_pos[ddir] 는 방향별 순차 "다음에 읽을" 위치.
+ * @ddir: READ/WRITE/TRIM (assert ddir_rw).
+ * @offset: [출력] file_offset 기준 상대 오프셋.
+ * @return: 0=성공, 1=파일 끝 도달 및 wrap 불가.
  *
- * 순차 I/O에서는 마지막 위치(last_pos)를 기준으로 다음 위치를 결정한다.
- * 시간 기반 실행에서 파일 끝에 도달하면 처음으로 되돌아간다.
- * ddir_seq_add를 통해 건너뛰기(hole) 또는 역방향 I/O도 지원한다.
+ * 알고리즘:
+ *  1) time_based + 단일 파일 + last_pos가 io_size+start_offset 이상이면
+ *     last_pos = file_offset 으로 wrap + cache invalidate.
+ *  2) td_rw + io_size > size (읽기+쓰기 따로 잡힌 경우) 유사 wrap 처리.
+ *  3) last_pos < real_file_size 이면:
+ *     - 역방향(ddir_seq_add < 0) 이고 시작점 도달: 끝으로 jump (io_size 또는
+ *       real_file_size 중 작은 쪽).
+ *     - pos = last_pos - file_offset 계산 후 ddir_seq_add 적용(홀/역방향).
+ *     - pos가 파일 끝을 넘으면 순방향은 0, 역방향은 끝으로 wrap.
+ *  4) 그 외에는 실패(1).
+ *
+ * ddir_seq_add 의미: 양수=홀 I/O 간격(blockalign + add), 음수=역방향 step,
+ * 0=연속.
+ *
+ * 호출 체인:
+ *   get_next_block → [이 함수] (td_random 아닐 때 또는 should_do_random false).
  */
 static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 			       enum fio_ddir ddir, uint64_t *offset)
@@ -884,17 +1041,29 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 	return 1;
 }
 
-/* [한국어] 다음 I/O 블록(오프셋)을 결정하는 핵심 함수.
+/* [한국어]
+ * get_next_block - 순차/랜덤 혼합 규칙에 따라 다음 I/O 위치 결정.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛 구조체
- * @ddir: 데이터 방향
- * @rw_seq: 읽기/쓰기 시퀀스 히트 여부 (1이면 새 시퀀스 시작)
- * @is_random: 결과가 랜덤 I/O인지 여부를 저장할 포인터
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드.
+ * @io_u: 결정 결과를 저장할 I/O 유닛(io_u->file 이미 세트).
+ * @ddir: READ/WRITE/TRIM.
+ * @rw_seq: 1=ddir_seq_nr 주기 히트로 새 시퀀스 결정 타이밍, 0=시퀀스 진행 중.
+ * @is_random: [출력] 결과가 랜덤이면 true (mark_random_map 호출 조건).
+ * @return: 0=성공, 1=실패.
  *
- * 랜덤/순차 결정, rw_seq 모드(SEQ/IDENT), randtrimwrite 등
- * 다양한 I/O 패턴에 따라 다음 블록 위치를 결정한다.
+ * 분기 트리:
+ *   randtrimwrite + WRITE → 직전 TRIM의 last_start 재사용 (trim+write 쌍).
+ *   rw_seq 히트 + td_random:
+ *     should_do_random=true → get_next_rand_block
+ *     should_do_random=false → get_next_seq_offset → 실패 시 rand 폴백.
+ *   rw_seq 히트 + 순차: get_next_seq_offset.
+ *   rw_seq 미히트 + RW_SEQ_SEQ: seq → 실패 시 rand 폴백.
+ *   rw_seq 미히트 + RW_SEQ_IDENT: last_start 재사용(같은 위치 반복).
+ *
+ * 결과 정규화: offset 또는 b 중 하나만 유효 → offset 은 그대로, b 는 *ba[ddir].
+ * io_u->verify_offset 도 동기 세팅.
+ *
+ * 호출 체인: get_next_offset → [이 함수].
  */
 static int get_next_block(struct thread_data *td, struct io_u *io_u,
 			  enum fio_ddir ddir, int rw_seq,
@@ -986,17 +1155,27 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
  * until we find a free one. For sequential io, just return the end of
  * the last io issued.
  */
-/* [한국어] 다음 I/O 오프셋을 결정하는 상위 함수.
+/* [한국어]
+ * get_next_offset - io_u->offset 결정 공용 진입점 + 파일 범위/ZBD 후처리.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛 구조체
- * @is_random: 결과가 랜덤 I/O인지 여부를 저장할 포인터
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드. td->ddir_seq_nr 카운터가 0 도달 시 새 시퀀스 → rw_seq_hit=1.
+ * @io_u: 대상. io_u->file/ddir 는 이미 세트. 출력은 io_u->offset, verify_offset.
+ * @is_random: [출력] 결과가 랜덤으로 결정되었는지(상위에서 axmap 세트 필요 판단).
+ * @return: 0=성공, 1=실패(소진 또는 파일 범위 초과).
  *
- * ddir_seq_nr 카운터를 관리하여 시퀀스 전환 시점을 판단하고,
- * get_next_block()을 호출하여 오프셋을 결정한다.
- * 결과 오프셋이 파일 범위 내에 있는지 검증하고,
- * file_offset을 더해 절대 오프셋으로 변환한다.
+ * 처리 순서:
+ *   1. ddir_seq_nr 카운터 관리: 설정되어 있고 감소 후 0이면 rw_seq_hit=1 → 다음
+ *      ddir_seq_nr 로 재충전 (순차/랜덤 교대 주기).
+ *   2. get_next_block → offset 결정.
+ *   3. offset >= io_size → 실패 (잡 io_size 초과).
+ *   4. offset += file_offset → 절대 주소로 변환.
+ *   5. offset >= real_file_size → 실패 (물리 크기 초과).
+ *   6. randtrimwrite + TRIM + last_start 일치 보정 로직 (위 함수 주석 참조).
+ *   7. verify_offset 동기 갱신.
+ *
+ * 호출 체인:
+ *   fill_io_u → [이 함수]
+ *   fill_multi_range_io_u → [이 함수]
  */
 static int get_next_offset(struct thread_data *td, struct io_u *io_u,
 			   bool *is_random)
@@ -1061,32 +1240,49 @@ static int get_next_offset(struct thread_data *td, struct io_u *io_u,
 	return 0;
 }
 
-/* [한국어] I/O 요청이 파일 범위 내에 맞는지 확인하는 인라인 함수.
+/* [한국어]
+ * io_u_fits - 제안된 I/O 가 잡의 유효 파일 범위(io_size + start_offset) 안에 드는지 판정.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛 구조체
- * @buflen: 확인할 버퍼 길이
- * @return: true=범위 내에 맞음, false=초과
+ * @td: 잡 스레드 (start_offset 계산).
+ * @io_u: io_u->offset 기준.
+ * @buflen: 시험할 길이.
+ * @return: true=적합, false=오버런.
+ *
+ * 호출 체인: get_next_buflen 내부 재추첨 루프, fill_io_u 의 최종 검증.
  */
 static inline bool io_u_fits(struct thread_data *td, struct io_u *io_u,
 			     unsigned long long buflen)
 {
 	struct fio_file *f = io_u->file;
 
+	/* [한국어] io_size 는 잡 옵션 상한, start_offset 은 그 시작 오프셋.
+	 * f->file_offset 이 start_offset 을 반영하고 있으므로 io_size+start_offset 이
+	 * 절대 주소 기준 "잡이 건드릴 수 있는 상한". */
 	return io_u->offset + buflen <= f->io_size + get_start_offset(td, f);
 }
 
-/* [한국어] 다음 I/O의 버퍼 길이(블록 크기)를 결정하는 함수.
+/* [한국어]
+ * get_next_buflen - I/O 블록 크기(바이트) 결정: 고정/bsrange/bssplit 분기.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛 구조체
- * @is_random: 현재 I/O가 랜덤인지 여부
- * @return: 결정된 버퍼 길이 (바이트), 0이면 실패
+ * @td: 잡 스레드. td->o.min_bs[ddir]/max_bs[ddir]/bssplit 테이블 참조.
+ *      td->bsrange_state[ddir] 가 bs 추첨 난수 상태.
+ * @io_u: io_u->ddir(+ bs_is_seq_rand 시 is_random 으로 DDIR_READ/WRITE 치환).
+ * @is_random: 이 I/O가 랜덤인지(순차 vs 랜덤에 다른 bs 적용 가능).
+ * @return: 선택된 buflen(바이트). 0이면 파일 공간 부족으로 실패.
  *
- * min_bs와 max_bs가 같으면 고정 블록 크기 반환.
- * 다르면 난수를 이용하여 범위 내 크기 결정.
- * bssplit이 설정된 경우 확률 분포에 따라 블록 크기 선택.
- * bs_unaligned가 아니면 min_bs 단위로 정렬.
+ * 분기:
+ *  1) randtrimwrite + WRITE: 직전 TRIM 의 버퍼 길이를 그대로 사용(쌍 매칭).
+ *  2) min_bs == max_bs: 고정 bs 즉시 반환(가장 일반적인 FIO 설정).
+ *  3) 일반: __rand 로 난수 뽑아
+ *     - bssplit_nr=0 → 선형 보간 minbs + maxbs*(r/(frand_max+1)).
+ *     - bssplit 있음 → 누적 확률 테이블 순회, (r/perc <= frand_max/100) 충족 시 선택.
+ *  4) bs_unaligned=0 이면 minbs 단위 정렬 — minbs 가 2의 거듭제곱이면 비트마스크
+ *     (buflen &= ~(minbs-1)), 아니면 나머지 연산(buflen -= buflen % minbs).
+ *  5) buflen > maxbs 클램프. io_u_fits(파일 끝까지 남은 공간)에 맞을 때까지 재추첨.
+ *
+ * 호출 체인:
+ *   fill_io_u → [이 함수]
+ *   fill_multi_range_io_u → [이 함수] (범위별 반복 호출).
  */
 static unsigned long long get_next_buflen(struct thread_data *td, struct io_u *io_u,
 				    bool is_random)
@@ -1169,13 +1365,17 @@ static unsigned long long get_next_buflen(struct thread_data *td, struct io_u *i
 	return buflen;
 }
 
-/* [한국어] 읽기/쓰기 혼합(rwmix) 바이트 카운터를 설정하는 함수.
+/* [한국어]
+ * set_rwmix_bytes - rwmix 방향 전환 임계점(td->rwmix_issues) 재계산.
  *
- * @td: 스레드 데이터
+ * @td: 잡 스레드.
  *
- * 현재 방향의 발행 횟수와 반대 방향의 비율을 곱해
- * 다음 방향 전환 시점을 결정한다.
- * 예: rwmix_read=70이면, write 비율 30%를 기준으로 전환 시점 계산.
+ * 호출 시점: get_rw_ddir 이 rwmix 방향을 바꿀 때.
+ *
+ * 계산식: rwmix_issues = io_issues[rwmix_ddir] * rwmix[rwmix_ddir^1] / 100
+ *   (반대 방향 비율만큼 현재 방향을 더 발행하면 누적 비율이 rwmix 에 수렴).
+ *   바이트 기반이 아니라 발행 횟수 기반인 이유: 버퍼드 쓰기는 빠르게 submit 되지만
+ *   reads 는 실질 완료까지 걸려 바이트 기준이면 왜곡됨(주석 원문 참조).
  */
 static void set_rwmix_bytes(struct thread_data *td)
 {
@@ -1191,12 +1391,14 @@ static void set_rwmix_bytes(struct thread_data *td)
 	td->rwmix_issues = (td->io_issues[td->rwmix_ddir] * diff) / 100;
 }
 
-/* [한국어] 읽기/쓰기 혼합에서 랜덤으로 방향을 결정하는 인라인 함수.
+/* [한국어]
+ * get_rand_ddir - rwmix 확률 추첨으로 DDIR_READ/WRITE 선택.
  *
- * @td: 스레드 데이터
- * @return: DDIR_READ 또는 DDIR_WRITE
+ * @td: 잡 스레드. td->rwmix_state 가 추첨 난수 상태.
+ * @return: DDIR_READ 또는 DDIR_WRITE.
  *
- * rwmix[DDIR_READ] 확률에 따라 읽기 또는 쓰기 방향을 결정한다.
+ * 1~100 균등 추첨, v <= rwmix[READ] 면 READ 아니면 WRITE.
+ * 호출 체인: get_rw_ddir → [이 함수] (rwmix 재전환 시점).
  */
 static inline enum fio_ddir get_rand_ddir(struct thread_data *td)
 {
@@ -1212,15 +1414,25 @@ static inline enum fio_ddir get_rand_ddir(struct thread_data *td)
 	return DDIR_WRITE;
 }
 
-/* [한국어] 진행 중인 모든 I/O를 대기하여 완료시키는 함수 (quiesce = 정지/안정화).
+/* [한국어]
+ * io_u_quiesce - 진행 중 I/O 모두 완료 대기(drain) — 슬립/QD조정 전 안정화.
  *
- * @td: 스레드 데이터
- * @return: 완료된 I/O 수 (양수) 또는 에러 코드 (음수)
+ * @td: 잡 스레드.
+ * @return: 처리한 완료 수(>=0) 또는 마지막 에러(음수).
  *
- * 슬립하기 전이나 큐 깊이를 줄일 때 호출하여,
- * 레이턴시 측정이 왜곡되지 않도록 대기 중인 I/O를 모두 완료시킨다.
- * io_u_queued 또는 cur_depth가 있으면 먼저 commit하고,
- * in_flight인 I/O가 모두 완료될 때까지 반복한다.
+ * 용도:
+ *  - usec_sleep 등 blocking 전: 이미 발행된 I/O 의 latency 측정 왜곡 방지.
+ *  - lat_target 이 QD 를 낮출 때: 상위 QD 시절 in-flight 가 축적되어 다음 사이클
+ *    latency 가 스파이크나는 "ramp-down 폭풍" 방지.
+ *  - verify 상태 전이 전.
+ *  - regrow_logs: TD_F_REGROW_LOGS 세트 시 iops/bw/clat 로그 배열 확장.
+ *
+ * 내부 흐름:
+ *   1. io_u_queued (SQE 빌드만 된 상태) 또는 cur_depth 양수 → td_io_commit (batch submit).
+ *   2. io_u_in_flight > 0 인 동안 io_u_queued_complete(1) 루프 → 모두 완료.
+ *   3. TD_F_REGROW_LOGS 설정되어 있으면 regrow_logs.
+ *
+ * 실행 컨텍스트: 잡 스레드.
  */
 int io_u_quiesce(struct thread_data *td)
 {
@@ -1258,15 +1470,23 @@ int io_u_quiesce(struct thread_data *td)
 	return err;
 }
 
-/* [한국어] 레이트 제한(rate limiting)에 따라 I/O 방향을 조정하는 함수.
+/* [한국어]
+ * rate_ddir - rate 옵션 준수를 위한 방향/타이밍 조정 (전환·슬립).
  *
- * @td: 스레드 데이터
- * @ddir: 원래 결정된 데이터 방향
- * @return: 조정된 데이터 방향 (또는 DDIR_TIMEOUT)
+ * @td: 잡 스레드. td->rate_next_io_time[ddir] 가 방향별 "다음 발행 허용 시각".
+ * @ddir: 상위(get_rw_ddir)에서 결정한 원 방향.
+ * @return: 조정된 방향(원 방향 유지/반대 방향 전환/DDIR_TIMEOUT).
  *
- * rate 옵션이 설정된 경우, 목표 속도를 초과하지 않도록
- * I/O 발행을 지연시키거나 반대 방향으로 전환한다.
- * 양쪽 모두 목표를 초과하면 적은 쪽의 대기 시간만큼 슬립한다.
+ * rate=<r,w,t> / rate_iops=<r,w,t> 옵션은 방향별 목표 속도 지정. fio 는 발행 시점에
+ * rate_next_io_time 을 체크하여:
+ *  - 이미 지났음(now >= next_time) → 지체 없이 발행.
+ *  - 아직 미래임 + td_rw + 반대 방향이 이미 지체 → 반대 방향으로 전환.
+ *  - 둘 다 미래 → 더 가까운 쪽으로 슬립. 더 가까운 쪽이 반대 방향이면 방향 전환.
+ *  - io_submit_mode=INLINE 이면 슬립 전 io_u_quiesce 로 in-flight 청산.
+ *  - 슬립 후 timeout 초과 → DDIR_TIMEOUT 반환(상위에서 잡 종료).
+ *
+ * 호출 체인:
+ *   get_rw_ddir → (should_check_rate true 면) [이 함수].
  */
 static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 {
@@ -1345,15 +1565,26 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
  * mixed read/write workload, check the rwmix cycle and switch if
  * necessary.
  */
-/* [한국어] 다음 I/O의 데이터 방향(read/write/sync/trim)을 결정하는 함수.
+/* [한국어]
+ * get_rw_ddir - 다음 io_u 의 데이터 방향 결정 (SYNC 메타 우선 + rwmix + rate).
  *
- * @td: 스레드 데이터
- * @return: 결정된 데이터 방향 (enum fio_ddir)
+ * @td: 잡 스레드. 내부 상태: td->rwmix_ddir(현재 rwmix 고정 방향),
+ *      td->rwmix_issues(방향 전환 임계), td->last_ddir_issued, td->io_issues[].
+ * @return: fio_ddir enum(READ/WRITE/TRIM/SYNC/DATASYNC/SYNC_FILE_RANGE/INVAL/TIMEOUT).
  *
- * 1. 먼저 fsync/fdatasync/sync_file_range 필요 여부 확인
- * 2. 읽기+쓰기 혼합이면 rwmix 비율에 따라 방향 결정
- * 3. 단일 방향(read/write/trim)이면 해당 방향 반환
- * 4. rate 제한이 있으면 rate_ddir()로 조정
+ * 결정 순서:
+ *   1. 마지막 발행이 WRITE 였으면 sync 주기 3종 체크:
+ *      - fsync_blocks 주기 → DDIR_SYNC
+ *      - fdatasync_blocks 주기 → DDIR_DATASYNC
+ *      - sync_file_range_nr 주기 → DDIR_SYNC_FILE_RANGE
+ *   2. td_rw(읽기+쓰기 혼합):
+ *      - rwmix_ddir 방향으로 rwmix_issues 만큼 발행했으면 → get_rand_ddir 로
+ *        rwmix[READ] 확률 추첨 → 전환 시 set_rwmix_bytes 로 다음 전환 임계 재계산.
+ *   3. 단일 방향: td_read/td_write/td_trim → 해당 ddir.
+ *   4. should_check_rate(rate 옵션 없음)이면 시각 조회 생략(50% IOPs 최적화),
+ *      있으면 rate_ddir 로 타이밍/전환 조정.
+ *
+ * 호출 체인: set_rw_ddir → [이 함수].
  */
 static enum fio_ddir get_rw_ddir(struct thread_data *td)
 {
@@ -1428,14 +1659,22 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 	return td->rwmix_ddir;
 }
 
-/* [한국어] io_u의 데이터 방향(ddir)을 설정하는 함수.
+/* [한국어]
+ * set_rw_ddir - io_u->ddir 및 acct_ddir 설정 + ZBD/trimwrite/barrier 후처리.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛 구조체
+ * @td: 잡 스레드.
+ * @io_u: 방향 결정 대상.
  *
- * get_rw_ddir()로 방향을 결정한 후,
- * ZBD(존 블록 디바이스) 모드와 trimwrite 모드에 맞게 조정하고,
- * 배리어(barrier) 플래그도 설정한다.
+ * 단계:
+ *   1. get_rw_ddir: 순수 방향 결정.
+ *   2. ZBD: zbd_adjust_ddir 로 write pointer 상태에 따라 READ→WRITE 등 재할당 가능.
+ *   3. trimwrite (td_trimwrite): last_start[WRITE]==last_start[TRIM] → 다음은 TRIM,
+ *      다르면 WRITE. 이 토글이 "쓰기/트림 쌍" 교대 발행의 핵심.
+ *   4. io_u->ddir = io_u->acct_ddir = ddir (통계도 같은 방향으로 기록).
+ *   5. WRITE + FIO_BARRIER 엔진 플래그 + barrier_blocks 주기 일치 → IO_U_F_BARRIER
+ *      set (BSG/SCSI 일부 엔진에서 의미, 엔진이 FUA 또는 cache flush 유발).
+ *
+ * 호출 체인: fill_io_u → [이 함수].
  */
 static void set_rw_ddir(struct thread_data *td, struct io_u *io_u)
 {
@@ -1467,13 +1706,19 @@ static void set_rw_ddir(struct thread_data *td, struct io_u *io_u)
 		io_u_set(td, io_u, IO_U_F_BARRIER);
 }
 
-/* [한국어] 파일 참조를 해제하고 에러를 기록하는 함수.
+/* [한국어]
+ * put_file_log - fio_file 참조 카운트 감소 + 실패 시 td_verror 로 에러 기록.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
+ * @td: 잡 스레드.
+ * @f: 해제 대상 fio_file. f->num_ref가 0이 되면 filesetup.c 가 실제 close 예약.
  *
- * put_file()로 파일 참조 카운트를 줄이고,
- * 실패 시 td_verror()로 에러를 기록한다.
+ * 호출 체인:
+ *   put_io_u → [이 함수] (io_u 가 파일 참조를 가진 경우)
+ *   set_io_u_file 에러 회수 경로 → [이 함수]
+ *   __get_io_u 재큐잉 경로 (runstate == TD_FSYNCING) → [이 함수]
+ *
+ * 에러 경로: put_file 반환값(ENOSPC/EIO 등)을 td_verror("file close") 로 기록 —
+ * 잡 상태에 에러 마킹만 하고 계속 진행(파일 개별 실패가 잡 전체 중단 아님).
  */
 void put_file_log(struct thread_data *td, struct fio_file *f)
 {
@@ -1483,19 +1728,49 @@ void put_file_log(struct thread_data *td, struct fio_file *f)
 		td_verror(td, ret, "file close");
 }
 
-/* [한국어] I/O 유닛을 프리리스트로 반환하는 함수.
+/* [한국어]
+ * put_io_u - ★ 핵심 ★ io_u 생명주기 종료 단계: 완료된 io_u를 freelist로 반환.
  *
- * @td: 스레드 데이터
- * @io_u: 반환할 I/O 유닛
+ * @td: 잡 스레드 데이터(자식이면 td->parent로 스위치).
+ * @io_u: 반환할 I/O 유닛. IO_U_F_FREE 이 아니어야 하며, FLIGHT 플래그는
+ *        io_completed/requeue_io_u에서 이미 clear되어 있다고 가정.
  *
- * I/O 완료 후 io_u를 프리리스트에 되돌려 재사용할 수 있게 한다.
- * 비동기 처리 시 락을 잡고, 파일 참조 해제, cur_depth 감소,
- * FREE 플래그 설정 후 프리리스트에 푸시한다.
- * 대기 중인 스레드에게 io_u가 사용 가능함을 알린다.
+ * io_u 상태 전이:
+ *   [completed or cancelled]
+ *         │ put_io_u()
+ *         ▼
+ *   1) zbd_put_io_u: ZBD 모드 시 open zone 참조 카운트 감소(경쟁: zbd.c lock).
+ *   2) needs_lock = td_async_processing(td): verify 스레드/offload 모드에서는
+ *      freelist/free_cond를 backend·verify 스레드가 공유 → mutex 필요.
+ *   3) td = td->parent (자식이면): io_u 풀은 부모 소유.
+ *   4) put_file_log (파일 참조 카운트--): fio_file::num_ref 감소. 0이 되면
+ *      close_file_timer 가 td_io_close_file 트리거.
+ *   5) io_u->file = NULL; IO_U_F_FREE 세트.
+ *   6) IN_CUR_DEPTH 플래그가 있으면 td->cur_depth--. 자식 스레드는 이 경로
+ *      불가(assert TD_F_CHILD 아님).
+ *   7) io_u_qpush(&td->io_u_freelist, io_u): 프리리스트 테일에 재삽입 — 이후
+ *      __get_io_u가 이 io_u를 popback으로 꺼냄.
+ *   8) td_io_u_free_notify: free_cond 브로드캐스트로 대기 중인 async processing
+ *      스레드에 "io_u 하나 풀렸음" 신호.
+ *
+ * 실행 컨텍스트: 잡 스레드(대부분) 또는 verify/offload 스레드. 후자에서는 needs_lock
+ * 가 true가 되어 __td_io_u_lock/unlock으로 freelist 접근 직렬화.
+ *
+ * 호출 체인 (caller):
+ *   io_u_sync_complete → [이 함수]
+ *   ios_completed → [이 함수] (requeue가 아닌 경우)
+ *   set_io_u_file 에러 경로 → [이 함수] (fill 실패 회수)
+ *   clear_io_u → [이 함수]
+ *   verify 경로: verify_io_u → [이 함수]
+ *   helper thread의 청소 경로에서도 호출 가능.
+ *
+ * 에러 경로: 이 함수 자체는 실패하지 않음(반환 void). put_file_log 실패는
+ * td_verror로 스레드 에러 마킹되지만 io_u 회수는 계속.
  */
 void put_io_u(struct thread_data *td, struct io_u *io_u)
 {
-	/* [한국어] 비동기 처리(검증 스레드 등) 시 락 필요 여부 결정 */
+	/* [한국어] 비동기 처리(verify async/offload submit) 활성 시에만 락 사용.
+	 * td_async_processing: TD_F_NEED_LOCK 계열 플래그 확인. 성능상 필요한 곳만. */
 	const bool needs_lock = td_async_processing(td);
 
 	/* [한국어] ZBD 관련 io_u 정리 */
@@ -1530,12 +1805,12 @@ void put_io_u(struct thread_data *td, struct io_u *io_u)
 		__td_io_u_unlock(td);
 }
 
-/* [한국어] io_u의 비행 중(in-flight) 플래그를 초기화하는 인라인 함수.
+/* [한국어]
+ * io_u_clear_inflight_flags - in-flight 관련 3비트(FLIGHT|BUSY_OK|PATTERN_DONE) clear.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- *
- * FLIGHT, BUSY_OK, PATTERN_DONE 플래그를 모두 제거한다.
+ * 분리된 이유: io_completed 와 clear_io_u 에서 동일 3비트를 한 번에 지우기 위함.
+ * PATTERN_DONE: fill_buffer_pattern 단계 완료 플래그 (다음 WRITE 재사용 차단).
+ * BUSY_OK: mark_random_map 스킵 허용 (중복 접근 허용). FLIGHT: 엔진 제출 상태.
  */
 static inline void io_u_clear_inflight_flags(struct thread_data *td,
 					      struct io_u *io_u)
@@ -1544,12 +1819,19 @@ static inline void io_u_clear_inflight_flags(struct thread_data *td,
 		   IO_U_F_PATTERN_DONE);
 }
 
-/* [한국어] io_u를 정리하고 프리리스트로 반환하는 함수.
+/* [한국어]
+ * clear_io_u - 엔진 에러 회수 경로에서 in-flight io_u 를 취소 처리 + freelist 복귀.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
+ * @td: 잡 스레드.
+ * @io_u: 취소할 I/O 유닛.
  *
- * 비행 중 플래그를 제거한 후 put_io_u()로 반환한다.
+ * 용도: 엔진 queue/prep 이 실패한 경우, 또는 잡 종료 시 정리 단계에서
+ * in-flight 상태로 남은 io_u 를 정상 경로(io_completed)를 거치지 않고 직접 회수.
+ * 통계/회계는 기록하지 않음(실패 I/O 는 account 대상 아님).
+ *
+ * 호출 체인:
+ *   engines/*.c의 에러 경로 → [이 함수]
+ *   backend.c cleanup_io_u → [이 함수]
  */
 void clear_io_u(struct thread_data *td, struct io_u *io_u)
 {
@@ -1557,14 +1839,34 @@ void clear_io_u(struct thread_data *td, struct io_u *io_u)
 	put_io_u(td, io_u);
 }
 
-/* [한국어] I/O 유닛을 재큐잉하는 함수 (재시도를 위해 큐에 되돌림).
+/* [한국어]
+ * requeue_io_u - io_u 를 io_u_requeues 큐로 되돌려 다음 이터레이션에 재시도.
  *
- * @td: 스레드 데이터
- * @io_u: 재큐잉할 I/O 유닛 (이중 포인터, 함수 종료 후 NULL로 설정)
+ * @td: 잡 스레드(자식이면 부모 td 사용).
+ * @io_u: 이중 포인터. 함수 종료 시 *io_u=NULL 로 설정해 호출자가 put_io_u를
+ *        중복 호출하지 않도록 함.
  *
- * short I/O(부분 완료) 등의 경우 io_u를 재큐잉 리스트에 넣어
- * 나중에 다시 처리할 수 있게 한다.
- * 이미 FLIGHT 상태였으면 io_issues 카운터를 되돌린다.
+ * 사용 케이스:
+ *  1) short I/O (io_completed에서 bytes < xfer_buflen): 이미 보낸 앞부분은 완료로
+ *     처리, 남은 xfer_buflen=resid, xfer_buf+=bytes, offset+=bytes 로 갱신하여
+ *     requeue_io_u → 다음 do_io 사이클이 __get_io_u 의 requeues 우선 경로로 발행.
+ *  2) FIO_Q_BUSY (td_io_queue 반환): 엔진 큐 포화. io_issues[ddir]-- 로 카운터
+ *     원복, IO_U_F_FLIGHT clear, cur_depth-- 후 재큐잉.
+ *
+ * io_u 상태 전이:
+ *   [in_flight or partial] → requeue_io_u → [io_u_requeues]
+ *     (IO_U_F_FLIGHT clear, IO_U_F_FREE set, cur_depth--, io_issues[ddir]--)
+ *                           → 다음 __get_io_u 에서 우선 재꺼냄
+ *
+ * 동기화: needs_lock(async processing) 시 td->io_u_lock 보호.
+ *
+ * 실행 컨텍스트: 잡 스레드 또는 async verify 스레드.
+ *
+ * 호출 체인:
+ *   io_completed (short I/O) → [이 함수]
+ *   backend.c do_io (FIO_Q_BUSY 경로) → [이 함수]
+ *
+ * 에러 경로: 없음(void). 가정: io_u->flags 의 FLIGHT 비트는 함수 진입 시에만 유효.
  */
 void requeue_io_u(struct thread_data *td, struct io_u **io_u)
 {
@@ -1607,14 +1909,23 @@ void requeue_io_u(struct thread_data *td, struct io_u **io_u)
 	*io_u = NULL;
 }
 
-/* [한국어] 스트라이드 존 모드를 설정하는 함수.
+/* [한국어]
+ * setup_strided_zone_mode - zone_mode=strided 에서 존 간 이동/순환 관리.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
+ * @td: 잡 스레드. td->zone_bytes 가 현재 존에서 누적 I/O 바이트, td->o.zone_size/
+ *      zone_range/zone_skip 옵션으로 존 레이아웃 결정.
+ * @io_u: 대상 I/O 유닛.
  *
- * 스트라이드 존 모드에서는 zone_size만큼 I/O하면
- * zone_range + zone_skip만큼 이동하여 다음 존으로 넘어간다.
- * 파일 끝을 넘으면 처음으로 순환한다.
+ * 동작: zone_bytes >= zone_size 가 되면
+ *   - file_offset += zone_range + zone_skip (다음 존 시작점).
+ *   - 파일 끝 넘으면 wrap to start_offset.
+ *   - zone_bytes 리셋.
+ *   - io_skip_bytes 누적(통계에서 제외).
+ * zone_size > zone_range 인 경우 같은 존 반복: last_pos 를 file_offset 으로 리셋.
+ * zone_bytes % zone_range == 0 일 때 fio_file_reset 으로 랜덤맵 재사용 가능하게.
+ *
+ * ZBD 모드와의 차이: strided 는 zone_range 로 간격 이동만, 실제 존 상태 추적 안 함.
+ * 호출 체인: fill_io_u → [이 함수] (zone_mode == STRIDED 분기).
  */
 static void setup_strided_zone_mode(struct thread_data *td, struct io_u *io_u)
 {
@@ -1665,14 +1976,23 @@ static void setup_strided_zone_mode(struct thread_data *td, struct io_u *io_u)
 		fio_file_reset(td, f);
 }
 
-/* [한국어] 다중 범위 trim I/O를 위해 io_u를 채우는 함수.
+/* [한국어]
+ * fill_multi_range_io_u - 다중 범위 TRIM I/O 생성 (num_range > 1 인 DSM discard).
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드. td->o.num_range 가 한 DSM 명령에 실을 범위 수.
+ * @io_u: io_u->buf 에 struct trim_range 배열을 쌓는다.
+ * @return: 0=성공(io_u->buflen=전체 trim 길이, number_trim=실제 범위 수),
+ *          1=첫 범위조차 못 만든 실패.
  *
- * num_range 개수만큼 trim 범위를 생성하여 io_u 버퍼에 저장한다.
- * 각 범위마다 오프셋과 길이를 결정하고, 랜덤맵에 표시한다.
+ * NVMe Dataset Management(DSM) 명령은 한 번에 여러 LBA 범위를 discard 가능 →
+ * fio 는 num_range 개 범위를 한 번에 생성해 엔진(NVMe passthru)에 전달.
+ *
+ * 처리: num_range 회 루프 — get_next_offset/get_next_buflen/파일 범위 검증 후
+ * struct trim_range { start, len } 를 io_u->buf 에 차례로 쌓음.
+ * 각 범위마다 f->last_start/last_pos 갱신 및 axmap 마킹(td_random 시).
+ * 중간 실패 시 break 후 누적된 buflen 이 양수면 성공(부분 생성도 유효).
+ *
+ * 호출 체인: fill_io_u → [이 함수] (multi_range_trim 분기).
  */
 static int fill_multi_range_io_u(struct thread_data *td, struct io_u *io_u)
 {
@@ -1741,20 +2061,43 @@ static int fill_multi_range_io_u(struct thread_data *td, struct io_u *io_u)
 	return 1;
 }
 
-/* [한국어] I/O 유닛의 핵심 정보(오프셋, 버퍼 길이, 방향)를 채우는 함수.
+/* [한국어]
+ * fill_io_u - I/O 유닛에 "어디/얼마나/무엇을" 값을 채워넣는 설정 함수.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @return: 0=성공, 1=실패
+ * @td: 잡 스레드.
+ * @io_u: 설정할 I/O 유닛(이미 __get_io_u로 할당된 상태, file 세트 전제).
+ * @return: 0=성공, 1=실패(호출자가 put_file_log + td_io_close_file로 정리).
  *
- * io_u의 전체 설정 과정:
- * 1. set_rw_ddir()로 데이터 방향(read/write/sync/trim) 결정
- * 2. 존 모드(strided/ZBD) 설정
- * 3. 다중 범위 trim이면 fill_multi_range_io_u() 호출
- * 4. 아니면 get_next_offset()으로 오프셋, get_next_buflen()으로 크기 결정
- * 5. ZBD 모드에서 블록 조정
- * 6. 데이터 보호(dp) 정보 채우기
- * 7. 랜덤맵에 표시
+ * 채우는 필드: io_u->ddir, io_u->acct_ddir, io_u->offset, io_u->verify_offset,
+ *              io_u->buflen, io_u->flags(IO_U_F_BARRIER 등), io_u->number_trim
+ *              (다중 범위 trim).
+ *
+ * 처리 단계:
+ *   1. NOIO 엔진 바이패스 (cpu/net 엔진 등 디스크 I/O 없는 경우 out).
+ *   2. set_rw_ddir: get_rw_ddir (rwmix/fsync/datasync/sync_file_range 선택) +
+ *      ZBD 조정(zbd_adjust_ddir) + trimwrite 토글 + IO_U_F_BARRIER 마킹.
+ *   3. ddir == INVAL/TIMEOUT 이면 실패.
+ *   4. ddir_sync(DDIR_SYNC/DATASYNC/SYNC_FILE_RANGE) 는 offset/buflen 불필요 → out.
+ *   5. zone_mode 분기: STRIDED (정해진 주기로 존 이동) 또는 ZBD (진짜 ZNS 존 관리).
+ *   6. 다중 범위 trim (num_range > 1 + DDIR_TRIM): fill_multi_range_io_u 로 범위
+ *      num_range개 연쇄 채움 → io_u->buf에 trim_range 배열 저장.
+ *   7. 단일 I/O: get_next_offset (순차/랜덤/LFSR/Zipf/...) + get_next_buflen
+ *      (bssplit CDF / bsrange / 단일 bs).
+ *   8. ZBD: zbd_adjust_block로 WRITE는 존 write pointer에 맞춰 정렬, 읽기는
+ *      유효 범위 클램프. io_u_eof 반환 시 실패(존 모두 닫힘).
+ *   9. Data Placement(FDP/Streams): dp_fill_dspec_data로 io_u->dtype/dspec 채움.
+ *  10. 파일 오버플로 최종 방어 검사(offset+buflen > real_file_size).
+ *  11. mark_random_map (norandommap=0 + td_random + axmap 있음): axmap에 세트,
+ *      세트 실패 시 buflen 축소 반영.
+ *
+ * 실행 컨텍스트: 잡 스레드 단독. 파일 통계/랜덤 상태 모두 td/f 소유라 락 없음.
+ *
+ * 호출 체인:
+ *   set_io_u_file → [이 함수] (파일 선택 직후)
+ *   fill_multi_range_io_u 는 같은 체인의 서브루틴.
+ *
+ * 에러 경로: 실패 시 호출자(set_io_u_file) 가 같은 파일로 재시도하거나
+ * 파일을 close하고 다음 파일 시도(file_service_type에 따라).
  */
 static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 {
@@ -1850,12 +2193,17 @@ out:
 	return 0;
 }
 
-/* [한국어] I/O 제출/완료 통계를 위한 범위별 카운터를 증가시키는 내부 함수.
+/* [한국어]
+ * __io_u_mark_map - 버킷 히스토그램 공용 인크리멘터 (7 버킷).
  *
- * @map: 통계 맵 배열 (7개 버킷: 0, 1-4, 5-8, 9-16, 17-32, 33-64, 65+)
- * @nr: 한 번에 제출/완료된 I/O 수
+ * @map: 대상 배열(ts.io_u_submit 또는 io_u_complete, 7 원소).
+ * @nr: 이번 호출에 들어온 I/O 수.
  *
- * 한 번의 제출/완료 호출에서 처리된 I/O 수를 범위별로 분류하여 기록한다.
+ * 버킷 경계: {0} {1..4} {5..8} {9..16} {17..32} {33..64} {65+}.
+ * nr=0 도 맵에 기록 — "getevents 로 0건 반환"의 빈도 추적용.
+ * fio_fallthrough: C fallthrough attribute (GCC warning 억제).
+ *
+ * 호출 체인: io_u_mark_submit/io_u_mark_complete → [이 함수].
  */
 static void __io_u_mark_map(uint64_t *map, unsigned int nr)
 {
@@ -1887,10 +2235,15 @@ static void __io_u_mark_map(uint64_t *map, unsigned int nr)
 	map[idx]++;
 }
 
-/* [한국어] I/O 제출 통계를 기록하는 함수.
+/* [한국어]
+ * io_u_mark_submit - 제출(submit) 배치 크기 히스토그램 기록.
  *
- * @td: 스레드 데이터
- * @nr: 한 번에 제출된 I/O 수
+ * @td: 잡 스레드. td->ts.io_u_submit 배열 + total_submit 카운터.
+ * @nr: 이번 submit 에 들어간 I/O 수.
+ *
+ * 호출 체인:
+ *   td_io_commit (ioengines.c) → [이 함수]
+ *   동기 엔진의 td_io_queue → [이 함수] (nr=1)
  */
 void io_u_mark_submit(struct thread_data *td, unsigned int nr)
 {
@@ -1898,10 +2251,14 @@ void io_u_mark_submit(struct thread_data *td, unsigned int nr)
 	td->ts.total_submit++;
 }
 
-/* [한국어] I/O 완료 통계를 기록하는 함수.
+/* [한국어]
+ * io_u_mark_complete - 완료(complete) 배치 크기 히스토그램 기록.
  *
- * @td: 스레드 데이터
- * @nr: 한 번에 완료된 I/O 수
+ * @td: 잡 스레드.
+ * @nr: 이번 getevents 로 회수된 I/O 수.
+ *
+ * 호출 체인:
+ *   ioengines.c 의 완료 경로 → [이 함수]
  */
 void io_u_mark_complete(struct thread_data *td, unsigned int nr)
 {
@@ -1909,13 +2266,16 @@ void io_u_mark_complete(struct thread_data *td, unsigned int nr)
 	td->ts.total_complete++;
 }
 
-/* [한국어] I/O 큐 깊이 통계를 기록하는 함수.
+/* [한국어]
+ * io_u_mark_depth - 현재 큐 깊이(cur_depth) 히스토그램에 nr 가산.
  *
- * @td: 스레드 데이터
- * @nr: 제출된 I/O 수
+ * @td: 잡 스레드.
+ * @nr: 이번 배치의 I/O 수(버킷 카운터에 곱해 가산).
  *
- * 현재 큐 깊이(cur_depth)를 범위별로 분류하여 기록한다.
- * 버킷: 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64+
+ * 버킷(멱승 기반): {1} {2..3} {4..7} {8..15} {16..31} {32..63} {64+}.
+ * cur_depth 기반 버킷 선택 후 ts.io_u_map[idx] += nr.
+ *
+ * 호출 체인: ioengines.c 엔진 별 commit 후 → [이 함수].
  */
 void io_u_mark_depth(struct thread_data *td, unsigned int nr)
 {
@@ -1947,12 +2307,16 @@ void io_u_mark_depth(struct thread_data *td, unsigned int nr)
 	td->ts.io_u_map[idx] += nr;
 }
 
-/* [한국어] 나노초 단위 레이턴시를 범위별로 기록하는 함수 (1000ns 미만).
+/* [한국어]
+ * io_u_mark_lat_nsec - 나노초 레이턴시 히스토그램 버킷 증가 (< 1000ns 전용).
  *
- * @td: 스레드 데이터
- * @nsec: 레이턴시 (나노초)
+ * @td: 잡 스레드. td->ts.io_u_lat_n[10] 배열에 누적.
+ * @nsec: 레이턴시(0~999ns). 1000ns 이상은 assert 실패 → 상위 io_u_mark_latency 가 분기.
  *
- * 0-1, 2-3, 4-9, 10-19, 20-49, 50-99, 100-249, 250-499, 500-749, 750-999 ns
+ * 버킷: {0..1} {2..3} {4..9} {10..19} {20..49} {50..99} {100..249} {250..499}
+ *       {500..749} {750..999} (10 버킷).
+ *
+ * 호출 체인: io_u_mark_latency(nsec<1000) → [이 함수].
  */
 static void io_u_mark_lat_nsec(struct thread_data *td, unsigned long long nsec)
 {
@@ -1996,10 +2360,13 @@ static void io_u_mark_lat_nsec(struct thread_data *td, unsigned long long nsec)
 	td->ts.io_u_lat_n[idx]++;
 }
 
-/* [한국어] 마이크로초 단위 레이턴시를 범위별로 기록하는 함수 (1~999 usec).
+/* [한국어]
+ * io_u_mark_lat_usec - 마이크로초 레이턴시 히스토그램 (1us~999us).
  *
- * @td: 스레드 데이터
- * @usec: 레이턴시 (마이크로초)
+ * @td: 잡 스레드. ts.io_u_lat_u[10] 배열.
+ * @usec: 레이턴시(1..999).
+ *
+ * 호출 체인: io_u_mark_latency(1000 <= nsec < 1000000) → [이 함수] (nsec/1000 전달).
  */
 static void io_u_mark_lat_usec(struct thread_data *td, unsigned long long usec)
 {
@@ -2043,13 +2410,14 @@ static void io_u_mark_lat_usec(struct thread_data *td, unsigned long long usec)
 	td->ts.io_u_lat_u[idx]++;
 }
 
-/* [한국어] 밀리초 단위 레이턴시를 범위별로 기록하는 함수 (1ms 이상).
+/* [한국어]
+ * io_u_mark_lat_msec - 밀리초 레이턴시 히스토그램 (1ms 이상 전 구간).
  *
- * @td: 스레드 데이터
- * @msec: 레이턴시 (밀리초)
+ * @td: 잡 스레드. ts.io_u_lat_m[12] 배열.
+ * @msec: 레이턴시(ms, 1 이상).
  *
- * 0-1, 2-3, 4-9, 10-19, 20-49, 50-99, 100-249, 250-499,
- * 500-749, 750-999, 1000-1999, 2000+ ms
+ * 버킷: {0..1}..{1000..1999} {2000+} (12 버킷). default 분기가 2000+ 처리.
+ * 호출 체인: io_u_mark_latency(nsec >= 1000000) → [이 함수] (nsec/1000000 전달).
  */
 static void io_u_mark_lat_msec(struct thread_data *td, unsigned long long msec)
 {
@@ -2099,10 +2467,18 @@ static void io_u_mark_lat_msec(struct thread_data *td, unsigned long long msec)
 	td->ts.io_u_lat_m[idx]++;
 }
 
-/* [한국어] 레이턴시를 적절한 단위(ns/us/ms)로 분류하여 기록하는 디스패처 함수.
+/* [한국어]
+ * io_u_mark_latency - 단위 자동 분기 (ns/us/ms) 레이턴시 히스토그램 갱신.
  *
- * @td: 스레드 데이터
- * @nsec: 레이턴시 (나노초)
+ * @td: 잡 스레드.
+ * @nsec: 완료 레이턴시(나노초).
+ *
+ * 3단계 분기:
+ *   nsec < 1000           → io_u_mark_lat_nsec (ns 버킷)
+ *   1000 <= nsec < 10^6   → io_u_mark_lat_usec(nsec/1000)
+ *   10^6 <= nsec          → io_u_mark_lat_msec(nsec/10^6)
+ *
+ * 호출 체인: account_io_completion (disable_clat=0) → [이 함수].
  */
 static void io_u_mark_latency(struct thread_data *td, unsigned long long nsec)
 {
@@ -2117,13 +2493,19 @@ static void io_u_mark_latency(struct thread_data *td, unsigned long long nsec)
 		io_u_mark_lat_msec(td, nsec / 1000000);
 }
 
-/* [한국어] 다음 파일 번호를 랜덤으로 선택하는 내부 함수.
+/* [한국어]
+ * __get_next_fileno_rand - 파일 번호 랜덤 선택 (file_service_type 에 따라 분포 분기).
  *
- * @td: 스레드 데이터
- * @return: 선택된 파일 번호
+ * @td: 잡 스레드.
+ * @return: td->files[] 배열 인덱스 (0..nr_files-1).
  *
- * 파일 서비스 타입(random, zipf, pareto, gauss)에 따라
- * 다음에 I/O할 파일 번호를 랜덤으로 결정한다.
+ * 분기:
+ *   FSERVICE_RANDOM: Tausworthe 균등.
+ *   FSERVICE_ZIPF/PARETO: td->next_file_zipf 상태 (zipf/pareto_next). FIO_FSERVICE_SHIFT
+ *     로 과생성 정밀도 내림 조정.
+ *   FSERVICE_GAUSS: td->next_file_gauss.
+ *
+ * 호출 체인: get_next_file_rand → [이 함수].
  */
 static unsigned int __get_next_fileno_rand(struct thread_data *td)
 {
@@ -2158,14 +2540,20 @@ static unsigned int __get_next_fileno_rand(struct thread_data *td)
 /*
  * Get next file to service by choosing one at random
  */
-/* [한국어] 랜덤으로 다음 서비스할 파일을 선택하는 함수.
+/* [한국어]
+ * get_next_file_rand - 랜덤 분포로 파일 선택 + 필요 시 open(open_files 상한 내).
  *
- * @td: 스레드 데이터
- * @goodf: 필수 플래그 (이 플래그가 있어야 선택)
- * @badf: 금지 플래그 (이 플래그가 있으면 건너뜀)
- * @return: 선택된 파일 포인터 또는 에러
+ * @td: 잡 스레드.
+ * @goodf: 이 플래그가 세트된 파일만 선택(예: FIO_FILE_open). 0이면 조건 없음.
+ * @badf: 이 플래그가 세트된 파일은 제외(예: FIO_FILE_closing).
+ * @return: fio_file* (성공), ERR_PTR(-EBUSY) (open_files 상한 초과).
  *
- * 파일이 닫혀 있으면 열고, 필요한 플래그 조건을 만족하는 파일을 찾을 때까지 반복.
+ * 루프: __get_next_fileno_rand 로 번호 추첨 → done 상태면 continue →
+ * 닫혀 있으면 td_io_open_file 시도 → 플래그 조건 충족 시 반환. 조건 미충족이면
+ * 방금 연 파일 닫고 다시 추첨. 무한 루프 가능성 있지만 상위가 nr_done_files
+ * 체크로 보호.
+ *
+ * 호출 체인: __get_next_file (FSERVICE_RANDOM/ZIPF/PARETO/GAUSS) → [이 함수].
  */
 static struct fio_file *get_next_file_rand(struct thread_data *td,
 					   enum fio_file_flags goodf,
@@ -2213,15 +2601,15 @@ static struct fio_file *get_next_file_rand(struct thread_data *td,
 /*
  * Get next file to service by doing round robin between all available ones
  */
-/* [한국어] 라운드 로빈 방식으로 다음 서비스할 파일을 선택하는 함수.
+/* [한국어]
+ * get_next_file_rr - 라운드 로빈으로 파일 선택 + 필요 시 open.
  *
- * @td: 스레드 데이터
- * @goodf: 필수 플래그
- * @badf: 금지 플래그
- * @return: 선택된 파일 포인터 또는 NULL
+ * @td: 잡 스레드. td->next_file 인덱스가 RR 커서.
+ * @goodf/badf: get_next_file_rand 와 동일.
+ * @return: fio_file* 또는 NULL(한 바퀴 돌아도 후보 없음). open_files 상한이면 ERR_PTR.
  *
- * next_file 인덱스를 순환하면서 조건에 맞는 파일을 찾는다.
- * 한 바퀴 돌아도 못 찾으면 NULL 반환.
+ * 호출 체인: __get_next_file (FSERVICE_RR/SEQ) → [이 함수].
+ * SEQ 모드에서도 RR 로 첫 후보 선택 후 file_service_file 로 고정 사용.
  */
 static struct fio_file *get_next_file_rr(struct thread_data *td, int goodf,
 					 int badf)
@@ -2281,16 +2669,22 @@ static struct fio_file *get_next_file_rr(struct thread_data *td, int goodf,
 	return f;
 }
 
-/* [한국어] 파일 서비스 정책에 따라 다음 파일을 선택하는 내부 함수.
+/* [한국어]
+ * __get_next_file - 파일 서비스 정책(SEQ/RR/RANDOM/분포) 디스패처.
  *
- * @td: 스레드 데이터
- * @return: 선택된 파일 포인터, NULL(모두 완료), 또는 에러 포인터
+ * @td: 잡 스레드.
+ * @return: 선택된 fio_file*, NULL(모든 파일 완료), ERR_PTR(상한 초과).
  *
- * 파일 서비스 타입에 따라:
- * - SEQ: 순차적으로 한 파일씩
- * - RR: 라운드 로빈
- * - RANDOM/ZIPF/PARETO/GAUSS: 랜덤 선택
- * file_service_left로 같은 파일에 연속 I/O 횟수를 제어.
+ * 우선순위:
+ *  1) 현재 file_service_file 이 살아있고(열림+닫힘 중 아님):
+ *     - SEQ 모드 → 그 파일 계속 사용.
+ *     - file_service_left 남아 있음 → 카운터 차감 후 그 파일 사용.
+ *  2) 새로 선택: RR/SEQ → get_next_file_rr, 그 외 → get_next_file_rand.
+ *  3) 새 파일 확정: file_service_file 갱신 + file_service_left = file_service_nr - 1
+ *     (한 파일에 연속 N개 I/O 후 전환).
+ *
+ * 실행 컨텍스트: 잡 스레드.
+ * 호출 체인: get_next_file → [이 함수].
  */
 static struct fio_file *__get_next_file(struct thread_data *td)
 {
@@ -2342,25 +2736,38 @@ out:
 	return f;
 }
 
-/* [한국어] 다음 서비스할 파일을 선택하는 래퍼 함수.
+/* [한국어]
+ * get_next_file - 파일 선택 래퍼(확장 여지를 위해 분리).
  *
- * @td: 스레드 데이터
- * @return: 선택된 파일 포인터
+ * @td: 잡 스레드.
+ * @return: __get_next_file 결과 그대로.
+ *
+ * 호출 체인: set_io_u_file → [이 함수] → __get_next_file.
  */
 static struct fio_file *get_next_file(struct thread_data *td)
 {
 	return __get_next_file(td);
 }
 
-/* [한국어] io_u에 파일을 설정하고 I/O 정보를 채우는 함수.
+/* [한국어]
+ * set_io_u_file - io_u 에 파일을 선택·바인딩하고 fill_io_u 로 I/O 정보 채움.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @return: 0=성공, 양수=실패, 음수=에러(-EBUSY 등)
+ * @td: 잡 스레드.
+ * @io_u: 대상. 성공 시 io_u->file + offset/buflen/ddir 세트.
+ * @return: 0=성공, 양수=파일 소진 실패(호출자는 ERR_PTR 등 변환),
+ *          음수=에러 포인터(-EBUSY 등 ERR_PTR).
  *
- * 파일을 가져오고 fill_io_u()로 I/O 정보를 채운다.
- * 실패하면 파일을 닫고 다음 파일을 시도한다.
- * 비균일 파일 서비스이면 파일을 리셋하고, 아니면 완료 처리한다.
+ * 루프 구조 — fill_io_u 실패 시 파일을 정리하고 다음 파일 시도:
+ *   1. get_next_file 로 파일 획득 (IS_ERR/NULL 처리).
+ *   2. io_u->file = f; get_file(f) 로 참조 카운트++.
+ *   3. fill_io_u 성공이면 break.
+ *   4. 실패 시: zbd_put_io_u + put_file_log + td_io_close_file + io_u->file=NULL.
+ *   5. ddir==TIMEOUT 이면 즉시 종료.
+ *   6. 비균일 분포이면 fio_file_reset 으로 재사용, 아니면 fio_file_set_done +
+ *      nr_done_files++ 로 영구 완료.
+ *   7. 다음 루프.
+ *
+ * 호출 체인: get_io_u → [이 함수] → get_next_file + fill_io_u.
  */
 static long set_io_u_file(struct thread_data *td, struct io_u *io_u)
 {
@@ -2405,13 +2812,21 @@ static long set_io_u_file(struct thread_data *td, struct io_u *io_u)
 	return 0;
 }
 
-/* [한국어] 최대 레이턴시 초과 시 치명적 에러를 기록하는 함수.
+/* [한국어]
+ * lat_fatal - max_latency 초과 시 치명적 에러(ETIMEDOUT) 마킹.
  *
- * @td: 스레드 데이터
- * @io_u: 해당 I/O 유닛
- * @icd: I/O 완료 데이터
- * @tnsec: 실제 레이턴시 (나노초)
- * @max_nsec: 허용 최대 레이턴시 (나노초)
+ * @td: 잡 스레드.
+ * @io_u: 문제의 io_u (파일/오프셋/길이/ddir 로그 출력).
+ * @icd: 배치 완료 컨텍스트. icd->error = ETIMEDOUT 로 마크.
+ * @tnsec: 실측 레이턴시.
+ * @max_nsec: 허용 상한.
+ *
+ * td->error 가 아직 세트 안 된 경우에만 log_err 출력 (첫 발생 1회).
+ * td_verror 로 에러 등록 → 상위 io_completed/io_u_*_complete 경로가 -1 반환 →
+ * 잡 종료. icd->error 설정으로 배치 내 후속 io_u 도 처리 후 종료 판단.
+ *
+ * 호출 체인: account_io_completion (max_latency 초과 또는 lat_target_failed
+ *             최종 실패) → [이 함수].
  */
 static void lat_fatal(struct thread_data *td, struct io_u *io_u, struct io_completion_data *icd,
 		      unsigned long long tnsec, unsigned long long max_nsec)
@@ -2427,16 +2842,22 @@ static void lat_fatal(struct thread_data *td, struct io_u *io_u, struct io_compl
 	icd->error = ETIMEDOUT;
 }
 
-/* [한국어] 레이턴시 타겟의 새 측정 사이클을 시작하는 함수.
+/* [한국어]
+ * lat_new_cycle - latency_target 이진 탐색의 한 사이클 재시작.
  *
- * @td: 스레드 데이터
+ * @td: 잡 스레드. latency_ts=기준 시각, latency_ios=기준 I/O 수, latency_failed=0.
  *
- * 현재 시각과 I/O 블록 수를 기록하여 새 측정 시작점으로 삼는다.
+ * 호출 체인:
+ *   __lat_target_failed (QD 낮춤 후) → [이 함수]
+ *   lat_target_success → [이 함수]
  */
 static void lat_new_cycle(struct thread_data *td)
 {
+	/* [한국어] 현재 시각 기록 — latency_window 경과 판정 기준점. */
 	fio_gettime(&td->latency_ts, NULL);
+	/* [한국어] 현재 총 I/O 블록 수 기록 — 이번 사이클 시작 시점. */
 	td->latency_ios = ddir_rw_sum(td->io_blocks);
+	/* [한국어] 이번 사이클의 타겟 초과 카운터 리셋. */
 	td->latency_failed = 0;
 }
 
@@ -2444,13 +2865,22 @@ static void lat_new_cycle(struct thread_data *td)
  * We had an IO outside the latency target. Reduce the queue depth. If we
  * are at QD=1, then it's time to give up.
  */
-/* [한국어] 레이턴시 타겟 초과 시 큐 깊이를 줄이는 내부 함수.
+/* [한국어]
+ * __lat_target_failed - latency_target 위반 시 QD 이진 탐색으로 낮춤.
  *
- * @td: 스레드 데이터
- * @return: true=QD=1에서도 실패(포기), false=QD 줄임
+ * @td: 잡 스레드. latency_qd/latency_qd_low/latency_qd_high 삼자로 이진 탐색.
+ * @return: true=QD=1 에서도 실패(잡 종료 신호), false=QD 낮춤 성공(계속).
  *
- * 이진 탐색 방식으로 큐 깊이를 줄인다.
- * QD를 줄인 후 기존 I/O를 모두 완료(quiesce)시키고 새 사이클 시작.
+ * 알고리즘:
+ *   - QD=1 이면 이미 최소 → 실패 반환(lat_fatal 트리거).
+ *   - qd_high = 현재 qd (이 위는 확실히 실패로 표시).
+ *   - qd = (qd + qd_low) / 2 (이진 하강).
+ *   - io_u_quiesce 로 상위 QD 시절 in-flight 드레인 → ramp-down 폭풍 방지.
+ *   - lat_new_cycle 로 기준점 리셋.
+ *
+ * 호출 체인:
+ *   lat_target_failed (percentile=100%) → [이 함수]
+ *   lat_target_check (percentile 미만 성공률) → [이 함수]
  */
 static bool __lat_target_failed(struct thread_data *td)
 {
@@ -2480,13 +2910,16 @@ static bool __lat_target_failed(struct thread_data *td)
 	return false;
 }
 
-/* [한국어] 레이턴시 타겟 초과 시 처리하는 외부 함수.
+/* [한국어]
+ * lat_target_failed - 즉시 실패 처리 (percentile=100%) vs 실패 카운트 누적만.
  *
- * @td: 스레드 데이터
- * @return: true=포기(QD=1에서도 실패), false=계속
+ * @td: 잡 스레드.
+ * @return: true=포기 확정, false=계속(카운트만 증가).
  *
- * percentile이 100%이면 즉시 __lat_target_failed() 호출.
- * 그렇지 않으면 실패 횟수만 증가시키고 나중에 판단.
+ * percentile < 100 이면 latency_window 동안 실패 비율로 판단해야 하므로
+ * 개별 초과만으로 즉시 포기하지 않음 → latency_failed++ 만.
+ *
+ * 호출 체인: account_io_completion → [이 함수].
  */
 static bool lat_target_failed(struct thread_data *td)
 {
@@ -2498,12 +2931,18 @@ static bool lat_target_failed(struct thread_data *td)
 	return false;
 }
 
-/* [한국어] 레이턴시 타겟을 초기화하는 함수.
+/* [한국어]
+ * lat_target_init - latency_target 이진 탐색 초기화 (QD=1 부터).
  *
- * @td: 스레드 데이터
+ * @td: 잡 스레드.
  *
- * latency_target이 설정되어 있으면 QD=1부터 시작하여
- * 이진 탐색으로 최적 QD를 찾아간다.
+ * 설정되어 있으면: latency_qd=1, latency_qd_high=iodepth, latency_qd_low=1,
+ * latency_ts=현재 시각, latency_ios=현재 io_blocks 합.
+ * 미설정이면: latency_qd=iodepth (전체 사용).
+ *
+ * 호출 체인:
+ *   backend.c init_io_u → [이 함수] (잡 시작 시)
+ *   lat_target_reset → [이 함수] (재초기화).
  */
 void lat_target_init(struct thread_data *td)
 {
@@ -2523,11 +2962,12 @@ void lat_target_init(struct thread_data *td)
 		td->latency_qd = td->o.iodepth;
 }
 
-/* [한국어] 레이턴시 타겟을 리셋하는 함수.
+/* [한국어]
+ * lat_target_reset - latency_end_run 아니면 init 재호출(파일 루프 경계 등).
  *
- * @td: 스레드 데이터
+ * @td: 잡 스레드.
  *
- * 실행이 아직 끝나지 않았으면 lat_target_init()으로 재초기화.
+ * latency_end_run=1 이면 최종 측정 사이클 진행 중이므로 건드리지 않음.
  */
 void lat_target_reset(struct thread_data *td)
 {
@@ -2535,14 +2975,22 @@ void lat_target_reset(struct thread_data *td)
 		lat_target_init(td);
 }
 
-/* [한국어] 레이턴시 타겟을 만족했을 때 큐 깊이를 올리는 함수.
+/* [한국어]
+ * lat_target_success - latency_target 만족 시 QD 이진 탐색으로 상향.
  *
- * @td: 스레드 데이터
+ * @td: 잡 스레드.
  *
- * 이진 탐색으로 QD를 올린다. 아직 실패 상한을 모르면 2배로,
- * 상한이 알려져 있으면 (현재 + 상한) / 2로 올린다.
- * 안정 상태에서 3회 연속 성공하면 상한을 1 올린다.
- * 최적 QD를 찾으면 작업을 종료한다.
+ * 알고리즘:
+ *   qd_low = 현재 qd.
+ *   qd_high 가 iodepth(미탐색)면 qd *= 2, 아니면 (qd + qd_high) / 2.
+ *   qd 상한 iodepth 클램프.
+ *   qd+1 == qd_high 인 안정 상태에서 3회 연속 성공 시 qd_high 를 1 올려
+ *   탐색 해상도 보존 (heuristic).
+ *   qd 변화 없음 + latency_end_run=0 → "최적 QD 발견" → 최종 측정 사이클 진입:
+ *     io_u_quiesce + reset_all_stats + reset_io_stats. latency_end_run=1.
+ *   이미 end_run 이었으면 td->done=1 로 잡 종료.
+ *
+ * 호출 체인: lat_target_check (percentile 만족) → [이 함수].
  */
 static void lat_target_success(struct thread_data *td)
 {
@@ -2611,13 +3059,18 @@ static void lat_target_success(struct thread_data *td)
 /*
  * Check if we can bump the queue depth
  */
-/* [한국어] 레이턴시 타겟 체크: 측정 윈도우가 끝났는지 확인하고 QD 조정.
+/* [한국어]
+ * lat_target_check - latency_window 종료 시 성공률 판정 후 QD 조정.
  *
- * @td: 스레드 데이터
+ * @td: 잡 스레드.
  *
- * latency_window 시간이 경과하면 성공률을 계산하고,
- * latency_percentile 이상이면 QD를 올리고,
- * 미만이면 QD를 내린다.
+ * utime_since_now(latency_ts) < latency_window → 조기 리턴.
+ * 도달 시: 이번 윈도우에 발행된 I/O 수 = io_blocks 합 - latency_ios,
+ *         성공률 = (ios - latency_failed) / ios * 100.
+ * 성공률 >= latency_percentile → lat_target_success,
+ * 미만 → __lat_target_failed.
+ *
+ * 호출 체인: backend.c do_io 루프 → [이 함수].
  */
 void lat_target_check(struct thread_data *td)
 {
@@ -2648,13 +3101,18 @@ void lat_target_check(struct thread_data *td)
  * If latency target is enabled, we might be ramping up or down and not
  * using the full queue depth available.
  */
-/* [한국어] I/O 큐가 가득 찼는지 확인하는 함수.
+/* [한국어]
+ * queue_full - freelist 고갈 또는 latency_target 가상 상한 도달 판정.
  *
- * @td: 스레드 데이터
- * @return: true=큐가 가득 참, false=아직 여유 있음
+ * @td: 잡 스레드(const).
+ * @return: true=추가 io_u 할당 불가, false=여유 있음.
  *
- * 프리리스트가 비었거나, 레이턴시 타겟에 의해
- * 현재 깊이가 목표 QD에 도달했으면 가득 찬 것으로 판단.
+ * 두 조건 중 하나:
+ *  1) io_u_qempty(freelist): 모든 io_u in-flight 상태.
+ *  2) latency_target 활성 + cur_depth >= latency_qd: QD 이진 탐색이 현재 허용한
+ *     가상 상한 도달 (실제 iodepth 옵션보다 낮을 수 있음).
+ *
+ * 호출 체인: __get_io_u → [이 함수], backend.c do_io → [이 함수].
  */
 bool queue_full(const struct thread_data *td)
 {
@@ -2671,17 +3129,41 @@ bool queue_full(const struct thread_data *td)
 	return td->cur_depth >= td->latency_qd;
 }
 
-/* [한국어] 프리리스트 또는 재큐잉 리스트에서 io_u를 가져오는 내부 함수.
+/* [한국어]
+ * __get_io_u - ★ 핵심 ★ io_u 생명주기 시작의 "풀에서 꺼내기" 단계.
  *
- * @td: 스레드 데이터
- * @return: 가져온 io_u 포인터 또는 NULL
+ * @td: 잡 스레드.
+ * @return: IO_U_F_FREE 해제된 깨끗한 io_u, 또는 NULL(stop_io 또는 락/대기 포기).
  *
- * I/O 유닛 할당의 핵심 함수. 다음 순서로 io_u를 가져온다:
- * 1. 재큐잉 리스트(requeues)에 있으면 거기서 가져옴 (재시도 우선)
- * 2. 큐가 가득 차지 않았으면 프리리스트에서 가져옴
- * 3. 비동기 처리 시 둘 다 없으면 대기(cond_wait)
+ * 상태 전이:
+ *   [io_u_requeues] (우선)        [io_u_freelist]
+ *         │                              │
+ *         └──────────┬───────────────────┘
+ *                    ▼
+ *        [이 함수가 꺼냄] → io_u (FREE clear, BARRIER/TRIMMED/VER_LIST/NO_FILE_PUT clear,
+ *                               cur_depth++, IN_CUR_DEPTH set, error=0, acct_ddir=-1)
+ *                    ▼
+ *            get_io_u의 후속 단계(check_get_trim/verify, set_io_u_file, fill_io_u, td_io_prep)
  *
- * 가져온 io_u의 플래그를 초기화하고 cur_depth를 증가시킨다.
+ * 우선순위:
+ *  1) td->io_u_requeues(재큐잉 큐): short I/O 재시도 또는 FIO_Q_BUSY 반환 재시도.
+ *     이미 offset/buflen/file이 설정되어 있을 수 있으므로 → 아래 get_io_u가
+ *     "io_u->file != NULL이면 fill 생략" 분기에서 이 상태를 활용.
+ *  2) td->io_u_freelist(프리리스트): queue_full()이 false일 때만 꺼낸다.
+ *     queue_full은 latency_target 모드에서는 td->latency_qd 상한을 적용.
+ *  3) 둘 다 없으면:
+ *     - async processing(verify 스레드 분리): pthread_cond_wait(&free_cond)로
+ *       io_u 회수 대기. 깨어나면 다시 시도(goto again).
+ *     - 그 외: NULL 반환 → get_io_u의 상위에서 td_io_getevents/io_u_quiesce 경로.
+ *
+ * 동기화: needs_lock 시 td->io_u_lock (pthread_mutex) 보호.
+ *
+ * 실행 컨텍스트: 잡 스레드(verify 스레드는 자체 td에서 동일 흐름).
+ *
+ * 호출 체인: get_io_u → [이 함수].
+ *
+ * 에러 경로: pthread_cond_wait 실패(신호/ENOMEM) 시 td->error=errno 설정 후
+ * io_u=NULL 반환.
  */
 struct io_u *__get_io_u(struct thread_data *td)
 {
@@ -2752,15 +3234,19 @@ again:
 	return io_u;
 }
 
-/* [한국어] trim 백로그에서 다음 trim을 가져올지 확인하는 함수.
+/* [한국어]
+ * check_get_trim - trim 백로그 주기 도달 시 io_u 를 TRIM 으로 강제 변환.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @return: true=trim을 가져옴, false=trim 없음
+ * @td: 잡 스레드. TD_F_TRIM_BACKLOG 플래그, trim_entries/trim_batch/trim_backlog.
+ * @io_u: 이번에 할당된 io_u (ddir 재할당 대상).
+ * @return: true=trim 으로 세트됨(상위는 out 건너뜀), false=trim 미발생.
  *
- * trim_backlog이 설정되어 있으면, 일정 주기마다
- * 이전에 기록된 위치를 trim하는 I/O를 발행한다.
- * trim_batch로 연속 trim 횟수를 제어한다.
+ * 흐름:
+ *  - trim_batch 남아 있으면 계속 trim(연속 소비).
+ *  - io_hist_len % trim_backlog == 0 + last_ddir_completed != TRIM 이면 새 배치 시작.
+ *  - get_next_trim (trim.c): 이전 쓰기 이력(io_hist)에서 trim 대상 영역 획득 → io_u 재설정.
+ *
+ * 호출 체인: get_io_u → [이 함수].
  */
 static bool check_get_trim(struct thread_data *td, struct io_u *io_u)
 {
@@ -2795,14 +3281,20 @@ static bool check_get_trim(struct thread_data *td, struct io_u *io_u)
 	return false;
 }
 
-/* [한국어] 검증 백로그에서 다음 검증을 가져올지 확인하는 함수.
+/* [한국어]
+ * check_get_verify - verify 백로그 주기 도달 시 io_u 를 verify READ 로 강제 변환.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @return: true=검증 I/O를 가져옴, false=없음
+ * @td: 잡 스레드. TD_F_VER_BACKLOG 플래그, io_hist_len, verify_batch/verify_backlog.
+ * @io_u: 재설정 대상.
+ * @return: true=verify 로 세트됨, false=미발생.
  *
- * verify_backlog이 설정되어 있으면, 일정 주기마다
- * 이전에 쓴 데이터를 읽어서 검증하는 I/O를 발행한다.
+ * 흐름:
+ *  - verify_batch 남아 있으면 계속 verify.
+ *  - io_hist_len % verify_backlog == 0 + last_ddir_completed != READ 이면 새 배치.
+ *  - get_next_verify (verify.c): verify_list 에서 검증 대상 io_piece 꺼내
+ *    io_u->offset/buflen/ddir=READ 로 세트, io_u->ipo 에 piece 포인터 연결.
+ *
+ * 호출 체인: get_io_u → [이 함수] (trim 체크 보다 먼저).
  */
 static bool check_get_verify(struct thread_data *td, struct io_u *io_u)
 {
@@ -2840,14 +3332,19 @@ static bool check_get_verify(struct thread_data *td, struct io_u *io_u)
  * 512b block in the range, since that should be the smallest block size
  * we can expect from a device.
  */
-/* [한국어] 버퍼 내용에 오프셋과 시간을 삽입하여 중복 제거를 방지하는 함수.
+/* [한국어]
+ * small_content_scramble - 쓰기 버퍼에 offset+timestamp 마커를 끼워 dedupe 회피.
  *
- * @io_u: I/O 유닛
+ * @io_u: 쓰기 io_u (xfer_buf 에 스크램블).
  *
- * 512바이트 블록 단위로 오프셋과 시작 시간을 버퍼에 삽입한다.
- * 이렇게 하면 같은 패턴 데이터라도 각 블록이 고유해져서
- * 단순한 중복 제거(dedupe) 시도를 방지한다.
- * 캐시라인(64바이트) 내에서 랜덤 위치에 데이터를 삽입하여 성능을 높인다.
+ * 목적: 간단한 디덥(dedupe) 최적화를 속이지 않도록 각 512B 블록이 고유해지게
+ * offset과 start_time 을 삽입. FIO의 dedupe_percentage 와 별개(dedupe 제어는
+ * fill_io_buffer 에서, 이 함수는 매 write 마다 호출).
+ *
+ * 배치: 512B 블록마다 캐시라인(64B) 내 8가지 위치 중 하나에 offset(8B), 마지막
+ * 16B 에 start_time.tv_sec/tv_nsec. 오프셋 선택에 (tv_nsec ^ boffset) & 7 사용.
+ *
+ * 호출 체인: get_io_u → [이 함수] (TD_F_SCRAMBLE_BUFFERS + !COMPRESS + !DO_VERIFY).
  */
 static void small_content_scramble(struct io_u *io_u)
 {
@@ -2899,32 +3396,56 @@ static void small_content_scramble(struct io_u *io_u)
  * Return an io_u to be processed. Gets a buflen and offset, sets direction,
  * etc. The returned io_u is fully ready to be prepped, populated and submitted.
  */
-/* [한국어] ★ 핵심 함수 ★ 처리할 io_u를 가져오는 최상위 함수.
+/* [한국어]
+ * get_io_u - ★ 핵심 ★ io_u 생명주기의 "할당+설정" 최상위 진입점.
  *
- * @td: 스레드 데이터
- * @return: 준비된 io_u 포인터, NULL(사용 가능한 io_u 없음), 에러 포인터
+ * @td: 잡 스레드.
+ * @return: 완전히 준비된 io_u (td_io_prep 까지 완료, 제출 즉시 가능),
+ *          NULL (stop_io/재큐잉 없음+프리리스트 가득), 또는 ERR_PTR(-EBUSY) 등
+ *          에러 포인터(IS_ERR로 검사).
  *
- * io_u의 전체 생명주기에서 "할당+설정" 단계를 담당한다.
- * 반환된 io_u는 다음이 모두 설정되어 즉시 제출할 수 있는 상태:
- *   - ddir (데이터 방향: read/write/trim/sync)
- *   - offset (I/O 시작 위치)
- *   - buflen (I/O 크기)
- *   - file (대상 파일)
- *   - buf/xfer_buf (데이터 버퍼)
- *   - ioprio (I/O 우선순위)
- *   - start_time (시작 시각)
+ * io_u 상태 전이:
+ *   [freelist or requeues]
+ *        │ __get_io_u (우선순위: requeues → freelist)
+ *        ▼
+ *   [allocated, plain] (IO_U_F_FREE clear, cur_depth++)
+ *        │
+ *        │ verify 백로그? (check_get_verify → get_next_verify → verify_list에서 pop)
+ *        ├── Yes (DDIR_READ로 fill_io_u 대체, offset/buflen은 verify_header에서)
+ *        │
+ *        │ trim 백로그? (check_get_trim → get_next_trim)
+ *        ├── Yes (DDIR_TRIM으로 강제 변환)
+ *        │
+ *        │ io_u->file 이미 세트됨? (requeue에서 온 io_u)
+ *        ├── Yes (그대로 사용 — offset/buflen/ddir 모두 유지)
+ *        │
+ *        │ iolog replay 모드?
+ *        ├── Yes (read_iolog_get이 로그에서 ddir/offset/buflen/buf 직접 채움)
+ *        │
+ *        │ 일반 경로
+ *        └── set_io_u_file → get_next_file → fill_io_u (set_rw_ddir + get_next_offset +
+ *                                                        get_next_buflen)
+ *                    ▼
+ *   [prepped: ddir, offset, buflen, file, buf, xfer_*, ioprio, start_time 채움]
+ *                    ▼
+ *            td_io_prep (엔진별 iocb/sqe/cdb 빌드)
+ *                    ▼
+ *              (do_io → td_io_queue)
  *
- * 처리 순서:
- * 1. __get_io_u()로 프리리스트/재큐잉에서 io_u 할당
- * 2. 검증(verify) 백로그 확인 -> 검증 I/O면 바로 out
- * 3. trim 백로그 확인 -> trim I/O면 바로 out
- * 4. 재큐잉에서 온 io_u면 파일이 이미 설정되어 있으므로 바로 out
- * 5. iolog 사용 시 로그에서 다음 I/O 정보 읽기
- * 6. 아니면 set_io_u_file()로 파일 선택 및 I/O 정보 설정
- * 7. 쓰기의 경우 버퍼 리필/스크램블 처리
- * 8. xfer_buf/xfer_buflen 설정
- * 9. td_io_prep()으로 엔진별 사전 준비
- * 10. start_time 기록
+ * 쓰기 버퍼 처리:
+ *  - TD_F_REFILL_BUFFERS: io_u_fill_buffer로 매 write마다 새 패턴 생성(dedupe 방지).
+ *  - TD_F_SCRAMBLE_BUFFERS: small_content_scramble 마커 삽입 (start_time 기록 후).
+ *  - TD_F_COMPRESS/TD_F_DO_VERIFY: scramble 금지 (패턴 보존).
+ *
+ * 실행 컨텍스트: 잡 스레드. get_io_u 호출 시점에 cur_depth++ 로 이 io_u 점유 기록.
+ *
+ * 호출 체인:
+ *   backend.c: do_io → [이 함수] → td_io_queue → ... → io_completed → put_io_u
+ *   verify 경로: do_verify → [이 함수] (verify_list 우선) → td_io_queue (READ) →
+ *                 verify_io_u (패턴 비교)
+ *
+ * 에러 경로: fill/iolog/prep 실패 시 err_put 레이블 → put_io_u로 freelist 복귀
+ * 후 ERR_PTR(ret) 반환 — 상위(do_io)는 errno 기반으로 재시도·종료 판단.
  */
 struct io_u *get_io_u(struct thread_data *td)
 {
@@ -3044,14 +3565,20 @@ err_put:
 	return ERR_PTR(ret);
 }
 
-/* [한국어] I/O 에러를 로그에 기록하는 내부 함수.
+/* [한국어]
+ * __io_u_log_error - I/O 에러 로그 출력 + 치명 여부에 따라 td->error 마킹.
  *
- * @td: 스레드 데이터
- * @io_u: 에러가 발생한 I/O 유닛
+ * @td: 잡 스레드.
+ * @io_u: 에러 발생 io_u (error/ddir/file/offset/xfer_buflen 참조).
  *
- * 비치명적 에러(무시 가능한 에러)는 error_dump 옵션이 있을 때만 로그에 기록.
- * 치명적 에러는 td_verror()로 스레드 에러 상태를 설정.
- * 디바이스 에러이면 별도 메시지 표시.
+ * td_non_fatal_error 판정(ignore_error 옵션, continue_on_error 비트):
+ *  - non-fatal + error_dump=0 → 조용히 리턴.
+ *  - 그 외 → log_err + (io_ops->errdetails 콜백 → 엔진별 상세 — SCSI sense data,
+ *    NVMe cpl_status 등).
+ *  - zbd_log_err: ZBD 존 오류 별도 포맷.
+ *  - 치명적 + td->error 아직 없음 → td_verror(io_u->error) 마킹.
+ *
+ * 호출 체인: io_u_log_error → [이 함수] (자신 + 부모).
  */
 static void __io_u_log_error(struct thread_data *td, struct io_u *io_u)
 {
@@ -3094,25 +3621,32 @@ static void __io_u_log_error(struct thread_data *td, struct io_u *io_u)
 		td_verror(td, io_u->error, "io_u error");
 }
 
-/* [한국어] I/O 에러를 로그에 기록하는 공개 함수 (부모 스레드에도 기록).
+/* [한국어]
+ * io_u_log_error - I/O 에러 외부 API: 자신과 부모 스레드 양쪽에 로깅.
  *
- * @td: 스레드 데이터
- * @io_u: 에러가 발생한 I/O 유닛
+ * @td: 잡 스레드. 자식이면 td->parent 로도 중복 로깅(verify async 스레드 등).
+ * @io_u: 에러 io_u.
+ *
+ * 호출 체인: io_completed (error 경로) → [이 함수].
  */
 void io_u_log_error(struct thread_data *td, struct io_u *io_u)
 {
 	__io_u_log_error(td, io_u);
-	/* [한국어] 자식 스레드면 부모에도 에러 기록 */
+	/* [한국어] 자식 스레드면 부모에도 에러 기록. async verify 경로에서
+	 * 부모(잡) 스레드 집계에도 반영. */
 	if (td->parent)
 		__io_u_log_error(td->parent, io_u);
 }
 
-/* [한국어] gtod(gettimeofday) 호출을 줄일 수 있는지 확인하는 인라인 함수.
+/* [한국어]
+ * gtod_reduce - 시간 측정(fio_gettime) 호출을 최소화해도 되는지 판정.
  *
- * @td: 스레드 데이터
- * @return: true=시간 측정 최소화 가능, false=일부 측정 필요
+ * @td: 잡 스레드.
+ * @return: true=gtod 전부 생략 가능(slat/clat/bw 모두 disabled 또는 gtod_reduce 옵션),
+ *          false=최소 하나 이상 활성 → fio_gettime 필요.
  *
- * clat, slat, bw 모두 비활성화되었거나 gtod_reduce가 설정되면 true.
+ * 용도: init_icd 가 icd.time 기록 여부 판단, account_io_completion 이 clat 계산
+ * 생략 여부 판단 등.
  */
 static inline bool gtod_reduce(struct thread_data *td)
 {
@@ -3120,13 +3654,18 @@ static inline bool gtod_reduce(struct thread_data *td)
 			|| td->o.gtod_reduce;
 }
 
-/* [한국어] trim된 블록 정보를 업데이트하는 함수.
+/* [한국어]
+ * trim_block_info - TRIM 완료 시 io log 의 해당 블록 상태를 TRIMMED 로 전이.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
+ * @td: 잡 스레드. td->ts.block_infos[] 는 iolog.c 가 관리하는 블록별 상태 추적.
+ * @io_u: TRIM 완료 io_u.
  *
- * 블록 정보 맵에서 해당 블록의 상태를 TRIMMED로 변경하고
- * trim 횟수를 증가시킨다.
+ * 블록 상태 머신(iolog.c):
+ *   UNINIT → 쓰기 후 WRITTEN → trim 후 TRIMMED → 재쓰기 후 WRITTEN_TRIMMED ...
+ * 이 함수는 TRIMMED 방향 전이만 처리. BLOCK_STATE_TRIM_FAILURE 이상이면 회수.
+ * 파라미터의 BLOCK_INFO_TRIMS 비트는 누적 trim 횟수.
+ *
+ * 호출 체인: account_io_completion (ddir==TRIM) → [이 함수].
  */
 static void trim_block_info(struct thread_data *td, struct io_u *io_u)
 {
@@ -3139,20 +3678,35 @@ static void trim_block_info(struct thread_data *td, struct io_u *io_u)
 	*info = BLOCK_INFO(BLOCK_STATE_TRIMMED, BLOCK_INFO_TRIMS(*info) + 1);
 }
 
-/* [한국어] I/O 완료 시 레이턴시/대역폭/IOPS 통계를 기록하는 함수.
+/* [한국어]
+ * account_io_completion - 완료된 io_u 의 lat/clat/bw/iops 샘플을 stat.c 에 전달.
  *
- * @td: 스레드 데이터
- * @io_u: 완료된 I/O 유닛
- * @icd: I/O 완료 데이터
- * @idx: 데이터 방향 인덱스
- * @bytes: 완료된 바이트 수
+ * @td: 잡 스레드(자식이면 부모로 전환 — 통계는 부모 집계).
+ * @io_u: 완료된 io_u.
+ * @icd: 배치 컨텍스트 (icd->time 이 완료 시각 기준점).
+ * @idx: 통계 방향 인덱스(READ/WRITE/TRIM/SYNC).
+ * @bytes: 실제 전송 바이트(xfer_buflen - resid).
  *
- * 다음 통계를 기록한다:
- * - lat (총 레이턴시): start_time ~ completion_time
- * - clat (완료 레이턴시): issue_time ~ completion_time
- * - bw (대역폭): 단위 시간당 전송량
- * - iops (초당 I/O 횟수)
- * - max_latency 초과 시 치명적 에러 처리
+ * 샘플 산출:
+ *   tnsec = ntime_since(start_time, icd->time)   → 총 lat (잡이 io_u 획득~완료)
+ *   llnsec = ntime_since(issue_time, icd->time)  → clat (제출~완료)
+ *   slat 는 별도로 io_u_queued() 에서 기록됨.
+ *
+ * 전파:
+ *   - add_lat_sample: ts.lat_* 히스토그램 누적.
+ *   - add_clat_sample: ts.clat_* 히스토그램.
+ *   - io_u_mark_latency: ts.io_u_lat_{n,u,m}sec 버킷.
+ *   - add_bw_sample/add_iops_sample: 윈도우 기반 rate 샘플(per_unit_log 조건).
+ *   - add_sync_clat_sample: ddir_sync 전용.
+ *   - trim_block_info: TRIM 전용.
+ *
+ * latency_target / max_latency 위반 검사:
+ *   - max_latency[idx] 초과 → lat_fatal → ETIMEDOUT 치명 에러.
+ *   - latency_target 초과 → lat_target_failed → percentile 100% 면 즉시 fatal.
+ *
+ * 통계 비활성(td->o.stats=0 또는 FIO_NOSTATS 엔진)이면 조기 리턴.
+ *
+ * 호출 체인: io_completed → [이 함수] (should_account 통과 시).
  */
 static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 				  struct io_completion_data *icd,
@@ -3225,14 +3779,17 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 		trim_block_info(td, io_u);
 }
 
-/* [한국어] 쓰기 완료 시 파일의 첫/마지막 쓰기 위치를 기록하는 함수.
+/* [한국어]
+ * file_log_write_comp - 쓰기 완료 시 파일의 dirty 범위(first_write..last_write) 확장.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @offset: 쓰기 오프셋
- * @bytes: 쓴 바이트 수
+ * @td: 잡 스레드(const).
+ * @f: 대상 파일.
+ * @offset/bytes: 방금 완료된 쓰기 범위.
  *
- * sync_file_range를 위해 dirty 범위를 추적한다.
+ * 용도: 다음 sync_file_range 호출(DDIR_SYNC_FILE_RANGE) 시 이 범위만 flush.
+ * 성공한 SYNC 후에는 first_write=last_write=-1ULL 로 리셋(io_completed 의 sync 경로).
+ *
+ * 호출 체인: io_completed (DDIR_WRITE 성공) → [이 함수].
  */
 static void file_log_write_comp(const struct thread_data *td, struct fio_file *f,
 				uint64_t offset, unsigned int bytes)
@@ -3248,12 +3805,16 @@ static void file_log_write_comp(const struct thread_data *td, struct fio_file *f
 		f->last_write = offset + bytes;
 }
 
-/* [한국어] I/O 통계를 기록해야 하는지 확인하는 함수.
+/* [한국어]
+ * should_account - 현재 통계 기록 조건 판정(ramp 완료 + RUNNING/VERIFYING 상태).
  *
- * @td: 스레드 데이터
- * @return: true=기록해야 함, false=아직 ramp 기간 또는 비활성 상태
+ * @td: 잡 스레드.
+ * @return: true=account_io_completion 호출 허용, false=무시(ramp 중 또는 잘못된 상태).
  *
- * ramp 기간이 끝나고 실행/검증 상태일 때만 통계를 기록한다.
+ * ramp_time 옵션이 활성이면 잡 시작 후 ramp_period 동안 통계 수집 안 함(워밍업).
+ * runstate 가 TD_RUNNING/TD_VERIFYING 이 아닌 상태(초기화/종료 중)도 무시.
+ *
+ * 호출 체인: io_completed → [이 함수] → account_io_completion 가드.
  */
 static bool should_account(struct thread_data *td)
 {
@@ -3261,23 +3822,54 @@ static bool should_account(struct thread_data *td)
 					   td->runstate == TD_VERIFYING);
 }
 
-/* [한국어] 단일 I/O 완료를 처리하는 핵심 내부 함수.
+/* [한국어]
+ * io_completed - ★ 핵심 ★ 단일 io_u 완료 처리: 상태 전이, 회계, verify 연계.
  *
- * @td: 스레드 데이터
- * @io_u_ptr: I/O 유닛 이중 포인터 (재큐잉 시 NULL로 설정될 수 있음)
- * @icd: I/O 완료 데이터
+ * @td: 잡 스레드 데이터.
+ * @io_u_ptr: io_u 이중 포인터. short I/O 재큐잉 시 requeue_io_u 가 *io_u_ptr=NULL로
+ *            바꿔 호출자(ios_completed/*_sync_complete)가 put_io_u를 건너뛰도록 한다.
+ *            end_io 콜백이 io_u를 교체할 수도 있어 이중 포인터.
+ * @icd: 배치 완료 데이터(nr/error/bytes_done[]/time). 이 함수는 icd->bytes_done[ddir]
+ *       에 완료 바이트 누적 + icd->error에 최초 에러 저장.
  *
- * I/O 완료 처리의 전체 흐름:
- * 1. FLIGHT 플래그 제거 및 inflight 캐시 무효화
- * 2. ZBD 쓰기 에러 복구 처리
- * 3. 검증(verify) 데이터 상태 업데이트
- * 4. sync 방향이면 통계 기록 후 반환
- * 5. read/write 완료:
- *    - short I/O(부분 완료) 감지 및 재큐잉
- *    - io_blocks, io_bytes 카운터 업데이트
- *    - 통계 기록
- *    - end_io 콜백 호출
- * 6. 에러 처리: 비치명적이면 에러 카운트 증가 후 계속
+ * io_u 상태 전이:
+ *   [in_flight (IO_U_F_FLIGHT set)] → io_completed →
+ *       성공+ddir_rw → [io_blocks++, io_bytes+=, ipo.flags clear(IP_F_IN_FLIGHT),
+ *                       account_io_completion, end_io 콜백, icd.bytes_done+=]
+ *                   → (상위에서 put_io_u → freelist)
+ *       성공+short → [xfer_buflen=resid, xfer_buf+=, offset+=, requeue_io_u]
+ *                   → (다음 do_io 이터레이션에서 나머지 발행)
+ *       성공+ddir_sync → [first_write=last_write=-1ULL, account_io_completion]
+ *       에러 → [td_non_fatal_error? 계속 : td_verror, icd.error=io_u->error]
+ *
+ * 주요 단계:
+ *   1. FLIGHT 상태 검증 후 IO_U_F_FLIGHT|BUSY_OK|PATTERN_DONE 3비트 동시 clear.
+ *   2. invalidate_inflight: offload overlap 추적 해제.
+ *   3. ZBD 쓰기 에러 복구(recover_zbd_write_error=1 + WRITE + !SYNCIO 조건).
+ *   4. verify 연계: io_u->ipo(io_piece) 가 있으면 에러는 unlog, 성공은
+ *      atomic_store_release(ipo->flags, ... & ~IP_F_IN_FLIGHT) — 메모리 배리어로
+ *      verify 스레드가 본 flags가 이전 쓰기 내용 "이후"를 보장.
+ *   5. ddir_sync 처리: dirty 범위 리셋 + account 후 조기 리턴.
+ *   6. read/write: resid != 0 면 short I/O → requeue(나머지 바이트 재발행).
+ *      bytes=xfer_buflen-resid 로 실제 전송량 계산.
+ *      io_blocks/io_bytes/this_io_blocks/this_io_bytes 각 업데이트 — this_io_*
+ *      는 현재 "런"(ramp 이후) 통계용, verify_list 플래그이면 this_io_* 누적 안 함.
+ *   7. DDIR_WRITE 시 file_log_write_comp로 first_write/last_write 범위 추적
+ *      (후속 sync_file_range 타겟용).
+ *   8. account_io_completion: lat/slat/clat/bw/iops 샘플 → stat.c.
+ *   9. io_u->end_io 콜백: verify_io_u_async 등. ret 값이 icd.error로 승격.
+ *  10. icd.error 처리: fatal이면 리턴, non-fatal이면 update_error_count+clear+continue.
+ *
+ * 실행 컨텍스트: 잡 스레드(sync 완료) 또는 잡 스레드(async 완료 수집).
+ * verify 스레드는 자체 io_completed를 호출.
+ *
+ * 호출 체인:
+ *   io_u_sync_complete → [이 함수] (1건 동기 완료)
+ *   ios_completed → [이 함수] (N건 비동기 완료 반복)
+ *   상위는 put_io_u로 freelist 반환.
+ *
+ * 에러 경로: icd->error가 세트되면 위의 update_error_count 호출 후 비치명이면
+ * 0으로 clear하여 루프 계속. 치명적이면 상위에서 td_verror → 잡 중단.
  */
 static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 			 struct io_completion_data *icd)
@@ -3411,13 +4003,25 @@ error:
 	}
 }
 
-/* [한국어] I/O 완료 데이터(icd)를 초기화하는 함수.
+/* [한국어]
+ * init_icd - io_completion_data(배치 컨텍스트) 필드 초기화.
  *
- * @td: 스레드 데이터
- * @icd: I/O 완료 데이터
- * @nr: 완료할 I/O 수
+ * @td: 잡 스레드.
+ * @icd: 초기화할 완료 컨텍스트(스택 할당이 일반적).
+ * @nr: 이 배치에서 처리할 완료 수.
  *
- * 현재 시각 기록, 에러 초기화, 바이트 카운터 초기화.
+ * 설정:
+ *   icd->time = 현재 시각 (gtod_reduce 미활성 시에만).
+ *   icd->nr = nr.
+ *   icd->error = 0.
+ *   icd->bytes_done[READ/WRITE/TRIM] = 0.
+ *
+ * icd->time 은 배치 내 모든 io_u 에 대해 같은 기준점을 사용 — 개별 io_u 마다
+ * gettime 호출 비용 회피.
+ *
+ * 호출 체인:
+ *   io_u_sync_complete → [이 함수] (nr=1)
+ *   io_u_queued_complete → [이 함수] (nr=getevents 반환값)
  */
 static void init_icd(struct thread_data *td, struct io_completion_data *icd,
 		     int nr)
@@ -3436,13 +4040,19 @@ static void init_icd(struct thread_data *td, struct io_completion_data *icd,
 		icd->bytes_done[ddir] = 0;
 }
 
-/* [한국어] 비동기 엔진에서 여러 I/O 완료를 처리하는 함수.
+/* [한국어]
+ * ios_completed - 비동기 완료 배치 N건을 엔진 event() → io_completed → put_io_u 순회.
  *
- * @td: 스레드 데이터
- * @icd: I/O 완료 데이터
+ * @td: 잡 스레드.
+ * @icd: init_icd 된 배치 컨텍스트.
  *
- * icd->nr 개수만큼 엔진의 event()로 완료된 io_u를 가져와
- * io_completed()로 처리한 후 put_io_u()로 반환한다.
+ * 루프: for i in 0..icd->nr-1 do
+ *   io_u = td->io_ops->event(td, i)  — 엔진별 i번째 완료 io_u 반환(libaio 는
+ *     aio_events[] 에서 꺼냄, io_uring 은 CQE 순회, posixaio 는 aio_error 확인 등).
+ *   io_completed(&io_u) — short I/O 면 io_u=NULL 로 세트될 수 있음.
+ *   io_u 유효하면 put_io_u 로 freelist 반환.
+ *
+ * 호출 체인: io_u_queued_complete → [이 함수].
  */
 static void ios_completed(struct thread_data *td,
 			  struct io_completion_data *icd)
@@ -3463,13 +4073,18 @@ static void ios_completed(struct thread_data *td,
 	}
 }
 
-/* [한국어] I/O 완료 후 bytes_done 카운터를 업데이트하는 함수.
+/* [한국어]
+ * io_u_update_bytes_done - 배치 완료 바이트를 td->bytes_done[] 에 누적.
  *
- * @td: 스레드 데이터
- * @icd: I/O 완료 데이터
+ * @td: 잡 스레드.
+ * @icd: 방금 처리한 배치 컨텍스트(bytes_done[ddir] 채워짐).
  *
- * 검증(verify) 모드에서는 bytes_verified를 업데이트하고,
- * 일반 모드에서는 bytes_done을 각 방향별로 업데이트한다.
+ * TD_VERIFYING 상태이면 READ 바이트를 bytes_verified 에 추가(verify 전용 집계).
+ * td_write 이면 그 시점에 조기 리턴(write 섞인 잡은 verify 중에도 write 바이트
+ * 누적을 bytes_done 에 반영 — 아래 루프 실행).
+ * 그 외에는 READ/WRITE/TRIM 각각 bytes_done 에 누적 — do_io 진행률 판정에 사용.
+ *
+ * 호출 체인: io_u_sync_complete/io_u_queued_complete → [이 함수].
  */
 static void io_u_update_bytes_done(struct thread_data *td,
 				   struct io_completion_data *icd)
@@ -3491,14 +4106,28 @@ static void io_u_update_bytes_done(struct thread_data *td,
 /*
  * Complete a single io_u for the sync engines.
  */
-/* [한국어] ★ 핵심 함수 ★ 동기 엔진용 단일 I/O 완료 처리 함수.
+/* [한국어]
+ * io_u_sync_complete - ★ 핵심 ★ 동기 엔진 1건 완료 처리.
  *
- * @td: 스레드 데이터
- * @io_u: 완료된 I/O 유닛
- * @return: 0=성공, -1=에러
+ * @td: 잡 스레드.
+ * @io_u: 방금 제출되자마자 완료된 io_u (FIO_Q_COMPLETED 반환 경로).
+ * @return: 0=성공, -1=치명적 에러(td_verror 로 에러 기록).
  *
- * 동기 I/O 엔진(sync, psync 등)에서 I/O 완료 후 호출된다.
- * icd 초기화 -> io_completed() -> put_io_u() -> bytes_done 업데이트
+ * 호출 시점: td_io_queue 가 FIO_Q_COMPLETED 를 반환한 직후 또는 SYNCIO 엔진의
+ * td_io_commit 내부에서. 완료된 io_u 가 1개 뿐이므로 icd.nr=1.
+ *
+ * 내부 흐름:
+ *   [FLIGHT io_u] → init_icd(1) → io_completed(큰 완료 로직 전체) → put_io_u →
+ *   bytes_done[ddir] 누적 → icd.error 면 -1.
+ *
+ * 호출 체인:
+ *   backend.c: do_io 루프에서 td_io_queue 반환값이 FIO_Q_COMPLETED 또는
+ *   ioengine에서 동기 완료 시 → [이 함수].
+ *
+ * 실행 컨텍스트: 잡 스레드.
+ *
+ * 에러 경로: icd.error 전파 → -1 반환 → do_io 루프에서 break_on_this_error
+ * 판정 후 잡 종료 여부 결정.
  */
 int io_u_sync_complete(struct thread_data *td, struct io_u *io_u)
 {
@@ -3527,15 +4156,38 @@ int io_u_sync_complete(struct thread_data *td, struct io_u *io_u)
 /*
  * Called to complete min_events number of io for the async engines.
  */
-/* [한국어] ★ 핵심 함수 ★ 비동기 엔진용 I/O 완료 처리 함수.
+/* [한국어]
+ * io_u_queued_complete - ★ 핵심 ★ 비동기 엔진 N건 완료 처리.
  *
- * @td: 스레드 데이터
- * @min_evts: 최소 완료 대기 이벤트 수 (0이면 논블로킹)
- * @return: 완료된 I/O 수 (양수) 또는 에러 (-1)
+ * @td: 잡 스레드.
+ * @min_evts: 최소 대기 완료 수. 0이면 논블로킹(timespec={0,0}).
+ * @return: 처리한 완료 수(>=0) 또는 -1(td_io_getevents 음수 반환 시).
  *
- * 비동기 I/O 엔진(libaio, io_uring 등)에서 완료 이벤트를 수집한다.
- * td_io_getevents()로 완료된 이벤트를 가져오고,
- * ios_completed()로 각각 처리한 후 bytes_done을 업데이트한다.
+ * 비동기 엔진(libaio/io_uring/posixaio/rdma/ime 등)에서 getevents 로 완료 배치를
+ * 한 번에 수확하고 io_completed 를 N회 돌려 "완료 회계"를 수행한다.
+ *
+ * 처리 순서:
+ *   1. min_evts 조정: 0 → 논블로킹 포인터(tvp). min_evts > cur_depth 면 클램프.
+ *   2. td_io_getevents(min=..., max=iodepth_batch_complete_max, tvp):
+ *      엔진별 syscall (io_getevents/io_uring_enter/aio_suspend/poll).
+ *      ret<0 → td_verror("td_io_getevents") 후 -1.
+ *      ret==0 → 즉시 0 반환 (논블로킹 경로에서 완료 없음).
+ *   3. init_icd(ret): icd.time=현재 시각(clat 기준점) 기록.
+ *   4. ios_completed: icd.nr 만큼 td->io_ops->event(i) 로 io_u 가져와
+ *      io_completed 반복, put_io_u 로 freelist 반환.
+ *   5. icd.error → td_verror → -1.
+ *   6. io_u_update_bytes_done: td->bytes_done[ddir] += icd.bytes_done[ddir].
+ *      verify 모드이면 bytes_verified 에 READ 누적.
+ *
+ * 실행 컨텍스트: 잡 스레드. 단, async verify 모드에서는 verify 스레드가 자체
+ * td로 이 함수 호출.
+ *
+ * 호출 체인:
+ *   backend.c: wait_for_completions → [이 함수]
+ *   do_io의 io_in_polling 경로, io_u_quiesce 경로도 사용.
+ *
+ * 에러 경로: ret<0(ENOMEM/EINVAL/EINTR 등) → td_verror. icd.error(I/O 자체 실패)
+ * → td_verror + -1. 둘 다 상위에서 break_on_this_error 판단.
  */
 int io_u_queued_complete(struct thread_data *td, int min_evts)
 {
@@ -3580,14 +4232,19 @@ int io_u_queued_complete(struct thread_data *td, int min_evts)
 /*
  * Call when io_u is really queued, to update the submission latency.
  */
-/* [한국어] ★ 핵심 함수 ★ I/O가 실제로 큐에 들어갔을 때 호출되는 함수.
+/* [한국어]
+ * io_u_queued - ★ 핵심 ★ td_io_queue 성공 시점에 slat(제출 지연) 샘플 기록.
  *
- * @td: 스레드 데이터
- * @io_u: 큐잉된 I/O 유닛
+ * @td: 잡 스레드(자식이면 부모로).
+ * @io_u: 방금 큐잉된 io_u (issue_time 이 td_io_queue 에서 fio_fill_issue_time 으로 세트됨).
  *
- * 제출 레이턴시(slat, submission latency)를 기록한다.
- * slat = io_u가 제출되기까지 걸린 시간 (start_time ~ issue_time).
- * ramp 기간이 끝나고 통계가 활성화된 경우에만 기록.
+ * slat = issue_time - start_time (io_u 획득 ~ 엔진 제출 직전).
+ * clat = completion_time - issue_time.
+ * lat  = completion_time - start_time.
+ *
+ * 조건: !disable_slat && ramp_period_over && td->o.stats.
+ *
+ * 호출 체인: ioengines.c td_io_queue → [이 함수] (FIO_Q_QUEUED 반환 직후).
  */
 void io_u_queued(struct thread_data *td, struct io_u *io_u)
 {
@@ -3602,19 +4259,24 @@ void io_u_queued(struct thread_data *td, struct io_u *io_u)
 /*
  * See if we should reuse the last seed, if dedupe is enabled
  */
-/* [한국어] 중복 제거(dedupe) 설정에 따라 버퍼 생성용 난수 상태를 결정하는 함수.
+/* [한국어]
+ * get_buf_state - dedupe_percentage/mode 에 따라 사용할 frand_state 결정 (중복 데이터 생성).
  *
- * @td: 스레드 데이터
- * @return: 사용할 난수 상태 포인터
+ * @td: 잡 스레드. buf_state/buf_state_prev/buf_state_ret/dedupe_working_set_states[].
+ * @return: 이번 채움에 사용할 난수 상태 포인터.
  *
- * dedupe_percentage에 따라:
- * - 0%: 항상 새 데이터 생성 (현재 상태 사용)
- * - 100%: 항상 같은 데이터 (이전 상태 복사 후 현재 상태 사용)
- * - 1-99%: 확률적으로 이전 데이터 재사용 또는 새 데이터 생성
+ * dedupe 개념: 같은 시드로 같은 데이터를 만들면 SSD/스토리지의 중복 제거 엔진이
+ * 한 번만 저장 → 실제 쓰기 바이트가 줄어 성능/공간 효과 관찰. FIO 는 dedupe
+ * 원본 비율을 사용자가 지정하면 그에 맞는 시드 패턴 재사용 전략 적용.
  *
- * dedupe_mode에 따라:
- * - REPEAT: 직전 데이터를 그대로 재사용
- * - WORKING_SET: 미리 정의된 고유 페이지 풀에서 랜덤 선택
+ * 분기:
+ *   dedupe_percentage=0 → buf_state (항상 새 데이터).
+ *   dedupe_percentage=100 → buf_state_prev 로 복사 후 buf_state 반환 (항상 동일).
+ *   1~99% + REPEAT 모드: 확률 적중 시 buf_state_prev 복사본 반환.
+ *   1~99% + WORKING_SET 모드: 사전 초기화된 working set 에서 랜덤 페이지 시드 선택.
+ *   확률 불적중 → buf_state (새 데이터).
+ *
+ * 호출 체인: fill_io_buffer → [이 함수] (compress_percentage || dedupe_percentage).
  */
 static struct frand_state *get_buf_state(struct thread_data *td)
 {
@@ -3659,12 +4321,18 @@ static struct frand_state *get_buf_state(struct thread_data *td)
 	return &td->buf_state;
 }
 
-/* [한국어] 버퍼 생성 후 난수 상태를 저장하는 함수.
+/* [한국어]
+ * save_buf_state - 버퍼 채움 후 frand 상태를 보존 — verify 패턴 재현 근거.
  *
- * @td: 스레드 데이터
- * @rs: 사용한 난수 상태 포인터
+ * @td: 잡 스레드.
+ * @rs: 방금 fill_random_buf 에 사용된 상태 포인터.
  *
- * 다음 dedupe 판단을 위해 현재 상태를 이전 상태로 복사.
+ * 로직:
+ *   dedupe_percentage=100 → rs 자리를 buf_state_prev 로 되돌림(REPEAT 보장).
+ *   그 외 rs == &td->buf_state → buf_state_prev 에 복사 (다음 REPEAT 분기 준비).
+ *   이 메커니즘이 verify 경로에서도 "같은 시드로 같은 패턴" 재생성하도록 한다.
+ *
+ * 호출 체인: fill_io_buffer → [이 함수].
  */
 static void save_buf_state(struct thread_data *td, struct frand_state *rs)
 {
@@ -3676,18 +4344,28 @@ static void save_buf_state(struct thread_data *td, struct frand_state *rs)
 		frand_copy(&td->buf_state_prev, rs);
 }
 
-/* [한국어] I/O 버퍼를 데이터로 채우는 함수.
+/* [한국어]
+ * fill_io_buffer - 쓰기 버퍼를 정책에 맞춰 채움(compress/dedupe/pattern/zero/random).
  *
- * @td: 스레드 데이터
- * @buf: 채울 버퍼 포인터
- * @min_write: 최소 쓰기 크기
- * @max_bs: 최대 블록 크기 (채울 전체 크기)
+ * @td: 잡 스레드.
+ * @buf: 채울 버퍼 시작 주소.
+ * @min_write: 최소 쓰기 단위(compress_chunk 경계 계산).
+ * @max_bs: 채울 전체 크기(바이트).
  *
- * 버퍼 채우기 우선순위:
- * 1. compress/dedupe 설정 시: 압축률에 맞는 혼합 패턴 생성
- * 2. buffer_pattern 설정 시: 지정된 패턴으로 채우기
- * 3. zero_buffers 설정 시: 0으로 채우기
- * 4. 기본: 랜덤 데이터로 채우기
+ * 우선순위(가장 먼저 매칭되는 정책 사용):
+ *  1) compress_percentage || dedupe_percentage → 청크 루프 +
+ *     fill_random_buf_percentage (perc% 는 압축 가능 패턴, 나머지는 랜덤).
+ *     get_buf_state/save_buf_state 로 dedupe 시드 재사용.
+ *  2) buffer_pattern_bytes > 0 → fill_buffer_pattern (사용자 지정 바이트열 반복).
+ *  3) zero_buffers → memset(0).
+ *  4) 기본 → fill_random_buf (Tausworthe 기반 랜덤).
+ *
+ * 예외: mem_type=CUDA_MALLOC 이면 호스트에서 채울 수 없어 no-op (libcufile 엔진이
+ * GPU 쪽에서 별도 초기화).
+ *
+ * 호출 체인:
+ *   io_u_fill_buffer → [이 함수] (REFILL_BUFFERS 세트 시 get_io_u 경로)
+ *   init_io_u_buffers (backend.c 초기화) → [이 함수]
  */
 void fill_io_buffer(struct thread_data *td, void *buf, unsigned long long min_write,
 		    unsigned long long max_bs)
@@ -3748,14 +4426,21 @@ void fill_io_buffer(struct thread_data *td, void *buf, unsigned long long min_wr
 /*
  * "randomly" fill the buffer contents
  */
-/* [한국어] io_u의 버퍼를 데이터로 채우는 래퍼 함수.
+/* [한국어]
+ * io_u_fill_buffer - io_u 별 버퍼 채움 래퍼 + buf_filled_len 리셋.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @min_write: 최소 쓰기 크기
- * @max_bs: 최대 블록 크기
+ * @td: 잡 스레드.
+ * @io_u: 대상 I/O 유닛 (io_u->buf 에 채움).
+ * @min_write/max_bs: fill_io_buffer 로 전달.
  *
- * buf_filled_len을 초기화하고 fill_io_buffer()를 호출한다.
+ * buf_filled_len=0 리셋: 이 필드는 "현재 버퍼에 채워진 바이트 수"를 기억해
+ * 다음 write 에서 같은 크기면 재채움 생략하는 최적화용. 여기서 리셋하면
+ * 호출 직후 fill_io_buffer 가 전체 채움을 수행한다.
+ *
+ * 호출 체인:
+ *   get_io_u (TD_F_REFILL_BUFFERS) → [이 함수]
+ *   backend.c init_io_u_buffers (잡 초기화) → [이 함수]
+ *   verify.c 의 verify 버퍼 준비 경로.
  */
 void io_u_fill_buffer(struct thread_data *td, struct io_u *io_u,
 		      unsigned long long min_write, unsigned long long max_bs)
@@ -3764,14 +4449,20 @@ void io_u_fill_buffer(struct thread_data *td, struct io_u *io_u,
 	fill_io_buffer(td, io_u->buf, min_write, max_bs);
 }
 
-/* [한국어] sync_file_range 시스템 콜을 수행하는 내부 함수.
+/* [한국어]
+ * do_sync_file_range - file_log_write_comp 가 추적한 dirty 범위만 부분 sync.
  *
- * @td: 스레드 데이터
- * @f: 파일 구조체
- * @return: sync_file_range()의 반환값
+ * @td: 잡 스레드(const). td->o.sync_file_range 가 SYNC_FILE_RANGE_* 플래그 비트.
+ * @f: 대상 파일. first_write..last_write 가 전 마지막 SYNC 이후 쓴 범위.
+ * @return: sync_file_range(2) 반환값 (성공 0 / 실패 -1/errno).
  *
- * 파일의 dirty 범위(first_write ~ last_write)에 대해
- * sync_file_range()를 호출하여 부분 동기화한다.
+ * Linux sync_file_range(fd, offset, nbytes, flags) 플래그:
+ *   SYNC_FILE_RANGE_WAIT_BEFORE (1): 시작 전 기존 쓰기 완료 대기.
+ *   SYNC_FILE_RANGE_WRITE (2): 쓰기 시작.
+ *   SYNC_FILE_RANGE_WAIT_AFTER (4): 완료 대기.
+ * fsync 와 달리 inode 메타데이터는 동기화 안 함.
+ *
+ * 호출 체인: do_io_u_sync (DDIR_SYNC_FILE_RANGE) → [이 함수].
  */
 static int do_sync_file_range(const struct thread_data *td,
 			      struct fio_file *f)
@@ -3787,17 +4478,24 @@ static int do_sync_file_range(const struct thread_data *td,
 	return sync_file_range(f->fd, offset, nbytes, td->o.sync_file_range);
 }
 
-/* [한국어] 동기화(sync) I/O를 수행하는 함수.
+/* [한국어]
+ * do_io_u_sync - ddir 에 따라 적절한 sync 계열 syscall 디스패치.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛 (ddir이 SYNC/DATASYNC/SYNC_FILE_RANGE/SYNCFS 중 하나)
- * @return: 성공 시 0 이상, 실패 시 음수
+ * @td: 잡 스레드(const).
+ * @io_u: DDIR_SYNC/DATASYNC/SYNC_FILE_RANGE/SYNCFS 중 하나.
+ * @return: syscall 반환값(0 또는 바이트 수). 음수면 io_u->error=errno 세트.
  *
- * io_u->ddir에 따라 적절한 동기화 시스템 콜을 호출:
- * - DDIR_SYNC: fsync() (macOS에서는 fcntl F_FULLFSYNC)
- * - DDIR_DATASYNC: fdatasync()
- * - DDIR_SYNC_FILE_RANGE: sync_file_range()
- * - DDIR_SYNCFS: syncfs()
+ * 분기:
+ *   DDIR_SYNC:
+ *     CONFIG_FCNTL_SYNC → fcntl(fd, F_FULLFSYNC) [macOS: 실제 디스크 물리 플러시]
+ *     그 외 → fsync(fd) [Linux: VFS 레이어까지 완전 동기]
+ *   DDIR_DATASYNC:
+ *     CONFIG_FDATASYNC → fdatasync(fd) [메타데이터 제외 데이터만 동기]
+ *     아니면 xfer_buflen 돌려주고 EINVAL(실제 I/O 는 수행 안 함, 통계상 건너뜀).
+ *   DDIR_SYNC_FILE_RANGE → do_sync_file_range(부분 동기).
+ *   DDIR_SYNCFS → syncfs(fd) [파일시스템 전체 동기 — Linux only].
+ *
+ * 호출 체인: engines/sync.c, engines/libaio.c (SYNCIO 폴백) 등 → [이 함수].
  */
 int do_io_u_sync(const struct thread_data *td, struct io_u *io_u)
 {
@@ -3831,16 +4529,21 @@ int do_io_u_sync(const struct thread_data *td, struct io_u *io_u)
 	return ret;
 }
 
-/* [한국어] trim I/O를 수행하는 함수.
+/* [한국어]
+ * do_io_u_trim - TRIM(BLKDISCARD/ FALLOC_PUNCH_HOLE) I/O 수행.
  *
- * @td: 스레드 데이터
- * @io_u: I/O 유닛
- * @return: 성공 시 xfer_buflen (trim된 바이트), 실패 시 0
+ * @td: 잡 스레드.
+ * @io_u: DDIR_TRIM io_u (offset/xfer_buflen 이 trim 범위).
+ * @return: 성공 시 trim 바이트 수(io_u->xfer_buflen), 실패 시 0 + io_u->error.
  *
- * ZBD 모드에서는 zbd_do_io_u_trim()을 먼저 시도하고,
- * 일반 모드에서는 os_trim()으로 파일의 지정된 범위를 trim한다.
- * trim은 SSD 등에서 더 이상 사용하지 않는 블록을 해제하여
- * 성능을 유지하는 데 사용된다.
+ * ZBD 모드: zbd_do_io_u_trim 이 먼저 처리 — ZNS 의 reset_wp 를 trim 의미로 사용.
+ *   io_u_completed 반환 시 즉시 완료로 처리(xfer_buflen 반환).
+ * 일반 모드: os_trim (os/os-linux.h 의 BLKDISCARD ioctl 또는 fallocate
+ *   PUNCH_HOLE|KEEP_SIZE — 파일 종류에 따라 os.c 에서 자동 분기).
+ *
+ * FIO_HAVE_TRIM 미정의 플랫폼(windows/solaris 일부) → EINVAL.
+ *
+ * 호출 체인: engines/sync.c 의 fio_io_end, libaio 의 DDIR_TRIM 동기 폴백 등.
  */
 int do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 {
