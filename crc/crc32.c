@@ -16,32 +16,52 @@
    Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.  */
 
 /*
- * [한국어 설명] CRC-32 체크섬 구현 (crc32.c)
+ * [한국어 설명] POSIX.2 표준 CRC-32 구현 — 다항식 0x04C11DB7(big-endian) (crc32.c)
  *
  * === 파일의 역할 ===
- * POSIX.2 표준 CRC-32 체크섬을 계산하는 함수를 구현한다.
- * 256개 항목의 룩업 테이블을 사용하여 바이트 단위로 빠르게 CRC를 계산한다.
- * 다항식: 0x04C11DB7 (이더넷, PKZIP, gzip 등에서 사용하는 표준 CRC-32)
+ * POSIX.2 `cksum` 호환 형태의 "non-reflected" CRC-32 를 소프트웨어로 계산한다.
+ * 생성 다항식은 0x04C11DB7(이더넷/PKZIP/gzip 과 동일한 generator, 본 구현은
+ * 반전하지 않은 MSB-first 형태)이며, 초기값 0, 최종 XOR 없음.
+ * 런타임 경로는 단 하나 — 256엔트리 룩업 테이블 `crctab[]`과 while 루프.
+ * 하드웨어 가속 버전은 없다(CRC-32C 와 혼동 주의: 하드웨어 CRC32 명령은 Castagnoli
+ * 다항식을 쓰며, 본 파일과는 다른 결과를 낸다).
  *
  * === 전체 아키텍처에서의 위치 ===
- * fio의 verify 기능에서 CRC-32 체크섬 옵션이 선택되었을 때 호출된다.
- * CRC-32C(Castagnoli)와 달리 하드웨어 가속이 없는 순수 소프트웨어 구현이다.
- * 호출 체인: verify.c → fio_crc32() → crctab[] 룩업 테이블 참조
+ * fio verify 경로의 VERIFY_CRC32 공급자.
+ * 쓰기 시 fill_crc32(verify.c) → fio_crc32() [이 파일]이 verify_header.v_crc32 (4B)를
+ * 채우고, 읽기 시 verify_io_u_crc32()가 재계산 후 비교. CRC-32C 는 별도 경로
+ * (crc32c.c + crc32c-intel.c + crc32c-arm64.c + fio_crc32c 인라인 디스패치)이며,
+ * 본 함수는 순수 POSIX CRC-32 옵션에서만 선택된다.
+ * 호출 체인:
+ *   verify.c::fill_crc32/verify_io_u_crc32 → [fio_crc32] → crctab[] 참조
+ *   crc/test.c::t_crc32 → [fio_crc32]
  *
  * === 타 모듈과의 연결 ===
- * - verify.c: verify=crc32 옵션 시 이 함수를 호출하여 데이터 무결성 검증
- * - crc/test.c: 벤치마크 테스트에서 성능 측정
- * - crc32c.c: 다른 다항식(Castagnoli)을 사용하는 별도 CRC-32 구현
+ * - crc32.h: fio_crc32() 프로토타입과 (부가) `uint32_t` 타입 재노출.
+ * - verify.c: verify=crc32 옵션이 선택되면 fill_crc32/verify_io_u_crc32 에서 호출.
+ * - crc/test.c: --crctest 벤치마크의 t_crc32 래퍼.
+ * - crc32c.c / crc32c-intel.c / crc32c-arm64.c: 혼동 방지 — 그쪽은 Castagnoli 다항식.
+ * 데이터 흐름: 쓰기 버퍼 → fio_crc32(초기 0) → verify_header.v_crc32 (4B).
+ * 동기화: 순수 계산 함수 — 재진입 안전. crctab[] 은 읽기 전용 상수.
  *
  * === 주요 함수 요약 ===
- * - fio_crc32(): 버퍼 데이터의 CRC-32 체크섬을 계산하여 반환
+ * - crctab[256]: 다항식 0x04C11DB7 로부터 생성된 MSB-first(non-reflected) 상수 테이블.
+ * - fio_crc32(buffer, length): 초기값 0에서 시작해 바이트 단위로 CRC 갱신 후 반환.
+ *   최종 XOR(~crc) 적용 없음 — 호출자가 필요하면 스스로 수행.
  */
 #include "crc32.h"
+/* [한국어] crc32.h: fio_crc32() 프로토타입과 uint32_t 타입 재노출.
+ * verify.c / crc/test.c 가 동일 헤더로 ABI 공유. */
 
 /*
- * [한국어] CRC-32 룩업 테이블 (256개 항목)
- * 다항식 0x04C11DB7로부터 미리 계산된 테이블이다.
- * 바이트 단위 처리 시 비트별 연산 대신 테이블 참조로 고속 계산이 가능하다.
+ * [한국어] CRC-32 룩업 테이블 (256개 × 4B = 1024B 상수).
+ * 설정자: 컴파일타임 하드코딩. 다항식 0x04C11DB7 의 MSB-first(반사 없음) 분할 결과.
+ * 읽는 자: 본 파일의 fio_crc32() 루프만(static 으로 외부 노출 차단).
+ * 값 범위: 엔트리 각 uint32_t 전체 범위. table[0]==0 고정(단위원).
+ * 동기화: .rodata 상주 — 락 없이 모든 스레드 공유 가능.
+ *
+ * 본 테이블 덕분에 런타임은 비트별 8회 shift/xor 대신 "XOR 1 + 시프트 1 + 테이블 조회 1"
+ * 로 바이트 한 개분 CRC 를 갱신한다 — 약 8배 가속.
  */
 static const uint32_t crctab[256] = {
   0x0,
@@ -100,27 +120,43 @@ static const uint32_t crctab[256] = {
 
 /*
  * [한국어]
- * fio_crc32 - 버퍼 데이터의 CRC-32 체크섬 계산
+ * fio_crc32 - 버퍼의 POSIX.2 CRC-32 체크섬 계산
  *
- * @buffer: CRC를 계산할 데이터 버퍼 포인터
- * @length: 데이터 길이(바이트)
- * @return: 계산된 32비트 CRC 체크섬 값
+ * @buffer: 바이트 데이터 포인터.
+ * @length: 길이(바이트, unsigned long — 대용량 버퍼도 한 번에 처리 가능).
+ * @return: 32비트 CRC. 최종 반전(~) 적용 없음(일부 CRC-32 표준은 최종 XOR 0xFFFFFFFF
+ *          을 요구하는데, 본 함수는 호출자에게 위임).
  *
- * 바이트 단위로 룩업 테이블을 참조하여 CRC-32를 계산한다.
- * 알고리즘: CRC를 8비트 좌측 시프트하고, (CRC 상위 8비트 ^ 현재 바이트)를
- * 테이블 인덱스로 사용하여 XOR 연산한다.
- * 초기값 0에서 시작하며, 최종 XOR 반전(~)은 수행하지 않는다.
+ * 알고리즘(non-reflected):
+ *   crc <<= 8 로 CRC 를 상위로 밀고,
+ *   (crc >> 24) 로 곧 버려질 최상위 바이트를 추출해 입력 바이트와 XOR 해 인덱스 생성,
+ *   crctab[index] 와 XOR 하여 다항식 분할 한 바이트 분을 완료.
+ *
+ * 실행 컨텍스트: 잡/verify 스레드, 재진입 안전. 전역 상태 없음.
  *
  * 호출 체인:
- *   verify.c / crc/test.c → [fio_crc32] → crctab[] 참조
+ *   verify.c::fill_crc32/verify_io_u_crc32 → [fio_crc32] → crctab[]
+ *   crc/test.c::t_crc32 → [fio_crc32]
  */
 uint32_t fio_crc32(const void *buffer, unsigned long length)
 {
+	/* [한국어] void* 를 바이트 포인터로 재해석 — 포인터 산술(cp++)과 역참조(*cp)용. */
 	const unsigned char *cp = (const unsigned char *) buffer;
+	/* [한국어] CRC-32 누적 레지스터. 초기값 0(POSIX.2). */
 	uint32_t crc = 0;
 
+	/* [한국어] length 후위 감소로 정확히 length 회 반복. length==0 이면 초기 CRC 그대로 반환. */
 	while (length--)
+		/* [한국어] 한 바이트분 다항식 분할:
+		 *   (crc >> 24)        — 곧 밖으로 밀려날 최상위 8비트를 하위로 이동.
+		 *   ^ *(cp++)          — 이번 입력 바이트와 XOR 로 테이블 인덱스 8비트 생성,
+		 *                        cp 를 다음 바이트로 진행.
+		 *   & 0xFF             — 8비트로 마스킹(이미 상위는 비어 있지만 방어적).
+		 *   crctab[...]         — 다항식에 의한 16단 분할 결과.
+		 *   (crc << 8) ^ ...    — CRC 를 한 바이트 위로 밀어 하위 8비트 공간을 만든 뒤
+		 *                        테이블 값과 XOR 하여 누적. */
 		crc = (crc << 8) ^ crctab[((crc >> 24) ^ *(cp++)) & 0xFF];
 
+	/* [한국어] 누적된 32비트 CRC 반환 — verify_header 나 벤치마크 누적기에 저장. */
 	return crc;
 }

@@ -25,48 +25,86 @@
  */
 
 /*
- * [한국어 설명] T10-DIF CRC-16 구현 (crct10dif_common.c)
+ * [한국어 설명] T10 DIF CRC-16 구현 (crct10dif_common.c)
  *
  * === 파일의 역할 ===
- * T10 DIF(Data Integrity Field) CRC-16을 구현한다.
- * CONFIG_LIBISAL 정의 시 Intel ISA-L 라이브러리의 crc16_t10dif()로 가속하고,
- * 미정의 시 소프트웨어 테이블 룩업 방식으로 계산한다.
- * 다항식: x^16 + x^15 + x^11 + x^9 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1 (0x8BB7)
+ * SCSI T10 DIF(Data Integrity Field) 규약의 16비트 Guard CRC를 구현한다.
+ * 사용 다항식: x^16 + x^15 + x^11 + x^9 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
+ * (=0x8BB7, reflected 아님, NVMe/SCSI PI Type1/2 Guard 필드와 동일).
+ * 본 파일은 두 백엔드를 제공한다:
+ *   1) CONFIG_LIBISAL 정의 시: Intel ISA-L 라이브러리의 crc16_t10dif() 로
+ *      PCLMULQDQ 하드웨어 가속을 위임(SSE4.2/AVX 급 CPU 에서 수 GB/s 달성).
+ *   2) 미정의 시: 256엔트리 룩업 테이블 기반 소프트웨어 구현.
+ * 초기값은 호출자가 지정(일반적으로 0, 또는 이어붙이기 시 직전 CRC).
  *
  * === 전체 아키텍처에서의 위치 ===
- * SCSI T10 표준의 DIF/DIX 프로토콜에서 512바이트 섹터마다 CRC를 부착한다.
- * fio에서는 이 CRC를 데이터 검증 옵션으로 사용할 수 있다.
- * 호출 체인: verify.c → fio_crc_t10dif() [이 파일]
+ * fio 의 verify 에서는 NVMe/SCSI PI 필드를 흉내내는 데이터 무결성 CRC로 사용된다.
+ * 특히 PI Type1/2 에서 512/4096B 섹터마다 2B Guard + 2B AppTag + 4B RefTag 형태의
+ * 8B/16B PI 필드가 부착되는데, 그 중 Guard 가 바로 T10 DIF CRC-16.
+ * xnvme/sg/io_uring_cmd 엔진이 PI를 활성화하면 컨트롤러가 CRC 를 자동 생성/검증하지만,
+ * fio 가 소프트웨어로 비교할 때는 이 함수를 호출한다.
+ * 호출 체인: verify.c / xnvme·sg 검증 경로 → [fio_crc_t10dif]
+ *            → (ISA-L 있으면) crc16_t10dif() / (없으면) 테이블 루프.
  *
  * === 타 모듈과의 연결 ===
- * - crc-t10dif.h: 인터페이스 정의
- * - verify.c: verify=crc-t10dif 옵션 시 호출
- * - ISA-L 라이브러리: CONFIG_LIBISAL 정의 시 하드웨어 가속 사용
+ * - crc-t10dif.h: fio_crc_t10dif() 프로토타입(초기 crc 입력을 받는 증분 API).
+ * - isa-l/crc.h (CONFIG_LIBISAL 시): crc16_t10dif() 공급 — 내부에 PCLMULQDQ 가속 루프.
+ * - verify.c: T10 DIF 검증 옵션이 활성화되면 호출.
+ * 데이터 흐름: 호출자 crc(초기 0) → fio_crc_t10dif → 갱신 CRC 반환 → 다음 섹터에 재투입 가능.
+ * 동기화: 순수 계산·테이블 read-only — 재진입 안전.
  *
  * === 주요 함수 요약 ===
- * - fio_crc_t10dif(): T10-DIF CRC-16 계산 (시드값을 받아 증분 계산 가능)
+ * - fio_crc_t10dif(crc, buffer, len): 증분 CRC-16 T10 DIF 계산. 반환값을 다음 호출의
+ *   crc 입력으로 전달하면 여러 세그먼트를 이어서 해시할 수 있다.
+ * - t10_dif_crc_table[256]: (ISA-L 미사용 경로용) 다항식 0x8BB7로 생성된 룩업 테이블.
  */
 
-/* [한국어] CONFIG_LIBISAL 정의 시: Intel ISA-L 라이브러리의 하드웨어 가속 CRC 사용 */
+/* [한국어] 빌드 분기: ISA-L(Intel Intelligent Storage Acceleration Library) 가 있으면
+ * PCLMULQDQ 가속 경로로 위임, 없으면 테이블 기반 소프트 루프. configure 단계에서
+ * `--enable-libisal` 또는 자동 검출 시 -DCONFIG_LIBISAL 이 정의되고, -lisal 링크가 추가된다. */
 #ifdef CONFIG_LIBISAL
 #include <isa-l/crc.h>
+/* [한국어] isa-l/crc.h: ISA-L 의 CRC 공공 API(crc16_t10dif, crc32_iscsi, crc64_* 등)
+ * 프로토타입을 제공. crc16_t10dif 는 내부에 PCLMULQDQ reduce-by-16 루프를 포함해
+ * 단일 패스로 수 GB/s 처리량을 낸다. */
 
+/*
+ * [한국어]
+ * fio_crc_t10dif - T10 DIF CRC-16 계산(ISA-L 가속 위임 버전)
+ *
+ * @crc:    현재까지 누적된 16비트 CRC 값(새 계산은 0, 이어붙이기는 직전 반환값).
+ * @buffer: 입력 데이터 포인터(바이트 스트림). 정렬 요건은 ISA-L 내부에서 처리.
+ * @len:    데이터 길이(바이트).
+ * @return: 갱신된 16비트 CRC.
+ *
+ * 본 경로는 얇은 래퍼 — 모든 실연산은 ISA-L 의 crc16_t10dif 가 담당하며,
+ * 해당 함수는 CPU 기능을 런타임에 자동 감지(AVX/AVX2/AVX-512)해 최적 경로를 선택.
+ *
+ * 호출 체인: verify.c → [fio_crc_t10dif] → isa-l::crc16_t10dif
+ */
 extern unsigned short fio_crc_t10dif(unsigned short crc,
 				     const unsigned char *buffer,
 				     unsigned int len)
 {
+	/* [한국어] ISA-L 하드웨어 가속 경로로 단순 위임. 내부는 PCLMULQDQ reduce-by-N 루프. */
 	return crc16_t10dif(crc, buffer, len);
 }
 
-/* [한국어] CONFIG_LIBISAL 미정의 시: 소프트웨어 테이블 룩업 방식 사용 */
+/* [한국어] CONFIG_LIBISAL 미정의 시: 테이블 기반 소프트웨어 구현을 사용한다. */
 #else
 #include "crc-t10dif.h"
+/* [한국어] crc-t10dif.h: fio_crc_t10dif() 프로토타입 제공. 테이블은 본 파일 내부 static.
+ * verify.c 등 호출자는 이 헤더만 포함하면 되며 구현 분기는 build-time 에 숨겨짐. */
 
 /* Table generated using the following polynomium:
  * x^16 + x^15 + x^11 + x^9 + x^8 + x^7 + x^5 + x^4 + x^2 + x + 1
  * gt: 0x8bb7
  */
-/* [한국어] T10-DIF CRC-16 룩업 테이블: 다항식 0x8BB7로부터 생성된 256개 항목 */
+/* [한국어] T10 DIF CRC-16 룩업 테이블(다항식 0x8BB7).
+ * 설정자: 컴파일타임 하드코딩 상수.
+ * 읽는 자: 하단 fio_crc_t10dif() 루프만.
+ * 값 범위: 엔트리 각 16비트, 256개(=512B). 본 파일 내부 static 으로 외부 노출 없음.
+ * 동기화: .rodata 상주 — 락 불필요. */
 static const unsigned short t10_dif_crc_table[256] = {
 	0x0000, 0x8BB7, 0x9CD9, 0x176E, 0xB205, 0x39B2, 0x2EDC, 0xA56B,
 	0xEFBD, 0x640A, 0x7364, 0xF8D3, 0x5DB8, 0xD60F, 0xC161, 0x4AD6,
@@ -102,16 +140,41 @@ static const unsigned short t10_dif_crc_table[256] = {
 	0xF0D8, 0x7B6F, 0x6C01, 0xE7B6, 0x42DD, 0xC96A, 0xDE04, 0x55B3
 };
 
+/*
+ * [한국어]
+ * fio_crc_t10dif - T10 DIF CRC-16 계산(소프트웨어 테이블 경로)
+ *
+ * @crc:    입력 CRC(새 계산은 0, 증분이면 직전 반환값).
+ * @buffer: 바이트 데이터 포인터.
+ * @len:    바이트 길이.
+ * @return: 갱신된 16비트 CRC.
+ *
+ * 알고리즘: 표준 CRC-16 반사 없는 폼(big-endian).
+ *   crc = (crc << 8) ^ t10_dif_crc_table[((crc >> 8) ^ buffer[i]) & 0xff]
+ * 매 반복마다 CRC 상위 8비트와 입력 바이트 XOR 해 테이블 인덱스 생성, CRC를 8비트
+ * 좌시프트 후 테이블 결과와 XOR. 이렇게 하면 한 바이트 분의 다항식 분할을
+ * 한 번에 해결한다.
+ *
+ * 호출 체인: verify.c / xnvme·sg PI 검증 → [fio_crc_t10dif] → t10_dif_crc_table[]
+ */
 extern unsigned short fio_crc_t10dif(unsigned short crc,
 				     const unsigned char *buffer,
 				     unsigned int len)
 {
+	/* [한국어] 반복 인덱스 — 루프 카운트 시작. unsigned int 로 선언되어 len 과 타입 일치. */
 	unsigned int i;
 
+	/* [한국어] 바이트 단위로 len 회 순회 — reflected 가 아니므로 "상위 8비트" 방식. */
 	for (i = 0 ; i < len ; i++)
+		/* [한국어] (crc >> 8) 로 상위 바이트를 하위로 가져오고 입력 바이트와 XOR 해
+		 * 0~255 인덱스를 만들어 테이블에서 16비트 잔여(synchroeffect)를 얻는다.
+		 * crc << 8 은 현 CRC 를 한 바이트 위로 밀어 새 입력 공간을 확보. 마지막 XOR 로
+		 * 8비트 분 다항식 분할 완료. */
 		crc = (crc << 8) ^ t10_dif_crc_table[((crc >> 8) ^ buffer[i]) & 0xff];
 
+	/* [한국어] 누적된 CRC 반환. 호출자는 PI Guard 필드(2B)에 기록하거나 비교. */
 	return crc;
 }
 
 #endif
+/* [한국어] CONFIG_LIBISAL 분기 종료. 두 경로 중 하나만 컴파일되어 링크에 참여. */

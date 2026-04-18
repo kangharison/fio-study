@@ -31,26 +31,38 @@
  *
  */
 /*
- * [한국어 설명] CRC-32C 소프트웨어 구현 (crc32c.c)
+ * [한국어 설명] CRC-32C(Castagnoli) 소프트웨어 폴백 구현 (crc32c.c)
  *
  * === 파일의 역할 ===
- * CRC-32C(Castagnoli) 체크섬의 소프트웨어 구현을 제공한다.
- * Castagnoli 다항식 0x1EDC6F41을 사용하며, iSCSI 드라이버에서 유래했다.
- * 이 구현은 하드웨어 가속(SSE4.2/ARM CRC)을 사용할 수 없을 때의 폴백이다.
+ * Castagnoli 다항식 0x1EDC6F41(reflected 0x82F63B78) 의 CRC-32C 를 256엔트리
+ * 룩업 테이블 기반 reflected 루프로 계산한다. iSCSI/SCTP/Btrfs 등 표준이며,
+ * Guy Castagnoli 의 논문(1993)과 linux-iscsi.c 에 기반. fio_crc32c() 인라인
+ * 디스패처(crc32c.h)가 `crc32c_intel_available`, `crc32c_arm64_available` 둘 다
+ * false 일 때만 본 `crc32c_sw()` 를 호출한다(폴백). 초기값 ~0, 최종 XOR 없음.
  *
  * === 전체 아키텍처에서의 위치 ===
- * fio_crc32c() 인라인 함수에서 하드웨어 가속이 불가능할 때 호출된다.
- * 호출 체인: verify.c → fio_crc32c() [crc32c.h] → crc32c_sw() [이 파일]
+ * fio verify 의 VERIFY_CRC32C 경로에서 x86/ARM 하드웨어 확장이 없는 환경
+ * (구형 CPU·크로스 컴파일·PowerPC/RISC-V 등)의 기본 백엔드.
+ * 호출 체인:
+ *   verify.c::fill_crc32c/verify_io_u_crc32c → fio_crc32c() [crc32c.h]
+ *     → (hw 미지원 시) [crc32c_sw] → crc32c_table[]
  *
  * === 타 모듈과의 연결 ===
- * - crc32c.h: 인터페이스 정의와 자동 디스패치 함수 fio_crc32c()
- * - crc32c-intel.c: Intel SSE4.2 하드웨어 가속 대안
- * - crc32c-arm64.c: ARM64 CRC 하드웨어 가속 대안
+ * - crc32c.h: fio_crc32c() 인라인 디스패처 — crc32c_intel_available ||
+ *   crc32c_arm64_available 를 보고 hw/sw 경로 선택.
+ * - crc32c-intel.c: x86 SSE4.2 CRC32 명령 경로.
+ * - crc32c-arm64.c: ARM CRC 확장 + PMULL 경로.
+ * - verify.c / crc/test.c: 호출자.
+ * 데이터 흐름: 쓰기버퍼 → crc32c_sw(초기 ~0) → 32비트 CRC → verify_header.v_crc32c (4B).
+ * 동기화: 순수 계산·const 테이블 — 재진입 안전.
  *
  * === 주요 함수 요약 ===
- * - crc32c_sw(): 테이블 기반 소프트웨어 CRC-32C 계산
+ * - crc32c_table[256]: reflected Castagnoli 룩업 테이블(상수 1024B).
+ * - crc32c_sw(data, length): ~0 초기값, bit-reflected 방식 바이트 단위 루프.
  */
 #include "crc32c.h"
+/* [한국어] crc32c.h: fio_crc32c() 디스패처·crc32c_sw/intel/arm64 프로토타입·
+ * crc32c_*_available 전역 extern 을 공급. 본 파일은 crc32c_sw() 만 정의. */
 
 /*
  * This is the CRC-32C table
@@ -62,10 +74,15 @@
  */
 
 /*
- * [한국어] CRC-32C 룩업 테이블 (256개 항목)
- * Castagnoli 다항식 0x1EDC6F41로부터 생성된 reflected(입출력 비트 반전) 테이블이다.
- * 표준 CRC-32와 다른 다항식을 사용하므로 테이블 값이 다르다.
- */
+ * [한국어] CRC-32C(Castagnoli) reflected 룩업 테이블.
+ * 설정자: 컴파일타임 하드코딩.
+ * 읽는 자: 본 파일 crc32c_sw() 루프만(static).
+ * 값 범위: 엔트리 각 uint32_t; 총 256개 × 4B = 1024B.
+ * 동기화: .rodata 상주 — 락 불필요.
+ *
+ * 표준 CRC-32(0x04C11DB7)와 달리 reflected 생성 방식을 쓰므로 동일한 입력에
+ * 대해서도 테이블 값과 최종 CRC 가 다르다. iSCSI/SCTP/Btrfs 등은 이 Castagnoli
+ * 변형을 "CRC-32C" 라는 이름으로 사용. */
 static const uint32_t crc32c_table[256] = {
 	0x00000000L, 0xF26B8303L, 0xE13B70F7L, 0x1350F3F4L,
 	0xC79A971FL, 0x35F1141CL, 0x26A1E7E8L, 0xD4CA64EBL,
@@ -140,26 +157,34 @@ static const uint32_t crc32c_table[256] = {
 
 /*
  * [한국어]
- * crc32c_sw - 소프트웨어 방식 CRC-32C 체크섬 계산
+ * crc32c_sw - 소프트웨어 CRC-32C 계산(reflected, 테이블 기반)
  *
- * @data: CRC를 계산할 데이터 버퍼 포인터
- * @length: 데이터 길이(바이트)
- * @return: 계산된 32비트 CRC-32C 값 (비트 반전 없음 - 초기값 ~0에서 시작)
+ * @data:   바이트 포인터.
+ * @length: 바이트 길이.
+ * @return: 32비트 CRC-32C. 초기 ~0, 최종 XOR 없음 — 표준 일부는 ~crc 반전을 요구하므로
+ *          호출자가 필요 시 별도 반전.
  *
- * reflected 방식으로 바이트 단위 테이블 룩업을 수행한다.
- * 초기값을 ~0(0xFFFFFFFF)으로 설정하고, 각 바이트마다:
- *   crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
- * 최종 반전(~)은 수행하지 않는다 (호출자가 필요시 처리).
+ * 알고리즘(reflected, LSB-first):
+ *   crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8);
+ * 매 반복마다 CRC 하위 8비트와 입력 바이트 XOR 로 테이블 인덱스 생성,
+ * CRC 를 8비트 우시프트한 값과 테이블 결과를 다시 XOR 하여 8비트 분 다항식 분할 완료.
  *
- * 호출 체인:
- *   fio_crc32c() [crc32c.h] → [crc32c_sw] → crc32c_table[] 참조
+ * 호출 체인: fio_crc32c() [crc32c.h] → [crc32c_sw] → crc32c_table[]
  */
 uint32_t crc32c_sw(unsigned char const *data, unsigned long length)
 {
+	/* [한국어] CRC-32C 표준 초기값 ~0 = 0xFFFFFFFF. */
 	uint32_t crc = ~0;
 
+	/* [한국어] length 후위 감소로 정확히 length 회 반복. */
 	while (length--)
+		/* [한국어] reflected 다항식 분할 한 바이트 분:
+		 *   (crc ^ *data++)   — 하위 바이트에 입력 XOR, data 포인터 전진.
+		 *   & 0xFFL            — 0..255 인덱스 마스킹(L 접미사는 long 영역 승격 방지용 과거 습관).
+		 *   crc32c_table[...]  — 해당 바이트의 다항식 나머지.
+		 *   ^ (crc >> 8)       — 8비트 우시프트한 원 CRC 와 결합. */
 		crc = crc32c_table[(crc ^ *data++) & 0xFFL] ^ (crc >> 8);
 
+	/* [한국어] 누적된 CRC 반환. */
 	return crc;
 }

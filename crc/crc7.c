@@ -6,22 +6,48 @@
  */
 
 /*
- * [한국어 설명] CRC-7 체크섬 구현 (crc7.c)
+ * [한국어 설명] CRC-7 체크섬 구현 — SD 카드/MMC 프로토콜 CRC (crc7.c)
  *
  * === 파일의 역할 ===
- * CRC-7 체크섬(다항식 x^7 + x^3 + 1)의 룩업 테이블과 계산 함수를 구현한다.
- * 7비트 CRC로, 출력 범위가 0~127이며 간단한 오류 검출에 사용된다.
+ * 7비트 CRC(다항식 x^7 + x^3 + 1 = 0x09) 계산을 제공한다. SD 카드 명령(CMD)
+ * 프레임의 CRC 필드, MMC 커맨드 프로토콜, 일부 SCSI 비표준 확장에서 사용되는
+ * 작은 CRC이며, 본 파일은 그 256엔트리 "신드롬 테이블"(`crc7_syndrome_table[]`)과
+ * 바이트 단위 계산 함수 `fio_crc7()`을 제공한다. 출력은 0~127(상위 비트 0).
+ * 테이블 엔트리는 "각 바이트 입력을 다항식 0x09 로 나눈 나머지"에 해당하며,
+ * 런타임에는 바이트별 테이블 조회 1회로 CRC 갱신이 완료된다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * 호출 체인: verify.c → fio_crc7() [이 파일] → crc7_byte() [crc7.h]
+ * fio verify 경로의 VERIFY_CRC7 공급자.
+ * 쓰기 시 fill_crc7(verify.c) → fio_crc7() [이 파일]이 verify_header.v_crc7
+ * 필드(1B)를 채우고, 읽기 시 verify_io_u_crc7()가 같은 경로로 재계산해 비교한다.
+ * CRC-7은 오류 검출력이 낮지만 1바이트 오버헤드라 극소형 메타데이터 검증에 유리.
+ * 호출 체인:
+ *   verify.c::fill_crc7/verify_io_u_crc7 → [fio_crc7] → crc7_byte() [crc7.h 인라인] → crc7_syndrome_table[]
+ *   crc/test.c::t_crc7 → [fio_crc7]
+ *
+ * === 타 모듈과의 연결 ===
+ * - crc7.h: fio_crc7() 프로토타입과 crc7_byte(crc, byte) 인라인(
+ *   crc7_syndrome_table[(crc << 1) ^ byte]) 제공, crc7_syndrome_table[] extern 선언.
+ * - verify.c: verify=crc7 옵션 경로.
+ * - crc/test.c: --crctest 벤치마크 러너의 t_crc7 래퍼.
+ * 데이터 흐름: 쓰기버퍼 → fio_crc7(초기값 0) → verify_header.v_crc7 (1B). 읽기 시 재계산 비교.
+ * 동기화: 순수 계산, const 테이블. 잡/verify 스레드 병렬 호출 안전.
  *
  * === 주요 함수 요약 ===
- * - fio_crc7(): 버퍼 전체의 CRC-7 체크섬을 바이트 단위로 계산
+ * - crc7_syndrome_table[256]: 다항식 x^7+x^3+1 (=0x09) 기반 바이트-단위 신드롬 테이블(상수).
+ * - fio_crc7(buffer, len): 초기값 0, bit-swap 없이 바이트 단위로 신드롬 테이블을 조회하여
+ *   7비트 CRC를 누적하고 최종값 반환.
  */
 #include "crc7.h"
+/* [한국어] crc7.h: fio_crc7() 프로토타입, crc7_byte(crc, byte) 인라인 래퍼,
+ * crc7_syndrome_table[] extern 선언 제공. verify.c/test.c 가 동일 헤더로 ABI 공유. */
 
 /* Table for CRC-7 (polynomial x^7 + x^3 + 1) */
-/* [한국어] CRC-7 신드롬 테이블: 다항식 x^7 + x^3 + 1로부터 미리 계산된 256개 항목 */
+/* [한국어] CRC-7 신드롬 테이블 — 다항식 x^7+x^3+1(=0x09)로부터 생성된 상수 배열.
+ * 설정자: 컴파일타임 고정(소스 하드코딩). 런타임 변경 불가(const).
+ * 읽는 자: crc7_byte()(crc7.h), fio_crc7()의 while 루프.
+ * 값 범위: 각 엔트리는 7비트(상위 1비트 0), 총 256엔트리(256B).
+ * 동기화: .rodata 상주 — 모든 스레드가 공유 가능, 락 불필요. */
 const unsigned char crc7_syndrome_table[256] = {
 	0x00, 0x09, 0x12, 0x1b, 0x24, 0x2d, 0x36, 0x3f,
 	0x48, 0x41, 0x5a, 0x53, 0x6c, 0x65, 0x7e, 0x77,
@@ -59,27 +85,33 @@ const unsigned char crc7_syndrome_table[256] = {
 
 /*
  * [한국어]
- * fio_crc7 - 버퍼 데이터의 CRC-7 체크섬 계산
+ * fio_crc7 - 버퍼의 CRC-7 체크섬(초기값 0) 계산
  *
- * @buffer: CRC를 계산할 데이터 버퍼
- * @len: 데이터 길이(바이트)
- * @return: 계산된 7비트 CRC 값 (0~127)
+ * @buffer: CRC를 계산할 데이터. unsigned char* 로 받으므로 호출자는 캐스팅해 전달 가능.
+ * @len:    데이터 길이(바이트). 0 이면 0 반환.
+ * @return: 7비트 CRC 값(상위 1비트 항상 0, 0~127). 검증 헤더 1B 필드에 저장 가능.
  *
- * 초기값 0에서 시작하여 각 바이트마다 crc7_byte()를 호출하고
- * 최종 CRC 값을 반환한다.
+ * 알고리즘: 테이블 기반 바이트 루프.
+ *   crc = crc7_byte(crc, *buf) = crc7_syndrome_table[(crc << 1) ^ byte]
+ * (crc7.h 의 인라인 정의 참고). 초기값 0·입출력 반전 없음.
+ *
+ * 실행 컨텍스트: 잡/verify 스레드 — 재진입 안전. 전역 변경 없음, 테이블은 read-only.
  *
  * 호출 체인:
- *   verify.c / crc/test.c → [fio_crc7] → crc7_byte() [crc7.h]
+ *   verify.c::fill_crc7/verify_io_u_crc7 → [fio_crc7] → crc7_byte(인라인) → crc7_syndrome_table[]
+ *   crc/test.c::t_crc7 → [fio_crc7]
  */
 unsigned char fio_crc7(const unsigned char *buffer, unsigned int len)
 {
-	/* [한국어] CRC-7 초기값 0 - 다항식 x^7+x^3+1의 표준 초기 시드 */
+	/* [한국어] CRC-7 초기값 0 — SD/MMC 커맨드 CRC 표준값. (상위 1비트는 계산 내내 0 유지.) */
 	unsigned char crc = 0;
 
-	/* [한국어] 바이트 단위로 감소 루프 - len==0이 되면 종료, 후위 감소로 마지막 바이트까지 처리 */
+	/* [한국어] len 후위 감소로 "현재 값 !=0 때만 루프 진입" → 자연스럽게 정확히 len 회 반복.
+	 * 바이트 단위 처리가 CRC-7의 유일한 경로(워드 단위 최적화 의미 없음). */
 	while (len--)
-		/* [한국어] 한 바이트를 CRC-7에 반영: crc7_byte()는 인라인으로 syndrome 테이블 룩업 수행 */
+		/* [한국어] crc7_byte: 현 CRC 를 1비트 좌시프트(<<1)하여 상위로 자리를 비운 뒤
+		 * 입력 바이트와 XOR 해 테이블 인덱스를 만든다. buffer++ 로 다음 바이트 진행. */
 		crc = crc7_byte(crc, *buffer++);
-	/* [한국어] 누적된 7비트 CRC 반환 - 상위 1비트는 0, 호출자(verify.c)가 검증 데이터로 사용 */
+	/* [한국어] 누적된 7비트 CRC 반환 — verify.c 가 verify_header.v_crc7(1B)에 저장·비교. */
 	return crc;
 }

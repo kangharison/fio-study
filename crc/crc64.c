@@ -10,41 +10,62 @@
  */
 
 /*
- * [한국어 설명] CRC-64 체크섬 구현 (crc64.c)
+ * [한국어 설명] CRC-64 체크섬(두 변종) 구현 (crc64.c)
  *
  * === 파일의 역할 ===
- * 두 가지 CRC-64 변형을 구현한다:
- *   1) fio_crc64(): 범용 CRC-64 (다항식 0x95AC9329AC4BC9B5, 초기값 ~0)
- *   2) fio_crc64_nvme(): NVMe 규격 64비트 CRC (위 주석의 다항식)
- * NVMe CRC-64는 CONFIG_LIBISAL64 정의 시 Intel ISA-L 라이브러리로 가속된다.
+ * 두 가지 CRC-64 변종을 한 파일에서 제공:
+ *   1) fio_crc64():      범용 CRC-64 (Jones 다항식 0x95AC9329AC4BC9B5, reflected,
+ *                        초기값 0, 최종 XOR 없음). 내장 crctab64[] 테이블 사용.
+ *   2) fio_crc64_nvme(): NVMe "Rocksoft" 64비트 CRC — NVMe TP 4055 가 정의한
+ *                        NVMe 64b Protection Information(PI, 64-bit Guard) 용 다항식:
+ *                        x^64 + x^63 + x^61 + ... + x^3 + 1.
+ *                        CONFIG_LIBISAL64 이면 ISA-L 의 crc64_rocksoft_refl() 에 위임,
+ *                        아니면 crc64table.h 의 crc64nvmetable 로 소프트웨어 계산.
+ * 두 함수는 초기값/마지막 XOR 규약이 다르므로 상호 호환 불가 — 호출자가 목적에
+ * 따라 선택해야 한다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * fio의 verify 기능에서 CRC-64 체크섬 옵션이 선택되었을 때 호출된다.
- * 64비트 CRC는 32비트 대비 충돌 확률이 극히 낮아 대용량 데이터 검증에 적합하다.
- * 호출 체인: verify.c → fio_crc64() / fio_crc64_nvme()
+ * fio verify 의 VERIFY_CRC64(범용) 와, NVMe PI Type1/2 (64b guard) 검증 경로.
+ * NVMe 64비트 PI 는 xnvme/io_uring_cmd 엔진에서 컨트롤러에 위임하는 경우가 많지만,
+ * 소프트웨어 비교가 필요한 경우 fio_crc64_nvme() 가 쓰인다.
+ * 호출 체인:
+ *   verify.c::fill_crc64/verify_io_u_crc64 → [fio_crc64] → crctab64[]
+ *   NVMe PI 검증 → [fio_crc64_nvme] → (ISA-L 또는 crc64nvmetable)
+ *   crc/test.c::t_crc64 → [fio_crc64]
  *
  * === 타 모듈과의 연결 ===
- * - verify.c: verify=crc64 옵션 시 호출
- * - crc64.h: 인터페이스 정의
- * - crc64table.h: NVMe CRC-64 룩업 테이블
- * - crc/test.c: 벤치마크 테스트
+ * - crc64.h: 두 함수의 프로토타입.
+ * - crc64table.h: `crc64nvmetable[256]` (NVMe 다항식) 상수 테이블 정의.
+ * - isa-l/crc64.h (CONFIG_LIBISAL64): ISA-L 의 crc64_rocksoft_refl() 가속.
+ * - verify.c: verify=crc64 옵션 경로.
+ * - crc/test.c: --crctest 벤치마크의 t_crc64 래퍼.
+ * 동기화: 두 함수 모두 순수 계산, 테이블 read-only — 재진입 안전.
  *
  * === 주요 함수 요약 ===
- * - fio_crc64(): 범용 CRC-64 계산 (crctab64 테이블 사용)
- * - fio_crc64_nvme(): NVMe CRC-64 계산 (crc64nvmetable 또는 ISA-L 사용)
+ * - crctab64[256]: Jones CRC-64 reflected 테이블(상수).
+ * - fio_crc64(buffer, length): 초기 0, reflected. 바이트 단위 테이블 루프.
+ * - fio_crc64_nvme(crc, p, len): NVMe Rocksoft CRC-64. 초기 crc 를 받아 증분 가능,
+ *   내부에서 ~crc 로 비반전·계산·반전 규약 수행.
  */
 #include "crc64.h"
+/* [한국어] crc64.h: fio_crc64() / fio_crc64_nvme() 프로토타입 공급. */
 #include "crc64table.h"
+/* [한국어] crc64table.h: NVMe 경로용 crc64nvmetable[256] 상수 배열 정의. */
 
 /*
  * poly 0x95AC9329AC4BC9B5ULL and init 0xFFFFFFFFFFFFFFFFULL
  */
 
 /*
- * [한국어] 범용 CRC-64 룩업 테이블 (256개 항목)
- * 다항식 0x95AC9329AC4BC9B5에서 생성된 테이블이다.
- * 초기값 0xFFFFFFFFFFFFFFFF(~0)에서 시작하여 바이트 단위로 계산한다.
- */
+ * [한국어] 범용 CRC-64 (Jones, reflected) 룩업 테이블.
+ * 설정자: 컴파일타임 하드코딩.
+ * 읽는 자: 본 파일의 fio_crc64() 루프만(static).
+ * 값 범위: 엔트리 각 uint64_t; 256개 × 8B = 2048B.
+ * 동기화: .rodata — 락 불필요.
+ *
+ * Jones 변종은 poly 0x95AC9329AC4BC9B5 를 쓰며, reflected 입출력, 초기값 0,
+ * 최종 XOR 없음. 64비트 CRC 는 32비트 대비 충돌 확률이 ~2^32 배 낮아 대용량
+ * 데이터 무결성 검증에 적합. */
 static const unsigned long long crctab64[256] = {
   0x0000000000000000ULL, 0x7ad870c830358979ULL, 0xf5b0e190606b12f2ULL,
   0x8f689158505e9b8bULL, 0xc038e5739841b68fULL, 0xbae095bba8743ff6ULL,
@@ -136,37 +157,62 @@ static const unsigned long long crctab64[256] = {
 
 /*
  * [한국어]
- * fio_crc64 - 범용 CRC-64 체크섬 계산
+ * fio_crc64 - 범용 Jones CRC-64 계산(초기값 0, reflected, 테이블 루프)
  *
- * @buffer: CRC를 계산할 데이터 버퍼
- * @length: 데이터 길이(바이트)
- * @return: 계산된 64비트 CRC 값
+ * @buffer: 바이트 포인터.
+ * @length: 바이트 길이.
+ * @return: 64비트 CRC.
  *
- * 초기값 0에서 시작, reflected 방식으로 바이트 단위 테이블 룩업을 수행한다.
+ * 알고리즘: reflected 다항식 분할 한 바이트 분 —
+ *   crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8).
  *
- * 호출 체인:
- *   verify.c / crc/test.c → [fio_crc64] → crctab64[] 참조
+ * 호출 체인: verify.c / crc/test.c → [fio_crc64] → crctab64[]
  */
 unsigned long long fio_crc64(const unsigned char *buffer, unsigned long length)
 {
+	/* [한국어] Jones CRC-64 초기값 0. (NVMe 버전과 달리 반전 시작 아님.) */
 	unsigned long long crc = 0;
 
+	/* [한국어] length 후위 감소로 정확히 length 회 반복. */
 	while (length--)
+		/* [한국어] reflected 분할 한 바이트 —
+		 *   crc ^ *buffer++ 로 하위 바이트에 입력 XOR + 포인터 전진,
+		 *   & 0xff 로 인덱스 마스킹,
+		 *   crctab64[...] 테이블 조회,
+		 *   crc >> 8 과 XOR 하여 CRC 갱신. */
 		crc = crctab64[(crc ^ *(buffer++)) & 0xff] ^ (crc >> 8);
 
+	/* [한국어] 누적된 64비트 CRC 반환. */
 	return crc;
 }
 
 #ifdef CONFIG_LIBISAL64
+/* [한국어] CONFIG_LIBISAL64 정의 시 ISA-L 라이브러리의 NVMe CRC-64 구현(PCLMULQDQ 가속)에
+ * 위임. configure 에서 -lisal 링크 + isa-l 헤더 감지되어야 활성. */
 #include <isa-l/crc64.h>
+/* [한국어] isa-l/crc64.h: crc64_rocksoft_refl(seed, buf, len) 선언. NVMe 규격(Rocksoft)의
+ * reflected CRC-64 를 계산하며 내부에 PCLMULQDQ 기반 reduce-by-16 고속 경로를 포함. */
 
+/*
+ * [한국어]
+ * fio_crc64_nvme - NVMe 64b PI Guard CRC(ISA-L 위임)
+ *
+ * @crc: seed(새 계산은 0, 증분은 직전 반환값). ISA-L 내부에서 반전 규약 처리.
+ * @p:   바이트 포인터.
+ * @len: 바이트 길이.
+ * @return: 갱신된 64비트 NVMe CRC.
+ *
+ * 호출 체인: NVMe PI 경로 → [fio_crc64_nvme] → isa-l::crc64_rocksoft_refl
+ */
 unsigned long long fio_crc64_nvme(unsigned long long crc, const void *p,
 				  unsigned int len)
 {
+	/* [한국어] ISA-L 가속 경로로 단순 위임. 반전·초기값 규약은 ISA-L 내부 처리. */
 	return crc64_rocksoft_refl(crc, p, len);
 }
 
 #else
+/* [한국어] ISA-L 미사용 경로: 소프트웨어 테이블 루프로 NVMe CRC-64 계산. */
 
 /**
  * fio_crc64_nvme - Calculate bitwise NVMe CRC64
@@ -175,18 +221,40 @@ unsigned long long fio_crc64_nvme(unsigned long long crc, const void *p,
  * @p: pointer to buffer over which CRC64 is run
  * @len: length of buffer @p
  */
+/*
+ * [한국어]
+ * fio_crc64_nvme - NVMe 64b PI Guard CRC(소프트웨어 테이블 경로)
+ *
+ * @crc: 시드/증분 CRC. 새 계산이면 0, 이어붙이기면 직전 반환값.
+ * @p:   바이트 포인터.
+ * @len: 바이트 길이.
+ * @return: 64비트 CRC.
+ *
+ * 알고리즘: Rocksoft CRC-64 규약 — 시작에 ~crc 반전, reflected 테이블 루프로 분할,
+ * 끝에 다시 ~crc 반전하여 반환(표준 "init/final XOR = all-ones" 규약 구현).
+ *
+ * 호출 체인: NVMe PI 경로 → [fio_crc64_nvme] → crc64nvmetable[]
+ */
 unsigned long long fio_crc64_nvme(unsigned long long crc, const void *p,
 				  unsigned int len)
 {
+	/* [한국어] void* 를 바이트 포인터로 재해석 — 포인터 산술 및 바이트 역참조용. */
 	const unsigned char *_p = p;
+	/* [한국어] 루프 카운터. */
 	unsigned int i;
 
+	/* [한국어] NVMe 규약: 초기 seed 를 반전 — 표준 "init XOR 0xFFFFFFFFFFFFFFFF" 구현. */
 	crc = ~crc;
 
+	/* [한국어] len 회 반복 — 바이트 단위 reflected 다항식 분할. */
 	for (i = 0; i < len; i++)
+		/* [한국어] (crc & 0xff) ^ *_p++ 로 하위 바이트에 입력 XOR + 포인터 전진 →
+		 * 테이블 인덱스 생성, (crc >> 8) 과 XOR 하여 CRC 갱신. */
 		crc = (crc >> 8) ^ crc64nvmetable[(crc & 0xff) ^ *_p++];
 
+	/* [한국어] 최종 XOR 0xFF..FF — 반전으로 반환(표준 "final XOR" 구현). */
 	return ~crc;
 }
 
 #endif
+/* [한국어] CONFIG_LIBISAL64 분기 종료 — 두 경로 중 하나만 링크에 참여. */
