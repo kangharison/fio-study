@@ -28,56 +28,106 @@
  *
  * === 파일의 역할 ===
  * MTD(Memory Technology Device) 라이브러리의 핵심 구현 파일이다.
- * sysfs(/sys/class/mtd)를 통해 MTD 장치 정보를 조회하고, ioctl을 통해
- * 소거(erase), 읽기(read), 쓰기(write), 잠금(lock/unlock), 배드블록 관리 등
- * MTD 장치의 모��� 주요 작업을 수행한다.
- * sysfs가 지원되지 않는 구형 커널에서는 libmtd_legacy.c로 폴백한다.
+ * MTD 는 Linux 커널의 "raw 플래시" 추상화 — NAND/NOR 플래시, MRAM, FRAM,
+ * UBI 볼륨 등 블록-계층 FS 를 두지 않는 장치를 공통 인터페이스로 다룬다.
+ * 본 파일은 sysfs(/sys/class/mtd)를 통해 장치 메타데이터를 조회하고,
+ * ioctl 계열(MEMGETINFO, MEMERASE/MEMERASE64, MEMWRITE, MEMGETBADBLOCK,
+ * MEMSETBADBLOCK, MEMLOCK/UNLOCK/ISLOCKED, MEMGETREGIONINFO, MEMREADOOB(64)/
+ * MEMWRITEOOB(64), MEMGETOOBSEL)을 통해 소거(erase)·읽기·쓰기·잠금·
+ * 배드블록 관리·OOB(Out-Of-Band) 영역 접근 등 MTD 장치의 모든 주요 작업을
+ * 수행한다. sysfs 가 지원되지 않는 구형 커널(2.6.30 미만)에서는 libmtd_legacy.c
+ * 로 폴백한다 — 해당 폴백 경로는 /proc/mtd 파싱과 MEMGETINFO ioctl 만으로
+ * 동작하며, subpage_size 를 얻을 수 없다는 제약이 있다.
+ *
+ * 핵심 개념:
+ *  - eraseblock(EB, PEB = Physical EB): 최소 소거 단위(NAND 는 보통 128KiB).
+ *    NAND 는 쓰기 전 반드시 소거 — 0→1 전환은 소거로만 가능.
+ *  - page(= min_io_size, writesize): 최소 읽기/쓰기 단위.
+ *  - subpage: NAND 가 page 내부에서 partial write 를 허용하는 세분 단위.
+ *  - OOB(Out-Of-Band): 각 page 의 spare 영역 — ECC/메타데이터 저장.
+ *  - 배드블록(bad block): NAND 제조 또는 사용 중 불량 판정된 EB. OOB 첫
+ *    바이트(또는 특정 매직)로 마킹. MEMGETBADBLOCK/MEMSETBADBLOCK 로 질의/마킹.
+ *  - 64비트 ioctl(MEMERASE64/MEMREADOOB64/MEMWRITEOOB64)은 커널 2.6.31+ 에서
+ *    등장 — 4GB 초과 장치 주소 지정 용. 미지원 커널은 ENOTTY 반환하므로
+ *    라이브러리가 런타임 프로빙 후 OFFS64_IOCTLS_NOT_SUPPORTED 캐시.
  *
  * === 전체 아키텍처에서의 위치 ===
- * fio의 MTD I/O 엔진에서 사용된다:
- *   engines/mtd.c → libmtd.h API → [libmtd.c] → sysfs 읽기 / ioctl 호출
+ * fio 의 MTD I/O 엔진에서 독점적으로 사용된다:
+ *   engines/mtd.c (ioengine) → libmtd.h API → [libmtd.c]
+ *     → sysfs 읽기 (read(2) on /sys/class/mtd/mtdN/*)
+ *     → ioctl(2) (MEMERASE64, MEMWRITE, MEMGETBADBLOCK 등)
+ *     → read(2)/write(2)/lseek(2) (데이터 경로)
+ *     → libmtd_legacy.c (sysfs 미지원 폴백)
  *
  * === 타 모듈과의 연결 ===
- * - libmtd.h: 공개 API 선언
- * - libmtd_int.h: struct libmtd 내부 구조체
- * - libmtd_legacy.c: sysfs 미지원 시 레거시 구현
- * - libmtd_common.h: 에러 매크로, xmalloc() 등
- * - <mtd/mtd-user.h>: MTD ioctl 정의 (MEMERASE, MEMWRITE 등)
+ * - libmtd.h: 공개 API 선언(libmtd_t, mtd_info, mtd_dev_info, mtd_read/write/
+ *   erase/is_bad/mark_bad/torture/…).
+ * - libmtd_int.h: struct libmtd 내부 구조체 — sysfs 경로 패턴·ioctl64 지원
+ *   상태 캐시. enum OFFS64_IOCTLS_* 정의.
+ * - libmtd_legacy.c: sysfs 미지원 분기 구현(legacy_libmtd_open/_dev_present/
+ *   _mtd_get_info/_get_dev_info/_get_dev_info1).
+ * - libmtd_common.h: 에러 매크로(errmsg, sys_errmsg, normsg) + xmalloc/xzalloc
+ *   (실패 시 abort).
+ * - compiler/compiler.h: FIO_ARRAY_SIZE 매크로 등.
+ * - <mtd/mtd-user.h>: MTD UAPI — ioctl 상수/구조체(mtd_info_user, erase_info_user/
+ *   user64, mtd_write_req, mtd_oob_buf/buf64, nand_oobinfo, MTD_OPS_AUTO_OOB,
+ *   MTD_NANDFLASH 등).
  *
- * === 주요 함수 요약 ===
- * - libmtd_open()/close(): 라이브러리 초기화/해제 (sysfs 경로 구성)
- * - mtd_get_info(): 시스템의 MTD 장치 목록 조회
- * - mtd_get_dev_info(): 개별 MTD 장치 상세 정보 조회
- * - mtd_erase(): 소거블록 소거 (MEMERASE/MEMERASE64 ioctl)
- * - mtd_read()/write(): MTD 장치 데이터 읽기/쓰기
- * - mtd_torture(): 소거블록 고문 테스트 (패턴 쓰기/읽기 반복)
+ * === 주요 함수/구조체 요약 ===
+ * - libmtd_open()/close(): 라이브러리 초기화/해제. sysfs 경로 문자열(mkpath)
+ *   들을 사전 조립하고 sysfs_is_supported 로 경로 유효성 프로빙.
+ * - mtd_get_info(): 시스템의 MTD 장치 목록 조회(mtd_dev_cnt, lowest/highest_num).
+ * - mtd_get_dev_info1()/mtd_get_dev_info(): 개별 MTD 장치 상세 정보 —
+ *   name/type/eraseblock_size/size/min_io/subpage/oob/region_cnt/flags.
+ * - mtd_erase(): 소거 — MEMERASE64 우선, 폴백 MEMERASE.
+ * - mtd_read()/write(): 데이터 경로 — lseek + read/write, mtd_write 는
+ *   OOB 동반 시 MEMWRITE ioctl 사용.
+ * - mtd_read_oob()/write_oob(): OOB 전용 접근 — do_oob_op 공통 헬퍼.
+ * - mtd_is_bad()/mark_bad(): MEMGETBADBLOCK/MEMSETBADBLOCK ioctl.
+ * - mtd_lock/unlock/is_locked(): MEMLOCK/MEMUNLOCK/MEMISLOCKED.
+ * - mtd_torture(): 소거블록 건전성 검증 — 패턴 쓰기·읽기·비교 반복.
+ * - mtd_write_img(): 이미지 파일을 장치에 일괄 쓰기.
+ * - mtd_probe_node(): 임의 노드가 MTD 인지 판정.
  */
-#include <limits.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <errno.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <dirent.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
-#include <inttypes.h>
+#include <limits.h>  /* [한국어] INT_MAX/INT_MIN — read_hex_int 범위 검증. */
+#include <stdlib.h>  /* [한국어] free/sscanf 지원. */
+#include <stdio.h>  /* [한국어] sscanf/sprintf. */
+#include <errno.h>  /* [한국어] errno 및 E* 상수 — ENOTTY/EOPNOTSUPP/ENOENT/EINVAL 분기. */
+#include <unistd.h>  /* [한국어] read/write/close/lseek. */
+#include <fcntl.h>  /* [한국어] open(2) 플래그 O_RDONLY/O_CLOEXEC. */
+#include <dirent.h>  /* [한국어] opendir/readdir/closedir — /sys/class/mtd 스캔. */
+#include <sys/types.h>  /* [한국어] 기본 POSIX 타입. */
+#include <sys/stat.h>  /* [한국어] stat(2) + S_ISCHR 검증. */
+#include <sys/ioctl.h>  /* [한국어] ioctl(2). */
+#include <inttypes.h>  /* [한국어] PRIu64/PRIdoff_t — 이식 가능 포맷 지정자. */
 
-#include "../compiler/compiler.h"
+#include "../compiler/compiler.h"  /* [한국어] FIO_ARRAY_SIZE 등 컴파일러 유틸. */
 
-#include <mtd/mtd-user.h>
-#include "libmtd.h"
+#include <mtd/mtd-user.h>  /* [한국어] MTD UAPI — 모든 ioctl 번호/구조체 소스. */
+#include "libmtd.h"  /* [한국어] libmtd 공개 API 선언. */
 
-#include "libmtd_int.h"
-#include "libmtd_common.h"
+#include "libmtd_int.h"  /* [한국어] struct libmtd 내부 + 경로 매크로(SYSFS_MTD, MTD_NAME_PATT 등). */
+#include "libmtd_common.h"  /* [한국어] errmsg/sys_errmsg/normsg/xmalloc/xzalloc. */
 
 /*
  * [한국어]
- * mkpath - 두 경로 구성요소를 합쳐 전체 경로 생성
+ * mkpath - 두 경로 구성요소를 '/' 로 합쳐 힙 문자열 반환
  *
- * sysfs 경로를 동적으로 구성하는 데 사용된다.
- * 예: mkpath("/sys/class/mtd", "mtd0") → "/sys/class/mtd/mtd0"
+ * @path: 기준 디렉토리 경로(예: "/sys/class/mtd").
+ * @name: 하위 이름 또는 패턴(예: "mtd%d" 같은 printf 패턴 포함 가능).
+ * @return: xmalloc 된 힙 문자열. xmalloc 실패 시 abort 되므로 NULL 반환은 없다.
+ *
+ * 동작:
+ * 1) 두 길이 계산.
+ * 2) len1 + len2 + 6 바이트 할당(슬래시 + NUL + 패턴 치환 여유).
+ * 3) path 복사 후 마지막이 '/' 가 아니면 '/' 삽입 — 중복 슬래시 방지.
+ * 4) name 을 NUL 포함 복사.
+ *
+ * sysfs 경로 및 printf 패턴(예: mtd_name = "/sys/class/mtd/mtd%d/name")을
+ * 동적으로 조립할 때 사용된다. libmtd_open 에서만 호출.
+ *
+ * 호출 체인:
+ *   libmtd_open() → [mkpath()] → xmalloc/memcpy
  */
 /**
  * mkpath - compose full path from 2 given components.
@@ -89,26 +139,39 @@
  */
 static char *mkpath(const char *path, const char *name)
 {
-	char *n;
-	size_t len1 = strlen(path);
-	size_t len2 = strlen(name);
+	char *n;  /* [한국어] 결과 힙 버퍼. */
+	size_t len1 = strlen(path);  /* [한국어] 기준 경로 길이. */
+	size_t len2 = strlen(name);  /* [한국어] 하위 이름 길이. */
 
-	n = xmalloc(len1 + len2 + 6);
+	n = xmalloc(len1 + len2 + 6);  /* [한국어] +6: '/' + NUL + 패턴 확장 여유(예: "%d" → 최대 몇 자리 숫자). */
 
-	memcpy(n, path, len1);
+	memcpy(n, path, len1);  /* [한국어] 기준 경로 복사(NUL 미포함). */
 	if (n[len1 - 1] != '/')
-		n[len1++] = '/';
+		n[len1++] = '/';  /* [한국어] 슬래시 자동 삽입 — path 가 슬래시로 끝나지 않을 때. */
 
-	memcpy(n + len1, name, len2 + 1);
+	memcpy(n + len1, name, len2 + 1);  /* [한국어] 이름 + NUL 복사. */
 	return n;
 }
 
 /*
  * [한국어]
- * read_data - sysfs 파일에서 데이터를 읽는 범용 헬퍼
+ * read_data - sysfs 속성 파일 전체를 한 번에 읽어 NUL-종단 버퍼로 반환
  *
- * sysfs 속성 파일은 작은 텍스트이므로 한 번에 읽어 NUL 종료 처리한다.
- * 파일 내용이 buf_len보다 크면 EINVAL 에러를 반환한다.
+ * @file: 읽을 파일 경로.
+ * @buf: 결과가 저장될 버퍼.
+ * @buf_len: 버퍼 크기(NUL 포함).
+ * @return: 성공 시 읽은 바이트 수(NUL 제외), 실패 시 -1.
+ *
+ * sysfs 속성 파일은 전형적으로 수십 바이트의 짧은 텍스트. 전체를 한 번에
+ * 읽어 버퍼에 담고, 범위 초과면 EINVAL 로 실패. 호출자는 이 버퍼를 이후
+ * sscanf/strcmp 로 해석. O_CLOEXEC 는 fork/exec 시 fd 누수 방지.
+ *
+ * 특이점: 버퍼를 가득 채운 후(= rd == buf_len) 한 번 더 read 를 시도해
+ * "버퍼 초과 데이터 존재" 를 탐지 — sysfs 포맷 가정 깨짐 시 방어. 이 추가
+ * read 는 일반 sysfs 파일에선 0 을 반환해야 정상.
+ *
+ * 호출 체인:
+ *   dev_read_data, read_hex_ll, read_pos_ll 등 → [read_data()] → open/read/close
  */
 /**
  * read_data - read data from a file.
@@ -122,40 +185,40 @@ static char *mkpath(const char *path, const char *name)
  */
 static int read_data(const char *file, void *buf, int buf_len)
 {
-	int fd, rd, tmp, tmp1;
+	int fd, rd, tmp, tmp1;  /* [한국어] tmp/tmp1: 초과 읽기 검사용 스크래치. */
 
-	fd = open(file, O_RDONLY | O_CLOEXEC);
+	fd = open(file, O_RDONLY | O_CLOEXEC);  /* [한국어] O_CLOEXEC: exec 시 fd 자동 닫힘. */
 	if (fd == -1)
 		return -1;
 
-	rd = read(fd, buf, buf_len);
+	rd = read(fd, buf, buf_len);  /* [한국어] 버퍼 크기만큼 일괄 읽기. */
 	if (rd == -1) {
 		sys_errmsg("cannot read \"%s\"", file);
 		goto out_error;
 	}
 
-	if (rd == buf_len) {
+	if (rd == buf_len) {  /* [한국어] 딱 맞게 채워졌으면 실제로는 더 있을 가능성 — 방어적 실패. */
 		errmsg("contents of \"%s\" is too long", file);
 		errno = EINVAL;
 		goto out_error;
 	}
 
-	((char *)buf)[rd] = '\0';
+	((char *)buf)[rd] = '\0';  /* [한국어] NUL 종단 — 호출자의 sscanf/strcmp 안전. */
 
 	/* Make sure all data is read */
-	tmp1 = read(fd, &tmp, 1);
+	tmp1 = read(fd, &tmp, 1);  /* [한국어] 1바이트 더 시도 — 추가 데이터 탐지. */
 	if (tmp1 == 1) {
 		sys_errmsg("cannot read \"%s\"", file);
 		goto out_error;
 	}
-	if (tmp1) {
+	if (tmp1) {  /* [한국어] tmp1 > 0 (사실 1만 가능): 초과 데이터 존재. */
 		errmsg("file \"%s\" contains too much data (> %d bytes)",
 		       file, buf_len);
 		errno = EINVAL;
 		goto out_error;
 	}
 
-	if (close(fd)) {
+	if (close(fd)) {  /* [한국어] close 실패도 감지 — NFS/drivers 에러 가능. */
 		sys_errmsg("close failed on \"%s\"", file);
 		return -1;
 	}
@@ -167,6 +230,20 @@ out_error:
 	return -1;
 }
 
+/*
+ * [한국어]
+ * read_major - sysfs 의 "dev" 파일에서 "major:minor\n" 를 파싱
+ *
+ * @file: 읽을 파일(/sys/class/mtd/mtdN/dev).
+ * @major: major 결과.
+ * @minor: minor 결과.
+ * @return: 성공 0, 실패 -1.
+ *
+ * sysfs 의 dev 속성은 고정 포맷 "MAJOR:MINOR\n". read_data 로 읽어 sscanf
+ * 로 분해. 음수 값 방어.
+ *
+ * 호출 체인: dev_get_major → [read_major()] → read_data + sscanf
+ */
 /**
  * read_major - read major and minor numbers from a file.
  * @file: name of the file to read from
@@ -178,19 +255,19 @@ out_error:
 static int read_major(const char *file, int *major, int *minor)
 {
 	int ret;
-	char buf[50];
+	char buf[50];  /* [한국어] "MAJOR:MINOR\n" + 여유. */
 
 	ret = read_data(file, buf, 50);
 	if (ret < 0)
 		return ret;
 
-	ret = sscanf(buf, "%d:%d\n", major, minor);
+	ret = sscanf(buf, "%d:%d\n", major, minor);  /* [한국어] 두 정수 추출 — 콜론 구분. */
 	if (ret != 2) {
 		errno = EINVAL;
 		return errmsg("\"%s\" does not have major:minor format", file);
 	}
 
-	if (*major < 0 || *minor < 0) {
+	if (*major < 0 || *minor < 0) {  /* [한국어] 음수 방어 — dev 번호는 unsigned. */
 		errno = EINVAL;
 		return errmsg("bad major:minor %d:%d in \"%s\"",
 			      *major, *minor, file);
@@ -199,6 +276,20 @@ static int read_major(const char *file, int *major, int *minor)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * dev_get_major - MTD 번호로부터 major/minor 조회(sysfs dev 파일 경로 조립)
+ *
+ * @lib: libmtd 디스크립터 — mtd_dev 패턴(/sys/class/mtd/mtd%d/dev)을 보유.
+ * @mtd_num: MTD 장치 번호.
+ * @major: 결과 major.
+ * @minor: 결과 minor.
+ * @return: 성공 0, 실패 -1.
+ *
+ * sprintf 로 패턴에 mtd_num 을 삽입해 실제 경로를 만들고 read_major 로 위임.
+ *
+ * 호출 체인: dev_node2num, mtd_probe_node → [dev_get_major()] → read_major
+ */
 /**
  * dev_get_major - get major and minor numbers of an MTD device.
  * @lib: libmtd descriptor
@@ -210,12 +301,23 @@ static int read_major(const char *file, int *major, int *minor)
  */
 static int dev_get_major(struct libmtd *lib, int mtd_num, int *major, int *minor)
 {
-	char file[strlen(lib->mtd_dev) + 50];
+	char file[strlen(lib->mtd_dev) + 50];  /* [한국어] VLA — 패턴 길이 + 숫자 확장 여유. */
 
-	sprintf(file, lib->mtd_dev, mtd_num);
+	sprintf(file, lib->mtd_dev, mtd_num);  /* [한국어] "%d" → 실제 번호 치환. */
 	return read_major(file, major, minor);
 }
 
+/*
+ * [한국어]
+ * dev_read_data - MTD 장치별 sysfs 파일에서 데이터 읽기(패턴 + 번호)
+ *
+ * @patt: printf 패턴(예: lib->mtd_name = "/sys/class/mtd/mtd%d/name").
+ * @mtd_num: 삽입할 번호.
+ * @buf/@buf_len: 결과 버퍼.
+ * @return: read_data 반환값 그대로.
+ *
+ * 호출 체인: mtd_get_dev_info1 → [dev_read_data()] → read_data
+ */
 /**
  * dev_read_data - read data from an MTD device's sysfs file.
  * @patt: file pattern to read from
@@ -228,12 +330,23 @@ static int dev_get_major(struct libmtd *lib, int mtd_num, int *major, int *minor
  */
 static int dev_read_data(const char *patt, int mtd_num, void *buf, int buf_len)
 {
-	char file[strlen(patt) + 100];
+	char file[strlen(patt) + 100];  /* [한국어] 패턴 길이 + 번호 자리 여유. */
 
 	sprintf(file, patt, mtd_num);
 	return read_data(file, buf, buf_len);
 }
 
+/*
+ * [한국어]
+ * read_hex_ll - 파일에서 16진 long long 정수 읽기
+ *
+ * @file: 읽을 파일.
+ * @value: 결과.
+ * @return: 성공 0, 실패 -1.
+ *
+ * sysfs 의 flags 등 16진으로 표기되는 속성 읽기용. 50B 고정 버퍼로 충분
+ * (최대 16 hex digit + 부호 + "\n").
+ */
 /**
  * read_hex_ll - read a hex 'long long' value from a file.
  * @file: the file to read from
@@ -245,32 +358,32 @@ static int dev_read_data(const char *patt, int mtd_num, void *buf, int buf_len)
  */
 static int read_hex_ll(const char *file, long long *value)
 {
-	int fd, rd;
-	char buf[50];
+	int fd, rd;  /* [한국어] fd: 파일 디스크립터, rd: 읽은 바이트 수. */
+	char buf[50];  /* [한국어] 16진 문자열 버퍼. */
 
-	fd = open(file, O_RDONLY | O_CLOEXEC);
+	fd = open(file, O_RDONLY | O_CLOEXEC);  /* [한국어] O_CLOEXEC: fork/exec 시 누수 방지. */
 	if (fd == -1)
 		return -1;
 
-	rd = read(fd, buf, sizeof(buf));
+	rd = read(fd, buf, sizeof(buf));  /* [한국어] 버퍼 전체 시도 읽기. */
 	if (rd == -1) {
 		sys_errmsg("cannot read \"%s\"", file);
 		goto out_error;
 	}
-	if (rd == sizeof(buf)) {
+	if (rd == sizeof(buf)) {  /* [한국어] 초과 데이터 방어 — sysfs 단일 값 가정. */
 		errmsg("contents of \"%s\" is too long", file);
 		errno = EINVAL;
 		goto out_error;
 	}
-	buf[rd] = '\0';
+	buf[rd] = '\0';  /* [한국어] sscanf 안전을 위한 NUL 종단. */
 
-	if (sscanf(buf, "%llx\n", value) != 1) {
+	if (sscanf(buf, "%llx\n", value) != 1) {  /* [한국어] 16진 long long 파싱. */
 		errmsg("cannot read integer from \"%s\"\n", file);
 		errno = EINVAL;
 		goto out_error;
 	}
 
-	if (*value < 0) {
+	if (*value < 0) {  /* [한국어] 음수 금지 — MTD 속성은 모두 unsigned. */
 		errmsg("negative value %lld in \"%s\"", *value, file);
 		errno = EINVAL;
 		goto out_error;
@@ -286,6 +399,16 @@ out_error:
 	return -1;
 }
 
+/*
+ * [한국어]
+ * read_pos_ll - 파일에서 10진 long long 양수 읽기
+ *
+ * @file/@value: 위와 동일.
+ * @return: 성공 0, 실패 -1.
+ *
+ * size/erasesize/writesize 같은 10진 양수 속성 읽기용. sysfs 는 크기 속성을
+ * 10진으로 표기.
+ */
 /**
  * read_pos_ll - read a positive 'long long' value from a file.
  * @file: the file to read from
@@ -526,6 +649,26 @@ static int dev_node2num(struct libmtd *lib, const char *node, int *mtd_num)
 	return -1;
 }
 
+/*
+ * [한국어]
+ * sysfs_is_supported - /sys/class/mtd 경로로 sysfs MTD 지원 프로빙
+ *
+ * @lib: 라이브러리 디스크립터.
+ * @return: 지원 1, 미지원 0, 에러 -1.
+ *
+ * 동작:
+ * 1) opendir(/sys/class/mtd). ENOENT = 완전히 pre-sysfs 커널 → 0 반환.
+ * 2) 디렉토리 엔트리 스캔하며 "mtd%d" 패턴 일치를 찾아 첫 mtd_num 취득
+ *    (예: 시스템에 mtd1 만 있고 mtd0 이 없을 수 있음).
+ * 3) 발견 실패 → 0(장치 없는 시스템 또는 pre-sysfs).
+ * 4) 발견한 mtdN 의 name 파일을 open 시도 — 2.6.29 처럼 디렉토리는 있으나
+ *    파일이 없는 중간기 커널 구분. name 파일이 없으면 0, 있으면 1.
+ *
+ * 주의: 장치가 전혀 없는 새 시스템은 pre-sysfs 로 오판될 수 있다 — 이 경우
+ * legacy 경로가 사용되지만 어차피 장치가 없으므로 실질적 영향 없음.
+ *
+ * 호출 체인: libmtd_open → [sysfs_is_supported()] → opendir/readdir/open
+ */
 /**
  * sysfs_is_supported - check whether the MTD sub-system supports MTD.
  * @lib: MTD library descriptor
@@ -544,15 +687,15 @@ static int dev_node2num(struct libmtd *lib, const char *node, int *mtd_num)
  */
 static int sysfs_is_supported(struct libmtd *lib)
 {
-	int fd, num = -1;
+	int fd, num = -1;  /* [한국어] num = -1 은 "아직 mtdN 못 찾음" 신호. */
 	DIR *sysfs_mtd;
-	char file[strlen(lib->mtd_name) + 10];
+	char file[strlen(lib->mtd_name) + 10];  /* [한국어] VLA — name 패턴에 숫자 치환용. */
 
-	sysfs_mtd = opendir(lib->sysfs_mtd);
+	sysfs_mtd = opendir(lib->sysfs_mtd);  /* [한국어] /sys/class/mtd 오픈. */
 	if (!sysfs_mtd) {
 		if (errno == ENOENT) {
 			errno = 0;
-			return 0;
+			return 0;  /* [한국어] 디렉토리 자체 없음 = pre-sysfs 커널. */
 		}
 		return sys_errmsg("cannot open \"%s\"", lib->sysfs_mtd);
 	}
@@ -563,14 +706,14 @@ static int sysfs_is_supported(struct libmtd *lib)
 	 */
 	while (1) {
 		int ret, mtd_num;
-		char tmp_buf[256];
+		char tmp_buf[256];  /* [한국어] sscanf 의 여분 문자 캡처 — 정확 매치 강제용. */
 		struct dirent *dirent;
 
 		dirent = readdir(sysfs_mtd);
 		if (!dirent)
-			break;
+			break;  /* [한국어] 엔트리 소진. */
 
-		if (strlen(dirent->d_name) >= 255) {
+		if (strlen(dirent->d_name) >= 255) {  /* [한국어] 비정상 긴 이름 방어. */
 			errmsg("invalid entry in %s: \"%s\"",
 			       lib->sysfs_mtd, dirent->d_name);
 			errno = EINVAL;
@@ -579,8 +722,8 @@ static int sysfs_is_supported(struct libmtd *lib)
 		}
 
 		ret = sscanf(dirent->d_name, MTD_NAME_PATT"%s",
-			     &mtd_num, tmp_buf);
-		if (ret == 1) {
+			     &mtd_num, tmp_buf);  /* [한국어] MTD_NAME_PATT = "mtd%d". %s 가 안 잡히면 정확 매치. */
+		if (ret == 1) {  /* [한국어] 숫자만 매치, 추가 문자 없음 = 정확한 "mtdN" 이름. */
 			num = mtd_num;
 			break;
 		}
@@ -593,17 +736,17 @@ static int sysfs_is_supported(struct libmtd *lib)
 		/* No mtd device, treat this as pre-sysfs system */
 		return 0;
 
-	sprintf(file, lib->mtd_name, num);
+	sprintf(file, lib->mtd_name, num);  /* [한국어] "/sys/class/mtd/mtdN/name" 조립. */
 	fd = open(file, O_RDONLY | O_CLOEXEC);
 	if (fd == -1)
-		return 0;
+		return 0;  /* [한국어] name 속성 없음 = 중간기 커널(2.6.29 등) — legacy 로 폴백. */
 
 	if (close(fd)) {
 		sys_errmsg("close failed on \"%s\"", file);
 		return -1;
 	}
 
-	return 1;
+	return 1;  /* [한국어] sysfs 완전 지원 확인. */
 }
 
 /*

@@ -1,14 +1,46 @@
 /*
- * [한국어 설명] NVMe CRC-64 룩업 테이블 (crc64table.h)
+ * [한국어 설명] NVMe CRC-64 Rocksoft 룩업 테이블 헤더 (crc64table.h)
  *
  * === 파일의 역할 ===
- * NVMe 규격에서 정의한 64비트 CRC의 룩업 테이블(256개 항목)을 제공한다.
- * crc64.c의 fio_crc64_nvme() 함수에서 CONFIG_LIBISAL64가 미정의일 때 사용한다.
- * NVMe 다항식은 crc64.c 상단 주석에 정의된 64차 다항식이다.
+ * NVMe 1.4+ Protection Information(PI) 64비트 Guard 필드 계산에 사용되는
+ * CRC-64 Rocksoft 다항식용 256 엔트리 reflected 룩업 테이블을 단일
+ * 정적(static) const 배열로 제공한다. 본 헤더는 오직 crc64.c 의 fio_crc64_nvme()
+ * 소프트웨어 폴백 경로에서 #include 되어 사용되며, CONFIG_LIBISAL64 가 정의되어
+ * ISA-L 의 crc64_rocksoft_refl() PCLMULQDQ 가속을 사용하는 빌드에서는 본 파일이
+ * 참조되지 않는다. 테이블 값은 NVMe Base Specification 의 CRC-64 Rocksoft
+ * 다항식(generator 0xAD93D23594C93659, reflected representation) 로부터 생성된
+ * 표준 Castagnoli-식 reflected 룩업이다.
+ *
+ * 참고로 fio 에는 CRC-64 변종이 둘 있다:
+ *   - 범용 Jones 다항식 CRC-64 (crc64.c::fio_crc64, 별도 테이블 crctab64[])
+ *   - NVMe Rocksoft CRC-64 (본 테이블) — 64B PI 전용
  *
  * === 전체 아키텍처에서의 위치 ===
- * 호출 체인: fio_crc64_nvme() [crc64.c] → crc64nvmetable[] [이 파일] 참조
+ * 호출 체인:
+ *   engines/nvme.c::fio_nvme_generate_guard() / fio_nvme_pi_verify()
+ *     → crc64.c::fio_crc64_nvme(crc, buf, len)
+ *       → (CONFIG_LIBISAL64 미정의 시) for 루프에서 바이트마다:
+ *           crc = (crc >> 8) ^ crc64nvmetable[(crc ^ byte) & 0xFF]
+ *
+ * === 타 모듈과의 연결 ===
+ * - crc64.c: 유일한 #include 자. fio_crc64_nvme() 의 소프트 폴백 루프에서 참조.
+ * - crc64.h: 상위 API 선언(fio_crc64_nvme).
+ * - engines/nvme.c: 64B PI Guard 계산 시 최종 호출자.
+ *
+ * === 주요 함수/구조체 요약 ===
+ * - crc64nvmetable[256]: 64비트 정적 상수 배열.
+ *   설정자: 본 헤더 포함 시 컴파일 타임에 초기화됨(translation unit 로컬 static).
+ *   읽는 자: fio_crc64_nvme() 바이트 루프.
+ *   값 범위: 64비트 부호 없는 정수. 각 엔트리는 해당 바이트 입력에 대한
+ *           Rocksoft 다항식 나머지(reflected) 사전 계산값.
+ *   동기화: static const — 읽기 전용, 스레드 공유 안전.
+ *
+ * 주의: 본 파일은 static 배열을 선언하므로 include 되는 translation unit 마다
+ *      개별 복사본이 생성된다. 실제로는 crc64.c 만 include 하므로 단일 인스턴스.
  */
+
+/* [한국어] 64비트 Rocksoft CRC 룩업 테이블 — 모든 엔트리는 reflected 바이트 입력의
+ * 다항식 나머지. 엔트리 순서 인덱스 i 는 reflected 입력 바이트 값. */
 static const unsigned long long crc64nvmetable[256] = {
 	0x0000000000000000ULL, 	0x7f6ef0c830358979ULL,
 	0xfedde190606b12f2ULL, 	0x81b31158505e9b8bULL,
