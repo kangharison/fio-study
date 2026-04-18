@@ -597,25 +597,29 @@ static void set_sig_handlers(void)
 static bool __check_min_rate(struct thread_data *td, struct timespec *now,
 			     enum fio_ddir ddir)
 {
-	/* 현재까지의 바이트 수와 블록(I/O) 수를 저장 */
+	/* [한국어] this_io_bytes/blocks 는 "현재 loop 구간" 의 누적 I/O. td->io_bytes 는
+	 * 잡 전체 누적 — keep_running 의 여러 loop 합산. ratemin 계산은 this_io_* 를 쓴다.
+	 * 변수에 스냅샷을 찍어 두어 계산 중 동시 증가해도 일관성 유지. */
 	unsigned long long current_rate_check_bytes = td->this_io_bytes[ddir];
 	unsigned long current_rate_check_blocks = td->this_io_blocks[ddir];
-	/* 사용자가 설정한 최소 속도 (바이트/초) */
+	/* [한국어] option_rate_bytes_min: ratemin=N (바이트/초). 0 이면 이 모드 비활성. */
 	unsigned long long option_rate_bytes_min = td->o.ratemin[ddir];
-	/* 사용자가 설정한 최소 IOPS */
+	/* [한국어] option_rate_iops_min: rate_iops_min=N (초당 IOPS). ratemin 과 배타. */
 	unsigned int option_rate_iops_min = td->o.rate_iops_min[ddir];
 
-	/* ddir이 읽기/쓰기 방향인지 확인 (TRIM 등은 제외) */
+	/* [한국어] SYNC/DATASYNC/SYNC_FILE_RANGE 같은 메타 ddir 에 대해서는 rate 검사가
+	 * 의미 없음 — 호출자가 for_each_rw_ddir 로 필터링하지만 방어적으로 assert. */
 	assert(ddir_rw(ddir));
 
-	/* 최소 속도 옵션이 설정되지 않았으면 검사 불필요 */
+	/* [한국어] 둘 다 0 이면 아예 검사 비활성 — 빠른 반환. */
 	if (!td->o.ratemin[ddir] && !td->o.rate_iops_min[ddir])
 		return false;
 
 	/*
 	 * allow a 2 second settle period in the beginning
 	 */
-	/* [한국어] 시작 후 2초간은 안정화 기간으로 검사 건너뜀 */
+	/* [한국어] 잡 시작 직후 2초는 캐시 워밍업/OS readahead/JIT 등으로 레이트가
+	 * 불안정 — 이 구간을 ratemin 검증에서 면제해 false positive 방지. */
 	if (mtime_since(&td->start, now) < 2000)
 		return false;
 
@@ -623,11 +627,15 @@ static bool __check_min_rate(struct thread_data *td, struct timespec *now,
 	 * if last_rate_check_blocks or last_rate_check_bytes is set,
 	 * we can compute a rate per ratecycle
 	 */
-	/* [한국어] 이전 검사 시점이 있으면 ratecycle 주기로 속도를 계산 */
+	/* [한국어] last_rate_check_* 중 하나라도 0 이 아니면 "이전 체크 시점이 존재" —
+	 * ratecycle 창을 이용해 샘플을 계산 가능. 첫 체크는 조건이 모두 0 이므로 false
+	 * 반환 후 스냅샷만 저장. */
 	if (td->last_rate_check_bytes[ddir] || td->last_rate_check_blocks[ddir]) {
-		/* 마지막 검사 이후 경과 시간 (밀리초) */
+		/* [한국어] mtime_since(past, now): ms 단위 경과. 이 값이 분모라 0 이면
+		 * DIV0 위험 — 같은 ms 에 두 번 호출된 극단적 경우. */
 		unsigned long spent = mtime_since(&td->last_rate_check_time[ddir], now);
-		/* ratecycle 주기가 아직 안 됐으면 건너뜀 */
+		/* [한국어] ratecycle(기본 1000ms): 샘플 창. 이보다 짧으면 측정 노이즈 과다 —
+		 * 아직 판정 유예. 두 조건 OR: spent==0 은 DIV0 방어 중복 가드. */
 		if (spent < td->o.ratecycle || spent==0)
 			return false;
 
@@ -635,35 +643,37 @@ static bool __check_min_rate(struct thread_data *td, struct timespec *now,
 			/*
 			 * check bandwidth specified rate
 			 */
-			/* [한국어] 대역폭(바이트/초) 기준 최소 속도 검사 */
+			/* [한국어] delta_bytes * 1000 / spent_ms = 바이트/초. 정수 산술로
+			 * *1000 먼저 해 정밀도 보존. */
 			unsigned long long current_rate_bytes =
 				((current_rate_check_bytes - td->last_rate_check_bytes[ddir]) * 1000) / spent;
 			if (current_rate_bytes < option_rate_bytes_min) {
 				log_err("%s: rate_min=%lluB/s not met, got %lluB/s\n",
 					td->o.name, option_rate_bytes_min, current_rate_bytes);
-				return true;  /* 최소 속도 미달 */
+				return true;  /* [한국어] true 반환 → 호출자 do_io 루프 탈출 → td_verror EIO. */
 			}
 		} else {
 			/*
 			 * checks iops specified rate
 			 */
-			/* [한국어] IOPS 기준 최소 속도 검사 */
+			/* [한국어] IOPS 계산: 동일 공식이되 블록 수(I/O 건수) 기준. */
 			unsigned long long current_rate_iops =
 				((current_rate_check_blocks - td->last_rate_check_blocks[ddir]) * 1000) / spent;
 
 			if (current_rate_iops < option_rate_iops_min) {
 				log_err("%s: rate_iops_min=%u not met, got %llu IOPS\n",
 					td->o.name, option_rate_iops_min, current_rate_iops);
-				return true;  /* 최소 IOPS 미달 */
+				return true;
 			}
 		}
 	}
 
-	/* 현재 값을 다음 검사 시점의 기준값으로 저장 */
+	/* [한국어] 스냅샷 롤오버: 다음 ratecycle 계산의 기준점. memcpy 로 timespec
+	 * 전체(tv_sec+tv_nsec) 복사. */
 	td->last_rate_check_bytes[ddir] = current_rate_check_bytes;
 	td->last_rate_check_blocks[ddir] = current_rate_check_blocks;
 	memcpy(&td->last_rate_check_time[ddir], now, sizeof(*now));
-	return false;  /* 최소 속도 충족 */
+	return false;  /* [한국어] 검사 통과 또는 첫 호출(스냅샷만 저장). */
 }
 
 /*
@@ -1474,12 +1484,18 @@ static enum fio_q_status io_u_submit(struct thread_data *td, struct io_u *io_u)
 	 * Check for overlap if the user asked us to, and we have
 	 * at least one IO in flight besides this one.
 	 */
-	/* [한국어] 겹침 검사: serialize_overlap이 설정되고 큐 깊이 > 1인 경우 */
+	/* [한국어] serialize_overlap=1: 같은 오프셋 영역을 동시에 read/write 하면
+	 * 저장계층 순서가 비결정적이 되어 verify 가 깨진다. cur_depth>1 은 "자기 자신
+	 * 외에 in-flight 가 하나라도 있을 때만" 검사 — 큐가 거의 빈 상태에서는
+	 * 겹침이 불가능하므로 불필요한 O(iodepth) 스캔 회피. 겹침이면 FIO_Q_BUSY 로
+	 * 호출자에게 "지금은 보낼 수 없다" 반환 → do_io 가 완료 수거 후 재시도. */
 	if (td->o.serialize_overlap && td->cur_depth > 1 &&
 	    in_flight_overlap(&td->io_u_all, io_u))
 		return FIO_Q_BUSY;
 
-	/* I/O 엔진의 queue 콜백을 호출하여 실제 제출 */
+	/* [한국어] td_io_queue: ioengines.c 디스패처 → ops->queue 콜백. 반환값은
+	 * FIO_Q_COMPLETED(즉시)/QUEUED(비동기 큐잉)/BUSY(엔진 포화)/음수(에러).
+	 * 이 반환을 그대로 호출자(do_io/do_verify)가 io_queue_event 로 처리. */
 	return td_io_queue(td, io_u);
 }
 
@@ -1954,9 +1970,14 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 	uint64_t total;
 	int left;
 	struct timespec now;
-	bool stall = false;  /* 대기 필요 여부 */
+	bool stall = false;
+	/* [한국어] stall = "이번에 실제로 thinktime 대기를 발생시켜야 하는가"
+	 * 의 최종 판정. thinktime_blocks / thinktime_iotime 둘 중 하나라도 조건을
+	 * 충족하면 true. 둘 다 미충족이면 0 대기로 조기 반환 — syscall 없이 통과. */
 
-	/* thinktime_iotime이 설정된 경우: I/O 시간 기준 대기 */
+	/* [한국어] thinktime_iotime: "I/O 시각 기준 X usec 이 흘렀으면 thinktime 수행".
+	 * last_thinktime 은 마지막으로 thinktime 을 수행한 시각. fio_gettime 을 한 번
+	 * 호출하고 utime_since 로 경과 시간 계산. */
 	if (td->o.thinktime_iotime) {
 		fio_gettime(&now, NULL);
 		if (utime_since(&td->last_thinktime, &now)
@@ -1976,7 +1997,9 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 
 	}
 
-	/* thinktime_blocks 기준 검사: 일정 블록 수마다 대기 */
+	/* [한국어] thinktime_blocks: 발행된 블록 수가 last_thinktime_blocks 로부터
+	 * N 개 이상 늘어나면 thinktime 수행. thinktime_blocks_counter 는 acct_ddir 기준
+	 * (예: verify 가 써놓은 블록은 제외). */
 	b = ddir_rw_sum(td->thinktime_blocks_counter);
 	if (b >= td->last_thinktime_blocks + td->o.thinktime_blocks)
 		stall = true;
@@ -1984,10 +2007,14 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 	if (!stall)
 		return;
 
-	/* [한국어] 대기 전에 진행 중인 모든 I/O를 완료시킴 */
+	/* [한국어] io_u_quiesce: 이미 발행된 모든 in-flight 를 완료시켜 "대기 중에도
+	 * 디스크는 계속 일하지 않도록". thinktime 의 의미는 "사용자 생각하는 시간 동안
+	 * 완전히 쉬는 것" 이므로 수면 전 드레인 필수. */
 	io_u_quiesce(td);
 
-	/* spin 대기 시간 결정 (남은 런타임 고려) */
+	/* [한국어] thinktime 은 spin + sleep 두 단계로 분해. spin 은 나노초~수μs 대기에
+	 * 유리하지만 CPU 소비. left 초기값=thinktime_spin(사용자 옵션). timeout 옵션이
+	 * 있으면 남은 런타임보다 길어지지 않도록 클램프 — 잡 종료 기한을 넘기지 않게. */
 	left = td->o.thinktime_spin;
 	if (td->o.timeout) {
 		runtime_left = td->o.timeout - utime_since_now(&td->epoch);
@@ -1995,7 +2022,7 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 			left = runtime_left;
 	}
 
-	/* CPU 바쁜 대기(spin) 수행 */
+	/* [한국어] usec_spin: clock_gettime 폴링 루프(rdtsc 기반 고정밀). total=실제 경과 μs. */
 	total = 0;
 	if (left)
 		total = usec_spin(left);
@@ -2005,19 +2032,23 @@ static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir,
 	 * where the vCPU could get descheduled or the hypervisor could steal
 	 * CPU time. Ensure "left" doesn't become negative.
 	 */
-	/* [한국어] 남은 씽크타임에서 spin 시간을 빼고, usleep으로 나머지 대기 */
+	/* [한국어] thinktime - spin 한 시간 = usleep 으로 마저 대기할 시간. usec_spin 이
+	 * VM 환경에서 의도보다 길게 돌 수 있어 total > thinktime 이면 음수 대신 0 사용. */
 	if (total < td->o.thinktime)
 		left = td->o.thinktime - total;
 	else
 		left = 0;
 
+	/* [한국어] sleep 구간도 timeout 으로 다시 클램프 — 긴 thinktime 이 timeout 을
+	 * 초과하지 않도록. */
 	if (td->o.timeout) {
 		runtime_left = td->o.timeout - utime_since_now(&td->epoch);
 		if (runtime_left < (unsigned long long)left)
 			left = runtime_left;
 	}
 
-	/* 슬립 대기 수행 */
+	/* [한국어] usec_sleep: 내부적으로 nanosleep(2) + td->terminate 주기 체크. SIGINT
+	 * 수신 시 조기 깨어날 수 있음. 반환값 = 실제로 잔 시간. */
 	if (left)
 		total += usec_sleep(td, left);
 
@@ -2294,22 +2325,34 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 {
 	unsigned int i;
 	int ret = 0;
-	uint64_t total_bytes, bytes_issued = 0;  /* 총 목표 바이트, 발행된 바이트 */
+	uint64_t total_bytes, bytes_issued = 0;
+	/* [한국어] total_bytes = 이번 do_io 호출에서 발행할 최대 바이트(루프 종료 조건).
+	 * bytes_issued = 지금까지 엔진에 제출 요청(queue)한 누적 바이트 — io_bytes(완료)와는 다름.
+	 * 완료 여부와 무관하게 "제출만" 세므로 time_based 가 아닌 한 total_bytes 에 도달하면
+	 * 더 이상 새 io_u 를 발행하지 않고 남은 in-flight 가 완료되길 기다린다. */
 
-	/* 현재까지의 bytes_done 스냅샷 저장 (나중에 차이를 계산하기 위해) */
+	/* [한국어] do_io 시작 직전의 bytes_done 을 저장해 두었다가, 함수 말미에서
+	 * td->bytes_done[i] - bytes_done[i] 로 "이번 do_io 가 실제 완료시킨 바이트" 를
+	 * 계산해 호출자(thread_main) 에 돌려준다. keep_running 이 loops 내부에서 여러 번
+	 * 호출되므로 잡 전체 합계와 구분해야 한다. */
 	for (i = 0; i < DDIR_RWDIR_CNT; i++)
 		bytes_done[i] = td->bytes_done[i];
 
-	/* [한국어] 런 상태 설정: 워밍업 구간이면 TD_RAMP, 아니면 TD_RUNNING */
+	/* [한국어] ramp_time 구간이면 TD_RAMP 로 진입 — ramp 는 워밍업이라 통계/latency
+	 * 집계에서 배제된다(stat.c 의 add_*_sample 이 in_ramp_period 체크). 워밍업이 끝나면
+	 * TD_RUNNING 으로 올라가서 비로소 샘플이 집계됨. */
 	if (in_ramp_period(td))
 		td_set_runstate(td, TD_RAMP);
 	else
 		td_set_runstate(td, TD_RUNNING);
 
-	/* 지연 시간 타겟 초기화 */
+	/* [한국어] latency_target 모드에서 이진 탐색을 위한 상태(queue_depth_probe/
+	 * success_count/next_check) 초기화. do_io 루프 말미의 lat_target_check 가 이를
+	 * 갱신해 목표 지연시간을 만족하는 최대 iodepth 를 자동 탐색한다. */
 	lat_target_init(td);
 
-	/* [한국어] 총 I/O 목표 바이트 수 결정 */
+	/* [한국어] size 옵션이 1차 기준. 아래 if 문들에서 verify_backlog/trimwrite/
+	 * io_size 조합에 따라 확장될 수 있다. */
 	total_bytes = td->o.size;
 
 	/*
@@ -2362,22 +2405,33 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 	while ((td->o.read_iolog_file && !flist_empty(&td->io_log_list)) ||
 		(!flist_empty(&td->trim_list)) || !io_issue_bytes_exceeded(td) ||
 		td->o.time_based) {
-		struct timespec comp_time;  /* 완료 시간 (속도 체크용) */
+		struct timespec comp_time;
+		/* [한국어] comp_time: 완료 이벤트 수거 시점의 벽시계. rate/ratemin 계산에서
+		 * "이 순간까지 몇 바이트 처리됐는가" 의 분모로 사용. should_check_rate 일 때만
+		 * 갱신되며, 나머지 경로에서는 초기화되지 않은 채로 넘어갈 수 있다. */
 		struct io_u *io_u;
 		int full;
 		enum fio_ddir ddir;
 
-		/* 리소스 사용량 업데이트 요청 확인 */
+		/* [한국어] SIGUSR1/상태요청에 응답해 한 번씩 getrusage(2) 호출. 인라인 체크는
+		 * td->update_rusage 원자 플래그 — 대부분은 if 바로 빠져나옴. */
 		check_update_rusage(td);
 
-		/* 종료 플래그 확인 */
+		/* [한국어] td->terminate=시그널/exitall 로 외부에서 종료 요청. td->done=이미
+		 * do_io 마지막 패스에서 "더 할 I/O 없음" 판단됨. 둘 중 하나면 즉시 탈출해
+		 * 남은 in-flight 수거 단계로 진입. */
 		if (td->terminate || td->done)
 			break;
 
-		/* 타임스탬프 캐시 갱신 */
+		/* [한국어] ts_cache = 이번 루프 반복의 "공유되는 현재 시각" 캐시.
+		 * fio_gettime 이 clock_gettime(2) 를 호출하므로 한 반복 내 여러 번 호출하면
+		 * 비싸다. LOG_MSEC_SLACK 이내면 이전 값을 재사용. */
 		update_ts_cache(td);
 
-		/* [한국어] 실행 시간 초과 확인 (캐시 + 실제 시간으로 이중 확인) */
+		/* [한국어] runtime 체크: cached ts 로 먼저 판정해 빠른 경로에서는 syscall 생략.
+		 * cache 기준으로 초과가 감지되면 __update_ts_cache 로 강제 재샘플링 후 한 번 더
+		 * 확인 — 캐시가 너무 오래된 값이어서 "성급한 종료" 를 유발하지 않도록 하는 이중 방어.
+		 * 확정되면 fio_mark_td_terminate(td) 로 terminate=1 세팅, 다음 반복에서 탈출. */
 		if (runtime_exceeded(td, &td->ts_cache)) {
 			__update_ts_cache(td);
 			if (runtime_exceeded(td, &td->ts_cache)) {
@@ -2386,7 +2440,9 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 			}
 		}
 
-		/* 흐름 제어 임계값 초과 시 이번 반복 건너뜀 */
+		/* [한국어] flow 옵션: 여러 잡 간 가중치 스로틀링. 이 잡의 몫이 초과됐으면
+		 * continue 로 건너뛰어 다른 잡이 먼저 진행하도록 양보. break 가 아니라 continue
+		 * 인 이유 — 종료가 아니라 일시적 양보. */
 		if (flow_threshold_exceeded(td))
 			continue;
 
@@ -2413,19 +2469,25 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 		 * 내부적으로 get_next_offset(), get_next_buflen() 등을 호출한다.
 		 * ============================================================ */
 		io_u = get_io_u(td);
+		/* [한국어] IS_ERR_OR_NULL: ERR_PTR 포인터 인코딩 또는 NULL. NULL 은 freelist
+		 * 고갈 같은 "나중에 다시 시도" 이고, ERR_PTR 은 errno 를 포인터에 담은 것. */
 		if (IS_ERR_OR_NULL(io_u)) {
 			int err = PTR_ERR(io_u);
 
 			io_u = NULL;
 			ddir = DDIR_INVAL;
 			if (err == -EBUSY) {
-				/* 엔진이 바쁨: 완료 이벤트 수거 후 재시도 */
+				/* [한국어] -EBUSY: 엔진이 내부적으로 포화라 신규 io_u 를 받을 수 없음
+				 * (예: libaio 의 aio_ring 가득). reap 레이블로 점프해 완료 이벤트를
+				 * 수거하고 cur_depth 를 낮춘 뒤 while 루프로 복귀해 재시도. */
 				ret = FIO_Q_BUSY;
 				goto reap;
 			}
 			if (td->o.latency_target)
+				/* [한국어] latency_target 이진 탐색 중에는 NULL 도 "현재 iodepth 로는
+				 * 더 못 보냄" 의 신호 — 탈출 대신 reap 후 탐색 피드백을 받는다. */
 				goto reap;
-			break;  /* 할당 실패: 루프 종료 */
+			break;  /* [한국어] 이외 실패(파일 끝/no-more-blocks 등) — 정상 종료 경로. */
 		}
 
 		/* [한국어] 쓰기 + 검증 모드: 검증 패턴을 io_u 버퍼에 기록
@@ -2504,25 +2566,36 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 		 *   B) 일반 모드: io_u_submit()으로 직접 제출
 		 * ============================================================ */
 		if (td->o.io_submit_mode == IO_MODE_OFFLOAD) {
-			/* [한국어] 오프로드 모드: 워크큐에 io_u를 넣어 별도 스레드가 처리 */
+			/* [한국어] OFFLOAD 모드: 호출 잡 스레드는 enqueue 만 하고 별도 워커 스레드
+			 * 풀이 실제 td_io_queue 를 실행한다. 용도 — serialize_overlap 같이
+			 * 동기화가 필요한 시나리오에서 I/O 제출 타이밍을 "제출 스레드"와 분리해
+			 * 겹침 검사를 일관되게. 대신 latency 가 증가한다. */
 			const unsigned long long blen = io_u->xfer_buflen;
 			const enum fio_ddir __ddir = acct_ddir(io_u);
 
 			if (td->error)
 				break;
 
-			/* 워크큐에 제출 */
+			/* [한국어] workqueue_enqueue: td->io_wq 의 ready_list 에 append +
+			 * cond_signal. 워커가 깨어나 td_io_queue 수행. 즉시 QUEUED 로 간주
+			 * (실제 큐잉 완료는 워커가 보장). */
 			workqueue_enqueue(&td->io_wq, &io_u->work);
 			ret = FIO_Q_QUEUED;
 
-			/* I/O 발행 통계 갱신 */
+			/* [한국어] 발행 회계: io_issues=발행 횟수, io_issue_bytes=발행 바이트,
+			 * rate_io_issue_bytes=rate 계산용(rate_ign_think 와 상호작용). 이 시점에
+			 * 증가시키는 이유 — OFFLOAD 경로는 워커가 실제 제출을 나중에 해도
+			 * 애플리케이션 관점의 발행 통계는 enqueue 시점이 정확. */
 			if (ddir_rw(__ddir)) {
 				td->io_issues[__ddir]++;
 				td->io_issue_bytes[__ddir] += blen;
 				td->rate_io_issue_bytes[__ddir] += blen;
 			}
 
-			/* 속도 제한 계산 */
+			/* [한국어] should_check_rate: ratemin/rate_iops_min 중 하나라도 설정되면 true.
+			 * usec_for_io 는 다음 I/O 를 보낼 수 있는 가장 이른 시각(마이크로초) 을
+			 * 누적 바이트 기준으로 계산(토큰버킷 유사). fio_gettime 으로 comp_time 을
+			 * 초기화해 둬야 후속 check_min_rate 가 올바른 spent 를 얻는다. */
 			if (ddir_rw(__ddir) && should_check_rate(td)) {
 				td->rate_next_io_time[__ddir] = usec_for_io(td, __ddir);
 				fio_gettime(&comp_time, NULL);
@@ -2561,6 +2634,10 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 			 *   - 완료된 io_u는 put_io_u()로 freelist에 반환됨
 			 * ============================================================ */
 reap:
+		/* [한국어] full = 큐 포화(cur_depth == iodepth). BUSY 반환은 엔진이 더는
+		 * 못 받는다는 뜻이므로 cur_depth>0 이면 수거해야 백프레셔가 풀린다.
+		 * io_in_polling: iodepth_batch_complete_{min,max} 둘 다 0 — "완료 즉시 수거"
+		 * 모드로 매 반복 수거. full/polling 둘 중 하나면 wait_for_completions 진입. */
 			full = queue_full(td) ||
 				(ret == FIO_Q_BUSY && td->cur_depth);
 			if (full || io_in_polling(td))
@@ -2569,20 +2646,29 @@ reap:
 		if (ret < 0)
 			break;
 
-		/* [한국어] thinkcycles 옵션: CPU 사이클을 소비하여 I/O 간 지연 시뮬레이션 */
+		/* [한국어] thinkcycles: CPU cycle 단위의 짧은 스핀(마이크로초 미만 지연)으로
+		 * "계산 후 I/O" 워크로드의 계산 시간을 모사. thinktime 과 달리 syscall 없이
+		 * 순수 CPU 루프만 돈다. */
 		if (ddir_rw(ddir) && td->o.thinkcycles)
 			cycles_spin(td->o.thinkcycles);
 
-		/* [한국어] thinktime 옵션: I/O 간 대기 시간 처리 */
+		/* [한국어] thinktime: I/O 간 대기. thinktime_blocks 블록마다 thinktime_spin
+		 * 만큼 스핀 후 (thinktime - thinktime_spin) 만큼 usleep. handle_thinktime 이
+		 * 분기 로직을 담당. */
 		if (ddir_rw(ddir) && td->o.thinktime)
 			handle_thinktime(td, ddir, &comp_time);
 
-		/* 아직 데이터 전송이 없고 NOIO 엔진이 아니면 다음 반복 */
+		/* [한국어] FIO_NOIO 엔진(cpuio 등) 은 실제 바이트 전송이 없으므로
+		 * bytes_done 이 0 이어도 루프를 계속 돌아야 함. 일반 엔진에서는 첫 완료가
+		 * 아직 수거되지 않은 상태에서 rate/latency 판정을 해봤자 의미가 없어
+		 * continue 로 건너뜀 — 샘플이 쌓이길 기다린다. */
 		if (!ddir_rw_sum(td->bytes_done) &&
 		    !td_ioengine_flagged(td, FIO_NOIO))
 			continue;
 
-		/* [한국어] 최소 속도(ratemin) 검사: 미달 시 에러로 종료 */
+		/* [한국어] ramp 구간은 통계 배제(워밍업) — ratemin 검사도 의미 없어 건너뜀.
+		 * check_min_rate 가 true 면 td_verror 로 EIO 기록 후 break. exitall_on_terminate
+		 * 또는 exitall_error 면 동료 잡까지 전부 종료 전파. */
 		if (!in_ramp_period(td) && should_check_rate(td)) {
 			if (check_min_rate(td, &comp_time)) {
 				if (exitall_on_terminate || td->o.exitall_error)
@@ -2591,7 +2677,8 @@ reap:
 				break;
 			}
 		}
-		/* 지연 시간 타겟 검사 */
+		/* [한국어] latency_target 이진 탐색 샘플 수집 — 지연 타겟 달성 여부에 따라
+		 * iodepth 를 위/아래로 조정. 워밍업 중에는 샘플 무의미하므로 제외. */
 		if (!in_ramp_period(td) && td->o.latency_target)
 			lat_target_check(td);
 	}
@@ -2601,11 +2688,14 @@ reap:
 
 	check_update_rusage(td);
 
-	/* trim 항목 누수 확인 */
+	/* [한국어] trim_entries 는 log_io_piece 로 추적되는 "미완료 트림" 카운터.
+	 * 모든 트림이 올바르게 완료/취소됐으면 0 이어야 함. 누수면 경고(버그 지표). */
 	if (td->trim_entries)
 		log_err("fio: %lu trim entries leaked?\n", td->trim_entries);
 
-	/* [한국어] fill_device 모드에서 공간 부족 에러는 정상 종료로 처리 */
+	/* [한국어] fill_device 모드: 디바이스가 가득 찰 때까지 쓰기 — ENOSPC/EDQUOT 는
+	 * "정상 종료 신호" 로 해석하고 error 를 지운다(td_verror 가 기록했을 수 있음).
+	 * fio_mark_td_terminate 는 이후 keep_running 에서 루프 탈출을 보장. */
 	if (td->o.fill_device && (td->error == ENOSPC || td->error == EDQUOT)) {
 		td->error = 0;
 		fio_mark_td_terminate(td);
@@ -2613,14 +2703,18 @@ reap:
 	if (!td->error) {
 		struct fio_file *f;
 
-		/* [한국어] 오프로드 모드에서는 워크큐 플러시, 일반 모드에서는 cur_depth 사용 */
+		/* [한국어] OFFLOAD 는 워커가 별도 스레드에서 제출 중이므로 workqueue_flush 로
+		 * 모든 워커가 ready_list 를 비우고 완료할 때까지 동기 대기. 일반 모드는
+		 * cur_depth 가 "현재 in-flight 수" 이므로 그만큼을 수거 목표로 전달. */
 		if (td->o.io_submit_mode == IO_MODE_OFFLOAD) {
 			workqueue_flush(&td->io_wq);
 			i = 0;
 		} else
 			i = td->cur_depth;
 
-		/* [한국어] 진행 중인 모든 I/O 완료 대기 */
+		/* [한국어] io_u_queued_complete(td, i): 최소 i 개 완료될 때까지 블록.
+		 * 루프가 "발행"을 중단하고 "수거" 단계로 전환되는 지점. fill_device 에서
+		 * 이 완료 중 ENOSPC 가 뒤늦게 전달되는 경우도 정상 처리. */
 		if (i) {
 			ret = io_u_queued_complete(td, i);
 			if (td->o.fill_device &&
@@ -3502,22 +3596,28 @@ static void *thread_main(void *data)
 	} else
 		td->pid = gettid();  /* [한국어] pthread 의 커널 LWP tid */
 
-	/* 로컬 시계 초기화 */
+	/* [한국어] TSC 기반 클럭 캘리브레이션(clock_thread 기능 있으면). 이 스레드만의
+	 * base clock 을 설정해 fio_gettime 의 시작점으로 사용. */
 	fio_local_clock_init();
 
 #ifdef CONFIG_LINUX
-	/* Linux에서 스레드 이름 설정 (ps 등에서 표시) */
+	/* [한국어] prctl(PR_SET_NAME) — /proc/[pid]/comm, top/ps 의 프로세스 이름을
+	 * 잡 이름으로 교체해 여러 잡 동시 실행 시 식별 가능. Linux 전용 syscall. */
 	if (o->comm)
 		prctl(PR_SET_NAME, o->comm);
 #endif
 
 	dprint(FD_PROCESS, "jobs pid=%d started\n", (int) td->pid);
 
-	/* 서버 모드인 경우 시작 메시지 전송 */
+	/* [한국어] 서버 모드: 클라이언트에게 "이 잡이 시작됐음" 알림(FIO_NET_CMD_START).
+	 * 클라이언트 측 gfio/fio-client 가 잡별 진행 표시를 시작하도록. */
 	if (is_backend)
 		fio_server_send_start(td);
 
-	/* [한국어] 리스트 초기화: I/O 로그, 히스토리, 검증, 트림 */
+	/* [한국어] 잡 스레드 고유 리스트 초기화. io_log_list = read_iolog replay 소스,
+	 * io_hist_list/io_hist_tree = verify 를 위한 쓰기 히스토리(오프셋/시드/numberio),
+	 * verify_list = verify_backlog 에서 쓰기→검증 대기 io_u 큐,
+	 * trim_list = pending trim entries. fork 모드에서도 자식이 COW 로 자기 복사본 소유. */
 	INIT_FLIST_HEAD(&td->io_log_list);
 	INIT_FLIST_HEAD(&td->io_hist_list);
 	INIT_FLIST_HEAD(&td->verify_list);
@@ -3558,7 +3658,9 @@ static void *thread_main(void *data)
 	 * A new gid requires privilege, so we need to do this before setting
 	 * the uid.
 	 */
-	/* [한국어] 그룹 ID와 사용자 ID 변경 (권한 관련) */
+	/* [한국어] setgid(2)/setuid(2) 는 권한 하강 전용 순서. setgid 를 먼저 해야 함 —
+	 * 일반적으로 setuid 후에는 gid 변경 권한이 사라지기 때문(root 에서 일반 유저로
+	 * 전환한 후에는 그룹을 바꿀 수 없다). -1U 는 "기본값(변경 안 함)" sentinel. */
 	if (o->gid != -1U && setgid(o->gid)) {
 		td_verror(td, errno, "setgid");
 		goto err;
@@ -3568,7 +3670,8 @@ static void *thread_main(void *data)
 		goto err;
 	}
 
-	/* 존(zone) 분배 인덱스 생성 */
+	/* [한국어] zonemode 옵션 관련 — 각 잡이 어느 zone 영역을 담당할지 할당 테이블
+	 * 생성(ZNS/디바이스 zone 분배). zonemode=strided/zbd 에서만 의미 있음. */
 	td_zone_gen_index(td);
 
 	/*
@@ -3682,8 +3785,10 @@ static void *thread_main(void *data)
 	if (!init_iolog(td))
 		goto err;
 
-	/* ioprio_set() has to be done before td_io_init() */
-	/* [한국어] I/O 우선순위 설정 (I/O 엔진 초기화 전에 해야 함) */
+	/* [한국어] ioprio_set(2) 는 프로세스/스레드의 기본 I/O 우선순위 설정(CFQ/BFQ
+	 * 스케줄러에서 의미 있음, mq-deadline 은 hint 제한적 사용). 엔진 초기화 전에
+	 * 해야 하는 이유 — 엔진이 첫 I/O 를 제출할 때 이 값이 BIO->ioprio 로 전파되므로.
+	 * IOPRIO_WHO_PROCESS, who=0 = 현재 스레드/프로세스 자신. */
 	if (fio_option_is_set(o, ioprio) ||
 	    fio_option_is_set(o, ioprio_class) ||
 	    fio_option_is_set(o, ioprio_hint)) {
@@ -3693,22 +3798,30 @@ static void *thread_main(void *data)
 			td_verror(td, errno, "ioprio_set");
 			goto err;
 		}
+		/* [한국어] ioprio_value: (class<<13) | level | (hint<<10) 16비트 인코딩.
+		 * 통계(ts.ioprio) 에 저장해 출력 시 표시. */
 		td->ioprio = ioprio_value(o->ioprio_class, o->ioprio,
 					  o->ioprio_hint);
 		td->ts.ioprio = td->ioprio;
 	}
 
-	/* [한국어] I/O 엔진 초기화 (예: libaio, io_uring, sync 등) */
+	/* [한국어] td_io_init: ioengine_ops->init 콜백 호출. libaio=io_setup(2),
+	 * io_uring=io_uring_setup(2), sync/psync 는 noop. 엔진별 상태(aio_ctx/SQ-CQ
+	 * 링/커넥션 등)를 여기서 생성. 실패하면 cleanup 경로로. */
 	if (td_io_init(td))
 		goto err;
 
-	/* 동기 I/O 엔진에서 iodepth > 1이면 경고 */
+	/* [한국어] FIO_SYNCIO 엔진(sync/psync/vsync/mmap/splice 등)은 한 번에 하나의
+	 * I/O 만 처리 가능. iodepth>1 로 설정돼 있어도 코어 루프가 사실상 순차 실행하므로
+	 * 사용자에게 노티 — OFFLOAD 모드에서는 별도 워커 스레드 각각이 동기 I/O 를
+	 * 병렬 실행하므로 경고 대상 제외. */
 	if (td_ioengine_flagged(td, FIO_SYNCIO) && td->o.iodepth > 1 && td->o.io_submit_mode != IO_MODE_OFFLOAD) {
 		log_info("note: both iodepth >= 1 and synchronous I/O engine "
 			 "are selected, queue depth will be capped at 1\n");
 	}
 
-	/* [한국어] I/O 유닛(io_u) 풀 초기화 - iodepth 개수만큼 io_u 할당 */
+	/* [한국어] init_io_u: io_u 풀(iodepth 개) 할당 + io_u_freelist 에 넣음. 또한
+	 * O_DIRECT 정렬 요구 시 posix_memalign/mmap 으로 정렬된 버퍼 할당. */
 	if (init_io_u(td))
 		goto err;
 
@@ -3800,16 +3913,19 @@ static void *thread_main(void *data)
 		fio_gettime(&td->start, NULL);
 		memcpy(&td->ts_cache, &td->start, sizeof(td->start));
 
-		/* 두 번째 이상의 루프에서는 I/O 상태 초기화 */
+		/* [한국어] 두 번째 이후 반복(loops 옵션). 이전 반복의 bytes_done/io_issues/
+		 * verify_list 등 누적 상태를 리셋해 "처음부터 다시" 실행. rand_seed 는 유지. */
 		if (clear_state) {
 			clear_io_state(td, 0);
 
-			/* unlink_each_loop 옵션: 각 루프마다 파일 삭제 후 재생성 */
+			/* [한국어] unlink_each_loop: 매 루프마다 파일을 삭제/재생성. cold 캐시
+			 * 상태에서 반복 측정하고 싶거나, extent 레이아웃 차이를 보고 싶을 때. */
 			if (o->unlink_each_loop && unlink_all_files(td))
 				break;
 		}
 
-		/* 이전 루프의 I/O 로그 정리 */
+		/* [한국어] 이전 반복의 io_piece(write log for verify) 를 RB-tree 에서 제거.
+		 * 여기서 비우지 않으면 메모리 누적 + 두 번째 loop 의 검증이 이전 데이터를 참조. */
 		prune_io_piece_log(td);
 
 		if (td->o.verify_only && td_write(td))
@@ -3851,8 +3967,11 @@ static void *thread_main(void *data)
 		 * contention from concurrent stat calls or other slow operations under
 		 * stat_sem.
 		 */
-		/* [한국어] 통계 세마포어 획득: 데드락 방지를 위해 trylock + 재시도
-		 * 5초 이상 대기하면 데드락으로 간주하고 에러 처리 */
+		/* [한국어] stat_sem = 모든 잡 공유 직렬화 세마포어 — show_running_run_stats
+		 * (SIGUSR1) 같은 "잡 진행 중 통계 스냅샷" 과의 경합을 방지. trylock + 1ms
+		 * usleep 루프로 SIGUSR1 핸들러의 blocking 구간이 길어도 check_update_rusage
+		 * 를 주기적으로 처리 가능. 5000회(5초) 초과는 상대방이 데드락에 빠졌다는
+		 * 강한 신호 → EDEADLK 로 자진 종료하고 전체 교착을 회피. */
 		deadlock_loop_cnt = 0;
 		do {
 			check_update_rusage(td);
@@ -3920,8 +4039,11 @@ static void *thread_main(void *data)
 	 * offload mode so that we don't clean up this job while
 	 * another thread is checking its io_u's for overlap
 	 */
-	/* [한국어] 오프로드 + 오버랩 체크 모드에서는 정리 전에 뮤텍스 획득.
-	 * 다른 스레드가 이 작업의 io_u를 겹침 검사 중일 수 있으므로. */
+	/* [한국어] td_offload_overlap = OFFLOAD + serialize_overlap 동시 활성. 이 조합
+	 * 에서는 여러 잡의 워커 스레드가 공통 overlap_check 뮤텍스로 io_u_all 접근을
+	 * 직렬화한다. runstate 를 TD_FINISHING 으로 바꾸기 전에 락을 잡아 "정리 중인 잡"
+	 * 의 io_u 배열을 다른 잡 워커가 스캔 중이면 충돌 — 잡 종료와 동시에 io_u 가
+	 * 해제되면 use-after-free. 락 보유 중 runstate 전이 후 즉시 해제. */
 	if (td_offload_overlap(td)) {
 		int res;
 
@@ -4551,21 +4673,27 @@ static void run_threads(struct sk_out *sk_out)
 	uint64_t m_rate, t_rate;  /* 최소 속도 합계, 목표 속도 합계 */
 	uint64_t spent;
 
-	/* gtod 오프로드 스레드 시작 (별도 스레드에서 gettimeofday 수행) */
+	/* [한국어] fio_gtod_offload: gettimeofday 를 전용 CPU/스레드로 격리해
+	 * 주 잡 스레드의 clock_gettime(2) 비용을 제거하는 최적화. cpu_used 마스크에서
+	 * 해당 CPU 를 빼둬 잡 스레드가 침범하지 않게 한다. */
 	if (fio_gtod_offload && fio_start_gtod_thread())
 		return;
 
-	/* 유휴 프로파일링 초기화 */
+	/* [한국어] idle CPU 프로파일링 — 잡 기간 중 각 CPU 의 유휴율을 측정해 병목 판단. */
 	fio_idle_prof_init();
 
-	/* 시그널 핸들러 등록 */
+	/* [한국어] 시그널 핸들러를 run_threads 직전에 등록하는 이유 — 잡 스폰 이전까지는
+	 * 기본 동작(즉시 종료)으로 두어 치명적 옵션 파싱 에러 시 hang 되지 않게.
+	 * 잡 스폰 시점부터는 graceful shutdown 이 필요하므로 여기서 등록. */
 	set_sig_handlers();
 
-	/* [한국어] 스레드/프로세스 수 집계 및 마운트 쓰기 검사 */
+	/* [한국어] 잡을 순회하며 (1) 쓰기가 마운트된 FS 에 향하는지 안전검사 —
+	 * /(root) 같은 활성 파일시스템에 raw 쓰기는 데이터 파괴 위험. (2) use_thread
+	 * 옵션에 따라 pthread/fork 분기 수를 집계해 시작 메시지와 이후 조절에 사용. */
 	nr_thread = nr_process = 0;
 	for_each_td(td) {
 		if (check_mount_writes(td))
-			return;  /* 마운트된 디바이스에 쓰기 시도 시 중단 */
+			return;
 		if (td->o.use_thread)
 			nr_thread++;
 		else
@@ -4688,7 +4816,9 @@ reap:
 				continue;
 			}
 
-			/* start_delay 옵션: 지정된 지연 시간이 지나지 않았으면 건너뜀 */
+			/* [한국어] start_delay: "잡 실행을 N usec 지연시킨다". genesis=잡 실행
+			 * 전체의 wall clock 시작점. 남은 지연 시간이 있으면 continue — 다른 잡
+			 * 스폰/수거를 먼저 진행하고 100ms 후 다시 검사. */
 			if (td->o.start_delay) {
 				spent = utime_since_genesis();
 
@@ -4696,24 +4826,32 @@ reap:
 					continue;
 			}
 
-			/* [한국어] stonewall 옵션: 이전 작업이 모두 완료될 때까지 대기 */
+			/* [한국어] stonewall: "이전에 스폰된 잡이 전부 끝날 때까지 이 잡은 시작
+			 * 금지". for 루프 전체를 break 하는 이유 — nr_started/nr_running 이 0
+			 * 이 될 때까지 이후 잡도 모두 묶여 기다려야 하므로, 개별 continue 가 아닌
+			 * 배치 전체 일시정지. */
 			if (td->o.stonewall && (nr_started || nr_running)) {
 				dprint(FD_PROCESS, "%s: stonewall wait\n",
 							td->o.name);
 				break;
 			}
 
-			/* wait_for 옵션: 지정된 작업이 완료될 때까지 대기 */
+			/* [한국어] wait_for="<name>": 특정 이름의 잡이 끝날 때까지 대기. stonewall
+			 * 과 달리 "특정 잡만" 지목 — continue 로 이 잡만 건너뛰고 다른 잡은 진행. */
 			if (waitee_running(td)) {
 				dprint(FD_PROCESS, "%s: waiting for %s\n",
 						td->o.name, td->o.wait_for);
 				continue;
 			}
 
-			/* 디스크 유틸리티 초기화 */
+			/* [한국어] /proc/diskstats 파싱 후 disk_util 엔트리 생성 — 잡 시작 전에
+			 * 해야 초기 카운터 스냅샷을 얻어 증분 계산이 가능. */
 			init_disk_util(td);
 
-			/* rusage 세마포어 초기화 */
+			/* [한국어] rusage_sem: 메인 스레드가 "통계 갱신 요청" 을 트리거하면
+			 * 잡 스레드가 getrusage(2) 를 호출하도록 조정. FIO_SEM_LOCKED 로 초기화 —
+			 * 먼저 down 하려고 시도하면 블록됨. update_rusage 플래그가 true 일 때만
+			 * 잡 스레드가 up 한다. */
 			td->rusage_sem = fio_sem_init(FIO_SEM_LOCKED);
 			td->update_rusage = 0;
 
@@ -4732,7 +4870,10 @@ reap:
 			fd->sk_out = sk_out;
 
 			if (td->o.use_thread) {
-				/* [한국어] pthread 모드: 스레드 생성 */
+				/* [한국어] use_thread=1: 같은 프로세스 내 pthread 로 잡 실행.
+				 * 장점 — 주소공간 공유로 smalloc/통계가 자연스럽게 공유 가능,
+				 * 메모리 오버헤드 감소. 단점 — fork 와 달리 전역 상태 격리 안 됨
+				 * (ioengine 의 전역 변수 충돌 가능). */
 				int ret;
 
 				dprint(FD_PROCESS, "will pthread_create\n");
@@ -4746,33 +4887,44 @@ reap:
 					break;
 				}
 				fd = NULL;
-				/* 스레드를 detach하여 자원 자동 해제 */
+				/* [한국어] pthread_detach: join() 없이도 스레드 종료 시 자원 자동
+				 * 회수. reap_threads 가 runstate==TD_EXITED 관측만으로 상태 전이. */
 				ret = pthread_detach(td->thread);
 				if (ret)
 					log_err("pthread_detach: %s",
 							strerror(ret));
 			} else {
-				/* [한국어] fork 모드: 자식 프로세스 생성 */
+				/* [한국어] use_thread=0(default): fork(2) 로 자식 프로세스 생성.
+				 * 주소공간이 COW 로 분리되어 각 잡의 ioengine 전역/TLS 가 격리.
+				 * 공유가 필요한 부분(startup_sem/stat_sem/agg_io_log)은 smalloc/
+				 * MAP_SHARED 로 사전 배치됨 — pshared 뮤텍스가 여기서 필수. */
 				pid_t pid;
 				dprint(FD_PROCESS, "will fork\n");
+				/* [한국어] read_barrier: fork 전 모든 쓰기가 보이도록 메모리 배리어.
+				 * COW 페이지 복사 타이밍과 뮤텍스/세마포어 상태의 일관성 보장. */
 				read_barrier();
 				pid = fork();
 				if (!pid) {
-					/* 자식 프로세스: thread_main 실행 후 _exit */
+					/* [한국어] 자식 프로세스 경로: thread_main 실행 후 _exit.
+					 * exit(3) 대신 _exit(2) — atexit 핸들러가 부모가 소유하던
+					 * 자원을 이중해제할 위험을 회피. */
 					int ret;
 
 					ret = (int)(uintptr_t)thread_main(fd);
-					/* _exit() does not flush buffers, so
-					 * do it ourselves */
+					/* [한국어] _exit() 는 stdio 버퍼를 flush 하지 않으므로
+					 * 수동으로 로그를 내보내 "잡 종료 메시지" 유실 방지. */
 					log_info_flush();
 					_exit(ret);
 				} else if (__td_index == fio_debug_jobno)
+					/* [한국어] --debugjob 옵션으로 지정된 잡의 pid 를 외부에
+					 * 노출 — gdb attach 용. */
 					*fio_debug_jobp = pid;
 				free(fd);
 				fd = NULL;
 			}
-			/* [한국어] startup_sem 대기: thread_main()이 초기화를 완료할 때까지.
-			 * 10초 타임아웃이 있으며, 초과 시 강제 종료. */
+			/* [한국어] startup_sem: thread_main 이 TD_INITIALIZED 에 도달하면 up.
+			 * 10초 타임아웃 = 한 잡의 초기화(파일 생성, io_u 할당, affinity 등) 가
+			 * 이보다 길면 무언가 잘못됐다는 지표. 전체 잡 terminate 후 abort. */
 			dprint(FD_MUTEX, "wait on startup_sem\n");
 			if (fio_sem_down_timeout(startup_sem, 10000)) {
 				log_err("fio: job startup hung? exiting.\n");
@@ -4789,34 +4941,43 @@ reap:
 		 * Wait for the started threads to transition to
 		 * TD_INITIALIZED.
 		 */
-		/* [한국어] 이번 배치의 모든 스레드가 TD_INITIALIZED가 될 때까지 대기
-		 * JOB_START_TIMEOUT (5초) 이내에 완료되어야 함 */
+		/* [한국어] JOB_START_TIMEOUT(5000ms) 이내에 이번 배치 모든 잡이
+		 * TD_INITIALIZED 에 도달해야 함. 이 단계에서는 아직 실제 I/O 시작 전 —
+		 * startup_sem 은 잡당 한 번 up 되었고 이제 runstate 만 관찰하면 된다.
+		 * 100ms 폴링 — 빠른 수렴과 CPU 절약의 절충점. */
 		fio_gettime(&this_start, NULL);
 		left = this_jobs;
 		while (left && !fio_abort) {
 			if (mtime_since_now(&this_start) > JOB_START_TIMEOUT)
 				break;
 
-			do_usleep(100000);  /* 100ms 간격으로 확인 */
+			do_usleep(100000);
 
 			for (i = 0; i < this_jobs; i++) {
 				td = map[i];
 				if (!td)
 					continue;
 				if (td->runstate == TD_INITIALIZED) {
+					/* [한국어] 정상 — 이 잡은 준비 완료. map 에서 제거하고
+					 * 카운트 감소. 아직 td->sem 을 올려주지 않았으므로
+					 * thread_main 은 여전히 블록 중. */
 					map[i] = NULL;
 					left--;
 				} else if (td->runstate >= TD_EXITED) {
-					/* 초기화 중에 이미 종료된 경우 */
+					/* [한국어] 초기화 중 goto err 로 빠져 이미 죽은 잡.
+					 * nr_running++ 는 reap_threads 가 nr_running-- 로 회수할
+					 * 일관성을 맞추기 위한 work-around(어차피 TD_EXITED 이므로
+					 * 곧 TD_REAPED 로 전이). */
 					map[i] = NULL;
 					left--;
 					todo--;
-					nr_running++; /* work-around... */
+					nr_running++;
 				}
 			}
 		}
 
-		/* 타임아웃으로 시작 실패한 작업 처리 */
+		/* [한국어] 타임아웃 도달해도 left>0 이면 일부 잡이 초기화 중 hang. kill(SIGTERM)
+		 * 로 강제 종료를 요청하고 부모는 배치 스폰을 포기한다(break). */
 		if (left) {
 			log_err("fio: %d job%s failed to start\n", left,
 					left > 1 ? "s" : "");
@@ -4824,7 +4985,7 @@ reap:
 				td = map[i];
 				if (!td)
 					continue;
-				kill(td->pid, SIGTERM);  /* 실패한 작업에 종료 신호 */
+				kill(td->pid, SIGTERM);
 			}
 			break;
 		}
@@ -4832,37 +4993,45 @@ reap:
 		/*
 		 * start created threads (TD_INITIALIZED -> TD_RUNNING).
 		 */
-		/* [한국어] 초기화 완료된 스레드를 실행 상태로 전환
-		 * td->sem을 올려서 thread_main()의 fio_sem_down(td->sem) 대기를 해제 */
+		/* [한국어] ===== 모든 잡 "동시 시작" 신호 ===== for_each_td 로 전체 잡을
+		 * 다시 순회하며 runstate==TD_INITIALIZED 인 것들에 td->sem up. 이렇게 한
+		 * 배치를 몰아서 시작해야 여러 잡이 비슷한 타이밍에 I/O 를 개시 —
+		 * 공정한 벤치마크 비교의 전제. */
 		for_each_td(td) {
 			if (td->runstate != TD_INITIALIZED)
 				continue;
 
-			/* 워밍업 구간이면 TD_RAMP, 아니면 TD_RUNNING */
+			/* [한국어] ramp_time 이 있으면 즉시 TD_RAMP(통계 제외), 없으면 TD_RUNNING. */
 			if (in_ramp_period(td))
 				td_set_runstate(td, TD_RAMP);
 			else
 				td_set_runstate(td, TD_RUNNING);
 			nr_running++;
 			nr_started--;
+			/* [한국어] m_rate/t_rate: 디버그용 글로벌 rate 합계. reap 시 감산. */
 			m_rate += ddir_rw_sum(td->o.ratemin);
 			t_rate += ddir_rw_sum(td->o.rate);
 			todo--;
-			fio_sem_up(td->sem);  /* "실행 시작" 신호 전송 */
+			/* [한국어] td->sem up → thread_main 의 fio_sem_down(td->sem) 해제 →
+			 * 실제 do_io 루프 진입. 이 한 호출이 "잡 시작" 의 핵심 동기화 지점. */
+			fio_sem_up(td->sem);
 		} end_for_each();
 
-		/* 종료된 스레드 수거 */
+		/* [한국어] 이번 반복에서 이미 종료된 잡을 회수 — 빨리 끝나는 짧은 잡이
+		 * 있을 수 있으므로(예: ramp 없이 소량 I/O). */
 		reap_threads(&nr_running, &t_rate, &m_rate);
 
-		/* 아직 시작할 작업이 남아있으면 100ms 대기 후 다음 반복 */
+		/* [한국어] 할 일이 남아 있으면 100ms 대기 후 다음 반복 — 스폰 레이트 제한. */
 		if (todo)
 			do_usleep(100000);
 	}
 
-	/* [한국어] 모든 작업이 종료될 때까지 수거 반복 */
+	/* [한국어] 스폰 끝. 아직 실행 중인 잡 수거 루프 — 10ms 간격으로 더 촘촘히 폴링
+	 * (100ms 보다 짧게) 해 종료 감지 지연을 줄임. reap_threads 는 waitpid/runstate
+	 * 검사로 TD_REAPED 전이시킨다. */
 	while (nr_running) {
 		reap_threads(&nr_running, &t_rate, &m_rate);
-		do_usleep(10000);  /* 10ms 간격 */
+		do_usleep(10000);
 	}
 
 	/* 유휴 프로파일링 중지 */

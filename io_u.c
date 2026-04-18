@@ -367,28 +367,39 @@ static uint64_t last_block(struct thread_data *td, struct fio_file *f,
 	uint64_t max_blocks;
 	uint64_t max_size;
 
-	/* [한국어] ddir이 유효한 read/write 방향인지 검증 */
+	/* [한국어] SYNC/DATASYNC/INVAL 등 비데이터 방향은 "블록 수" 개념 없음 →
+	 * 디버그 빌드에서 조기 탐지(상위 디스패처 버그). */
 	assert(ddir_rw(ddir));
 
 	/*
 	 * Hmm, should we make sure that ->io_size <= ->real_file_size?
 	 * -> not for now since there is code assuming it could go either.
 	 */
-	/* [한국어] 파일의 I/O 크기를 가져오되, 실제 파일 크기를 초과하지 않도록 제한 */
+	/* [한국어] io_size = 잡 옵션(size/io_size)으로 설정된 논리 상한,
+	 * real_file_size = open 시 실제 fstat 된 바이트 크기. 둘 중 작은 쪽이
+	 * 실제로 접근 가능한 한계 — io_size 가 더 클 수 있는 이유는 파일이 미확장
+	 * 상태(write extend 전)일 수 있기 때문. */
 	max_size = f->io_size;
 	if (max_size > f->real_file_size)
 		max_size = f->real_file_size;
 
-	/* [한국어] 스트라이드 존 모드에서는 zone_range로 제한 */
+	/* [한국어] ZONE_MODE_STRIDED: fio 가 관리하는 "가상 존" 범위 내에서만 I/O.
+	 * 한 존(zone_range 바이트) 내에서만 블록 선택하도록 상한을 줄인다.
+	 * ZBD 모드(ZNS 장치)와는 다름 — 여기선 fio 자체가 가짜 존 경계를 그어 패턴만 재현. */
 	if (td->o.zone_mode == ZONE_MODE_STRIDED && td->o.zone_range)
 		max_size = td->o.zone_range;
 
-	/* [한국어] min_bs가 ba보다 크면, 마지막 블록이 파일 끝을 넘지 않도록 보정 */
+	/* [한국어] ba(블록 정렬) 는 I/O 시작 오프셋 격자이고, min_bs 는 실제 쓰는
+	 * 바이트. min_bs > ba 면 마지막 ba 격자에서 시작 시 끝이 파일 상한을 넘을 수
+	 * 있어 max_size 를 (min_bs - ba) 만큼 미리 빼서 안전 여백 확보. */
 	if (td->o.min_bs[ddir] > td->o.ba[ddir])
 		max_size -= td->o.min_bs[ddir] - td->o.ba[ddir];
 
-	/* [한국어] ba(블록 정렬 단위)로 나눠서 최대 블록 수 계산 */
+	/* [한국어] 블록 수 = max_size / ba — 랜덤 분포에서 [0..max_blocks) 추첨 후
+	 * ba 곱해 오프셋으로 변환. uint64_t 캐스트는 32비트 플랫폼에서 오버플로 방지. */
 	max_blocks = max_size / (uint64_t) td->o.ba[ddir];
+	/* [한국어] max_size < ba (파일이 블록보다 작음) → 접근 불가, 0 반환 →
+	 * 상위 __get_next_rand_offset_* 가 1(실패) 전파 후 잡 종료 또는 다음 파일. */
 	if (!max_blocks)
 		return 0;
 
@@ -636,12 +647,15 @@ static int __get_next_rand_offset_zoned_abs(struct thread_data *td,
 	uint64_t lastb, send, stotal;
 	unsigned int v;
 
-	/* [한국어] 파일의 마지막 블록 번호 계산 */
+	/* [한국어] 파일의 유효 상한 블록 수. 0 이면 max_size < ba → 접근 불가 →
+	 * 이 분포로도 오프셋 만들 수 없으므로 실패 전파. */
 	lastb = last_block(td, f, ddir);
 	if (!lastb)
 		return 1;
 
-	/* [한국어] 존 분할이 설정되지 않았으면 기본 랜덤 오프셋 사용 */
+	/* [한국어] 사용자가 random_distribution=zoned_abs 를 지정했더라도 해당
+	 * 방향(ddir)에 대한 zone_split 이 없다면 기본 균등으로 폴백 — bail 라벨은
+	 * send==-1U 버그 경로와 공유해 동일 폴백. */
 	if (!td->o.zone_split_nr[ddir]) {
 bail:
 		return __get_next_rand_offset(td, f, ddir, b, lastb);
@@ -650,24 +664,28 @@ bail:
 	/*
 	 * Generate a value, v, between 1 and 100, both inclusive
 	 */
-	/* [한국어] 1~100 사이의 난수를 생성하여 어느 존에 해당하는지 결정 */
+	/* [한국어] 1..100 난수로 존 버킷 선택. init_random_file_service 가 사용자
+	 * zone_split 비율(예 70/30)을 100 슬롯 zone_state_index[ddir][0..99] 로
+	 * 사전 전개해 둔 덕에 O(1) 테이블 조회만으로 확률적 존 결정이 가능. */
 	v = rand_between(&td->zone_state, 1, 100);
 
 	/*
 	 * Find our generated table. 'send' is the end block of this zone,
 	 * 'stotal' is our start offset.
 	 */
-	/* [한국어] 생성된 난수 v에 해당하는 존 인덱스에서 시작/끝 블록 가져오기 */
+	/* [한국어] v-1 인덱스로 해당 존의 (size_prev, size) 바이트 쌍 획득. */
 	zsi = &td->zone_state_index[ddir][v - 1];
-	/* [한국어] 이전 존까지의 누적 크기 (시작 오프셋) */
+	/* [한국어] stotal = 이전 존들까지 누적 바이트 / ba → 블록 단위 시작점.
+	 * __get_next_rand_offset 이 "블록 번호" 단위로 동작하므로 ba 로 정규화 필수. */
 	stotal = zsi->size_prev / td->o.ba[ddir];
-	/* [한국어] 현재 존의 끝 위치 */
+	/* [한국어] send = 현재 존 끝 바이트 / ba → 반개구간 [stotal, send) 블록 집합. */
 	send = zsi->size / td->o.ba[ddir];
 
 	/*
 	 * Should never happen
 	 */
-	/* [한국어] 버그 체크: send가 유효하지 않은 경우 */
+	/* [한국어] send == -1U(unsigned sentinel)는 init 단계에서 이 슬롯이 채워지지
+	 * 않은 상태 — fio 버그. fio_did_warn 로 1회만 출력 후 bail(균등 폴백)로 계속. */
 	if (send == -1U) {
 		if (!fio_did_warn(FIO_WARN_ZONED_BUG))
 			log_err("fio: bug in zoned generation\n");
@@ -678,7 +696,8 @@ bail:
 		 * the file/device size. We can't handle that gracefully,
 		 * so error and exit.
 		 */
-		/* [한국어] 존 범위가 파일 크기를 초과하면 에러 */
+		/* [한국어] 사용자가 zoned_abs=".../2g" 등 파일보다 큰 구간을 지정한
+		 * 경우. 잘못된 테스트 설정이므로 폴백 없이 즉시 실패(잡 종료 유도). */
 		log_err("fio: zoned_abs sizes exceed file size\n");
 		return 1;
 	}
@@ -686,11 +705,12 @@ bail:
 	/*
 	 * Generate index from 0..send-stotal
 	 */
-	/* [한국어] 선택된 존 내에서 랜덤 오프셋 생성 */
+	/* [한국어] 존 내부 상대 블록 번호를 기본 균등으로 추첨. 존 내부에는 axmap
+	 * 조건이 그대로 적용 가능(file_randommap=true 시). 실패면 그대로 전파. */
 	if (__get_next_rand_offset(td, f, ddir, b, send - stotal) == 1)
 		return 1;
 
-	/* [한국어] 존의 시작 오프셋을 더해 최종 블록 번호 결정 */
+	/* [한국어] 존 상대 번호에 stotal(존 시작) 을 더해 파일 전역 블록 번호로 승격. */
 	*b += stotal;
 	return 0;
 }
@@ -719,12 +739,13 @@ static int __get_next_rand_offset_zoned(struct thread_data *td,
 	uint64_t offset, lastb;
 	struct zone_split_index *zsi;
 
-	/* [한국어] 마지막 블록 번호 계산 */
+	/* [한국어] 파일 유효 블록 상한. 0이면 파일 크기 < ba → 이 분포 적용 불가. */
 	lastb = last_block(td, f, ddir);
 	if (!lastb)
 		return 1;
 
-	/* [한국어] 존 분할 미설정 시 기본 랜덤 방식 사용 */
+	/* [한국어] zone_split_nr[ddir]==0 이면 이 방향에 zoned 설정이 없는 것 →
+	 * 기본 균등으로 폴백. bail 라벨은 버그(send==-1U) 경로와 공유. */
 	if (!td->o.zone_split_nr[ddir]) {
 bail:
 		return __get_next_rand_offset(td, f, ddir, b, lastb);
@@ -733,20 +754,22 @@ bail:
 	/*
 	 * Generate a value, v, between 1 and 100, both inclusive
 	 */
-	/* [한국어] 1~100 사이 난수 생성 */
+	/* [한국어] 1..100 난수로 확률 테이블 조회(zoned 의 100 슬롯 전개된 룩업). */
 	v = rand_between(&td->zone_state, 1, 100);
 
-	/* [한국어] 난수 v에 해당하는 존의 퍼센트 범위 가져오기 */
+	/* [한국어] 해당 버킷의 zone_split_index 획득 — zoned_abs 와 달리 여기선
+	 * size_perc(%) 필드를 사용. init 시 바이트 아닌 백분율 그대로 저장. */
 	zsi = &td->zone_state_index[ddir][v - 1];
-	/* [한국어] 이전 존까지의 누적 퍼센트 (시작 퍼센트) */
+	/* [한국어] stotal: 이전 존들까지 누적 백분율(0~100). zoned_abs 와 달리 아직
+	 * 바이트로 전환 안 된 상태 — 파일 크기와 독립적인 "상대 비율" 표현. */
 	stotal = zsi->size_perc_prev;
-	/* [한국어] 현재 존의 끝 퍼센트 */
+	/* [한국어] send: 현재 존 끝 백분율. 구간 [stotal, send)%의 파일 영역 표현. */
 	send = zsi->size_perc;
 
 	/*
 	 * Should never happen
 	 */
-	/* [한국어] 유효성 체크 */
+	/* [한국어] send==-1U 는 init 단계 누락 슬롯 — fio 버그. 경고 1회 후 폴백. */
 	if (send == -1U) {
 		if (!fio_did_warn(FIO_WARN_ZONED_BUG))
 			log_err("fio: bug in zoned generation\n");
@@ -758,26 +781,31 @@ bail:
 	 * marks the end of the current IO range. 'stotal' marks
 	 * the start, in percent.
 	 */
-	/* [한국어] 퍼센트를 실제 블록 오프셋으로 변환 */
+	/* [한국어] 백분율 → 실제 블록 오프셋 변환. stotal==0 이면 offset=0 지름길 —
+	 * 0 곱셈 회피 + stotal*lastb 오버플로 예방(lastb 가 테라바이트 스케일일 때). */
 	if (stotal)
 		offset = stotal * lastb / 100ULL;
 	else
 		offset = 0;
 
-	/* [한국어] 존의 크기를 블록 수로 변환 */
+	/* [한국어] 존 폭(블록 수) = 전체블록 * (send-stotal) / 100.
+	 * 여기서 lastb 를 덮어써 다음 __get_next_rand_offset 의 상한으로 재사용 —
+	 * 원래 lastb 값은 이 시점 이후 필요 없음. */
 	lastb = lastb * (send - stotal) / 100ULL;
 
 	/*
 	 * Generate index from 0..send-of-lastb
 	 */
-	/* [한국어] 존 내에서 랜덤 블록 생성 */
+	/* [한국어] 존 내부 [0..존폭) 블록 추첨. axmap 이 있으면 그대로 연동
+	 * (file_randommap true 시). 실패(소진) 면 1 전파. */
 	if (__get_next_rand_offset(td, f, ddir, b, lastb) == 1)
 		return 1;
 
 	/*
 	 * Add our start offset, if any
 	 */
-	/* [한국어] 존의 시작 오프셋을 더해 최종 위치 결정 */
+	/* [한국어] 존 상대 블록 → 파일 전역 블록으로 승격(offset 더하기).
+	 * stotal==0 이면 offset==0 이라 이 분기는 생략 가능(미세 최적화). */
 	if (offset)
 		*b += offset;
 
@@ -810,11 +838,14 @@ bail:
 static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 				enum fio_ddir ddir, uint64_t *b)
 {
-	/* [한국어] SP Random 모드이고 쓰기 방향이면 SP Random 사용 */
+	/* [한국어] sprandom(WRITE 비복원 1회 커버리지) 옵션 + WRITE 분기. 다른 분포를
+	 * 지정해도 sprandom 이 true 이면 쓰기만 가로채서 "모든 주소 정확히 한 번 쓰기"
+	 * 를 강제. 읽기/트림에는 해당 없어 아래 random_distribution 대로 흘러감. */
 	if (td->o.sprandom && ddir == DDIR_WRITE) {
 		return __get_next_rand_offset_sprandom(td, f, ddir, b, 0);
 	} else if (td->o.random_distribution == FIO_RAND_DIST_RANDOM) {
-		/* [한국어] 기본 균일 랜덤 분포 */
+		/* [한국어] 기본 균일 랜덤 — 이 분기만 lastb 를 호출자에서 미리 계산해
+		 * 전달하는 구조(다른 분포는 내부에서 lastb 직접 계산). */
 		uint64_t lastb;
 
 		lastb = last_block(td, f, ddir);
@@ -823,19 +854,19 @@ static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 
 		return __get_next_rand_offset(td, f, ddir, b, lastb);
 	} else if (td->o.random_distribution == FIO_RAND_DIST_ZIPF)
-		/* [한국어] Zipf 분포 */
+		/* [한국어] Zipf(1/k^theta) — 핫 블록 집중. axmap 없음(중복 접근 허용). */
 		return __get_next_rand_offset_zipf(td, f, ddir, b);
 	else if (td->o.random_distribution == FIO_RAND_DIST_PARETO)
-		/* [한국어] Pareto 분포 */
+		/* [한국어] Pareto(80/20 모델) — Zipf 과 유사 긴 꼬리. 내부에서 f->zipf 재사용. */
 		return __get_next_rand_offset_pareto(td, f, ddir, b);
 	else if (td->o.random_distribution == FIO_RAND_DIST_GAUSS)
-		/* [한국어] 가우시안 분포 */
+		/* [한국어] 정규분포(N(mu=lastb/2, sigma=lastb*dev/100)) — 파일 중앙 집중. */
 		return __get_next_rand_offset_gauss(td, f, ddir, b);
 	else if (td->o.random_distribution == FIO_RAND_DIST_ZONED)
-		/* [한국어] 퍼센트 기반 존 분할 */
+		/* [한국어] 퍼센트 기반 zoned — "앞 50%에 70%, 뒤 50%에 30%" 상대 비율. */
 		return __get_next_rand_offset_zoned(td, f, ddir, b);
 	else if (td->o.random_distribution == FIO_RAND_DIST_ZONED_ABS)
-		/* [한국어] 절대 크기 기반 존 분할 */
+		/* [한국어] 절대 바이트 기반 zoned_abs — "[0,1g)에 70%, [1g,3g)에 30%". */
 		return __get_next_rand_offset_zoned_abs(td, f, ddir, b);
 
 	log_err("fio: unknown random distribution: %d\n", td->o.random_distribution);
@@ -859,13 +890,16 @@ static bool should_do_random(struct thread_data *td, enum fio_ddir ddir)
 {
 	unsigned int v;
 
-	/* [한국어] 100%이면 항상 랜덤 */
+	/* [한국어] perc_rand==100 이면 rand_between 호출 자체를 생략 —
+	 * IOPs 집약 워크로드에서 난수 생성 비용을 피하는 fast path. */
 	if (td->o.perc_rand[ddir] == 100)
 		return true;
 
-	/* [한국어] 1~100 사이 난수를 생성하여 perc_rand와 비교 */
+	/* [한국어] seq_rand_state[ddir] 는 방향별 독립 시드를 유지 — READ 경로의
+	 * 난수 흐름이 WRITE 경로에 영향을 주지 않도록 분리(재현성 보장). */
 	v = rand_between(&td->seq_rand_state[ddir], 1, 100);
 
+	/* [한국어] v ∈ [1,100], perc_rand ∈ [0,100]. v <= perc_rand 확률은 perc_rand/100. */
 	return v <= td->o.perc_rand[ddir];
 }
 
@@ -888,8 +922,14 @@ static void loop_cache_invalidate(struct thread_data *td, struct fio_file *f)
 {
 	struct thread_options *o = &td->o;
 
-	/* [한국어] 캐시 무효화 옵션이 켜져 있고 direct I/O가 아닌 경우에만 실행 */
+	/* [한국어] invalidate_cache=1 + !odirect 조합만 의미가 있음:
+	 *  - odirect=1 은 이미 페이지캐시를 우회하므로 무효화 불필요.
+	 *  - invalidate_cache=0 이면 사용자가 재사용 캐시 효과를 의도한 경우이므로 건드리지 않음.
+	 * file_invalidate_cache 는 내부적으로 posix_fadvise(POSIX_FADV_DONTNEED) 또는
+	 * POSIX_FADV_DONTNEED 지원 안 되는 경우 msync/munmap 경로로 캐시 드랍. */
 	if (o->invalidate_cache && !o->odirect) {
+		/* [한국어] ret 는 에러 무시(fio_unused 속성). file_invalidate 실패가
+		 * 잡 진행을 막아선 안 됨 — 캐시 드랍은 성능 측정 보조 수단일 뿐. */
 		int fio_unused ret;
 
 		ret = file_invalidate_cache(td, f);
@@ -915,15 +955,21 @@ static void loop_cache_invalidate(struct thread_data *td, struct fio_file *f)
 static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
 			       enum fio_ddir ddir, uint64_t *b)
 {
-	/* [한국어] 먼저 랜덤 오프셋 생성 시도 */
+	/* [한국어] 1차 시도 — 분포의 상태 기기에서 다음 블록 추출. 성공(0)이면 즉시 반환. */
 	if (!get_next_rand_offset(td, f, ddir, b))
 		return 0;
 
-	/* [한국어] 시간 기반 또는 비균일 파일 서비스 모드에서는 파일 리셋 후 재시도 */
+	/* [한국어] 분포 소진 시 2차 시도: 파일 상태(axmap/LFSR/Zipf 내부 카운터)를 리셋.
+	 *  - time_based=1: 지정된 시간 동안 계속 돌아야 하므로 공간 소진 시 재사용 필수.
+	 *  - __FIO_FSERVICE_NONUNIFORM (Zipf/Pareto/Gauss): 비균등 분포는 특성상 소진
+	 *    개념이 "접근 완료"가 아니라 "상태 재초기화"로 해결.
+	 * fio_file_reset 이 axmap 을 모두 0으로 되돌리고, loop_cache_invalidate 로
+	 * 직전 사이클의 페이지 캐시를 드랍해 캐시 hit 으로 성능 왜곡 방지. */
 	if (td->o.time_based ||
 	    (td->o.file_service_type & __FIO_FSERVICE_NONUNIFORM)) {
 		fio_file_reset(td, f);
 		loop_cache_invalidate(td, f);
+		/* [한국어] 리셋 후 재시도 — 성공이면 그대로 반환. 실패면 아래 로깅 후 1 반환. */
 		if (!get_next_rand_offset(td, f, ddir, b))
 			return 0;
 	}
@@ -971,7 +1017,9 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 	 * If we reach the end for a time based run, reset us back to 0
 	 * and invalidate the cache, if we need to.
 	 */
-	/* [한국어] 시간 기반 실행에서 파일 끝에 도달하면 처음으로 되돌림 */
+	/* [한국어] time_based 잡은 "runtime 초 동안 반복" 의미 → 파일 끝 도달 시
+	 * file_offset 으로 wrap 하여 계속 I/O. nr_files==1 제한은 다중 파일 시 파일
+	 * 간 전환으로 wrap 을 대신하도록 하기 위함(파일별 편향 방지). */
 	if (f->last_pos[ddir] >= f->io_size + get_start_offset(td, f) &&
 	    o->time_based && o->nr_files == 1) {
 		f->last_pos[ddir] = f->file_offset;
@@ -982,7 +1030,9 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 	 * If we reach the end for a rw-io-size based run, reset us back to 0
 	 * and invalidate the cache, if we need to.
 	 */
-	/* [한국어] 읽기+쓰기 혼합에서 io_size가 size보다 클 때, 끝에 도달하면 리셋 */
+	/* [한국어] td_rw + io_size > size 케이스 — 사용자가 파일 크기보다 큰 총
+	 * I/O 양을 요청했을 때(예 100GB 파일에 300GB I/O). 이 방향에서 파일 끝에
+	 * 닿으면 순환 재시작 필요 — time_based 조건 없음에 주의(바이트 기반 루프). */
 	if (td_rw(td) && o->io_size > o->size) {
 		if (f->last_pos[ddir] >= f->io_size + get_start_offset(td, f)) {
 			f->last_pos[ddir] = f->file_offset;
@@ -990,25 +1040,31 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 		}
         }
 
-	/* [한국어] 마지막 위치가 실제 파일 크기 내에 있으면 다음 오프셋 계산 */
+	/* [한국어] last_pos 가 아직 파일 크기 내 — 정상 순차 진행 또는 wrap 후 상태. */
 	if (f->last_pos[ddir] < f->real_file_size) {
 		uint64_t pos;
 
 		/*
 		 * Only rewind if we already hit the end
 		 */
-		/* [한국어] 역방향 순차 I/O에서 파일 시작점에 도달했으면 끝으로 되돌림 */
+		/* [한국어] ddir_seq_add<0 (역방향 시퀀스) + last_pos==file_offset 은
+		 * "직전에 시작점 도달 → 다시 rewind 필요" 상태. file_offset 조건은
+		 * "처음 잡 시작 시의 동일 상태(시작점==file_offset)" 와 구분하기 위함. */
 		if (f->last_pos[ddir] == f->file_offset &&
 		    f->file_offset && o->ddir_seq_add < 0) {
+			/* [한국어] 점프할 끝점: io_size vs real_file_size 중 작은 쪽.
+			 * io_size(사용자 요청)가 파일 크기보다 작으면 그 상한까지만 역주행. */
 			if (f->real_file_size > f->io_size)
 				f->last_pos[ddir] = f->io_size;
 			else
 				f->last_pos[ddir] = f->real_file_size;
 		}
 
-		/* [한국어] 파일 오프셋 기준 상대 위치 계산 */
+		/* [한국어] pos 는 "파일 시작(file_offset) 상대" 오프셋 — 아래 ddir_seq_add
+		 * 연산을 절대 주소가 아닌 상대 주소 공간에서 처리하기 위한 정규화. */
 		pos = f->last_pos[ddir] - f->file_offset;
-		/* [한국어] ddir_seq_add가 설정되어 있으면 건너뛰기 적용 */
+		/* [한국어] ddir_seq_add 는 "홀 I/O 간격(양수)" 또는 "역주행 스텝(음수)".
+		 * pos==0 이면 아직 첫 I/O 전 — add 적용 없이 0부터 시작 유지(초기 케이스 보호). */
 		if (pos && o->ddir_seq_add) {
 			pos += o->ddir_seq_add;
 
@@ -1018,7 +1074,10 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 			 * beginning again. If we're doing backwards IO,
 			 * wrap to the end.
 			 */
-			/* [한국어] 파일 끝을 넘으면 순방향은 처음으로, 역방향은 끝으로 순환 */
+			/* [한국어] add 적용 후 pos >= real_file_size:
+			 *  - 순방향(add > 0): 파일 처음으로 wrap (홀 I/O 가 끝을 넘어감).
+			 *  - 역방향(add < 0): 끝(io_size 또는 real_file_size)으로 wrap 후
+			 *    add 한 번 더 적용(역방향 스텝 유지). */
 			if (pos >= f->real_file_size) {
 				if (o->ddir_seq_add > 0)
 					pos = f->file_offset;
@@ -1037,7 +1096,8 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 		return 0;
 	}
 
-	/* [한국어] 파일 끝을 넘어서면 실패 반환 */
+	/* [한국어] last_pos >= real_file_size — 순차 I/O 공간 완전 소진. time_based
+	 * 나 td_rw wrap 조건이 위에서 처리 안 됐으므로 여기선 진짜 실패(1). */
 	return 1;
 }
 
@@ -1075,51 +1135,63 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 
 	assert(ddir_rw(ddir));
 
-	/* [한국어] 초기화: 아직 결정되지 않은 상태 */
+	/* [한국어] sentinel -1ULL 로 초기화 — 결정 분기 이후 어느 쪽이 세트되었는지
+	 * 구분 (offset != -1 이면 순차 경로, b != -1 이면 랜덤 경로). */
 	b = offset = -1ULL;
 
-	/* [한국어] randtrimwrite 모드의 쓰기는 바로 직전 trim 위치를 사용 */
+	/* [한국어] randtrimwrite: 같은 영역에 TRIM → WRITE 를 쌍으로 내는 모드.
+	 * WRITE 발행 시 직전 TRIM 의 last_start 를 재사용해 "방금 trim 한 자리에
+	 * 바로 쓰기" 패턴을 만든다. BUSY_OK 는 axmap 이 이 쓰기를 충돌 처리하지
+	 * 않도록 한다(이미 TRIM 이 axmap 을 마킹했을 수 있음). */
 	if (td_randtrimwrite(td) && ddir == DDIR_WRITE) {
 		/* don't mark randommap for these writes */
-		/* [한국어] 랜덤맵에 표시하지 않도록 BUSY_OK 설정 */
 		io_u_set(td, io_u, IO_U_F_BUSY_OK);
+		/* [한국어] file_offset 을 빼서 "파일 상대" 오프셋으로 정규화. 상위에서
+		 * 다시 file_offset 을 더해 절대 주소로 복원. */
 		offset = f->last_start[DDIR_TRIM] - f->file_offset;
 		*is_random = true;
 		ret = 0;
 	} else if (rw_seq) {
-		/* [한국어] rw_seq가 1이면 새 시퀀스 시작 */
+		/* [한국어] rw_seq==1: ddir_seq_nr 주기가 끝나 "새 시퀀스" 를 시작하는 타이밍.
+		 * 이때만 랜덤/순차 결정을 다시 하고, 이후 ddir_seq_nr 회는 같은 모드로 진행. */
 		if (td_random(td)) {
-			/* [한국어] 랜덤 모드에서 실제로 랜덤을 할지 순차를 할지 확률적 결정 */
+			/* [한국어] 잡이 random 이어도 percentage_random<100 이면 일부는 순차.
+			 * should_do_random 으로 이번 새 시퀀스를 어느 쪽으로 갈지 추첨. */
 			if (should_do_random(td, ddir)) {
 				ret = get_next_rand_block(td, f, ddir, &b);
 				*is_random = true;
 			} else {
-				/* [한국어] 순차로 결정됐으면 순차 오프셋 시도, 실패 시 랜덤 */
+				/* [한국어] 순차로 결정. BUSY_OK 설정 이유: 이번 순차 I/O 가
+				 * 이전 axmap 히트(동일 블록)여도 그대로 진행 — 순차의 연속성
+				 * 우선. 순차 실패(파일 끝) 시 랜덤 폴백으로 진행 보장. */
 				*is_random = false;
 				io_u_set(td, io_u, IO_U_F_BUSY_OK);
 				ret = get_next_seq_offset(td, f, ddir, &offset);
 				if (ret)
+					/* [한국어] 순차 실패(파일 끝) → 랜덤으로 폴백해 잡 진행 유지. */
 					ret = get_next_rand_block(td, f, ddir, &b);
 			}
 		} else {
-			/* [한국어] 순차 전용 모드 */
+			/* [한국어] td_random 이 false → 순수 순차(읽기/쓰기/트림 중 하나의 sequential). */
 			*is_random = false;
 			ret = get_next_seq_offset(td, f, ddir, &offset);
 		}
 	} else {
-		/* [한국어] rw_seq가 0: 시퀀스 진행 중 */
+		/* [한국어] rw_seq_hit=0: 이미 시작된 시퀀스의 중간 — 모드 판정 없이 계속.
+		 * BUSY_OK 는 순차 연속성 보장(axmap 충돌 우회). */
 		io_u_set(td, io_u, IO_U_F_BUSY_OK);
 		*is_random = false;
 
 		if (td->o.rw_seq == RW_SEQ_SEQ) {
-			/* [한국어] RW_SEQ_SEQ: 순차 우선, 실패 시 랜덤 폴백 */
+			/* [한국어] 일반 순차 진행 — 파일 끝 도달 시 랜덤 폴백. */
 			ret = get_next_seq_offset(td, f, ddir, &offset);
 			if (ret) {
 				ret = get_next_rand_block(td, f, ddir, &b);
 				*is_random = false;
 			}
 		} else if (td->o.rw_seq == RW_SEQ_IDENT) {
-			/* [한국어] RW_SEQ_IDENT: 같은 위치에 반복 접근 */
+			/* [한국어] rw_seq=identical 모드 — 매번 "같은 위치" 반복(스트레스 테스트).
+			 * last_start[ddir]==-1ULL 은 "아직 한 번도 발행 안 함" — 이때만 0 부터 시작. */
 			if (f->last_start[ddir] != -1ULL)
 				offset = f->last_start[ddir] - f->file_offset;
 			else
@@ -1131,19 +1203,20 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 		}
 	}
 
-	/* [한국어] 성공 시 io_u->offset 설정 */
+	/* [한국어] 결정 성공 시 offset 또는 b 중 세트된 쪽을 io_u->offset 으로 승격. */
 	if (!ret) {
 		if (offset != -1ULL)
-			/* [한국어] offset이 직접 지정된 경우 (순차 등) */
+			/* [한국어] 순차/IDENT/randtrimwrite 경로 — offset 은 이미 바이트 단위. */
 			io_u->offset = offset;
 		else if (b != -1ULL)
-			/* [한국어] 블록 번호가 지정된 경우, ba(블록 정렬) 단위로 변환 */
+			/* [한국어] 랜덤 경로 — b 는 ba 블록 번호. ba 곱해 바이트 오프셋으로 변환. */
 			io_u->offset = b * td->o.ba[ddir];
 		else {
 			log_err("fio: bug in offset generation: offset=%llu, b=%llu\n", (unsigned long long) offset, (unsigned long long) b);
 			ret = 1;
 		}
-		/* [한국어] 검증용 오프셋도 동일하게 설정 */
+		/* [한국어] verify_offset 을 offset 과 동기 — verify 경로가 이 필드를 기준
+		 * 으로 패턴 재생성. WRITE 시점의 오프셋 그대로 저장해 READ-back 매칭 보장. */
 		io_u->verify_offset = io_u->offset;
 	}
 
@@ -1186,17 +1259,19 @@ static int get_next_offset(struct thread_data *td, struct io_u *io_u,
 
 	assert(ddir_rw(ddir));
 
-	/* [한국어] ddir_seq_nr 카운터 감소, 0이 되면 새 시퀀스 시작 */
+	/* [한국어] ddir_seq_nr>0 옵션은 "매 N회마다 순차↔랜덤 재결정" 제어. 0이 되면
+	 * rw_seq_hit 으로 표시 후 카운터 재충전. 예) ddir_seq_nr=10 → 10개마다 새 시퀀스. */
 	if (td->o.ddir_seq_nr && !--td->ddir_seq_nr) {
 		rw_seq_hit = 1;
 		td->ddir_seq_nr = td->o.ddir_seq_nr;
 	}
 
-	/* [한국어] 다음 블록 결정 */
+	/* [한국어] rw_seq_hit 값을 get_next_block 에 전달해 새 시퀀스면 모드 재추첨. */
 	if (get_next_block(td, io_u, ddir, rw_seq_hit, is_random))
 		return 1;
 
-	/* [한국어] 오프셋이 io_size를 초과하는지 검증 */
+	/* [한국어] io_u->offset 은 아직 "파일 상대" (file_offset 안 더한 상태).
+	 * io_size 는 잡 옵션의 논리 상한이므로 상대 오프셋과 직접 비교 가능. */
 	if (io_u->offset >= f->io_size) {
 		dprint(FD_IO, "get_next_offset: offset %llu >= io_size %llu\n",
 					(unsigned long long) io_u->offset,
@@ -1204,9 +1279,12 @@ static int get_next_offset(struct thread_data *td, struct io_u *io_u,
 		return 1;
 	}
 
-	/* [한국어] 파일의 시작 오프셋을 더해 절대 오프셋으로 변환 */
+	/* [한국어] file_offset(start_offset + 파일 선두 스킵) 을 더해 "파일 내 절대
+	 * 바이트 오프셋" 으로 승격 — 이후 엔진 경로는 모두 절대 오프셋 사용. */
 	io_u->offset += f->file_offset;
-	/* [한국어] 절대 오프셋이 실제 파일 크기를 초과하는지 검증 */
+	/* [한국어] 절대 오프셋이 real_file_size 를 넘으면 I/O 불가능(파일 크기
+	 * 변경된 경우 등). io_size < real_file_size 인 경우 위 검사가 더 엄격했지만
+	 * 반대인 경우 이 검사가 실제 안전 가드. */
 	if (io_u->offset >= f->real_file_size) {
 		dprint(FD_IO, "get_next_offset: offset %llu >= size %llu\n",
 					(unsigned long long) io_u->offset,
@@ -1295,44 +1373,51 @@ static unsigned long long get_next_buflen(struct thread_data *td, struct io_u *i
 
 	assert(ddir_rw(ddir));
 
-	/* [한국어] randtrimwrite 모드의 쓰기는 직전 trim 크기를 그대로 사용 */
+	/* [한국어] randtrimwrite 의 WRITE 는 직전 TRIM 과 같은 바이트 길이 재사용 —
+	 * "trim 한 영역 그대로 다시 쓰기" 쌍 매칭. last_pos - last_start 가 trim 길이. */
 	if (td_randtrimwrite(td) && ddir == DDIR_WRITE) {
 		struct fio_file *f = io_u->file;
 
 		return f->last_pos[DDIR_TRIM] - f->last_start[DDIR_TRIM];
 	}
 
-	/* [한국어] bs_is_seq_rand 옵션: 순차/랜덤에 따라 다른 bs 설정 사용 */
+	/* [한국어] bs_is_seq_rand 옵션은 bs_[READ]/bs_[WRITE] 를 "실제 방향" 대신
+	 * "순차=READ / 랜덤=WRITE" 의미로 재해석 — 읽기/쓰기 혼합이 아니면서
+	 * 순차/랜덤을 다른 bs 로 테스트하려는 사용자를 위한 편의 스위치. */
 	if (td->o.bs_is_seq_rand)
 		ddir = is_random ? DDIR_WRITE : DDIR_READ;
 
-	/* [한국어] 해당 방향의 최소/최대 블록 크기 */
+	/* [한국어] 방향별 min/max bs 획득. 이후 분기 기준. */
 	minbs = td->o.min_bs[ddir];
 	maxbs = td->o.max_bs[ddir];
 
-	/* [한국어] 최소=최대이면 고정 블록 크기 */
+	/* [한국어] 고정 bs(블록 크기)면 추첨 전 즉시 반환 — IOPs 집약 워크로드의 핫패스. */
 	if (minbs == maxbs)
 		return minbs;
 
 	/*
 	 * If we can't satisfy the min block size from here, then fail
 	 */
-	/* [한국어] 최소 블록 크기도 파일 범위에 맞지 않으면 실패 */
+	/* [한국어] 최소 bs 조차 파일 남은 공간에 안 들어가면 실패 — 상위가 파일 끝 처리. */
 	if (!io_u_fits(td, io_u, minbs))
 		return 0;
 
-	/* [한국어] 난수 생성기의 최대값 */
+	/* [한국어] bs 추첨 전용 난수 상태에서 상한값 조회 — Tausworthe 는 2^64-1 등. */
 	frand_max = rand_max(&td->bsrange_state[ddir]);
 	do {
-		/* [한국어] 난수 생성 */
+		/* [한국어] 매 이터레이션마다 새 난수(재추첨) — 파일 끝 안 맞을 때 재시도. */
 		r = __rand(&td->bsrange_state[ddir]);
 
 		if (!td->o.bssplit_nr[ddir]) {
-			/* [한국어] bssplit 미설정: minbs~maxbs 범위에서 균일 분포 */
+			/* [한국어] bssplit 없음 → [minbs, minbs+maxbs) 선형 보간.
+			 * r/(frand_max+1.0) ∈ [0,1) 비율로 maxbs 곱한 뒤 minbs 더하기. */
 			buflen = minbs + (unsigned long long) ((double) maxbs *
 					(r / (frand_max + 1.0)));
 		} else {
-			/* [한국어] bssplit 설정: 확률 테이블에 따라 블록 크기 선택 */
+			/* [한국어] bssplit 설정: 누적 확률 분포(CDF) 기반 선택.
+			 * 예) "4k/70:8k/20:16k/10" — i=0 시 perc=70, 여기에 난수가
+			 * 해당하면 4k 확정. 식 (r / perc <= frand_max / 100) 은
+			 * "r 이 perc 백분율 누적 내에 들어가는가" 판정(정수 버림 주의). */
 			long long perc = 0;
 			unsigned int i;
 
@@ -1343,24 +1428,28 @@ static unsigned long long get_next_buflen(struct thread_data *td, struct io_u *i
 					continue;
 				buflen = bsp->bs;
 				perc += bsp->perc;
-				/* [한국어] 누적 확률이 난수 비율을 초과하고 범위 내이면 선택 */
+				/* [한국어] 누적 비율에 적중 + 파일에 맞으면 이 bs 로 확정. */
 				if ((r / perc <= frand_max / 100ULL) &&
 				    io_u_fits(td, io_u, buflen))
 					break;
 			}
 		}
 
-		/* [한국어] 블록 크기 정렬: 2의 거듭제곱이면 비트마스크, 아니면 나머지 연산 */
+		/* [한국어] bs 정렬: minbs 단위 경계로 내림. 2의 거듭제곱이면 AND 마스크
+		 * (buflen & ~(minbs-1)) 로 1 cycle, 아니면 modulo 로 계산. bs_unaligned=1
+		 * 이면 이 정렬 자체를 생략(비정렬 I/O 스트레스 테스트용). */
 		power_2 = is_power_of_2(minbs);
 		if (!td->o.bs_unaligned && power_2)
 			buflen &= ~(minbs - 1);
 		else if (!td->o.bs_unaligned && !power_2)
 			buflen -= buflen % minbs;
-		/* [한국어] 최대 블록 크기 초과 방지 */
+		/* [한국어] 보간 결과가 maxbs 초과하면 클램프(부동소수점 반올림 여유 흡수). */
 		if (buflen > maxbs)
 			buflen = maxbs;
 	} while (!io_u_fits(td, io_u, buflen));
-	/* [한국어] 파일 범위 내에 맞을 때까지 반복 */
+	/* [한국어] 파일 남은 공간이 buflen 에 맞을 때까지 재추첨 루프. 이론상
+	 * 무한 루프 가능하나 io_u_fits(minbs) 가 위에서 보장되어 있어 최소 bs 까지는
+	 * 축소되며 결국 수렴. */
 
 	return buflen;
 }
@@ -1447,11 +1536,16 @@ int io_u_quiesce(struct thread_data *td)
 	 * io's that have been actually submitted to an async engine,
 	 * and cur_depth is meaningless for sync engines.
 	 */
-	/* [한국어] 큐에 쌓인 I/O가 있으면 먼저 커밋(제출) */
+	/* [한국어] io_u_queued 는 SQE 빌드만 되고 아직 commit 안 된 io_u 수. cur_depth 는
+	 * 잡이 점유한 io_u 수. 둘 중 하나라도 있으면 flush 해야 in-flight 가 정확 — 그
+	 * 후 getevents 로 완료 수확. td_io_commit 은 엔진의 .commit 콜백 호출 = 실제
+	 * 커널 submit(io_uring_enter, io_submit). */
 	if (td->io_u_queued || td->cur_depth)
 		td_io_commit(td);
 
-	/* [한국어] 비행 중(in-flight)인 I/O가 모두 완료될 때까지 대기 */
+	/* [한국어] io_u_in_flight 는 submit 후 완료 안 된 io_u 수 — 0 될 때까지 반복
+	 * getevents(1). 1개씩 완료하는 이유: 각 완료 시 io_completed 가 다른 io_u 를
+	 * 재큐잉할 수 있어 배치 경계 관리가 단순. */
 	while (td->io_u_in_flight) {
 		ret = io_u_queued_complete(td, 1);
 		if (ret > 0)
@@ -1460,10 +1554,13 @@ int io_u_quiesce(struct thread_data *td)
 			err = ret;
 	}
 
-	/* [한국어] 검증 로그 버퍼가 가득 찼으면 확장 */
+	/* [한국어] TD_F_REGROW_LOGS 는 "로그 배열 확장 필요" 플래그. quiesce 시점이
+	 * 자연스러운 확장 지점(다른 io_u 진행 중이 아님) — 확장 중 메모리 이동이
+	 * 있으면 안전. */
 	if (td->flags & TD_F_REGROW_LOGS)
 		regrow_logs(td);
 
+	/* [한국어] 반환값 해석: completed 가 있으면 성공 우선(>0). 없으면 err(음수) 전파. */
 	if (completed)
 		return completed;
 
@@ -1490,19 +1587,20 @@ int io_u_quiesce(struct thread_data *td)
  */
 static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 {
-	/* [한국어] 반대 방향 */
+	/* [한국어] XOR 1 트릭: READ(0)↔WRITE(1) 토글. ddir 이 TRIM 이면 사용 안 됨(위에서 가드). */
 	enum fio_ddir odir = ddir ^ 1;
 	uint64_t usec;
 	uint64_t now;
 
 	assert(ddir_rw(ddir));
-	/* [한국어] 현재 시각 (에포크 기준 마이크로초) */
+	/* [한국어] epoch(잡 시작 시각) 대비 경과 usec — rate_next_io_time 과 동일 좌표계. */
 	now = utime_since_now(&td->epoch);
 
 	/*
 	 * if rate_next_io_time is in the past, need to catch up to rate
 	 */
-	/* [한국어] 현재 방향의 다음 I/O 예정 시각이 이미 지났으면 바로 진행 */
+	/* [한국어] rate_next_io_time <= now: 목표 속도 대비 이미 뒤처져 있음 → 슬립
+	 * 없이 즉시 발행해 따라잡기. */
 	if (td->rate_next_io_time[ddir] <= now)
 		return ddir;
 
@@ -1510,12 +1608,12 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 	 * We are ahead of rate in this direction. See if we
 	 * should switch.
 	 */
-	/* [한국어] 현재 방향이 목표 속도보다 앞서 있음 -> 전환 검토 */
+	/* [한국어] 이 방향은 앞서 있음. 혼합 잡이면 반대 방향으로 전환 가능성 검토. */
 	if (td_rw(td) && td->o.rwmix[odir]) {
 		/*
 		 * Other direction is behind rate, switch
 		 */
-		/* [한국어] 반대 방향이 뒤처져 있으면 반대 방향으로 전환 */
+		/* [한국어] 반대 방향이 뒤처져 있으면 즉시 그쪽으로 전환 — 슬립 없음. */
 		if (td->rate_next_io_time[odir] <= now)
 			return odir;
 
@@ -1523,7 +1621,8 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 		 * Both directions are ahead of rate. sleep the min,
 		 * switch if necessary
 		 */
-		/* [한국어] 양쪽 모두 앞서 있으면, 더 빨리 도달하는 쪽으로 슬립 */
+		/* [한국어] 양쪽 모두 앞서 있음 → 더 빨리 허용되는 쪽으로 슬립. 반대
+		 * 방향이 더 빠르면 ddir 자체를 odir 로 바꿔 슬립 후 반대 방향 발행. */
 		if (td->rate_next_io_time[ddir] <=
 		    td->rate_next_io_time[odir]) {
 			usec = td->rate_next_io_time[ddir] - now;
@@ -1532,13 +1631,17 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 			ddir = odir;
 		}
 	} else
+		/* [한국어] 단일 방향 잡: 그냥 이 방향의 "다음 허용 시각"까지 기다림. */
 		usec = td->rate_next_io_time[ddir] - now;
 
-	/* [한국어] 인라인 모드에서는 슬립 전에 대기 중인 I/O 완료 */
+	/* [한국어] io_submit_mode=INLINE(기본) 은 잡 스레드가 직접 submit — 슬립 전에
+	 * in-flight 을 청산해야 ramp-down 폭풍(슬립 도중 완료 누적이 다음 사이클에
+	 * 한꺼번에 터져 latency 왜곡) 방지. OFFLOAD 모드는 별도 스레드가 처리해 필요 없음. */
 	if (td->o.io_submit_mode == IO_MODE_INLINE)
 		io_u_quiesce(td);
 
-	/* [한국어] 타임아웃 초과 시 DDIR_TIMEOUT 반환 */
+	/* [한국어] 슬립 이후가 timeout(잡 제한시간)을 초과하면 슬립 최소화 + DDIR_TIMEOUT
+	 * 으로 잡 종료. usec 이 음수가 될 수 있는 케이스(now > timeout)는 별도 처리. */
 	if (td->o.timeout && ((usec + now) > td->o.timeout)) {
 		/*
 		 * check if the usec is capable of taking negative values
@@ -1549,10 +1652,11 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 		}
 		usec = td->o.timeout - now;
 	}
-	/* [한국어] 목표 속도에 맞추기 위해 슬립 */
+	/* [한국어] usec_sleep: 짧으면 spin, 길면 nanosleep. td->terminate 폴링 가능. */
 	usec_sleep(td, usec);
 
-	/* [한국어] 슬립 후 타임아웃 또는 종료 확인 */
+	/* [한국어] 슬립에서 깨어나면 상황 재평가 — timeout 경과 또는 terminate 신호
+	 * 받았으면 잡 종료 유도(DDIR_TIMEOUT). */
 	now = utime_since_now(&td->epoch);
 	if ((td->o.timeout && (now > td->o.timeout)) || td->terminate)
 		ddir = DDIR_TIMEOUT;
@@ -1594,19 +1698,22 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 	 * See if it's time to fsync/fdatasync/sync_file_range first,
 	 * and if not then move on to check regular I/Os.
 	 */
-	/* [한국어] 마지막 I/O가 쓰기였으면 sync 필요 여부 확인 */
+	/* [한국어] sync 는 쓰기 누적 후에만 의미 있음(last_ddir_issued == WRITE 가드).
+	 * should_fsync: 전역 옵션/런타임 조건(예: 종료 직전 aux sync). */
 	if (should_fsync(td) && td->last_ddir_issued == DDIR_WRITE) {
-		/* [한국어] fsync_blocks마다 DDIR_SYNC 발행 */
+		/* [한국어] 쓰기 io_issues 가 fsync_blocks 배수일 때 fsync 삽입 —
+		 * io_issues>0 가드는 "0번째 IO 에 바로 fsync" 오판 방지. */
 		if (td->o.fsync_blocks && td->io_issues[DDIR_WRITE] &&
 		    !(td->io_issues[DDIR_WRITE] % td->o.fsync_blocks))
 			return DDIR_SYNC;
 
-		/* [한국어] fdatasync_blocks마다 DDIR_DATASYNC 발행 */
+		/* [한국어] fdatasync 주기 체크(메타 제외 데이터 동기). */
 		if (td->o.fdatasync_blocks && td->io_issues[DDIR_WRITE] &&
 		    !(td->io_issues[DDIR_WRITE] % td->o.fdatasync_blocks))
 			return DDIR_DATASYNC;
 
-		/* [한국어] sync_file_range 주기적 발행 */
+		/* [한국어] sync_file_range 주기 — 부분 sync. first_write/last_write
+		 * 범위에 기반해 실행. */
 		if (td->sync_file_range_nr && td->io_issues[DDIR_WRITE] &&
 		    !(td->io_issues[DDIR_WRITE] % td->sync_file_range_nr))
 			return DDIR_SYNC_FILE_RANGE;
@@ -1616,16 +1723,19 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 		/*
 		 * Check if it's time to seed a new data direction.
 		 */
-		/* [한국어] 읽기+쓰기 혼합: rwmix_issues 초과 시 방향 전환 */
+		/* [한국어] 현재 rwmix_ddir 방향으로 이미 rwmix_issues 개 발행했으면
+		 * 비율 전환 타이밍 — 다른 방향으로 넘어갈지 추첨. */
 		if (td->io_issues[td->rwmix_ddir] >= td->rwmix_issues) {
 			/*
 			 * Put a top limit on how many bytes we do for
 			 * one data direction, to avoid overflowing the
 			 * ranges too much
 			 */
-			/* [한국어] 랜덤으로 새 방향 선택 */
+			/* [한국어] rwmix[READ]% 확률로 READ, 나머지는 WRITE — 원본 비율 유지. */
 			ddir = get_rand_ddir(td);
 
+			/* [한국어] 실제로 방향 전환되면 새 목표 임계값(rwmix_issues) 재계산.
+			 * 같은 방향이면 기존 임계값 유지. */
 			if (ddir != td->rwmix_ddir)
 				set_rwmix_bytes(td);
 
@@ -1633,16 +1743,16 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 		}
 		ddir = td->rwmix_ddir;
 	} else if (td_read(td))
-		/* [한국어] 읽기 전용 */
+		/* [한국어] rw=read 옵션 — 전용 READ. */
 		ddir = DDIR_READ;
 	else if (td_write(td))
-		/* [한국어] 쓰기 전용 */
+		/* [한국어] rw=write — 전용 WRITE. */
 		ddir = DDIR_WRITE;
 	else if (td_trim(td))
-		/* [한국어] trim 전용 */
+		/* [한국어] rw=trim — 전용 TRIM (trimwrite 는 set_rw_ddir 의 토글로 처리). */
 		ddir = DDIR_TRIM;
 	else
-		/* [한국어] 유효하지 않은 방향 */
+		/* [한국어] 옵션 조합 오류 — 상위에서 INVAL 감지 후 잡 종료. */
 		ddir = DDIR_INVAL;
 
 	if (!should_check_rate(td)) {
@@ -1651,10 +1761,11 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
 		 * isn't being used. this imrpoves IOPs 50%. See:
 		 * https://github.com/axboe/fio/issues/1501#issuecomment-1418327049
 		 */
-		/* [한국어] rate 체크가 불필요하면 시간 관련 호출 생략 (성능 50% 향상) */
+		/* [한국어] rate 옵션 미설정 → rate_ddir 호출(=utime_since_now gettime) 생략.
+		 * 높은 IOPs 워크로드(수백만 IOPs)에서 gettime 오버헤드가 50% 까지 차지할 수 있음. */
 		td->rwmix_ddir = ddir;
 	} else
-		/* [한국어] rate 제한 적용 */
+		/* [한국어] rate 지정 시 타이밍/전환 조정(슬립, 방향 스왑, timeout 처리). */
 		td->rwmix_ddir = rate_ddir(td, ddir);
 	return td->rwmix_ddir;
 }
@@ -1678,27 +1789,32 @@ static enum fio_ddir get_rw_ddir(struct thread_data *td)
  */
 static void set_rw_ddir(struct thread_data *td, struct io_u *io_u)
 {
-	/* [한국어] 기본 방향 결정 */
+	/* [한국어] get_rw_ddir: rwmix/rate/sync 주기 등 모든 방향 결정 요인 통합. */
 	enum fio_ddir ddir = get_rw_ddir(td);
 
-	/* [한국어] ZBD 모드에서 방향 조정 */
+	/* [한국어] ZBD(ZNS) 모드: write pointer 가 전체 존을 다 채운 상태면 READ 로,
+	 * 존이 비어 있는 상태에서 READ 요청이면 대체 존 선택 등 상태 기반 재할당. */
 	if (td->o.zone_mode == ZONE_MODE_ZBD)
 		ddir = zbd_adjust_ddir(td, io_u, ddir);
 
-	/* [한국어] trimwrite 모드에서 trim과 write를 번갈아 수행 */
+	/* [한국어] trimwrite(rw=trimwrite) 모드: 각 영역에 WRITE → TRIM 쌍으로 발행.
+	 * last_start[WRITE]==last_start[TRIM] 은 "방금 쌍 완성" 상태 → 다음 위치에
+	 * TRIM 시작. 다르면 "TRIM 은 발행했고 WRITE 가 따라올 차례". */
 	if (td_trimwrite(td) && !ddir_sync(ddir)) {
 		struct fio_file *f = io_u->file;
-		/* [한국어] 마지막 write와 trim 위치가 같으면 다음은 trim */
 		if (f->last_start[DDIR_WRITE] == f->last_start[DDIR_TRIM])
 			ddir = DDIR_TRIM;
 		else
 			ddir = DDIR_WRITE;
 	}
 
-	/* [한국어] ddir과 acct_ddir(통계 기록용 방향) 설정 */
+	/* [한국어] ddir: 실제 I/O 방향. acct_ddir: 통계 기록 방향 — 같게 두지만 trim
+	 * 등이 별도 통계로 잡힐 때 달라질 수 있음. */
 	io_u->ddir = io_u->acct_ddir = ddir;
 
-	/* [한국어] 배리어 플래그 설정: barrier_blocks마다 I/O 배리어 삽입 */
+	/* [한국어] BARRIER 플래그 (FIO_BARRIER 엔진만 의미 있음 — BSG/SCSI 일부). 첫
+	 * 쓰기(!io_issues==0) 는 제외하여 "주기 0 에 무조건 세트" 버그 방지. 엔진이
+	 * 이 플래그 보고 FUA 또는 cache flush 삽입. */
 	if (io_u->ddir == DDIR_WRITE && td_ioengine_flagged(td, FIO_BARRIER) &&
 	    td->o.barrier_blocks &&
 	   !(td->io_issues[DDIR_WRITE] % td->o.barrier_blocks) &&
@@ -1769,36 +1885,48 @@ void put_file_log(struct thread_data *td, struct fio_file *f)
  */
 void put_io_u(struct thread_data *td, struct io_u *io_u)
 {
-	/* [한국어] 비동기 처리(verify async/offload submit) 활성 시에만 락 사용.
-	 * td_async_processing: TD_F_NEED_LOCK 계열 플래그 확인. 성능상 필요한 곳만. */
+	/* [한국어] 비동기 처리 활성 시에만 락 — verify_async(별도 스레드가 verify)
+	 * 또는 io_submit_mode=offload(별도 스레드가 submit) 모드에서 freelist 를
+	 * 잡 스레드와 그 헬퍼가 공유 → pthread_mutex 필요. 일반 모드(단일 스레드)는
+	 * 락 자체가 캐시 오염을 일으켜 회피. */
 	const bool needs_lock = td_async_processing(td);
 
-	/* [한국어] ZBD 관련 io_u 정리 */
+	/* [한국어] ZBD(Zoned Block Device) 가 활성이면 open_zone 참조 카운트 감소.
+	 * 존 내부 동시성 제어용. 일반 장치는 no-op. */
 	zbd_put_io_u(td, io_u);
 
-	/* [한국어] 자식 스레드면 부모 스레드의 리스트 사용 */
+	/* [한국어] verify 스레드 등 자식 스레드에서 호출한 경우 io_u 풀은 부모 소유
+	 * → 모든 갱신이 부모 td 기준으로 이뤄져야 cur_depth/freelist 일관성 유지. */
 	if (td->parent)
 		td = td->parent;
 
 	if (needs_lock)
 		__td_io_u_lock(td);
 
-	/* [한국어] 파일 참조가 있고 NO_FILE_PUT가 아니면 파일 참조 해제 */
+	/* [한국어] IO_U_F_NO_FILE_PUT: verify 경로 등에서 파일 참조 해제를 명시적으로
+	 * 보류할 때 사용. 일반 경로는 put_file_log 로 file->num_ref 감소 → 0 되면
+	 * 파일 close 스케줄. */
 	if (io_u->file && !(io_u->flags & IO_U_F_NO_FILE_PUT))
 		put_file_log(td, io_u->file);
 
-	/* [한국어] 파일 포인터 초기화 및 FREE 플래그 설정 */
+	/* [한국어] 파일 바인딩 해제. 다음 __get_io_u 에서 꺼내질 때 file==NULL 이
+	 * "빈 슬롯" 마커 — set_io_u_file 재수행 필요 판단. */
 	io_u->file = NULL;
+	/* [한국어] IO_U_F_FREE 세트 — queue_full/__get_io_u 의 assert 가 이 비트 확인. */
 	io_u_set(td, io_u, IO_U_F_FREE);
 
-	/* [한국어] 현재 깊이(cur_depth) 감소 */
+	/* [한국어] IO_U_F_IN_CUR_DEPTH 는 __get_io_u 에서 cur_depth++ 할 때 세트됨 —
+	 * 해제 시 cur_depth--. 자식 스레드는 이 경로 불가(부모 cur_depth 직접 조작
+	 * 금지, TD_F_CHILD assert 로 탐지). */
 	if (io_u->flags & IO_U_F_IN_CUR_DEPTH) {
 		td->cur_depth--;
 		assert(!(td->flags & TD_F_CHILD));
 	}
-	/* [한국어] 프리리스트에 io_u 반환 */
+	/* [한국어] io_u_qpush: freelist 테일에 재삽입(FIFO 순환). __get_io_u 는
+	 * io_u_qpop(헤드) 로 꺼냄 → LRU 성 보장(가장 오래전 해제된 것부터 재사용). */
 	io_u_qpush(&td->io_u_freelist, io_u);
-	/* [한국어] 대기 중인 스레드에게 io_u 사용 가능 알림 */
+	/* [한국어] free_cond 브로드캐스트로 __get_io_u 에서 cond_wait 중이던
+	 * verify_async/offload 스레드 깨움 — "io_u 하나 반납됨" 신호. */
 	td_io_u_free_notify(td);
 
 	if (needs_lock)
@@ -1872,7 +2000,8 @@ void requeue_io_u(struct thread_data *td, struct io_u **io_u)
 {
 	const bool needs_lock = td_async_processing(td);
 	struct io_u *__io_u = *io_u;
-	/* [한국어] 통계 기록용 방향 */
+	/* [한국어] acct_ddir 는 io_u->acct_ddir(통계 기록용 방향). TRIM/SYNC 등의
+	 * 실제 ddir 과 다를 수 있어(예: trimwrite 의 write 는 ddir=WRITE, acct=WRITE). */
 	enum fio_ddir ddir = acct_ddir(__io_u);
 
 	dprint(FD_IO, "requeue %p\n", __io_u);
@@ -1883,29 +2012,33 @@ void requeue_io_u(struct thread_data *td, struct io_u **io_u)
 	if (needs_lock)
 		__td_io_u_lock(td);
 
-	/* [한국어] FREE 플래그 설정 */
+	/* [한국어] FREE 비트 세트 — freelist/requeues 둘 다 "발급 가능" 상태 의미. */
 	io_u_set(td, __io_u, IO_U_F_FREE);
-	/* [한국어] 비행 중이었던 read/write면 발행 카운터 되돌림 */
+	/* [한국어] FIO_Q_BUSY 반환 경로: td_io_queue 가 io_issues[ddir]++ 를 이미 수행
+	 * 했는데 엔진이 실제론 submit 하지 못했으므로 카운터 원복 필요. short I/O
+	 * 경로에선 FLIGHT 인 상태로 들어오므로 조건 일치. */
 	if ((__io_u->flags & IO_U_F_FLIGHT) && ddir_rw(ddir))
 		td->io_issues[ddir]--;
 
-	/* [한국어] FLIGHT 플래그 제거 */
+	/* [한국어] FLIGHT clear — 더 이상 엔진에 점유되어 있지 않음. */
 	io_u_clear(td, __io_u, IO_U_F_FLIGHT);
-	/* [한국어] 현재 깊이 감소 */
+	/* [한국어] put_io_u 와 동일 — IN_CUR_DEPTH 였다면 cur_depth-- 로 부채 해소. */
 	if (__io_u->flags & IO_U_F_IN_CUR_DEPTH) {
 		td->cur_depth--;
 		assert(!(td->flags & TD_F_CHILD));
 	}
 
-	/* [한국어] 재큐잉 리스트에 푸시 */
+	/* [한국어] io_u_rpush: requeues 헤드에 push → __get_io_u 의 io_u_rpop 이
+	 * 이 io_u 를 freelist 보다 먼저 꺼내 재시도. offset/buflen/file 보존. */
 	io_u_rpush(&td->io_u_requeues, __io_u);
-	/* [한국어] 사용 가능 알림 */
+	/* [한국어] 대기 중 스레드에게 "재큐잉된 io_u 있음" 신호(free_cond 와 공유). */
 	td_io_u_free_notify(td);
 
 	if (needs_lock)
 		__td_io_u_unlock(td);
 
-	/* [한국어] 호출자의 포인터를 NULL로 설정 */
+	/* [한국어] *io_u=NULL: 호출자(io_completed 등)가 이 io_u 에 대해 put_io_u 를
+	 * 이중 호출하지 않도록 마커 리셋. 이중 해제 방지. */
 	*io_u = NULL;
 }
 
@@ -1938,20 +2071,23 @@ static void setup_strided_zone_mode(struct thread_data *td, struct io_u *io_u)
 	/*
 	 * See if it's time to switch to a new zone
 	 */
-	/* [한국어] 현재 존에서 zone_size만큼 I/O했으면 다음 존으로 이동 */
+	/* [한국어] 현재 존 누적 바이트가 zone_size 도달 → 다음 존으로 이동.
+	 * zone_bytes 리셋, file_offset 이 (zone_range + zone_skip) 만큼 전진.
+	 * zone_skip 은 존 사이에 건너뛰는 공간(핫/콜드 블록 분리 시뮬레이션). */
 	if (td->zone_bytes >= td->o.zone_size) {
 		td->zone_bytes = 0;
-		/* [한국어] zone_range + zone_skip만큼 오프셋 이동 */
 		f->file_offset += td->o.zone_range + td->o.zone_skip;
 
 		/*
 		 * Wrap from the beginning, if we exceed the file size
 		 */
-		/* [한국어] 파일 끝을 넘으면 처음으로 순환 */
+		/* [한국어] 파일 끝 넘으면 start_offset 으로 wrap — 존 주기가 파일 전체를 순회. */
 		if (f->file_offset >= f->real_file_size)
 			f->file_offset = get_start_offset(td, f);
 
+		/* [한국어] last_pos 도 새 file_offset 으로 동기 — 순차 I/O 가 새 존 시작점부터 재개. */
 		f->last_pos[io_u->ddir] = f->file_offset;
+		/* [한국어] io_skip_bytes 누적 — 전체 I/O 통계에서 제외되는 "건너뛴" 공간 기록. */
 		td->io_skip_bytes += td->o.zone_skip;
 	}
 
@@ -1959,8 +2095,9 @@ static void setup_strided_zone_mode(struct thread_data *td, struct io_u *io_u)
 	 * If zone_size > zone_range, then maintain the same zone until
 	 * zone_bytes >= zone_size.
 	 */
-	/* [한국어] zone_size > zone_range일 때, zone_range 끝에 도달하면
-	 * 같은 존의 시작으로 돌아감 (zone_bytes가 zone_size에 도달할 때까지) */
+	/* [한국어] zone_size > zone_range 구성에서 순차 진행이 zone_range 경계를
+	 * 넘으면 "존을 다 덮음" → 같은 존의 시작으로 되돌려 동일 존 반복 I/O.
+	 * zone_bytes 가 zone_size 에 도달할 때까지 이 재반복. */
 	if (f->last_pos[io_u->ddir] >= (f->file_offset + td->o.zone_range)) {
 		dprint(FD_IO, "io_u maintain zone offset=%" PRIu64 "/last_pos=%" PRIu64 "\n",
 				f->file_offset, f->last_pos[io_u->ddir]);
@@ -1971,7 +2108,8 @@ static void setup_strided_zone_mode(struct thread_data *td, struct io_u *io_u)
 	 * For random: if 'norandommap' is not set and zone_size > zone_range,
 	 * map needs to be reset as it's done with zone_range everytime.
 	 */
-	/* [한국어] 랜덤 I/O에서 zone_range 단위로 랜덤맵 리셋 */
+	/* [한국어] zone_range 바이트 주기마다 axmap 리셋 — 존 내 재반복 시 랜덤맵 재사용.
+	 * zone_bytes % zone_range == 0 은 "존 경계 정확히 도달" 조건. */
 	if ((td->zone_bytes % td->o.zone_range) == 0)
 		fio_file_reset(td, f);
 }
@@ -2002,27 +2140,30 @@ static int fill_multi_range_io_u(struct thread_data *td, struct io_u *io_u)
 	struct fio_file *f = io_u->file;
 	uint8_t *buf;
 
+	/* [한국어] io_u->buf 는 잡 초기화 시 할당된 버퍼 — 여기에 struct trim_range 를
+	 * 연속 배치. 엔진(nvme passthru)이 이 배열 주소를 DSM 명령의 range descriptor
+	 * 로 전달해 한 번에 여러 LBA 범위를 discard. */
 	buf = io_u->buf;
 	buflen = 0;
 
-	/* [한국어] num_range 개수만큼 반복하여 trim 범위 생성 */
+	/* [한국어] num_range 개의 trim 범위를 생성. 중간 실패는 break 후 부분 성공 판정. */
 	while (i < td->o.num_range) {
 		range = (struct trim_range *)buf;
-		/* [한국어] 오프셋 결정 */
+		/* [한국어] 각 범위마다 독립적으로 오프셋 선택 (get_next_offset 호출). */
 		if (get_next_offset(td, io_u, &is_random)) {
 			dprint(FD_IO, "io_u %p, failed getting offset\n",
 			       io_u);
 			break;
 		}
 
-		/* [한국어] 버퍼 길이 결정 */
+		/* [한국어] 이 범위의 길이(바이트). bsrange/bssplit 분포 그대로 적용. */
 		io_u->buflen = get_next_buflen(td, io_u, is_random);
 		if (!io_u->buflen) {
 			dprint(FD_IO, "io_u %p, failed getting buflen\n", io_u);
 			break;
 		}
 
-		/* [한국어] 파일 크기 초과 검사 */
+		/* [한국어] offset+buflen 이 파일 크기를 넘으면 해당 범위는 포기 (앞까지는 유효). */
 		if (io_u->offset + io_u->buflen > io_u->file->real_file_size) {
 			dprint(FD_IO, "io_u %p, off=0x%llx + len=0x%llx exceeds file size=0x%llx\n",
 			       io_u,
@@ -2031,18 +2172,20 @@ static int fill_multi_range_io_u(struct thread_data *td, struct io_u *io_u)
 			break;
 		}
 
-		/* [한국어] trim 범위의 시작 오프셋과 길이를 기록 */
+		/* [한국어] trim_range 구조체(start, len) 를 io_u->buf 에 기록. */
 		range->start = io_u->offset;
 		range->len = io_u->buflen;
+		/* [한국어] 누적 buflen — 모든 범위의 총 바이트 수(통계용). */
 		buflen += io_u->buflen;
-		/* [한국어] 파일의 마지막 시작/위치 업데이트 */
+		/* [한국어] 다음 범위 계산 및 통계/트리거에 쓰일 last_start/pos 업데이트. */
 		f->last_start[io_u->ddir] = io_u->offset;
 		f->last_pos[io_u->ddir] = io_u->offset + range->len;
 
+		/* [한국어] 버퍼 포인터를 다음 trim_range 위치로 전진. */
 		buf += sizeof(struct trim_range);
 		i++;
 
-		/* [한국어] 랜덤 I/O면 랜덤맵에 표시 */
+		/* [한국어] 각 범위도 단일 trim 처럼 axmap 에 마킹(랜덤 모드). */
 		if (td_random(td) && file_randommap(td, io_u->file))
 			mark_random_map(td, io_u, io_u->offset, io_u->buflen);
 		dprint_io_u(io_u, "fill");
@@ -2052,12 +2195,14 @@ static int fill_multi_range_io_u(struct thread_data *td, struct io_u *io_u)
 		 * Set buffer length as overall trim length for this IO, and
 		 * tell the ioengine about the number of ranges to be trimmed.
 		 */
-		/* [한국어] 전체 trim 길이와 범위 수를 io_u에 설정 */
+		/* [한국어] io_u->buflen 을 전체 범위 합계로, number_trim 을 실제 생성된
+		 * 범위 수로 설정 — 엔진이 DSM 명령에 number_trim 을 개수 필드로 사용. */
 		io_u->buflen = buflen;
 		io_u->number_trim = i;
 		return 0;
 	}
 
+	/* [한국어] 첫 범위도 생성 못했으면 실패 — 상위가 파일 전환/잡 종료 처리. */
 	return 1;
 }
 
@@ -2105,14 +2250,16 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 	uint64_t offset;
 	enum io_u_action ret;
 
-	/* [한국어] NOIO 엔진이면 I/O 설정 건너뜀 */
+	/* [한국어] FIO_NOIO 엔진(cpu/net 등)은 실제 디스크 I/O 없음 — 오프셋/버퍼 설정
+	 * 전부 skip, ddir 만 결정되면 됨. 바로 out 으로 점프. */
 	if (td_ioengine_flagged(td, FIO_NOIO))
 		goto out;
 
-	/* [한국어] 1단계: 데이터 방향 결정 */
+	/* [한국어] ① ddir 결정: rwmix / fsync / datasync / sync_file_range / rate 조정 /
+	 * ZBD 조정 / trimwrite 토글 / barrier_blocks 판정 일체 포함. */
 	set_rw_ddir(td, io_u);
 
-	/* [한국어] 유효하지 않은 방향이면 실패 */
+	/* [한국어] rate_ddir 가 타임아웃 반환하거나 잘못된 방향일 때. 잡 종료 유도. */
 	if (io_u->ddir == DDIR_INVAL || io_u->ddir == DDIR_TIMEOUT) {
 		dprint(FD_IO, "invalid direction received ddir = %d", io_u->ddir);
 		return 1;
@@ -2120,17 +2267,19 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 	/*
 	 * fsync() or fdatasync() or trim etc, we are done
 	 */
-	/* [한국어] sync 계열 방향이면 오프셋/크기 설정 불필요 */
+	/* [한국어] ddir_sync(DDIR_SYNC/DATASYNC/SYNC_FILE_RANGE): 오프셋/길이 개념 없음.
+	 * out 에서 verify_offset=offset 은 수행되지만 의미 있는 값 아님(초기값 0). */
 	if (!ddir_rw(io_u->ddir))
 		goto out;
 
-	/* [한국어] 2단계: 존 모드 설정 */
+	/* [한국어] ② 존 모드 보정. STRIDED 는 fio 가 만든 가짜 존, ZBD 는 실제 ZNS 장치. */
 	if (td->o.zone_mode == ZONE_MODE_STRIDED)
 		setup_strided_zone_mode(td, io_u);
 	else if (td->o.zone_mode == ZONE_MODE_ZBD)
 		setup_zbd_zone_mode(td, io_u);
 
-	/* [한국어] 3단계: 다중 범위 trim이면 별도 처리 */
+	/* [한국어] ③ 다중 범위 DSM trim (num_range>1 + DDIR_TRIM): 여러 범위를 한 개
+	 * io_u 에 쌓아 NVMe passthru 가 한 번에 discard. fill_multi_range_io_u 이 전담. */
 	if (multi_range_trim(td, io_u)) {
 		if (fill_multi_range_io_u(td, io_u))
 			return 1;
@@ -2139,22 +2288,26 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 		 * No log, let the seq/rand engine retrieve the next buflen and
 		 * position.
 		 */
-		/* [한국어] 4단계: 오프셋 결정 */
+		/* [한국어] ④-1 오프셋: 순차/랜덤(+ 분포) 분기 디스패치. is_random 출력으로
+		 * 아래 mark_random_map 호출 여부 결정. */
 		if (get_next_offset(td, io_u, &is_random)) {
 			dprint(FD_IO, "io_u %p, failed getting offset\n", io_u);
 			return 1;
 		}
 
-		/* [한국어] 4단계: 버퍼 길이(블록 크기) 결정 */
+		/* [한국어] ④-2 블록 크기: bsrange 선형/bssplit CDF/고정 bs 분기. */
 		io_u->buflen = get_next_buflen(td, io_u, is_random);
 		if (!io_u->buflen) {
 			dprint(FD_IO, "io_u %p, failed getting buflen\n", io_u);
 			return 1;
 		}
 	}
+	/* [한국어] offset 백업 — ZBD adjust 가 io_u->offset 을 변경할 수 있어
+	 * 원본(랜덤맵 세트 기준) 을 따로 보관. */
 	offset = io_u->offset;
 
-	/* [한국어] 5단계: ZBD 모드에서 블록 위치/크기 조정 */
+	/* [한국어] ⑤ ZBD: write pointer 위치에 맞춰 offset/buflen 재정렬. 존이 모두
+	 * 닫혔으면 io_u_eof → 이번 오프셋으로는 I/O 불가 → 실패 전파(다음 파일 시도). */
 	if (td->o.zone_mode == ZONE_MODE_ZBD) {
 		ret = zbd_adjust_block(td, io_u);
 		if (ret == io_u_eof) {
@@ -2163,11 +2316,13 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 		}
 	}
 
-	/* [한국어] 6단계: 데이터 보호(Data Placement) 정보 채우기 */
+	/* [한국어] ⑥ Data Placement(NVMe FDP/Streams/Placement ID): io_u 에 dtype/dspec
+	 * 메타 채움. 엔진(nvme passthru)이 제출 시 명령 필드에 삽입. */
 	if (td->o.dp_type != FIO_DP_NONE)
 		dp_fill_dspec_data(td, io_u);
 
-	/* [한국어] 파일 크기 초과 검사 */
+	/* [한국어] 최종 안전가드 — ZBD adjust 후에도 offset+buflen 이 파일 크기를
+	 * 넘으면 버그. 방어적 체크. */
 	if (io_u->offset + io_u->buflen > io_u->file->real_file_size) {
 		dprint(FD_IO, "io_u %p, off=0x%llx + len=0x%llx exceeds file size=0x%llx\n",
 			io_u,
@@ -2179,16 +2334,21 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 	/*
 	 * mark entry before potentially trimming io_u
 	 */
-	/* [한국어] 7단계: 랜덤 I/O면 랜덤맵에 표시 (io_u->buflen이 줄어들 수 있음) */
+	/* [한국어] ⑦ axmap 마킹: norandommap=0 + td_random + 랜덤맵 활성 + 다중범위 아님.
+	 * 반환값이 원 buflen 보다 작으면 이미 점유된 블록에 걸렸다는 뜻 → buflen 축소
+	 * 반영(이 io_u 는 축소된 영역만 커버). 다음 io_u 는 다른 블록으로. */
 	if (!multi_range_trim(td, io_u) && td_random(td) && file_randommap(td, io_u->file))
 		io_u->buflen = mark_random_map(td, io_u, offset, io_u->buflen);
 
 out:
 	if (!multi_range_trim(td, io_u))
 		dprint_io_u(io_u, "fill");
-	/* [한국어] 검증용 오프셋 설정 */
+	/* [한국어] verify_offset 은 verify 경로가 이 io_u 의 원본 오프셋을 재현할 때
+	 * 사용 — rand 재추첨이나 ZBD adjust 로 offset 이 변해도 verify 가 원본 기준
+	 * 패턴을 복원. */
 	io_u->verify_offset = io_u->offset;
-	/* [한국어] 존 바이트 카운터 업데이트 */
+	/* [한국어] zone_bytes 는 STRIDED zone 모드의 현재 존 사용량 추적 — setup_strided_
+	 * zone_mode 에서 zone_size 도달 판정에 사용. ZBD 모드에선 zbd.c 가 별도 관리. */
 	td->zone_bytes += io_u->buflen;
 	return 0;
 }
@@ -2209,9 +2369,12 @@ static void __io_u_mark_map(uint64_t *map, unsigned int nr)
 {
 	int idx = 0;
 
+	/* [한국어] 7 버킷 (멱승 로그 스케일 근사): 0 | 1-4 | 5-8 | 9-16 | 17-32 | 33-64 | 65+
+	 * nr 값에 따라 idx 결정 후 아래에서 ++. switch/case range (GNU 확장) 사용. */
 	switch (nr) {
 	default:
-		idx = 6;	/* [한국어] 65개 이상 */
+		/* [한국어] 65+ 대형 배치 — 마지막 버킷. */
+		idx = 6;
 		break;
 	case 33 ... 64:
 		idx = 5;
@@ -2227,11 +2390,16 @@ static void __io_u_mark_map(uint64_t *map, unsigned int nr)
 		break;
 	case 1 ... 4:
 		idx = 1;
+		/* [한국어] fio_fallthrough: GCC fallthrough attribute 로 의도적 관통.
+		 * idx=1 세트 후 case 0 으로 관통해 break 하지만 추가 로직 실행 안 함 —
+		 * "1..4 와 0 은 같은 처리 스킴" 표현(배열 인덱스만 다름). */
 		fio_fallthrough;
 	case 0:
+		/* [한국어] nr=0 (getevents 가 0건 반환) 도 기록 — 폴링 실패 빈도 추적. */
 		break;
 	}
 
+	/* [한국어] 해당 버킷 카운터 증가 — 락 없음(잡 스레드 단독 소유 통계). */
 	map[idx]++;
 }
 
@@ -2281,9 +2449,12 @@ void io_u_mark_depth(struct thread_data *td, unsigned int nr)
 {
 	int idx = 0;
 
+	/* [한국어] 7 버킷 (2^n 경계): 1 | 2-3 | 4-7 | 8-15 | 16-31 | 32-63 | 64+
+	 * cur_depth 기준 버킷 선택 후 += nr — nr 은 이번 배치의 io_u 수. */
 	switch (td->cur_depth) {
 	default:
-		idx = 6;	/* [한국어] 64 이상 */
+		/* [한국어] 64 이상 — 큰 큐 깊이. */
+		idx = 6;
 		break;
 	case 32 ... 63:
 		idx = 5;
@@ -2299,11 +2470,14 @@ void io_u_mark_depth(struct thread_data *td, unsigned int nr)
 		break;
 	case 2 ... 3:
 		idx = 1;
+		/* [한국어] fallthrough: cur_depth=1 과 [2,3] 이 같은 break 공유. */
 		fio_fallthrough;
 	case 1:
+		/* [한국어] cur_depth=1 (깊이 1 동기 제출) — idx=0. */
 		break;
 	}
 
+	/* [한국어] io_u_map 에 nr 누적 — __io_u_mark_map 과 달리 "개수 가중치" 가산. */
 	td->ts.io_u_map[idx] += nr;
 }
 
@@ -2482,14 +2656,16 @@ static void io_u_mark_lat_msec(struct thread_data *td, unsigned long long msec)
  */
 static void io_u_mark_latency(struct thread_data *td, unsigned long long nsec)
 {
+	/* [한국어] 3 자리수 스케일 분기 — 각 스케일마다 10개 버킷으로 해상도 유지.
+	 * 단일 1000 버킷 대신 ns/us/ms 분리로 dynamic range 수억 배 커버. */
 	if (nsec < 1000)
-		/* [한국어] 1000ns 미만 -> 나노초 단위 */
+		/* [한국어] 0..999ns — NVMe/Optane 수준 초저지연. */
 		io_u_mark_lat_nsec(td, nsec);
 	else if (nsec < 1000000)
-		/* [한국어] 1ms 미만 -> 마이크로초 단위 */
+		/* [한국어] 1us..999us — SSD 일반 지연. nsec/1000 으로 usec 단위 정수화. */
 		io_u_mark_lat_usec(td, nsec / 1000);
 	else
-		/* [한국어] 1ms 이상 -> 밀리초 단위 */
+		/* [한국어] 1ms 이상 — HDD 또는 네트워크 스토리지. nsec/1e6 으로 msec 정수화. */
 		io_u_mark_lat_msec(td, nsec / 1000000);
 }
 
@@ -2511,7 +2687,8 @@ static unsigned int __get_next_fileno_rand(struct thread_data *td)
 {
 	unsigned long fileno;
 
-	/* [한국어] 기본 랜덤: 균일 분포로 파일 번호 선택 */
+	/* [한국어] 균등 분포 — next_file_state Tausworthe 난수에서 [0, nr_files) 사상.
+	 * 다른 분포들과 달리 여기선 shift 없이 바로 반환. */
 	if (td->o.file_service_type == FIO_FSERVICE_RANDOM) {
 		uint64_t frand_max = rand_max(&td->next_file_state);
 		unsigned long r;
@@ -2521,7 +2698,9 @@ static unsigned int __get_next_fileno_rand(struct thread_data *td)
 				* (r / (frand_max + 1.0)));
 	}
 
-	/* [한국어] Zipf/Pareto/가우시안 분포로 파일 번호 선택 */
+	/* [한국어] 비균등 분포들 — 상태 머신의 next 함수 호출. FIO_FSERVICE_SHIFT 는
+	 * "over-provision bits" — 분포 정밀도를 위해 (nr_files << SHIFT) 범위로 생성
+	 * 후 shift 로 실제 인덱스 추출(소수점 정밀도 회수 효과). */
 	if (td->o.file_service_type == FIO_FSERVICE_ZIPF)
 		fileno = zipf_next(&td->next_file_zipf);
 	else if (td->o.file_service_type == FIO_FSERVICE_PARETO)
@@ -2534,6 +2713,7 @@ static unsigned int __get_next_fileno_rand(struct thread_data *td)
 		return 0;
 	}
 
+	/* [한국어] over-provision 한 bits 제거 → [0, nr_files) 인덱스 도출. */
 	return fileno >> FIO_FSERVICE_SHIFT;
 }
 
@@ -2563,36 +2743,42 @@ static struct fio_file *get_next_file_rand(struct thread_data *td,
 	int fno;
 
 	do {
+		/* [한국어] 이 반복에서 새로 open 한 파일인지 마커 — 플래그 불일치시
+		 * close 해야 할지 판단. 기존에 열려 있던 파일은 close 안 함. */
 		int opened = 0;
 
-		/* [한국어] 랜덤 파일 번호 생성 */
+		/* [한국어] 분포별 파일 인덱스 추첨. */
 		fno = __get_next_fileno_rand(td);
 
 		f = td->files[fno];
-		/* [한국어] 이미 완료된 파일이면 건너뜀 */
+		/* [한국어] 이미 완료(I/O 소진)된 파일 skip — 루프 재추첨. */
 		if (fio_file_done(f))
 			continue;
 
-		/* [한국어] 파일이 아직 열리지 않았으면 열기 시도 */
+		/* [한국어] 파일 아직 open 전이면 open 시도. */
 		if (!fio_file_open(f)) {
 			int err;
 
-			/* [한국어] 열린 파일 수 제한 확인 */
+			/* [한국어] open_files 상한 초과 — 현재는 못 연다는 의미. -EBUSY 로
+			 * 상위에 힌트(다른 파일 close 후 재시도). */
 			if (td->nr_open_files >= td->o.open_files)
 				return ERR_PTR(-EBUSY);
 
+			/* [한국어] td_io_open_file: 엔진의 .open_file 콜백 호출. 실패 시
+			 * 다음 파일 추첨으로 넘어감. */
 			err = td_io_open_file(td, f);
 			if (err)
 				continue;
 			opened = 1;
 		}
 
-		/* [한국어] 플래그 조건 확인: goodf 만족하고 badf 없으면 선택 */
+		/* [한국어] 플래그 조건 평가 — goodf 가 필수 비트 세트, badf 는 제외할 비트. */
 		if ((!goodf || (f->flags & goodf)) && !(f->flags & badf)) {
 			dprint(FD_FILE, "get_next_file_rand: %p\n", f);
 			return f;
 		}
-		/* [한국어] 조건 불만족 시 방금 연 파일은 닫기 */
+		/* [한국어] 조건 불일치 + 방금 열린 파일이면 원상복구하기 위해 close.
+		 * 기존에 열려 있던 파일은 그대로 두고 다음 추첨 — 일관된 파일 상태 유지. */
 		if (opened)
 			td_io_close_file(td, f);
 	} while (1);
@@ -2614,7 +2800,8 @@ static struct fio_file *get_next_file_rand(struct thread_data *td,
 static struct fio_file *get_next_file_rr(struct thread_data *td, int goodf,
 					 int badf)
 {
-	/* [한국어] 시작 위치 기억 (한 바퀴 돌았는지 확인용) */
+	/* [한국어] 루프 시작 시점의 next_file 저장 — 한 바퀴 순회 종료 감지 (모든 파일
+	 * 검사 완료 시 탈출). */
 	unsigned int old_next_file = td->next_file;
 	struct fio_file *f;
 
@@ -2623,19 +2810,19 @@ static struct fio_file *get_next_file_rr(struct thread_data *td, int goodf,
 
 		f = td->files[td->next_file];
 
-		/* [한국어] 다음 파일 인덱스 증가 (순환) */
+		/* [한국어] RR 커서 전진 + nr_files 모듈로 wrap — 다음 호출에서 그 다음 파일 검사. */
 		td->next_file++;
 		if (td->next_file >= td->o.nr_files)
 			td->next_file = 0;
 
 		dprint(FD_FILE, "trying file %s %x\n", f->file_name, f->flags);
-		/* [한국어] 완료된 파일이면 건너뜀 */
+		/* [한국어] 완료 파일 skip — f=NULL 세트해 루프 종료 후 리턴값 판정에 사용. */
 		if (fio_file_done(f)) {
 			f = NULL;
 			continue;
 		}
 
-		/* [한국어] 파일이 열리지 않았으면 열기 시도 */
+		/* [한국어] 파일 닫혀 있으면 open. open_files 상한 검사 동일. */
 		if (!fio_file_open(f)) {
 			int err;
 
@@ -2654,16 +2841,18 @@ static struct fio_file *get_next_file_rr(struct thread_data *td, int goodf,
 
 		dprint(FD_FILE, "goodf=%x, badf=%x, ff=%x\n", goodf, badf,
 								f->flags);
-		/* [한국어] 플래그 조건 충족 시 선택 */
+		/* [한국어] 플래그 조건 충족 → break(탈출, f 반환). */
 		if ((!goodf || (f->flags & goodf)) && !(f->flags & badf))
 			break;
 
+		/* [한국어] 불일치 + 방금 열렸으면 close. */
 		if (opened)
 			td_io_close_file(td, f);
 
+		/* [한국어] f=NULL 로 다시 리셋 — "이 파일은 선택 불가" 마커. 반복 지속. */
 		f = NULL;
 	} while (td->next_file != old_next_file);
-	/* [한국어] 한 바퀴 돌 때까지 반복 */
+	/* [한국어] 한 바퀴 순회 완료 — 후보 없으면 f=NULL 반환. */
 
 	dprint(FD_FILE, "get_next_file_rr: %p\n", f);
 	return f;
@@ -2692,7 +2881,7 @@ static struct fio_file *__get_next_file(struct thread_data *td)
 
 	assert(td->o.nr_files <= td->files_index);
 
-	/* [한국어] 모든 파일이 완료됐으면 NULL 반환 */
+	/* [한국어] nr_done_files: 영구 완료 파일 수. nr_files 도달하면 잡 종료 신호. */
 	if (td->nr_done_files >= td->o.nr_files) {
 		dprint(FD_FILE, "get_next_file: nr_open=%d, nr_done=%d,"
 				" nr_files=%d\n", td->nr_open_files,
@@ -2701,20 +2890,21 @@ static struct fio_file *__get_next_file(struct thread_data *td)
 		return NULL;
 	}
 
-	/* [한국어] 현재 서비스 중인 파일이 유효하면 계속 사용 */
+	/* [한국어] 이전 get 에서 선정해 둔 file_service_file 이 여전히 사용 가능하면 재사용. */
 	f = td->file_service_file;
 	if (f && fio_file_open(f) && !fio_file_closing(f)) {
-		/* [한국어] 순차 모드면 파일이 끝날 때까지 계속 */
+		/* [한국어] SEQ 모드는 이 파일이 완전히 끝날 때까지 계속 사용 — 전환 없음. */
 		if (td->o.file_service_type == FIO_FSERVICE_SEQ)
 			goto out;
-		/* [한국어] 아직 남은 서비스 횟수가 있으면 계속 */
+		/* [한국어] file_service_nr 옵션은 "한 파일당 연속 I/O 수" — left 카운터
+		 * 감소시키며 0 도달하면 아래에서 새 파일 선정. */
 		if (td->file_service_left) {
 			td->file_service_left--;
 			goto out;
 		}
 	}
 
-	/* [한국어] 라운드 로빈/순차이면 RR 방식, 아니면 랜덤 방식 */
+	/* [한국어] 새 파일 선정: RR/SEQ 는 라운드 로빈, 나머지(RANDOM/ZIPF/PARETO/GAUSS) 는 분포. */
 	if (td->o.file_service_type == FIO_FSERVICE_RR ||
 	    td->o.file_service_type == FIO_FSERVICE_SEQ)
 		f = get_next_file_rr(td, FIO_FILE_open, FIO_FILE_closing);
@@ -2724,9 +2914,9 @@ static struct fio_file *__get_next_file(struct thread_data *td)
 	if (IS_ERR(f))
 		return f;
 
-	/* [한국어] 새 파일을 현재 서비스 파일로 설정 */
+	/* [한국어] 현재 서비스 파일로 갱신 — 다음 get 때 위 "재사용" 분기 활용. */
 	td->file_service_file = f;
-	/* [한국어] 이 파일에 연속으로 서비스할 횟수 설정 */
+	/* [한국어] file_service_nr - 1: 이미 지금 1회 사용으로 카운트되므로 하나 덜. */
 	td->file_service_left = td->file_service_nr - 1;
 out:
 	if (f)
@@ -2774,31 +2964,38 @@ static long set_io_u_file(struct thread_data *td, struct io_u *io_u)
 	struct fio_file *f;
 
 	do {
-		/* [한국어] 다음 서비스할 파일 가져오기 */
+		/* [한국어] 파일 서비스 정책(SEQ/RR/RANDOM/분포)에 따라 후보 파일 선택.
+		 * NULL = 모든 파일 완료, ERR_PTR = open_files 상한 초과 등 에러. */
 		f = get_next_file(td);
 		if (IS_ERR_OR_NULL(f))
 			return PTR_ERR(f);
 
-		/* [한국어] io_u에 파일 설정 및 참조 카운트 증가 */
+		/* [한국어] io_u 와 파일을 양방향 바인딩 + num_ref 증가. put_io_u 에서
+		 * put_file_log 로 참조 해제 대칭. */
 		io_u->file = f;
 		get_file(f);
 
-		/* [한국어] fill_io_u()로 I/O 정보 채우기 성공 시 루프 종료 */
+		/* [한국어] fill_io_u 성공 시 루프 탈출 — offset/buflen/ddir 세팅 완료. */
 		if (!fill_io_u(td, io_u))
 			break;
 
-		/* [한국어] 실패 시 정리: ZBD 해제, 파일 참조 해제 및 닫기 */
+		/* [한국어] 실패 경로 정리: zbd_put_io_u 로 존 참조 해제, put_file_log +
+		 * td_io_close_file 로 파일 닫음. io_u->file=NULL 마커. */
 		zbd_put_io_u(td, io_u);
 
 		put_file_log(td, f);
 		td_io_close_file(td, f);
 		io_u->file = NULL;
 
-		/* [한국어] 타임아웃이면 즉시 반환 */
+		/* [한국어] set_rw_ddir → rate_ddir 이 DDIR_TIMEOUT 반환했을 수 있음 —
+		 * 잡 종료가 의도이므로 여기서도 즉시 실패 전파. */
 		if (io_u->ddir == DDIR_TIMEOUT)
 			return 1;
 
-		/* [한국어] 비균일 서비스이면 파일 리셋, 아니면 완료 처리 */
+		/* [한국어] Zipf/Pareto/Gauss(NONUNIFORM): 파일 소진 개념이 아닌 "상태
+		 * 재초기화" 전략 — fio_file_reset 후 다음 루프에서 이 파일 재시도.
+		 * 균등/SEQ/RR 인 경우 "이 파일 완전 완료" → set_done + 카운터 증가로 다음
+		 * 파일로 넘어감. */
 		if (td->o.file_service_type & __FIO_FSERVICE_NONUNIFORM)
 			fio_file_reset(td, f);
 		else {
@@ -2884,18 +3081,22 @@ static void lat_new_cycle(struct thread_data *td)
  */
 static bool __lat_target_failed(struct thread_data *td)
 {
-	/* [한국어] QD=1이면 더 줄일 수 없으므로 포기 */
+	/* [한국어] latency_qd=1 에서도 latency_target 을 만족 못 함 → 디스크가 본질적으로
+	 * 목표 latency 를 충족 불가 → lat_fatal 트리거 필요(반환 true). */
 	if (td->latency_qd == 1)
 		return true;
 
-	/* [한국어] 현재 QD를 상한으로 설정 */
+	/* [한국어] 현재 qd 는 "실패로 확인된 값" → qd_high 로 갱신해 이 위는 더 이상 탐색 안 함. */
 	td->latency_qd_high = td->latency_qd;
 
+	/* [한국어] qd==qd_low 인 경계 상태에서 추가 하강이 필요하면 low 를 한 단 더
+	 * 내려 탐색 여지 확보 — 그렇지 않으면 이진 탐색이 동일 값에 수렴해 버림. */
 	if (td->latency_qd == td->latency_qd_low)
 		td->latency_qd_low--;
 
-	/* [한국어] 이진 탐색: (현재 + 하한) / 2 */
+	/* [한국어] 이진 하강: 새 qd = (현재 + low) / 2. 예) 32 → 16 → 8 ... */
 	td->latency_qd = (td->latency_qd + td->latency_qd_low) / 2;
+	/* [한국어] 안정 카운터 리셋 — 이번 사이클은 실패이므로 연속 성공 카운트 재시작. */
 	td->latency_stable_count = 0;
 
 	dprint(FD_RATE, "Ramped down: %d %d %d\n", td->latency_qd_low, td->latency_qd, td->latency_qd_high);
@@ -2904,7 +3105,9 @@ static bool __lat_target_failed(struct thread_data *td)
 	 * When we ramp QD down, quiesce existing IO to prevent
 	 * a storm of ramp downs due to pending higher depth.
 	 */
-	/* [한국어] QD를 줄인 후 진행 중인 I/O를 모두 완료시킴 */
+	/* [한국어] 이전 QD 시절의 in-flight 가 남아 있으면 그 완료 latency 는 "하강 후
+	 * 발행" 이 아님에도 새 사이클 판단에 섞여 또 실패 판정을 유발해 폭주. quiesce
+	 * 로 모두 비운 뒤 새 사이클 진입. */
 	io_u_quiesce(td);
 	lat_new_cycle(td);
 	return false;
@@ -2997,7 +3200,7 @@ static void lat_target_success(struct thread_data *td)
 	const unsigned int qd = td->latency_qd;
 	struct thread_options *o = &td->o;
 
-	/* [한국어] 현재 QD를 하한으로 설정 */
+	/* [한국어] 이번 qd 는 "성공 확인" → qd_low 로 갱신(이 밑은 더 이상 탐색 안 함). */
 	td->latency_qd_low = td->latency_qd;
 
 	if (td->latency_qd + 1 == td->latency_qd_high) {
@@ -3009,7 +3212,9 @@ static void lat_target_success(struct thread_data *td)
 		 * heuristic here. If we get lat_target_success() 3 times
 		 * in a row, increase latency_qd_high by 1.
 		 */
-		/* [한국어] 안정 상태: 3회 연속 성공 시 상한을 1 올림 */
+		/* [한국어] qd+1 == qd_high 는 이진 탐색이 멈춘 경계 상태. 3회 연속
+		 * 성공해도 qd 는 그대로인 "고정 상태" — 실제로는 qd+1 도 가능할 수
+		 * 있으므로 qd_high 를 1 올려 탐색 공간 재개. 휴리스틱 단순 카운터. */
 		if (++td->latency_stable_count >= 3) {
 			td->latency_qd_high++;
 			td->latency_stable_count = 0;
@@ -3021,13 +3226,15 @@ static void lat_target_success(struct thread_data *td)
 	 * of bisecting from highest possible queue depth. If we have set
 	 * a limit other than td->o.iodepth, bisect between that.
 	 */
-	/* [한국어] 아직 실패 경험 없으면 2배로, 있으면 이진 탐색 */
+	/* [한국어] qd_high == iodepth 는 "아직 한 번도 실패 안 함" 상태 — 상한 탐색
+	 * 이 안 끝났으므로 2배로 빠르게 상승. 이미 실패(qd_high < iodepth)면 이진
+	 * 탐색으로 정밀 조정. */
 	if (td->latency_qd_high != o->iodepth)
 		td->latency_qd = (td->latency_qd + td->latency_qd_high) / 2;
 	else
 		td->latency_qd *= 2;
 
-	/* [한국어] iodepth 상한 제한 */
+	/* [한국어] 사용자 지정 iodepth 를 넘지 않도록 상한 클램프. */
 	if (td->latency_qd > o->iodepth)
 		td->latency_qd = o->iodepth;
 
@@ -3037,14 +3244,16 @@ static void lat_target_success(struct thread_data *td)
 	 * Same as last one, we are done. Let it run a latency cycle, so
 	 * we get only the results from the targeted depth.
 	 */
-	/* [한국어] QD가 변하지 않으면 최적값을 찾은 것 */
+	/* [한국어] qd 가 이전 qd 와 동일 = 이진 탐색 수렴(더 이상 변할 곳 없음).
+	 * latency_run=0 기본 모드는 여기서 최종 측정 사이클에 진입 또는 종료. */
 	if (!o->latency_run && td->latency_qd == qd) {
 		if (td->latency_end_run) {
-			/* [한국어] 최종 실행도 완료됨 -> 작업 종료 */
+			/* [한국어] 이미 최종 측정 사이클 중이었음 → 두 번째 수렴 = 확정 종료. */
 			dprint(FD_RATE, "We are done\n");
 			td->done = 1;
 		} else {
-			/* [한국어] 최적 QD에서 최종 측정 실행 시작 */
+			/* [한국어] 첫 수렴 — 최적 qd 확정. 기존 통계를 리셋하고 이 qd 만으로
+			 * 최종 측정 윈도우 시작(순수한 타겟 QD 성능 보고서 생성). */
 			dprint(FD_RATE, "Quiesce and final run\n");
 			io_u_quiesce(td);
 			td->latency_end_run = 1;
@@ -3078,19 +3287,21 @@ void lat_target_check(struct thread_data *td)
 	uint64_t ios;
 	double success_ios;
 
-	/* [한국어] 측정 윈도우 경과 시간 확인 */
+	/* [한국어] latency_window 옵션(usec) 경과 여부 확인. 미경과면 아직 표본 부족 → 조기 리턴. */
 	usec_window = utime_since_now(&td->latency_ts);
 	if (usec_window < td->o.latency_window)
 		return;
 
-	/* [한국어] 이 윈도우 동안의 I/O 수와 성공률 계산 */
+	/* [한국어] 이번 윈도우 발행 I/O 수 = 현재 누적 - latency_ios(윈도우 시작 시점 스냅샷).
+	 * 성공률 = (ios - failed) / ios * 100%. */
 	ios = ddir_rw_sum(td->io_blocks) - td->latency_ios;
 	success_ios = (double) (ios - td->latency_failed) / (double) ios;
 	success_ios *= 100.0;
 
 	dprint(FD_RATE, "Success rate: %.2f%% (target %.2f%%)\n", success_ios, td->o.latency_percentile.u.f);
 
-	/* [한국어] 성공률이 목표 이상이면 QD 올림, 미만이면 내림 */
+	/* [한국어] percentile 임계(기본 100%) 이상이면 이 qd 에서 목표 달성 → 상향.
+	 * 미만이면 qd 를 낮춰 부하 감소. 이진 탐색 기본 스텝. */
 	if (success_ios >= td->o.latency_percentile.u.f)
 		lat_target_success(td);
 	else
@@ -3116,16 +3327,19 @@ void lat_target_check(struct thread_data *td)
  */
 bool queue_full(const struct thread_data *td)
 {
-	/* [한국어] 프리리스트가 비었으면 가득 참 */
+	/* [한국어] io_u_qempty: freelist 헤드/테일 동일 검사 → O(1). 모든 io_u 가
+	 * in_flight 상태임을 의미. */
 	const int qempty = io_u_qempty(&td->io_u_freelist);
 
 	if (qempty)
 		return true;
-	/* [한국어] 레이턴시 타겟이 없으면 아직 여유 있음 */
+	/* [한국어] latency_target 미설정이면 실제 물리 iodepth 까지 여유 있음 — 위
+	 * qempty 가 유일한 가드. */
 	if (!td->o.latency_target)
 		return false;
 
-	/* [한국어] 현재 깊이가 레이턴시 목표 QD에 도달했으면 가득 참 */
+	/* [한국어] latency_target 활성 시 cur_depth >= latency_qd 면 이진 탐색이 허용한
+	 * 가상 상한 도달 — 실제 io_u 는 남아 있어도 지금은 발급 금지. */
 	return td->cur_depth >= td->latency_qd;
 }
 
@@ -3170,7 +3384,8 @@ struct io_u *__get_io_u(struct thread_data *td)
 	const bool needs_lock = td_async_processing(td);
 	struct io_u *io_u = NULL;
 
-	/* [한국어] 정지 상태이면 NULL 반환 */
+	/* [한국어] td->stop_io 는 runtime/runt 만료 등 외부에서 "이번 잡 더 이상 발행
+	 * 금지" 신호. 새 io_u 뽑지 않고 NULL 로 상위에 종료 유도. */
 	if (td->stop_io)
 		return NULL;
 
@@ -3178,20 +3393,28 @@ struct io_u *__get_io_u(struct thread_data *td)
 		__td_io_u_lock(td);
 
 again:
-	/* [한국어] 1순위: 재큐잉 리스트에서 꺼내기 */
+	/* [한국어] 1순위: io_u_requeues(재큐잉 리스트). FIO_Q_BUSY 재시도 또는
+	 * short I/O 나머지 처리 등 "이어서 발행할 io_u" 가 여기 들어 있음.
+	 * offset/buflen/file 보존된 상태 — set_io_u_file/fill_io_u 건너뜀. */
 	if (!io_u_rempty(&td->io_u_requeues)) {
 		io_u = io_u_rpop(&td->io_u_requeues);
+		/* [한국어] resid 는 short I/O 재발행 시 "남은 바이트" 의미인데, 이번
+		 * 재시도는 0 부터 새로 카운트해야 하므로 리셋. */
 		io_u->resid = 0;
-		/* [한국어] fsync 중이면 파일 참조 해제 */
+		/* [한국어] TD_FSYNCING 단계(잡 종료 전 최종 fsync)에서는 파일 레퍼런스
+		 * 를 유지할 필요 없음 — fsync 는 fd 만 있으면 수행. put_file_log 로
+		 * num_ref 감소 → 조기 close 스케줄. */
 		if (io_u->file && td->runstate == TD_FSYNCING) {
 			put_file_log(td, io_u->file);
 			io_u->file = NULL;
 		}
 	} else if (!queue_full(td)) {
-		/* [한국어] 2순위: 큐에 여유가 있으면 프리리스트에서 꺼내기 */
+		/* [한국어] 2순위: freelist. queue_full 이 false 일 때만 — latency_target
+		 * 이 활성이면 latency_qd 가상 상한 적용. */
 		io_u = io_u_qpop(&td->io_u_freelist);
 
-		/* [한국어] 새로 꺼낸 io_u 초기화 */
+		/* [한국어] freelist 에서 꺼낸 io_u 는 "완전 초기화" 필요 — 이전 잡 사이클의
+		 * 잔여 상태(file/buflen/resid/end_io) 가 남아 있을 수 있기 때문. */
 		io_u->file = NULL;
 		io_u->buflen = 0;
 		io_u->resid = 0;
@@ -3199,16 +3422,24 @@ again:
 	}
 
 	if (io_u) {
-		/* [한국어] FREE 상태였는지 검증 */
+		/* [한국어] freelist/requeues 모두 FREE 비트 세트 상태로 저장되어 있어야
+		 * 함 — 생명주기 반상 보장을 위한 불변. */
 		assert(io_u->flags & IO_U_F_FREE);
-		/* [한국어] 각종 플래그 초기화 */
+		/* [한국어] "회수-후-재사용" 시점에 누적된 플래그를 일괄 클리어.
+		 *  FREE: 더 이상 사용 가능 상태 아님.
+		 *  NO_FILE_PUT: 이전 사용 시 세트된 특수 경로 마커.
+		 *  TRIMMED: 이전에 TRIM 된 io_u (verify 연계).
+		 *  BARRIER: 이전 WRITE 가 배리어였을 수 있음.
+		 *  VER_LIST: verify_list 에서 가져왔던 상태. */
 		io_u_clear(td, io_u, IO_U_F_FREE | IO_U_F_NO_FILE_PUT |
 				 IO_U_F_TRIMMED | IO_U_F_BARRIER |
 				 IO_U_F_VER_LIST);
 
 		io_u->error = 0;
 		io_u->acct_ddir = -1;
-		/* [한국어] 현재 깊이 증가 */
+		/* [한국어] cur_depth 증가와 IN_CUR_DEPTH 세트는 반드시 쌍 — put/requeue
+		 * 경로에서 이 비트 확인 후 cur_depth-- 수행. 자식 스레드는 부모 cur_depth
+		 * 직접 조작 금지(TD_F_CHILD assert). */
 		td->cur_depth++;
 		assert(!(td->flags & TD_F_CHILD));
 		io_u_set(td, io_u, IO_U_F_IN_CUR_DEPTH);
@@ -3219,7 +3450,10 @@ again:
 		 * We ran out, wait for async verify threads to finish and
 		 * return one
 		 */
-		/* [한국어] 프리리스트가 비었으면 비동기 검증 스레드 완료 대기 */
+		/* [한국어] 둘 다 비었을 때: verify_async/offload 스레드만 남아 있을 수
+		 * 있음 → free_cond 에 블로킹 대기. put_io_u/requeue 가 브로드캐스트하면
+		 * 깨어나 again 으로 재시도. 단일 스레드 모드면 여기 진입 안 하고
+		 * 그냥 NULL 반환(상위가 getevents 경로로 완료 수확). */
 		assert(!(td->flags & TD_F_CHILD));
 		ret = pthread_cond_wait(&td->free_cond, &td->io_u_lock);
 		if (fio_unlikely(ret != 0)) {
@@ -3250,26 +3484,33 @@ again:
  */
 static bool check_get_trim(struct thread_data *td, struct io_u *io_u)
 {
-	/* [한국어] trim 백로그 플래그가 없으면 패스 */
+	/* [한국어] TD_F_TRIM_BACKLOG 는 trim_backlog>0 옵션 활성 표식 — 미설정이면
+	 * 이 경로 자체 skip. 핫패스 체크. */
 	if (!(td->flags & TD_F_TRIM_BACKLOG))
 		return false;
-	/* [한국어] trim할 엔트리가 없으면 패스 */
+	/* [한국어] trim_entries 는 "trim 가능한 io_piece 수". 0 이면 이전 쓰기 이력
+	 * 자체가 없어 trim 대상 없음. trim_batch 카운터도 리셋해 다음 쓰기까지 대기. */
 	if (!td->trim_entries) {
 		td->trim_batch = 0;
 		return false;
 	}
 
-	/* [한국어] trim_batch가 남아 있으면 계속 trim */
+	/* [한국어] 진행 중인 배치 우선 — trim_batch>0 이면 계속 소비. */
 	if (td->trim_batch) {
 		td->trim_batch--;
+		/* [한국어] get_next_trim: trim.c 가 io_hist 에서 다음 trim 대상 꺼내
+		 * io_u 를 재설정(ddir=TRIM, offset/buflen 설정). 실패 시 배치 종료. */
 		if (get_next_trim(td, io_u))
 			return true;
 		else
 			td->trim_batch = 0;
 	} else if (!(td->io_hist_len % td->o.trim_backlog) &&
 		     td->last_ddir_completed != DDIR_TRIM) {
-		/* [한국어] trim_backlog 주기에 도달하고 마지막이 trim이 아니면 trim 시작 */
+		/* [한국어] 새 배치 진입 조건: io_hist_len(누적 쓰기 기록)이 trim_backlog
+		 * 배수 + 직전 완료가 TRIM 아닐 때. 후자는 연속 trim 루프 방지. */
 		if (get_next_trim(td, io_u)) {
+			/* [한국어] 배치 크기 결정: trim_batch 옵션이 있으면 그 값, 없으면
+			 * trim_backlog 와 동일 — "backlog 전체를 한 번에 trim". */
 			td->trim_batch = td->o.trim_batch;
 			if (!td->trim_batch)
 				td->trim_batch = td->o.trim_backlog;
@@ -3298,25 +3539,30 @@ static bool check_get_trim(struct thread_data *td, struct io_u *io_u)
  */
 static bool check_get_verify(struct thread_data *td, struct io_u *io_u)
 {
-	/* [한국어] 검증 백로그 플래그가 없으면 패스 */
+	/* [한국어] verify_backlog 옵션 활성 여부. 미설정이면 즉시 false 로 일반 경로 진행. */
 	if (!(td->flags & TD_F_VER_BACKLOG))
 		return false;
 
+	/* [한국어] io_hist_len: 누적된 (verify 가능) 쓰기 기록 수. 0이면 아직 verify
+	 * 대상 없음. */
 	if (td->io_hist_len) {
 		int get_verify = 0;
 
-		/* [한국어] verify_batch가 남아 있으면 계속 검증 */
+		/* [한국어] 진행 중 verify 배치 소비 — trim 과 동일 패턴. */
 		if (td->verify_batch)
 			get_verify = 1;
 		else if (!(td->io_hist_len % td->o.verify_backlog) &&
 			 td->last_ddir_completed != DDIR_READ) {
-			/* [한국어] verify_backlog 주기에 도달하면 검증 시작 */
+			/* [한국어] 새 verify 배치 진입: io_hist_len 이 verify_backlog 배수 +
+			 * 직전 완료가 READ 아닐 때. last=READ 조건은 verify 루프 폭주 방지. */
 			td->verify_batch = td->o.verify_batch;
 			if (!td->verify_batch)
 				td->verify_batch = td->o.verify_backlog;
 			get_verify = 1;
 		}
 
+		/* [한국어] get_next_verify 성공 = verify_list 에서 io_piece 꺼내 io_u 재설정.
+		 * io_u->ddir=READ, offset/buflen/ipo 세트 — 후속 td_io_queue 가 verify 읽기 발행. */
 		if (get_verify && !get_next_verify(td, io_u)) {
 			td->verify_batch--;
 			return true;
@@ -3348,19 +3594,22 @@ static bool check_get_verify(struct thread_data *td, struct io_u *io_u)
  */
 static void small_content_scramble(struct io_u *io_u)
 {
-	/* [한국어] 512바이트 블록 수 계산 */
+	/* [한국어] buflen >> 9 == buflen / 512 — 512B 는 대부분 디바이스의 최소
+	 * 논리 블록. 이보다 세분화해도 디덥 관점에서 의미 없음. */
 	unsigned long long i, nr_blocks = io_u->buflen >> 9;
 	unsigned int offset;
 	uint64_t boffset, *iptr;
 	char *p;
 
+	/* [한국어] buflen < 512 면 스크램블 대상 없음(잠재적 디버그 케이스). */
 	if (!nr_blocks)
 		return;
 
 	p = io_u->xfer_buf;
 	boffset = io_u->offset;
 
-	/* [한국어] 이전에 채워진 버퍼 정보 초기화 */
+	/* [한국어] 이전에 채워진 상태 리셋 — scramble 후 이 버퍼는 오직 지금 시점의
+	 * offset/time 에만 유효. 다음 쓰기에 재사용 시 재채움 유도. */
 	if (io_u->buf_filled_len)
 		io_u->buf_filled_len = 0;
 
@@ -3370,7 +3619,9 @@ static void small_content_scramble(struct io_u *io_u)
 	 * Scramble content within the blocks in the same cacheline to
 	 * speed things up.
 	 */
-	/* [한국어] 캐시라인 내 삽입 위치 결정 (0~7번 캐시라인 중 하나) */
+	/* [한국어] 캐시라인 내 삽입 위치(0~7) 결정. tv_nsec ^ boffset 해시 후 & 7 로
+	 * 저비트 3개 사용 — 시간/위치에 따라 고루 분산. 512B 가 8개 캐시라인을
+	 * 포함하므로 8 중 하나 선택. */
 	offset = (io_u->start_time.tv_nsec ^ boffset) & 7;
 
 	for (i = 0; i < nr_blocks; i++) {
@@ -3378,15 +3629,18 @@ static void small_content_scramble(struct io_u *io_u)
 		 * Fill offset into start of cacheline, time into end
 		 * of cacheline
 		 */
-		/* [한국어] 캐시라인 시작에 오프셋 삽입 */
+		/* [한국어] 해당 캐시라인(offset 번째 64B 블록) 시작에 현재 바이트 오프셋
+		 * 을 8B 값으로 삽입 — 각 512B 블록이 고유 id 를 갖게 됨(dedupe 회피). */
 		iptr = (void *) p + (offset << 6);
 		*iptr = boffset;
 
-		/* [한국어] 캐시라인 끝에 시간 삽입 */
+		/* [한국어] 마지막 캐시라인의 끝 16B 에 tv_sec/tv_nsec 타임스탬프 —
+		 * 같은 offset 을 시간 다르게 쓰면 버퍼도 달라지므로 세션 간 dedupe 차단. */
 		iptr = (void *) p + 64 - 2 * sizeof(uint64_t);
 		iptr[0] = io_u->start_time.tv_sec;
 		iptr[1] = io_u->start_time.tv_nsec;
 
+		/* [한국어] 다음 512B 블록으로 전진 — boffset 도 512 증가시켜 각 블록이 고유 id. */
 		p += 512;
 		boffset += 512;
 	}
@@ -3454,36 +3708,41 @@ struct io_u *get_io_u(struct thread_data *td)
 	int do_scramble = 0;
 	long ret = 0;
 
-	/* [한국어] 1단계: io_u 할당 (프리리스트 또는 재큐잉에서) */
+	/* [한국어] ① io_u 풀에서 할당. requeues 우선, 그 다음 freelist. */
 	io_u = __get_io_u(td);
 	if (!io_u) {
 		dprint(FD_IO, "__get_io_u failed\n");
 		return NULL;
 	}
 
-	/* [한국어] 2단계: 검증 백로그에서 검증 I/O가 있으면 가져옴 */
+	/* [한국어] ② verify 백로그 주기 도달이면 verify 경로로 강제 변환 — verify_list
+	 * 의 io_piece 를 가져와 io_u->ddir=READ 로 세트, offset/buflen 도 piece 에서. */
 	if (check_get_verify(td, io_u))
 		goto out;
-	/* [한국어] 3단계: trim 백로그에서 trim I/O가 있으면 가져옴 */
+	/* [한국어] ③ trim 백로그 주기 도달이면 TRIM 으로 변환 — 이전 쓰기 이력에서
+	 * trim 대상 추출. */
 	if (check_get_trim(td, io_u))
 		goto out;
 
 	/*
 	 * from a requeue, io_u already setup
 	 */
-	/* [한국어] 4단계: 재큐잉에서 온 io_u면 이미 설정 완료 */
+	/* [한국어] ④ __get_io_u 가 requeues 에서 꺼낸 경우 io_u->file 이 이미 세트되어
+	 * 있음(offset/buflen/ddir 도) — 다시 fill_io_u 할 필요 없이 바로 out. */
 	if (io_u->file)
 		goto out;
 
 	/*
 	 * If using an iolog, grab next piece if any available.
 	 */
-	/* [한국어] 5단계: iolog 사용 시 로그에서 다음 I/O 정보 읽기 */
+	/* [한국어] ⑤ iolog replay 모드: 로그 파일에서 ddir/offset/buflen 을 읽어와 그대로
+	 * 적용. 기록-재생(replay) 워크로드용. */
 	if (td->flags & TD_F_READ_IOLOG) {
 		if (read_iolog_get(td, io_u))
 			goto err_put;
 	} else if (set_io_u_file(td, io_u)) {
-		/* [한국어] 6단계: 파일 선택 및 I/O 정보 채우기 */
+		/* [한국어] ⑥ 일반 경로: 파일 선택 + fill_io_u 통합 루프. 실패 시 -EBUSY
+		 * 로 상위에 "잠시 후 재시도" 힌트(getevents 후 다시). */
 		ret = -EBUSY;
 		dprint(FD_IO, "io_u %p, setting file failed\n", io_u);
 		goto err_put;
@@ -3497,28 +3756,33 @@ struct io_u *get_io_u(struct thread_data *td)
 
 	assert(fio_file_open(f));
 
-	/* [한국어] 7단계: 읽기/쓰기 방향이고 다중 범위 trim이 아닌 경우 */
+	/* [한국어] read/write/trim 분기 + 다중 범위 trim 아닌 단일 I/O 만 여기서 처리
+	 * (다중 범위 trim 은 fill_multi_range_io_u 가 내부적으로 last_start/pos 관리). */
 	if (ddir_rw(io_u->ddir) && !multi_range_trim(td, io_u)) {
-		/* [한국어] buflen이 0이면 에러 (NOIO 엔진 제외) */
+		/* [한국어] buflen=0 은 fill_io_u 버그. NOIO 엔진은 I/O 를 안 보내므로 예외. */
 		if (!io_u->buflen && !td_ioengine_flagged(td, FIO_NOIO)) {
 			dprint(FD_IO, "get_io_u: zero buflen on %p\n", io_u);
 			goto err_put;
 		}
 
-		/* [한국어] 파일의 마지막 시작/위치 업데이트 */
+		/* [한국어] last_start/last_pos: 다음 순차 I/O 계산의 기준점. last_start 는
+		 * rw_seq=IDENT / trimwrite 토글에도 사용. 반드시 여기서 갱신. */
 		f->last_start[io_u->ddir] = io_u->offset;
 		f->last_pos[io_u->ddir] = io_u->offset + io_u->buflen;
 
 		if (io_u->ddir == DDIR_WRITE) {
-			/* [한국어] 쓰기: 버퍼 리필이 필요하면 새 데이터로 채움 */
+			/* [한국어] WRITE: 사용자 의도에 따른 버퍼 처리 분기. */
 			if (td->flags & TD_F_REFILL_BUFFERS) {
+				/* [한국어] 매 쓰기마다 새 패턴 생성 — dedupe/compress 회피. */
 				io_u_fill_buffer(td, io_u,
 					td->o.min_bs[DDIR_WRITE],
 					io_u->buflen);
 			} else if ((td->flags & TD_F_SCRAMBLE_BUFFERS) &&
 				   !(td->flags & TD_F_COMPRESS) &&
 				   !(td->flags & TD_F_DO_VERIFY)) {
-				/* [한국어] 스크램블 대상이면 나중에 처리 (시간 기록 후) */
+				/* [한국어] scramble: 512B 마다 offset+timestamp 마커 삽입.
+				 * start_time 이 필요하므로 아래 td_io_prep 후 수행으로 지연.
+				 * compress/verify 모드에서는 패턴 보존 필요 → scramble 금지. */
 				do_scramble = 1;
 			}
 		} else if (io_u->ddir == DDIR_READ) {
@@ -3526,7 +3790,8 @@ struct io_u *get_io_u(struct thread_data *td)
 			 * Reset the buf_filled parameters so next time if the
 			 * buffer is used for writes it is refilled.
 			 */
-			/* [한국어] 읽기: buf_filled_len 초기화 (다음 쓰기 시 리필 필요) */
+			/* [한국어] 읽기 후 이 io_u 가 다시 WRITE 로 쓰일 때 버퍼 재채움 유도 —
+			 * buf_filled_len==0 이 "채움 필요" 마커. */
 			io_u->buf_filled_len = 0;
 		}
 	}
@@ -3534,32 +3799,38 @@ struct io_u *get_io_u(struct thread_data *td)
 	/*
 	 * Set io data pointers.
 	 */
-	/* [한국어] 8단계: 전송 버퍼 포인터 설정 */
+	/* [한국어] xfer_buf/xfer_buflen 은 "엔진이 실제 읽고 쓰는" 포인터/길이. short I/O
+	 * 재큐잉 시 xfer_buf 가 전진하고 xfer_buflen 이 줄지만, buf/buflen 은 원본 유지 —
+	 * verify 등이 원본 범위 재현 가능. */
 	io_u->xfer_buf = io_u->buf;
 	io_u->xfer_buflen = io_u->buflen;
 
 	/*
 	 * Remember the issuing context priority. The IO engine may change this.
 	 */
-	/* [한국어] I/O 우선순위 설정 */
+	/* [한국어] 잡 스레드 기본 ioprio 복사. cmdprio 등으로 per-I/O 변경할 수 있으며,
+	 * 엔진(libaio/io_uring)이 이 값을 ioprio_set/IORING_SETUP_IOPRIO 로 전달. */
 	io_u->ioprio = td->ioprio;
 	io_u->clat_prio_index = 0;
 out:
 	assert(io_u->file);
-	/* [한국어] 9단계: 엔진별 사전 준비 (td_io_prep) */
+	/* [한국어] ⑦ 엔진별 사전 준비: iocb/sqe/cdb 필드 빌드. 실패하면 err_put 경로. */
 	if (!td_io_prep(td, io_u)) {
-		/* [한국어] 10단계: 레이턴시 측정을 위한 시작 시각 기록 */
+		/* [한국어] ⑧ lat 측정 기준 시각 기록 — td_io_prep 후, queue 전.
+		 * disable_lat=1 이면 overhead 제거 목적. */
 		if (!td->o.disable_lat)
 			fio_gettime(&io_u->start_time, NULL);
 
-		/* [한국어] 버퍼 스크램블 처리 (시작 시각이 필요하므로 여기서 수행) */
+		/* [한국어] scramble 은 start_time 의 tv_sec/tv_nsec 을 버퍼에 삽입하므로
+		 * 반드시 gettime 이후에 수행. */
 		if (do_scramble)
 			small_content_scramble(io_u);
 
 		return io_u;
 	}
 err_put:
-	/* [한국어] 실패 시 io_u를 프리리스트로 반환 */
+	/* [한국어] 실패 경로: io_u 를 freelist 로 회수 후 에러 포인터로 반환. 상위
+	 * do_io 는 IS_ERR 로 감지해 -EBUSY 면 getevents 후 재시도. */
 	dprint(FD_IO, "get_io_u failed\n");
 	put_io_u(td, io_u);
 	return ERR_PTR(ret);
@@ -3669,12 +3940,15 @@ static inline bool gtod_reduce(struct thread_data *td)
  */
 static void trim_block_info(struct thread_data *td, struct io_u *io_u)
 {
+	/* [한국어] io_u_block_info: io_u->offset/buflen 기준 블록의 block_info 슬롯 주소.
+	 * 비트 필드: [31..16]=trim_count, [15..0]=state enum. */
 	uint32_t *info = io_u_block_info(td, io_u);
 
-	/* [한국어] 이미 trim 실패 이상 상태이면 건너뜀 */
+	/* [한국어] BLOCK_STATE_TRIM_FAILURE 이상은 최종 상태(실패 보존) — 덮어쓰기 금지. */
 	if (BLOCK_INFO_STATE(*info) >= BLOCK_STATE_TRIM_FAILURE)
 		return;
 
+	/* [한국어] state=TRIMMED 로 전이 + trim 횟수 1 증가. 하나의 원자 store 로 업데이트. */
 	*info = BLOCK_INFO(BLOCK_STATE_TRIMMED, BLOCK_INFO_TRIMS(*info) + 1);
 }
 
@@ -3712,30 +3986,37 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 				  struct io_completion_data *icd,
 				  const enum fio_ddir idx, unsigned int bytes)
 {
-	/* [한국어] gtod 축소 여부: 축소하지 않을 때만 clat 계산 */
+	/* [한국어] gtod_reduce=1 또는 slat/clat/bw 전부 disable 이면 fio_gettime 호출을
+	 * 생략 가능 — no_reduce 가 false 면 clat 계산 자체가 의미 없음(시간 안 찍힘). */
 	const int no_reduce = !gtod_reduce(td);
 	unsigned long long llnsec = 0;
 
-	/* [한국어] 자식 스레드면 부모의 통계에 기록 */
+	/* [한국어] 자식(verify async/offload) 스레드의 완료는 부모 td 의 통계에 집계 —
+	 * 사용자 관점에서 잡 단위 통계가 단일 뷰. */
 	if (td->parent)
 		td = td->parent;
 
-	/* [한국어] 통계 비활성화이면 건너뜀 */
+	/* [한국어] stats=0 옵션 또는 FIO_NOSTATS 엔진(예: cpu 엔진처럼 I/O 없는 모드)은
+	 * 통계 수집 skip — 의미 없는 샘플로 리소스 낭비 방지. */
 	if (!td->o.stats || td_ioengine_flagged(td, FIO_NOSTATS))
 		return;
 
-	/* [한국어] clat 계산: issue_time ~ completion_time */
+	/* [한국어] clat(completion latency) = 제출~완료 시간. issue_time 은 td_io_queue
+	 * 에서 fio_fill_issue_time 으로 세트. icd->time 은 배치 완료 시각(init_icd). */
 	if (no_reduce)
 		llnsec = ntime_since(&io_u->issue_time, &icd->time);
 
-	/* [한국어] lat(총 레이턴시) 계산 및 기록: start_time ~ completion_time */
+	/* [한국어] lat(total latency) = io_u 획득 시점(start_time) ~ 완료. fill_io_u
+	 * 후 td_io_prep 전에 fio_gettime 으로 세트. clat 보다 크며 큐잉 대기까지 포함. */
 	if (!td->o.disable_lat) {
 		unsigned long long tnsec;
 
 		tnsec = ntime_since(&io_u->start_time, &icd->time);
+		/* [한국어] ts.lat_* 히스토그램에 샘플 추가 — bytes 가중으로 대역폭 환산도 가능. */
 		add_lat_sample(td, idx, tnsec, bytes, io_u);
 
-		/* [한국어] 프로파일 연산자의 레이턴시 콜백 호출 */
+		/* [한국어] profile(예 tiobench/act) 에 등록된 io_u_lat 콜백 호출. 프로파일
+		 * 이 자체 조건 판정 후 icd->error 를 세트해 잡 조기 종료 유도 가능. */
 		if (td->flags & TD_F_PROFILE_OPS) {
 			struct prof_io_ops *ops = &td->prof_io_ops;
 
@@ -3743,12 +4024,14 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 				icd->error = ops->io_u_lat(td, tnsec);
 		}
 
-		/* [한국어] read/write에 대해 최대 레이턴시 및 타겟 검사 */
+		/* [한국어] read/write 방향만 레이턴시 목표/한계 체크(TRIM/SYNC 은 성능
+		 * 측정 중심 밖). max_latency[idx] 는 방향별 독립. */
 		if (ddir_rw(idx)) {
-			/* [한국어] max_latency 초과 시 치명적 에러 */
+			/* [한국어] max_latency 는 절대 상한 — 1회 초과로 즉시 ETIMEDOUT fatal. */
 			if (td->o.max_latency[idx] && tnsec > td->o.max_latency[idx])
 				lat_fatal(td, io_u, icd, tnsec, td->o.max_latency[idx]);
-			/* [한국어] latency_target 초과 시 처리 */
+			/* [한국어] latency_target 은 이진 탐색 기준 — 초과시 lat_target_failed
+			 * 에서 percentile 정책에 따라 즉시 fatal 또는 카운터 증가. */
 			if (td->o.latency_target && tnsec > td->o.latency_target) {
 				if (lat_target_failed(td))
 					lat_fatal(td, io_u, icd, tnsec, td->o.latency_target);
@@ -3757,24 +4040,26 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 	}
 
 	if (ddir_rw(idx)) {
-		/* [한국어] clat(완료 레이턴시) 기록 및 레이턴시 분포 업데이트 */
+		/* [한국어] clat 샘플 추가 + 지연 히스토그램 버킷(ns/us/ms 3단계) 갱신. */
 		if (!td->o.disable_clat) {
 			add_clat_sample(td, idx, llnsec, bytes, io_u);
 			io_u_mark_latency(td, llnsec);
 		}
 
-		/* [한국어] 대역폭(bw) 샘플 기록 */
+		/* [한국어] bw 로그: per_unit_log 가 true 면 이번 완료를 로그 윈도우에 기록.
+		 * 로그 간격 설정 시에만 활성화 — 없으면 집계는 io_bytes 누적만으로 계산. */
 		if (!td->o.disable_bw && per_unit_log(td->bw_log))
 			add_bw_sample(td, io_u, bytes, llnsec);
 
-		/* [한국어] IOPS 샘플 기록 */
+		/* [한국어] IOPS 로그 — no_reduce 조건은 llnsec 유효성 보장 + 로그 활성화 검사. */
 		if (no_reduce && per_unit_log(td->iops_log))
 			add_iops_sample(td, io_u, bytes);
 	} else if (ddir_sync(idx) && !td->o.disable_clat)
-		/* [한국어] sync 방향의 clat 기록 */
+		/* [한국어] sync 는 읽기/쓰기 회계와 별도 — ts.sync_stat 에 clat 만 누적. */
 		add_sync_clat_sample(&td->ts, llnsec);
 
-	/* [한국어] trim 블록 정보 업데이트 */
+	/* [한국어] TRIM 완료 시 block_info 상태를 TRIMMED 로 전이 — iolog 가 블록별
+	 * 상태를 쓰기/트림 횟수로 추적해 verify/trimwrite 정합성 판단. */
 	if (td->ts.nr_block_infos && io_u->ddir == DDIR_TRIM)
 		trim_block_info(td, io_u);
 }
@@ -3797,10 +4082,12 @@ static void file_log_write_comp(const struct thread_data *td, struct fio_file *f
 	if (!f)
 		return;
 
-	/* [한국어] 첫 쓰기 위치 업데이트 */
+	/* [한국어] first_write = 이번 sync 주기 이후 쓰기 중 "가장 작은 offset".
+	 * -1ULL sentinel 은 "아직 이 주기에 쓰기 없음" — 첫 쓰기 시 offset 로 초기화. */
 	if (f->first_write == -1ULL || offset < f->first_write)
 		f->first_write = offset;
-	/* [한국어] 마지막 쓰기 위치 업데이트 */
+	/* [한국어] last_write = 가장 큰 끝 바이트(= offset + bytes). 다음 sync_file_range
+	 * 호출 시 [first_write, last_write) 영역만 flush 대상. */
 	if (f->last_write == -1ULL || ((offset + bytes) > f->last_write))
 		f->last_write = offset + bytes;
 }
@@ -3880,13 +4167,18 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 
 	dprint_io_u(io_u, "complete");
 
-	/* [한국어] FLIGHT 상태였는지 검증 후 플래그 제거 */
+	/* [한국어] FLIGHT 비트 확인 — in-flight 아닌 io_u 를 완료하는 것은 상위 버그.
+	 * io_u_clear_inflight_flags 는 FLIGHT/BUSY_OK/PATTERN_DONE 3비트 동시 제거. */
 	assert(io_u->flags & IO_U_F_FLIGHT);
 	io_u_clear_inflight_flags(td, io_u);
-	/* [한국어] inflight 캐시 무효화 (중복 I/O 방지) */
+	/* [한국어] offload submit 모드에서 동일 오프셋 중복 제출 방지용 in-flight
+	 * 맵에서 이 io_u 제거. 일반 모드는 no-op. */
 	invalidate_inflight(td, io_u);
 
-	/* [한국어] ZBD 모드에서 쓰기 에러 복구 */
+	/* [한국어] ZBD + recover_zbd_write_error=1 + WRITE 에러 + 비동기 엔진 조건:
+	 * ZNS 장치는 write pointer 불일치 등으로 쓰기 실패 가능 — 복구 시도(write
+	 * pointer 재조회 후 offset 정렬). SYNCIO 엔진은 이미 엔진 레벨에서 동기
+	 * 처리되므로 제외. */
 	if (td->o.zone_mode == ZONE_MODE_ZBD && td->o.recover_zbd_write_error &&
 	    io_u->error && io_u->ddir == DDIR_WRITE &&
 	    !td_ioengine_flagged(td, FIO_SYNCIO))
@@ -3895,41 +4187,49 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 	/*
 	 * Mark IO ok to verify
 	 */
-	/* [한국어] 검증 상태 업데이트 */
+	/* [한국어] io_u->ipo: verify 메타데이터 (io_piece). 쓰기 발행 시 log_io_piece
+	 * 로 verify_list 에 추가되고 io_u->ipo 가 그 piece 를 가리킴. */
 	if (io_u->ipo) {
 		/*
 		 * Remove errored entry from the verification list
 		 */
-		/* [한국어] 에러 시 검증 목록에서 제거 */
+		/* [한국어] 에러면 이 영역은 신뢰할 수 없으므로 verify_list 에서 제거 —
+		 * 후속 do_verify 가 이 영역을 건드리지 않도록. */
 		if (io_u->error)
 			unlog_io_piece(td, io_u);
 		else {
-			/* [한국어] 성공 시 IN_FLIGHT 플래그 제거 (검증 가능 상태) */
+			/* [한국어] 성공: ipo->flags 에서 IP_F_IN_FLIGHT 원자적 해제.
+			 * atomic_store_release: 이 스토어 이전의 모든 메모리 쓰기(io_u->buf
+			 * 의 내용 등)가 verify 스레드에 반드시 보이도록 release 배리어. */
 			atomic_store_release(&io_u->ipo->flags,
 					io_u->ipo->flags & ~IP_F_IN_FLIGHT);
 		}
 	}
 
-	/* [한국어] sync 방향 처리 */
+	/* [한국어] sync 계열(fsync/fdatasync/sync_file_range): offset/buflen 이 무의미. */
 	if (ddir_sync(ddir)) {
 		if (io_u->error)
 			goto error;
-		/* [한국어] sync 성공 시 dirty 범위 초기화 */
+		/* [한국어] sync 성공 = 모든 pending write 가 영속화됨 → dirty 범위 리셋.
+		 * 다음 sync 주기까지 file_log_write_comp 가 범위 재누적. */
 		if (f) {
 			f->first_write = -1ULL;
 			f->last_write = -1ULL;
 		}
+		/* [한국어] sync clat 은 특수 경로(add_sync_clat_sample) — buflen 을 바이트
+		 * 대신 전달하는데 통계적으로는 "이 sync 에 관여한 메타데이터 크기" 근사. */
 		if (should_account(td))
 			account_io_completion(td, io_u, icd, ddir, io_u->buflen);
 		return;
 	}
 
-	/* [한국어] 마지막 완료된 방향 기록 */
+	/* [한국어] last_ddir_completed 는 check_get_trim/verify 에서 "최근 완료
+	 * 방향이 아니면 새 배치 진입" 조건에 쓰임. 루프 발산 방지. */
 	td->last_ddir_completed = ddir;
 
-	/* [한국어] read/write 성공 완료 처리 */
+	/* [한국어] 성공 + read/write/trim 분기 — 실제 데이터 처리 회계 경로. */
 	if (!io_u->error && ddir_rw(ddir)) {
-		/* [한국어] 실제 전송된 바이트 (전체 - 잔여) */
+		/* [한국어] 실제 전송 바이트 = 요청량 - 잔여량(엔진이 부분만 처리 가능). */
 		unsigned long long bytes = io_u->xfer_buflen - io_u->resid;
 		int ret;
 
@@ -3937,40 +4237,51 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 		 * Make sure we notice short IO from here, and requeue them
 		 * appropriately!
 		 */
-		/* [한국어] short I/O 감지: 일부만 전송된 경우 나머지를 재큐잉 */
+		/* [한국어] short I/O: 요청 < 완료. 일부는 성공, 나머지 resid 는 다시
+		 * 발행 필요. xfer_buf/offset 을 성공분만큼 전진시키고 buflen 을 잔여로
+		 * 줄여 requeue_io_u → 다음 do_io 이터레이션에서 이어서 발행. */
 		if (bytes && io_u->resid) {
 			io_u->xfer_buflen = io_u->resid;
 			io_u->xfer_buf += bytes;
 			io_u->offset += bytes;
 			td->ts.short_io_u[io_u->ddir]++;
-			/* [한국어] 파일 범위 내이면 재큐잉하여 나머지 처리 */
+			/* [한국어] 새 offset 이 여전히 파일 내면 재발행. 파일 끝 넘어가면
+			 * 그대로 정상 완료로 처리(아래로 흘러감). */
 			if (io_u->offset < io_u->file->real_file_size) {
 				requeue_io_u(td, io_u_ptr);
 				return;
 			}
 		}
 
-		/* [한국어] I/O 블록/바이트 카운터 업데이트 */
+		/* [한국어] 누적 통계 갱신 — io_blocks 는 완료 블록 수(IOPs 기반),
+		 * io_bytes 는 총 바이트(대역폭 기반). 잡 전체 수명 누계. */
 		td->io_blocks[ddir]++;
 		td->io_bytes[ddir] += bytes;
 
-		/* [한국어] 검증 목록이 아닌 경우 현재 실행의 카운터도 업데이트 */
+		/* [한국어] this_io_* 는 "현재 런"(ramp 이후) 집계로 verify 경로와 분리.
+		 * VER_LIST 플래그는 이 io_u 가 verify 재발행이므로 실제 워크로드 통계에
+		 * 섞이면 안 됨(verify 는 별도 카운터). */
 		if (!(io_u->flags & IO_U_F_VER_LIST)) {
 			td->this_io_blocks[ddir]++;
 			td->this_io_bytes[ddir] += bytes;
 		}
 
-		/* [한국어] 쓰기 완료 시 파일의 쓰기 범위 기록 */
+		/* [한국어] 쓰기 성공 후 first_write/last_write 범위 확장 — 이후
+		 * DDIR_SYNC_FILE_RANGE 시 이 범위만 부분 sync 대상으로 사용. */
 		if (ddir == DDIR_WRITE)
 			file_log_write_comp(td, f, io_u->offset, bytes);
 
-		/* [한국어] 통계 기록 */
+		/* [한국어] stats 활성 + ramp 통과 시에만 샘플 기록 — ramp 워밍업
+		 * 기간에 수집하면 대표성 훼손. */
 		if (should_account(td))
 			account_io_completion(td, io_u, icd, ddir, bytes);
 
+		/* [한국어] icd.bytes_done[ddir] 은 배치 합산 — 호출자가 td->bytes_done 에
+		 * 1회만 더하도록 집계 분리. */
 		icd->bytes_done[ddir] += bytes;
 
-		/* [한국어] end_io 콜백 호출 (검증 등) */
+		/* [한국어] end_io 콜백(verify_io_u_async 등): 완료 직후 추가 처리가 필요한
+		 * 경로용. 반환값 != 0 이면 icd.error 로 승격(단, 이미 에러면 덮어쓰지 않음). */
 		if (io_u->end_io) {
 			ret = io_u->end_io(td, io_u_ptr);
 			io_u = *io_u_ptr;
@@ -3979,14 +4290,15 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 		}
 	} else if (io_u->error) {
 error:
-		/* [한국어] 에러 처리 */
+		/* [한국어] 에러 경로 — icd.error 에 기록 + io_u_log_error 로 상세 출력. */
 		icd->error = io_u->error;
 		io_u_log_error(td, io_u);
 	}
 	if (icd->error) {
 		enum error_type_bit eb = td_error_type(ddir, icd->error);
 
-		/* [한국어] 비치명적 에러이면 카운트만 증가하고 계속 진행 */
+		/* [한국어] ignore_error 로 비치명 판정이면 그대로 리턴 — 상위 update_error
+		 * 없이 fatal 처리(상위에서 break_on_this_error 결정). */
 		if (!td_non_fatal_error(td, eb, icd->error))
 			return;
 
@@ -3994,7 +4306,8 @@ error:
 		 * If there is a non_fatal error, then add to the error count
 		 * and clear all the errors.
 		 */
-		/* [한국어] 에러 카운트 증가 및 에러 상태 초기화 */
+		/* [한국어] continue_on_error 등으로 비치명이면 에러 카운터만 증가시키고
+		 * td->error/icd->error/io_u->error 를 리셋해 잡 계속 진행. */
 		update_error_count(td, icd->error);
 		td_clear_error(td);
 		icd->error = 0;
@@ -4028,14 +4341,15 @@ static void init_icd(struct thread_data *td, struct io_completion_data *icd,
 {
 	int ddir;
 
-	/* [한국어] gtod 축소 모드가 아니면 현재 시각 기록 */
+	/* [한국어] gtod_reduce 모드면 fio_gettime 자체를 생략(clat 측정 불가해도 수용).
+	 * 정상 모드에서는 이 시각이 icd 내 모든 io_u 의 공통 완료 기준점. */
 	if (!gtod_reduce(td))
 		fio_gettime(&icd->time, NULL);
 
 	icd->nr = nr;
 
 	icd->error = 0;
-	/* [한국어] 각 방향별 바이트 카운터 초기화 */
+	/* [한국어] DDIR_RWDIR_CNT 만큼 루프 — READ/WRITE/TRIM 각 슬롯 0 초기화. */
 	for (ddir = 0; ddir < DDIR_RWDIR_CNT; ddir++)
 		icd->bytes_done[ddir] = 0;
 }
@@ -4061,13 +4375,15 @@ static void ios_completed(struct thread_data *td,
 	int i;
 
 	for (i = 0; i < icd->nr; i++) {
-		/* [한국어] 엔진에서 i번째 완료된 io_u 가져오기 */
+		/* [한국어] 엔진별 .event(td, i) 콜백: i번째 완료된 io_u* 반환.
+		 * libaio=aio_events[i].data, io_uring=CQE user_data 역참조,
+		 * posixaio=aiocb 리스트에서 완료된 것. 순서는 엔진 정의. */
 		io_u = td->io_ops->event(td, i);
 
-		/* [한국어] 완료 처리 */
+		/* [한국어] short I/O 재큐잉 시 io_u 가 NULL 로 세트되어 나옴. */
 		io_completed(td, &io_u, icd);
 
-		/* [한국어] 프리리스트로 반환 (재큐잉된 경우 io_u가 NULL) */
+		/* [한국어] 정상 완료(NULL 아님)만 freelist 로. NULL = requeue 경로. */
 		if (io_u)
 			put_io_u(td, io_u);
 	}
@@ -4091,14 +4407,17 @@ static void io_u_update_bytes_done(struct thread_data *td,
 {
 	int ddir;
 
-	/* [한국어] 검증 모드에서는 읽기 바이트를 검증 바이트로 기록 */
+	/* [한국어] TD_VERIFYING: 쓰기 완료 후 검증 단계 (do_verify). 이때 읽어들이는
+	 * 바이트는 "이미 bytes_done 에 계산된 쓰기"의 재-읽기이므로 bytes_done 에
+	 * 또 더하면 이중 계산. 대신 bytes_verified 별도 카운터에 누적. td_write 이면
+	 * 같이 쓰기도 있는 잡(쓰기+verify)이므로 아래 루프로 계속. */
 	if (td->runstate == TD_VERIFYING) {
 		td->bytes_verified += icd->bytes_done[DDIR_READ];
 		if (td_write(td))
 			return;
 	}
 
-	/* [한국어] 각 방향별 완료 바이트 누적 */
+	/* [한국어] 일반 경로 — READ/WRITE/TRIM 각 방향 바이트를 누적 진행률에 합산. */
 	for (ddir = 0; ddir < DDIR_RWDIR_CNT; ddir++)
 		td->bytes_done[ddir] += icd->bytes_done[ddir];
 }
@@ -4133,21 +4452,25 @@ int io_u_sync_complete(struct thread_data *td, struct io_u *io_u)
 {
 	struct io_completion_data icd;
 
-	/* [한국어] 완료 데이터 초기화 (시각 기록 등) */
+	/* [한국어] nr=1 로 icd 초기화 — 동기 완료는 항상 단건. icd.time 은 완료 시각
+	 * 기준점으로 account_io_completion 이 latency 계산에 사용. */
 	init_icd(td, &icd, 1);
-	/* [한국어] I/O 완료 처리 (통계, 에러, 재큐잉 등) */
+	/* [한국어] 이중 포인터 전달 — short I/O 재큐잉 시 io_u=NULL 로 세트되어
+	 * 아래 put_io_u 가 스킵됨(requeue 경로는 이미 freelist 아닌 requeues 에 들어감). */
 	io_completed(td, &io_u, &icd);
 
-	/* [한국어] io_u 반환 (재큐잉되지 않은 경우) */
+	/* [한국어] io_u != NULL 이면 정상 완료 → freelist 반납. NULL 이면 requeued 상태. */
 	if (io_u)
 		put_io_u(td, io_u);
 
+	/* [한국어] icd.error 는 io_u->error 또는 end_io 콜백 에러가 전파된 값. td_verror
+	 * 로 잡 에러 마킹 후 -1 반환해 상위 do_io 루프가 break_on_this_error 판정. */
 	if (icd.error) {
 		td_verror(td, icd.error, "io_u_sync_complete");
 		return -1;
 	}
 
-	/* [한국어] bytes_done 카운터 업데이트 */
+	/* [한국어] bytes_done[ddir] 누적 — 잡 진행률(done/size) 판정에 사용. */
 	io_u_update_bytes_done(td, &icd);
 
 	return 0;
@@ -4198,24 +4521,30 @@ int io_u_queued_complete(struct thread_data *td, int min_evts)
 
 	dprint(FD_IO, "io_u_queued_complete: min=%d\n", min_evts);
 
-	/* [한국어] min_evts=0이면 논블로킹 (타임아웃 0) */
+	/* [한국어] min_evts=0 은 논블로킹 폴링 — ts={0,0} 포인터를 tvp 로 넘겨
+	 * 엔진 getevents 가 블로킹하지 않게 한다(io_getevents 의 timeout 인자). */
 	if (!min_evts)
 		tvp = &ts;
-	/* [한국어] min_evts가 cur_depth를 초과하면 조정 */
+	/* [한국어] min_evts > cur_depth 는 논리적 오류(없는 io_u 를 기다림 → 영원히
+	 * 블로킹). cur_depth 로 클램프해 deadlock 회피. */
 	else if (min_evts > td->cur_depth)
 		min_evts = td->cur_depth;
 
 	/* No worries, td_io_getevents fixes min and max if they are
 	 * set incorrectly */
-	/* [한국어] 엔진에서 완료 이벤트 가져오기 */
+	/* [한국어] td_io_getevents: 엔진의 .getevents 콜백 호출. libaio=io_getevents,
+	 * io_uring=io_uring_enter(GETEVENTS), posixaio=aio_suspend/aio_error 등.
+	 * 반환값: 완료 수, 음수=errno 음수화. */
 	ret = td_io_getevents(td, min_evts, td->o.iodepth_batch_complete_max, tvp);
 	if (ret < 0) {
 		td_verror(td, -ret, "td_io_getevents");
 		return ret;
 	} else if (!ret)
+		/* [한국어] 논블로킹 폴링에서 완료 없음 — 정상. */
 		return ret;
 
-	/* [한국어] 완료 데이터 초기화 및 처리 */
+	/* [한국어] ret 건을 한꺼번에 icd 에 잡고 icd.time 을 배치 기준 시각으로 설정 —
+	 * 모든 io_u 의 clat 이 동일 시각 기준(개별 gettime 호출 회피). */
 	init_icd(td, &icd, ret);
 	ios_completed(td, &icd);
 	if (icd.error) {
@@ -4223,7 +4552,7 @@ int io_u_queued_complete(struct thread_data *td, int min_evts)
 		return -1;
 	}
 
-	/* [한국어] bytes_done 카운터 업데이트 */
+	/* [한국어] 배치 바이트 합계를 td->bytes_done 에 누적. */
 	io_u_update_bytes_done(td, &icd);
 
 	return ret;
@@ -4248,10 +4577,15 @@ int io_u_queued_complete(struct thread_data *td, int min_evts)
  */
 void io_u_queued(struct thread_data *td, struct io_u *io_u)
 {
+	/* [한국어] 3중 조건: slat 활성 + ramp 통과 + stats 켜짐. 셋 중 하나라도 false
+	 * 면 fio_gettime/통계 기록 자체를 skip (IOPs 집약 경로 보호). */
 	if (!td->o.disable_slat && ramp_period_over(td) && td->o.stats) {
+		/* [한국어] 자식 스레드(verify async 등)의 slat 은 부모 td 의 ts 에 집계 —
+		 * 잡 단위 단일 뷰 유지. */
 		if (td->parent)
 			td = td->parent;
-		/* [한국어] slat 샘플 기록 */
+		/* [한국어] add_slat_sample: issue_time - start_time 을 ts.slat_* 에 추가.
+		 * start_time 은 get_io_u 에서 찍음, issue_time 은 td_io_queue 에서 찍음. */
 		add_slat_sample(td, io_u);
 	}
 }
@@ -4283,16 +4617,19 @@ static struct frand_state *get_buf_state(struct thread_data *td)
 	unsigned int v;
 	unsigned long long i;
 
-	/* [한국어] dedupe 비활성화: 항상 현재 상태 (새 데이터) */
+	/* [한국어] dedupe 비활성 → 항상 buf_state(전진하는 고유 시드) 사용. 매 호출
+	 * 마다 다른 데이터 — SSD dedupe 엔진이 중복 감지 안 함. */
 	if (!td->o.dedupe_percentage)
 		return &td->buf_state;
 	else if (td->o.dedupe_percentage == 100) {
-		/* [한국어] 100% dedupe: 이전 상태를 보존하고 현재 상태 사용 */
+		/* [한국어] 100% dedupe: 모든 버퍼가 동일해야 함. buf_state 가 전진해
+		 * 버리면 다음엔 다른 데이터가 되어 dedupe 실패 → prev 에 현재를 백업한
+		 * 뒤 save_buf_state 에서 다시 prev 로 복원해 사실상 고정. */
 		frand_copy(&td->buf_state_prev, &td->buf_state);
 		return &td->buf_state;
 	}
 
-	/* [한국어] 확률적 결정: 1~100 사이 난수 생성 */
+	/* [한국어] 1~100 난수 v: v ≤ dedupe_percentage 이면 이 버퍼는 "중복" 대상. */
 	v = rand_between(&td->dedupe_state, 1, 100);
 
 	if (v <= td->o.dedupe_percentage)
@@ -4304,11 +4641,15 @@ static struct frand_state *get_buf_state(struct thread_data *td)
 			* a subsequent intention to generate a deduped buffer
 			* might result in generating a unique one
 			*/
-			/* [한국어] REPEAT 모드: 이전 상태의 복사본 반환 */
+			/* [한국어] REPEAT: 직전 고유 시드(buf_state_prev)를 _ret 에 복사해
+			 * 반환. 호출자가 이 시드를 전진시키더라도 원본 prev 는 유지 —
+			 * 이후 dedupe 버퍼 생성 시 또다시 prev 재사용 가능. */
 			frand_copy(&td->buf_state_ret, &td->buf_state_prev);
 			return &td->buf_state_ret;
 		case DEDUPE_MODE_WORKING_SET:
-			/* [한국어] WORKING_SET 모드: 고유 페이지 풀에서 랜덤 선택 */
+			/* [한국어] WORKING_SET: 사전 초기화된 num_unique_pages 개 고유
+			 * 시드 풀에서 랜덤 선택 — 여러 개 중복 쌍이 공존하는 현실적
+			 * dedupe 패턴(예: 같은 파일의 여러 복사본) 재현. */
 			i = rand_between(&td->dedupe_working_set_index_state, 0, td->num_unique_pages - 1);
 			frand_copy(&td->buf_state_ret, &td->dedupe_working_set_states[i]);
 			return &td->buf_state_ret;
@@ -4317,7 +4658,7 @@ static struct frand_state *get_buf_state(struct thread_data *td)
 			assert(0);
 		}
 
-	/* [한국어] dedupe 확률에 걸리지 않으면 새 데이터 생성 */
+	/* [한국어] 확률 불적중 → 새 고유 데이터. buf_state 가 매번 전진해 유일성 확보. */
 	return &td->buf_state;
 }
 
@@ -4372,12 +4713,16 @@ void fill_io_buffer(struct thread_data *td, void *buf, unsigned long long min_wr
 {
 	struct thread_options *o = &td->o;
 
-	/* [한국어] CUDA 메모리이면 호스트에서 채울 수 없으므로 건너뜀 */
+	/* [한국어] MEM_CUDA_MALLOC: libcufile 엔진 전용 GPU 메모리. 호스트에서
+	 * memcpy/patterned fill 불가(CUDA 커널 경로 필요) → 엔진 자체에서 별도
+	 * 초기화하도록 no-op. */
 	if (o->mem_type == MEM_CUDA_MALLOC)
 		return;
 
 	if (o->compress_percentage || o->dedupe_percentage) {
-		/* [한국어] 압축/dedupe: 청크 단위로 혼합 패턴 생성 */
+		/* [한국어] 압축/dedupe 혼합 모드 — compress_chunk 단위로 루프. 각 청크마다
+		 * perc% 비율만큼 "압축 가능한 패턴", 나머지는 랜덤을 혼합. dedupe 시드
+		 * 재사용을 위해 get_buf_state/save_buf_state 쌍 사용. */
 		unsigned int perc = td->o.compress_percentage;
 		struct frand_state *rs = NULL;
 		unsigned long long left = max_bs;
@@ -4391,18 +4736,23 @@ void fill_io_buffer(struct thread_data *td, void *buf, unsigned long long min_wr
 			 * means we should retrack the steps we took for compression
 			 * as well.
 			 */
-			/* [한국어] 첫 청크에서 dedupe 여부 결정 */
+			/* [한국어] rs 는 첫 청크에서만 결정 — 같은 io_u 안의 모든 청크는
+			 * 동일 dedupe 결정을 공유해야 "전체 버퍼가 dedupe 인가/아닌가"
+			 * 이분법 유지. 중간에 바뀌면 SSD dedupe 엔진이 부분만 인식. */
 			if (!rs)
 				rs = get_buf_state(td);
 
 			min_write = min(min_write, left);
 
-			/* [한국어] compress_chunk 단위로 처리 */
+			/* [한국어] 이번 청크 길이 = min(min_write, compress_chunk).
+			 * compress_chunk=0(미설정) 이면 min_not_zero 가 min_write 그대로 사용. */
 			this_write = min_not_zero(min_write,
 						(unsigned long long) td->o.compress_chunk);
 
-			/* [한국어] 지정된 압축률에 맞는 혼합 패턴 생성
-			 * (perc% 는 압축 가능한 패턴, 나머지는 랜덤) */
+			/* [한국어] fill_random_buf_percentage: 내부에서 perc% 의 바이트를
+			 * buffer_pattern(고정 반복 패턴) 으로 채우고 나머지는 랜덤 —
+			 * 적당한 압축률 달성. dedupe 동일 시드 재사용으로 같은 버퍼
+			 * 만들면 SSD dedupe 엔진이 중복 감지. */
 			fill_random_buf_percentage(rs, buf, perc,
 				this_write, this_write,
 				o->buffer_pattern,
@@ -4410,16 +4760,18 @@ void fill_io_buffer(struct thread_data *td, void *buf, unsigned long long min_wr
 
 			buf += this_write;
 			left -= this_write;
+			/* [한국어] 청크마다 시드 상태 저장 — 다음 쓰기 dedupe 시 이 시드 재사용 근거. */
 			save_buf_state(td, rs);
 		} while (left);
 	} else if (o->buffer_pattern_bytes)
-		/* [한국어] 지정된 패턴으로 채우기 */
+		/* [한국어] 고정 바이트 패턴 반복 — 사용자가 "0xdeadbeef" 등 지정.
+		 * 압축률은 100% 근접(완전 반복). verify 와 자연 호환. */
 		fill_buffer_pattern(td, buf, max_bs);
 	else if (o->zero_buffers)
-		/* [한국어] 0으로 채우기 */
+		/* [한국어] 전부 0 — 일부 SSD가 zero 는 실제 쓰기 없이 처리(TRIM 유사 효과). */
 		memset(buf, 0, max_bs);
 	else
-		/* [한국어] 랜덤 데이터로 채우기 */
+		/* [한국어] 기본 — Tausworthe 랜덤. 비압축/비dedupe 일반 워크로드 재현. */
 		fill_random_buf(get_buf_state(td), buf, max_bs);
 }
 
@@ -4503,26 +4855,40 @@ int do_io_u_sync(const struct thread_data *td, struct io_u *io_u)
 
 	if (io_u->ddir == DDIR_SYNC) {
 #ifdef CONFIG_FCNTL_SYNC
+		/* [한국어] macOS: F_FULLFSYNC 는 실제 물리 디스크 플러시 요청.
+		 * 일반 fsync 는 FS 캐시까지만 flush 하고 장치 write cache 는 안 비움. */
 		ret = fcntl(io_u->file->fd, F_FULLFSYNC);
 #else
+		/* [한국어] Linux: fsync(2) — 데이터+메타데이터 모두 디스크에 동기. */
 		ret = fsync(io_u->file->fd);
 #endif
 	} else if (io_u->ddir == DDIR_DATASYNC) {
 #ifdef CONFIG_FDATASYNC
+		/* [한국어] fdatasync(2): 메타데이터(mtime 등) 제외, 데이터 블록만 동기.
+		 * 파일 크기 변경 등 꼭 필요한 메타는 여전히 포함됨. */
 		ret = fdatasync(io_u->file->fd);
 #else
+		/* [한국어] 플랫폼 미지원 — "성공한 것처럼" xfer_buflen 반환 + EINVAL 표기.
+		 * 잡이 멈추지 않도록 완료 처리 흉내, 하지만 에러로 기록. */
 		ret = io_u->xfer_buflen;
 		io_u->error = EINVAL;
 #endif
 	} else if (io_u->ddir == DDIR_SYNC_FILE_RANGE) {
+		/* [한국어] sync_file_range(2): first_write..last_write 부분 범위만 flush —
+		 * fsync 보다 비용 낮음, 메타데이터 미동기. */
 		ret = do_sync_file_range(td, io_u->file);
 	} else if (io_u->ddir == DDIR_SYNCFS) {
+		/* [한국어] syncfs(2) [Linux 2.6.39+]: 해당 fd 가 속한 파일시스템 전체
+		 * 동기 — 같은 FS 의 다른 파일도 flush. 테스트에서 전역 상태 리셋에 유용. */
 		ret = syncfs(io_u->file->fd);
 	} else {
+		/* [한국어] 알 수 없는 ddir — 상위 로직 버그. 통계용으로 xfer_buflen 반환. */
 		ret = io_u->xfer_buflen;
 		io_u->error = EINVAL;
 	}
 
+	/* [한국어] syscall 음수 반환 → errno 에 실제 에러. io_u->error 에 전파해 상위
+	 * 에러 핸들링 경로 활성화. */
 	if (ret < 0)
 		io_u->error = errno;
 
@@ -4548,29 +4914,35 @@ int do_io_u_sync(const struct thread_data *td, struct io_u *io_u)
 int do_io_u_trim(struct thread_data *td, struct io_u *io_u)
 {
 #ifndef FIO_HAVE_TRIM
-	/* [한국어] trim 미지원 플랫폼에서는 EINVAL 에러 */
+	/* [한국어] FIO_HAVE_TRIM 미정의 플랫폼(Windows/Solaris 등) — trim 지원 없음.
+	 * io_u->error=EINVAL 표기 + 0 반환(상위에서 에러 경로). */
 	io_u->error = EINVAL;
 	return 0;
 #else
 	struct fio_file *f = io_u->file;
 	int ret;
 
-	/* [한국어] ZBD 모드에서 trim 처리 */
+	/* [한국어] ZBD(ZNS): trim 의 의미가 "reset_wp" (zone write pointer 초기화) —
+	 * 일반 BLKDISCARD 가 아닌 존 리셋 명령. zbd_do_io_u_trim 이 존 상태 기반 처리. */
 	if (td->o.zone_mode == ZONE_MODE_ZBD) {
 		ret = zbd_do_io_u_trim(td, io_u);
-		/* [한국어] ZBD에서 완전히 처리되었으면 바로 반환 */
+		/* [한국어] io_u_completed: ZBD 쪽에서 완전히 처리됨 (OS 레벨 trim 스킵). */
 		if (ret == io_u_completed)
 			return io_u->xfer_buflen;
 		if (ret)
 			goto err;
 	}
 
-	/* [한국어] OS의 trim 기능으로 지정된 범위 trim */
+	/* [한국어] os_trim: 플랫폼별 trim 구현 래퍼(os/os-linux.h 등).
+	 *  - 블록 디바이스: BLKDISCARD ioctl (NVMe 는 커널이 DSM 명령 발행).
+	 *  - 일반 파일: fallocate(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE).
+	 * 반환 0 = 성공, 양수 = errno. */
 	ret = os_trim(f, io_u->offset, io_u->xfer_buflen);
 	if (!ret)
 		return io_u->xfer_buflen;
 
 err:
+	/* [한국어] 실패 경로 공용: io_u->error 에 errno 기록 후 0(바이트 0 처리) 반환. */
 	io_u->error = ret;
 	return 0;
 #endif
