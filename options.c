@@ -1,129 +1,383 @@
 /*
- * [한국어 설명] fio 옵션 정의 및 파싱 콜백 구현 (options.c)
+ * [한국어 설명] fio 옵션 정의 및 파싱 콜백 구현 (options.c) — 전체 옵션 정의 허브
  *
  * === 파일의 역할 ===
- * 이 파일은 fio의 모든 옵션(약 300개 이상)을 정의하는 핵심 파일이다.
- * 각 옵션의 이름, 타입, 오프셋, 기본값, 도움말, posval을 fio_options[] 배열에
- * 정의하고, 복잡한 옵션을 위한 커스텀 파싱 콜백 함수를 구현한다.
+ * 이 파일은 fio의 **모든** 옵션을 단일 fio_options[] 배열로 정의하는 핵심 허브다.
+ * 각 옵션은 struct fio_option 엔트리로 표현되며 `--name=value` 형식의 CLI 플래그와
+ * `name=value` 형식의 잡 파일(INI) 라인으로 동일하게 파싱된다. 옵션 수는 약 300여 개로
+ * I/O 기본(filename/rw/bs/size/iodepth), 엔진 선택, 버퍼 관리, verify, log, runtime,
+ * random 분포, rate limit, trim, ZBD, FDP, dedupe, compress, cgroup, CPU affinity,
+ * steady state, stats, error handling, network 등 거의 모든 런타임 동작을 제어한다.
+ * 단순 INT/BOOL 옵션은 파서가 자동 저장하지만, 복합 문자열(bssplit, rw, cpumask,
+ * verify_pattern, random_distribution 등)은 이 파일에서 제공하는 str_*_cb 콜백이
+ * 직접 파싱하여 thread_options에 결과를 채운다.
+ *
+ * 추가로 이 파일은 **키워드 치환 시스템**(fio_keywords: $pagesize/$mb_memory/$ncpus),
+ * **환경 변수 치환**(fio_option_dup_subs: ${VAR}), **bc(1) 기반 산술 계산**(bc_calc),
+ * **유사 옵션명 추천**(show_closest_option — 레벤슈타인 거리), **옵션 설정 여부 비트맵**
+ * (set_options[]), **엔진별 동적 옵션 등록**(add_option/add_opt_posval)까지 담당한다.
  *
  * === 전체 아키텍처에서의 위치 ===
- * init.c의 parse_options()에서 parse.c의 파싱 엔진을 통해 이 파일의
- * fio_options[] 배열을 참조하여 옵션을 파싱한다.
- * 호출 체인: parse_options() [init.c] → parse_option() [parse.c] → fio_options[] [이 파일]
+ *                 CLI (argv)         잡 파일 (.fio / --name= blocks)
+ *                     │                       │
+ *                     ▼                       ▼
+ *              init.c::parse_cmd_line    init.c::__parse_jobs_ini
+ *                          \                 /
+ *                           ▼               ▼
+ *                        init.c::add_job(td, opts[])
+ *                                    │
+ *                                    ▼
+ *                     ┌── options.c::fio_options_parse(td, opts, n)
+ *                     │        1) sort_options() ─ prio 순 정렬 (filename이 directory 뒤)
+ *                     │        2) dup_and_sub_options() ─ ${ENV}, $pagesize 치환 + bc 계산
+ *                     │        3) for each: parse.c::parse_option(opt, fio_options, ...)
+ *                     │              └─ 매칭된 fio_option 엔트리의 type/off1/cb 참조해
+ *                     │                 파싱 엔진이 값을 thread_options에 저장
+ *                     │        4) 인식 못한 옵션 → ioengine_load() → td->io_ops->options 재시도
+ *                     │        5) 여전히 인식 못하면 show_closest_option() 추천
+ *                     ▼
+ *              td->o (struct thread_options) 필드들이 모두 채워진 상태
+ *                                    │
+ *                                    ▼
+ *              init.c::fixup_options()  ← 교차 검증, 기본값 보정
+ *                                    │
+ *                                    ▼
+ *              backend.c::thread_main()  ← 실제 I/O 실행
+ *
+ * 호출 체인 (파싱 경로):
+ *   fio_options_parse [이 파일]
+ *     └→ parse_option [parse.c]
+ *          ├→ (단순 타입) thread_options 필드에 직접 저장
+ *          └→ (cb 지정) str_*_cb() [이 파일] — 문자열 분해/검증/변환 후 저장
+ *
+ * 호출 체인 (값 조회 경로):
+ *   add_job/fixup_options/thread_main/io_u.c/...
+ *     └→ td->o.<field>  또는  fio_option_is_set(&td->o, <field>)
  *
  * === 타 모듈과의 연결 ===
- * - init.c: parse_cmd_line()/parse_jobs_ini()에서 fio_options[] 참조
- * - parse.c: 파싱 엔진이 fio_options[]의 타입/오프셋/콜백으로 값을 저장
- * - thread_options.h: 옵션 값이 저장되는 대상 구조체 (offsetof로 참조)
- * - optgroup.c: 옵션 그룹/카테고리 정의
- * - 데이터 흐름: 잡파일/CLI → parse.c → fio_options[].cb → thread_options
+ * - **parse.c** (파싱 엔진): fio_option 엔트리의 type/off1~off6/minval/maxval/posval/
+ *   def/cb/verify/parent/hide/prio/alias/exclusive_group 필드를 해석해 문자열→이진값
+ *   변환과 thread_options 저장을 수행. 이 파일은 엔트리 **정의**, parse.c는 **해석**.
+ * - **thread_options.h**: fio_option.off1 = offsetof(struct thread_options, field) 로
+ *   저장 대상 필드를 정적 지정. thread_options는 잡 1개의 모든 옵션 스냅샷.
+ * - **options.h**: 이 파일 외부 API 선언(fio_options_parse/fio_cmd_option_parse/
+ *   fio_option_find/add_option/add_opt_posval/fio_option_mark_set/fio_options_free 등).
+ * - **optgroup.h**: FIO_OPT_C_{IO,ENGINE,GENERAL,FILE,STAT,LOG,VERIFY,PROFILE} 카테고리와
+ *   FIO_OPT_G_* (수십 개 세부 그룹: IO_BASIC, IO_BUF, IO_FLOW, FILENAME, RANDOM, ZONE,
+ *   LATPROF, RATE, VERIFY, LOG, CRED, TRIM, STEADYSTATE, ZBD, DEDUPE, ...) 분류 식별자 정의.
+ *   `fio --enghelp=<name>` 등 도움말 필터링/GUI 옵션 트리에 사용.
+ * - **ioengines.c**: ioengine_load() 에서 td->io_ops->options(엔진별 fio_option 배열)를
+ *   얻어 엔진 전용 옵션을 파싱. 엔진이 add_opt_posval() 로 ioengine 옵션의 posval에
+ *   자기 이름을 등록한다.
+ * - **init.c**: parse_options → parse_cmd_line/__parse_jobs_ini 에서 이 파일의 API 사용.
+ * - **filesetup.c** (add_file, add_dir_files): str_filename_cb/str_opendir_cb에서 호출.
+ * - **lib/pattern.c** (parse_and_fill_pattern_alloc): buffer_pattern/verify_pattern 파싱.
+ * - **verify.h**: VERIFY_* 매크로(VERIFY_NONE/CRC32/MD5/PATTERN/...) posval 매핑에 사용.
+ * - **zbd.h**: zoned_mode 관련 옵션의 posval/cb.
+ * - **lib/rand.h** / **lib/zipf.c** / **lib/gauss.c**: random_distribution의 실제 구현.
+ * - **cmdprio.c / cmdprio.h**: libaio/io_uring/sg 공유 cmdprio_* 옵션(percentage/bssplit).
+ * - 데이터 흐름: **잡파일/CLI 문자열** → parse.c 어휘 분석 → fio_options[].cb 호출 →
+ *   str_*_cb 가 strsep/strtok/sscanf로 분해 → add_file/fio_cpuset_init/pattern_alloc/
+ *   bssplit_ddir 등으로 thread_options 내부 자료구조 구축 → backend가 소비.
  *
  * === 주요 함수/구조체 요약 ===
- * - fio_options[]: 약 300개 이상의 fio 옵션 정의 배열
- * - str_rw_cb(): I/O 패턴(rw) 옵션 파싱 콜백
- * - str_bssplit_cb(): 블록 크기 분포(bssplit) 파싱 콜백
- * - fio_options_parse(): 잡 파일의 옵션 목록 파싱
- * - fio_option_is_set(): 특정 옵션의 설정 여부 확인
+ * [최상위 배열]
+ * - fio_options[FIO_MAX_OPTS]:  ~300개 fio_option 엔트리. NULL sentinel(.name=NULL)로 종료.
+ * - fio_keywords[]:  $pagesize/$mb_memory/$ncpus 치환 테이블. init 시 값 채움.
+ *
+ * [복합 옵션 파서 콜백 (본 파일의 정수)]
+ * - str_rw_cb():          rw=write,4k 형식의 ddir + 시퀀스 오프셋/주기 파싱.
+ * - str_bssplit_cb():     bs=4k/50:8k/30:16k/20 형식의 블록크기 확률 분포 파싱.
+ * - str_fst_cb():         file_service_type = random/roundrobin/zipf/pareto/gauss 파싱.
+ * - str_random_distribution_cb(): random 오프셋 분포(zipf/pareto/gauss/zoned/zoned_abs).
+ * - str_mem_cb():         iomem = malloc/shm/mmap/mmaphuge/... 및 ":" 뒤 경로 추출.
+ * - str_verify_pattern_cb() / str_buffer_pattern_cb(): 패턴 문자열/16진수/"%o" 파싱.
+ * - str_cpumask_cb() / str_cpus_allowed_cb(): CPU affinity 마스크 / 범위 표기 파싱.
+ * - str_numa_cpunodes_cb() / str_numa_mpol_cb(): NUMA 노드/정책 파싱 (libnuma).
+ * - str_fdp_pli_cb() / str_dp_scheme_cb(): FDP placement ID 리스트/scheme 파일 검증.
+ * - str_filename_cb() / str_directory_cb() / str_opendir_cb(): 대상 파일/디렉토리 등록.
+ * - str_ignore_error_cb() / str_replay_skip_cb(): 에러 무시 / blktrace 재생 필터.
+ * - str_steadystate_cb(): iops:10%, bw:5%, lat:1ms 등 정상상태 판정 기준 파싱.
+ * - str_ioengine_external_cb(): ioengine=external:/path/to/engine.so 분리 + stat 검증.
+ * - str_size_cb() / str_io_size_cb() / str_offset_cb() / str_offset_increment_cb() /
+ *   str_zoneskip_cb(): 백분율/존 단위/절대값 3-way 인코딩 파싱.
+ * - str_write_bw_log_cb / str_write_lat_log_cb / str_write_iops_log_cb /
+ *   str_write_hist_log_cb: 성능 로그 활성화 + 파일명 저장.
+ *
+ * [파싱/유틸 외부 API]
+ * - fio_options_parse():       잡의 옵션 배열을 파싱하는 메인 드라이버.
+ * - fio_cmd_option_parse():    커맨드라인 --opt val 형식 파싱.
+ * - fio_options_dup_and_init(): CLI용 struct option[] 테이블 생성(getopt_long).
+ * - fio_fill_default_options(): 모든 옵션의 기본값 적용.
+ * - fio_show_option_help():    fio --cmdhelp=<opt> 출력.
+ * - fio_options_mem_dupe() / fio_options_free(): fork/종료 시 문자열 복제/해제.
+ * - fio_option_find():         이름으로 fio_options[] 조회 (외부 노출).
+ * - fio_option_mark_set() / __fio_option_is_set(): 설정 여부 비트맵 get/set.
+ * - add_option() / add_opt_posval() / del_opt_posval(): 엔진이 동적으로 옵션/posval 등록.
+ * - invalidate_profile_options(): 프로파일 unload 시 해당 옵션들을 INVALID로 무효화.
+ *
+ * [키워드/환경 치환]
+ * - fio_keywords_init() / fio_keywords_exit(): $pagesize/$mb_memory/$ncpus 초기화·해제.
+ * - fio_option_dup_subs(): ${ENV} → getenv() 값 치환.
+ * - fio_keyword_replace(): $keyword → 값 치환. 치환 후 산술 연산 포함 시 bc_calc().
+ * - bc_calc(): popen("bc") 로 size=1024*1024 같은 표현식 계산.
+ *
+ * [저수준 헬퍼]
+ * - split_parse_ddir():       "값/퍼센트:값/퍼센트:..." 범용 분할 파서.
+ * - str_split_parse():        ddir 3-way("읽기,쓰기,트림") 분리 드라이버.
+ * - parse_cmdprio_bssplit_entry() / split_parse_prio_ddir(): cmdprio_bssplit 파싱.
+ * - split_parse_distr():      "값:중심" 형식의 분포 파라미터 파싱.
+ * - str2error():              "EINVAL" → 22 같은 errno 이름 → 번호 변환.
+ * - get_next_str() / get_max_str_idx() / set_name_idx() / get_name_by_idx():
+ *   콜론 구분 파일 리스트 순회 (escape '\:' 지원).
+ * - rw_verify() / gtod_cpu_verify(): .verify 콜백 (추가 사후 검증).
+ * - is_valid_steadystate() / parse_zoned_distribution() / zone_split_ddir(): 보조 파서.
+ *
+ * === fio_option 엔트리 필드 핸드북 ===
+ * 각 fio_options[] 엔트리는 다음 필드를 갖는다 (parse.h 정의):
+ * - .name:    옵션 이름 (CLI/INI에서 사용). 필수.
+ * - .lname:   긴 설명(long name). GUI 및 --cmdhelp 출력에 사용.
+ * - .alias:   옵션의 별칭 (예: "readwrite" → "rw").
+ * - .type:    값의 파싱 타입:
+ *             FIO_OPT_STR / STR_STORE / STR_VAL(숫자+단위 k/m/g) / STR_VAL_INT / INT /
+ *             ULL / BOOL / FLOAT_LIST / RANGE / STR_MULTI / STR_SET / STR_VAL_ZONE /
+ *             DEPRECATED / UNSUPPORTED / INVALID / STR_ULL / ...
+ * - .off1~.off6: thread_options 내 대상 필드 오프셋 (offsetof). 최대 6개 필드에 분산 저장.
+ * - .def:     기본값 문자열. parse.c 가 매 잡 초기화 시 적용.
+ * - .help:    짧은 도움말 (--cmdhelp=opt, fio --help 에 출력).
+ * - .cb:      커스텀 콜백 함수. 단순 타입으로 표현 불가한 문자열을 직접 파싱.
+ *             시그니처 2종: int (*)(void *data, const char *str)  /  int (*)(void *data, long long *val).
+ *             data = &td->o 이므로 cb_data_to_td(data) 매크로로 td 역산.
+ * - .verify:  파싱 후 의존성 검증 콜백 (예: read_only 모드에서 write 잡 금지 — rw_verify).
+ * - .minval / .maxval: INT/ULL 타입 상한/하한. parse.c가 클램프하거나 에러.
+ * - .minlen / .maxlen: STR_STORE 문자열 길이 제한.
+ * - .interval:  GUI 슬라이더 단계 값 (예: 1).
+ * - .posval:    STR/STR_MULTI 타입의 허용 값 테이블. PARSE_MAX_VP=32 슬롯.
+ *               각 엔트리 { .ival = "문자열", .oval = 정수값, .help = "설명", .cb = 옵셔널 콜백 }.
+ *               엔진 이름 posval은 런타임에 add_opt_posval 로 동적 추가됨.
+ * - .parent:   상위 옵션명. 이 옵션의 효과는 parent가 활성일 때만 의미 있음.
+ * - .hide:     `fio --help` 출력에서 숨김 (기본값일 때 출력 안 함).
+ * - .hide_on_set: 다른 옵션 설정 시 숨김 처리.
+ * - .exclusive_group: 같은 그룹의 옵션들은 상호배타 (하나만 설정 가능).
+ * - .prio:     파싱 우선순위. 음수=나중 파싱, 양수=먼저 파싱.
+ *              예: filename.prio=-1 → directory 먼저 처리되도록 강제.
+ * - .category / .group: FIO_OPT_C_*/FIO_OPT_G_* (optgroup.h). 도움말 분류 및 GUI.
+ * - .prof_name: 이 옵션이 속한 프로파일명. invalidate_profile_options()가 사용.
+ * - .is_seconds / .is_time: STR_VAL_TIME 타입의 단위 해석 힌트.
+ *
+ * === 키워드/치환 치트시트 ===
+ * - $pagesize, $mb_memory, $ncpus: 시스템 값 (fio_keywords_init).
+ * - ${ENV_VAR}: 환경 변수 (fio_option_dup_subs).
+ * - $jobname, $jobnum, $filenum: 파일명 포맷 치환 (filesetup.c 에서 처리).
+ * - $pid, $clientuid: 런타임 식별자.
+ * - 산술 연산(+-  /): bc(1) 유틸리티로 계산. 예: size=$mb_memory*1024.
+ *
+ * === 실행 컨텍스트 ===
+ * - 모든 파싱은 **메인 프로세스의 init 단계**에서 수행. 잡 스레드 생성 전.
+ * - fio_clock_source_cb 같은 몇몇 콜백은 시간 초기화를 바로 수행 (즉시 효과).
+ * - parse_dryrun() == true 면 부수효과(파일 추가/문자열 복제) 생략 — 단순 검증 모드.
+ * - 파싱 중 오류는 log_err()+td_verror() 로 보고, 콜백은 0=성공/!=0=실패 반환.
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <ctype.h>
-#include <string.h>
-#include <assert.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
+#include <stdio.h>            /* [한국어] popen/pclose/fread/sprintf — bc_calc 에서 bc(1) 서브프로세스 파이프. FILE*/fopen 계열. */
+#include <stdlib.h>           /* [한국어] malloc/calloc/realloc/free/strtol/strtoull/atoi/getenv — 파싱 콜백 전반에서 필수. */
+#include <unistd.h>           /* [한국어] 간접 POSIX 정의(pid_t 등). 일부 os 헤더 체인에서 요구. */
+#include <ctype.h>            /* [한국어] isdigit — str_numa_mpol_cb 의 nodelist 유효성 검사. */
+#include <string.h>           /* [한국어] strcmp/strncmp/strstr/strchr/strsep/strdup/strlen/memcpy/memset/memmove — 거의 모든 콜백이 사용. */
+#include <assert.h>           /* [한국어] parse_and_fill_pattern_alloc 반환 이후 패턴 바이트 수 > 0 보증. */
+#include <fcntl.h>            /* [한국어] open(2) 관련 플래그 — 일부 옵션 cb가 stat/lstat 계열과 함께 사용. */
+#include <sys/stat.h>         /* [한국어] stat/lstat/struct stat/S_ISREG/S_ISDIR — 파일명·디렉토리·외부 엔진 경로 유효성 검증. */
+#include <netinet/in.h>       /* [한국어] INET6_ADDRSTRLEN — client_sockaddr_str 버퍼 크기. */
 
-#include "fio.h"             /* fio 핵심 구조체 및 매크로 */
-#include "verify.h"          /* 데이터 검증 관련 */
-#include "parse.h"           /* 옵션 파싱 프레임워크 */
-#include "lib/pattern.h"     /* 버퍼 패턴 처리 */
-#include "options.h"         /* 옵션 API 선언 */
-#include "optgroup.h"        /* 옵션 그룹/카테고리 */
-#include "zbd.h"             /* Zoned Block Device */
+#include "fio.h"             /* [한국어] fio 핵심 — struct thread_data/thread_options, td_verror, log_err,
+                              *         dprint(FD_PARSE), td_random/td_read/td_write 매크로, FIO_MAX_OPTS,
+                              *         cpus_configured, os_phys_mem, page_size, fio_clock_source 등
+                              *         이 파일의 거의 모든 심볼이 여기서 공급된다. */
+#include "verify.h"          /* [한국어] VERIFY_NONE/CRC32/MD5/PATTERN/... posval 매핑과 verify_pattern_cb
+                              *         내부의 verify 기본값 설정에 사용. */
+#include "parse.h"           /* [한국어] struct fio_option/parse_option/parse_cmd_option/options_init/
+                              *         options_to_lopts/find_option/fill_default_options/options_free/
+                              *         options_mem_dupe/sort_options/string_distance 등 파싱 프레임워크 API.
+                              *         이 파일은 정의, parse.c는 해석. */
+#include "lib/pattern.h"     /* [한국어] parse_and_fill_pattern_alloc/struct pattern_fmt_desc/paste_blockoff —
+                              *         buffer_pattern/verify_pattern 옵션에서 %o(오프셋) 치환 및
+                              *         16진수/문자열 패턴 컴파일에 사용. */
+#include "options.h"         /* [한국어] 이 파일이 외부에 노출하는 함수 프로토타입 선언. */
+#include "optgroup.h"        /* [한국어] FIO_OPT_C_{GENERAL,FILE,IO,ENGINE,STAT,LOG,VERIFY,PROFILE} 카테고리와
+                              *         FIO_OPT_G_* 수십 개 세부 그룹. 각 엔트리의 .category/.group 필드에 사용. */
+#include "zbd.h"             /* [한국어] Zoned Block Device 관련 매크로/열거형 — zonemode, zone_size 등 옵션의 posval 값. */
 
-/* [한국어] --client 옵션에 사용되는 서버 소켓 주소 문자열 */
+/* [한국어] --client 옵션에 사용되는 서버 소켓 주소 문자열.
+ * 설정자: 클라이언트 모드 진입 시(server.c) IPv4/IPv6 주소를 INET_ADDRSTRLEN/INET6_ADDRSTRLEN 포맷으로 저장.
+ * 읽는 자: set_name_idx() 에서 unique_filename 옵션이 켜졌을 때 파일명 prefix로 사용.
+ * 값 범위: 빈 문자열("") 또는 유효한 IP 문자열 (IPv6 최장 45자 + 널 종단).
+ * 동기화: 단일 프로세스에서 시작 시 1회 세팅되고 이후 읽기 전용이라 별도 락 불필요. */
 char client_sockaddr_str[INET6_ADDRSTRLEN] = { 0 };
 
 /*
- * [한국어] 콜백 데이터(thread_options 포인터) → thread_data 포인터 변환 매크로
- * 파싱 콜백은 data로 &td->o를 받으므로, container_of로 td를 역산한다.
+ * [한국어] 콜백 데이터(thread_options 포인터) → thread_data 포인터 변환 매크로.
+ *
+ * 배경: parse.c 의 파서가 cb에 data로 전달하는 값은 &td->o 이다(struct thread_options 포인터).
+ * 그러나 콜백은 td->flags, td->file_service_nr, td->zipf_theta 등 thread_data 자체의 필드에
+ * 접근해야 할 때가 많다. 이 매크로는 container_of 이디엄으로 thread_options 포인터에서
+ * thread_data 포인터를 역산한다 (struct thread_data 안에 struct thread_options o 가 임베드되어 있음).
+ *
+ * 사용 예: 거의 모든 str_*_cb 콜백 첫 줄에 `struct thread_data *td = cb_data_to_td(data);`
  */
 #define cb_data_to_td(data)	container_of(data, struct thread_data, o)
 
 /*
- * [한국어] 버퍼 패턴 포맷 디스크립터
- * "%o"는 I/O 오프셋을 버퍼 패턴에 삽입하는 데 사용된다.
- * 예: buffer_pattern="%o" → 각 블록의 오프셋이 데이터로 채워짐
+ * [한국어] 버퍼 패턴 포맷 디스크립터 — verify_pattern 에서 "%o" 매크로를 해석.
+ *
+ * 구조체 배경: struct pattern_fmt_desc {const char *fmt; size_t len; paste_fn *paste;} 는
+ * lib/pattern.h 가 제공하는 포맷 디스크립터 테이블 엔트리 타입이다. parse_and_fill_pattern_alloc()
+ * 가 패턴 문자열을 파싱하면서 fmt 문자열을 만나면 해당 엔트리의 paste 콜백으로 런타임에 값을 삽입.
+ *
+ * "%o"  → I/O 오프셋(8바이트)을 버퍼 패턴 슬롯에 삽입. paste_blockoff 가 io_u->offset을 LE로 기록.
+ *         예: verify_pattern="%o" → 각 블록 첫 8바이트가 해당 블록의 offset 값 → 잘못된 위치로
+ *         쓴 경우 검증 단계에서 offset 불일치로 손상 탐지.
+ *
+ * 마지막 { } 는 sentinel로 빈 엔트리(fmt=NULL)를 의미해 배열 순회 종료 조건.
+ * FIO_FIELD_SIZE(io_u *, offset) 는 sizeof(io_u->offset) = 8 바이트(uint64_t)이므로
+ * 패턴 내 "%o" 자리표시자는 8바이트 슬롯을 차지한다.
  */
 static const struct pattern_fmt_desc fmt_desc[] = {
 	{
-		.fmt   = "%o",
-		.len   = FIO_FIELD_SIZE(struct io_u *, offset),
-		.paste = paste_blockoff
+		.fmt   = "%o",                                      /* [한국어] 치환할 포맷 문자열 (printf 스타일). */
+		.len   = FIO_FIELD_SIZE(struct io_u *, offset),     /* [한국어] 치환 결과가 차지할 바이트 수 = sizeof(uint64_t). */
+		.paste = paste_blockoff                             /* [한국어] 런타임에 오프셋을 LE 바이트로 기록하는 콜백. */
 	},
-	{ }
+	{ }                                                         /* [한국어] sentinel — fmt=NULL 로 순회 종료. */
 };
 
 /*
- * [한국어] mmap/mmaphuge 옵션에서 ":"으로 구분된 파일 경로를 추출
- * 예: "mmap:/tmp/hugefile" → "/tmp/hugefile" 반환
+ * [한국어]
+ * get_opt_postfix() — 콜론으로 구분된 옵션 문자열의 ":뒤" 부분을 strdup으로 복제해 반환.
+ *
+ * @str: 원본 옵션 문자열 (예: "mmap:/tmp/hugefile", "rw=write,4k", "zipf:1.2").
+ * @return: 콜론 뒤 문자열의 독립 복사본 (호출자가 free 책임). 콜론이 없으면 NULL.
+ *
+ * 왜 필요한가: fio의 많은 옵션은 "주값:파라미터" 형식을 사용한다. 예를 들어 iomem=mmap:/tmp/xxx,
+ * file_service_type=zipf:1.2, ioengine=external:/path/to/so 등. 파서는 먼저 주값(mmap, zipf,
+ * external)으로 엔트리를 매칭하고, cb 콜백이 이 함수로 ":뒤" 파라미터를 추출한다.
+ *
+ * 동작 단계:
+ * 1) strstr로 ":" 위치 탐색.
+ * 2) 없으면 NULL 반환 (파라미터 없음 — 호출자는 기본 동작).
+ * 3) ":" 다음 문자부터 시작해 앞뒤 공백 제거.
+ * 4) strdup으로 독립 문자열 반환.
+ *
+ * 호출 체인: str_mem_cb / str_fst_cb / str_rw_cb / str_sfr_cb / str_random_distribution_cb /
+ *           str_steadystate_cb → [get_opt_postfix] → caller uses returned string + frees it.
+ *
+ * 주의: 반환값은 반드시 free() 해야 함.
  */
 static char *get_opt_postfix(const char *str)
 {
-	char *p = strstr(str, ":");
+	char *p = strstr(str, ":");        /* [한국어] 구분자 위치 탐색. */
 
-	if (!p)
+	if (!p)                            /* [한국어] 콜론 없음 → 파라미터 없음을 NULL로 신호. */
 		return NULL;
 
-	p++;
-	strip_blank_front(&p);
-	strip_blank_end(p);
-	return strdup(p);
+	p++;                               /* [한국어] 콜론 다음 문자로 이동 (실제 파라미터 시작). */
+	strip_blank_front(&p);             /* [한국어] 앞쪽 공백 제거 (parse.h 매크로, p 포인터를 전진). */
+	strip_blank_end(p);                /* [한국어] 뒤쪽 공백을 NUL로 치환. */
+	return strdup(p);                  /* [한국어] 원본 str이 곧 해제될 수 있으므로 독립 복사본을 반환. */
 }
 
 /*
- * [한국어] 분포 파라미터 파싱: "값:중심" 형식에서 값과 중심점을 분리
- * 예: "1.2:50" → val=1.2, center=50.0
+ * [한국어]
+ * split_parse_distr() — "값:중심" 형식의 분포 파라미터 문자열을 파싱.
+ *
+ * @str:    원본 문자열. 예: "1.2", "1.2:0.5". 콜론 뒤는 중심점 (선택적).
+ * @val:    [out] 주값 (double). 예: zipf theta, pareto input, gauss dev.
+ * @center: [out] 분포 중심점 (0.0~1.0). 콜론이 없으면 변경되지 않음 (호출자가 -1.0 기본 세팅).
+ * @return: true=성공, false=파싱 실패 (str_to_float 에러 또는 OOM).
+ *
+ * 왜 필요한가: random_distribution=zipf:1.2 같은 옵션에서 zipf는 이미 posval로 분리되고,
+ * cb가 ":뒤" 부분 "1.2" 만 받는다. 그런데 fio는 추가로 "zipf:1.2:0.5" 형식으로 분포의
+ * 중심점을 지정할 수 있다 (0~1 범위, 기본 0.5 = 영역 중앙). 이 함수가 그 2-way 분리를 한다.
+ *
+ * 동작 단계:
+ * 1) str 복제 (strsep이 원본을 수정하므로).
+ * 2) ":" 찾기 → 있으면 앞뒤 분리 후 뒤쪽을 center로 파싱.
+ * 3) 앞쪽을 val로 파싱.
+ * 4) 복제본 free 후 결과 반환.
+ *
+ * 호출 체인: str_fst_cb / str_random_distribution_cb → [split_parse_distr] → str_to_float.
  */
 static bool split_parse_distr(const char *str, double *val, double *center)
 {
 	char *cp, *p;
 	bool r;
 
-	p = strdup(str);
-	if (!p)
+	p = strdup(str);                   /* [한국어] 원본 보존을 위해 복제 (이 함수는 로컬 버퍼로 작업). */
+	if (!p)                            /* [한국어] OOM 방어. */
 		return false;
 
-	cp = strstr(p, ":");
+	cp = strstr(p, ":");               /* [한국어] 중심점 구분자 탐색. */
 	r = true;
-	if (cp) {
-		*cp = '\0';
-		cp++;
-		r = str_to_float(cp, center, 0);
+	if (cp) {                          /* [한국어] ":" 발견 — 뒤쪽이 중심점. */
+		*cp = '\0';                    /* [한국어] 주값 부분을 NUL 종단으로 자른다. */
+		cp++;                          /* [한국어] 중심점 시작 위치로 진행. */
+		r = str_to_float(cp, center, 0); /* [한국어] 문자열 → double. */
 	}
-	r = r && str_to_float(p, val, 0);
-	free(p);
+	r = r && str_to_float(p, val, 0);  /* [한국어] 중심 파싱 성공 시에만 주값 파싱 (단락 평가). */
+	free(p);                           /* [한국어] 복제 버퍼 해제. */
 	return r;
 }
 
-/* [한국어] bssplit 퍼센트 기준 정렬 비교 함수 */
+/*
+ * [한국어]
+ * bs_cmp() — qsort() 콜백: bssplit 배열을 퍼센트(perc) 오름차순으로 정렬.
+ *
+ * @p1, @p2: struct bssplit* (void* 캐스트). perc 필드 비교.
+ * @return:  p1<p2 → 음수, p1>p2 → 양수, 같으면 0. (qsort 관례)
+ *
+ * 왜 필요한가: 런타임에 io_u.c::get_next_buflen()가 0~100 난수를 뽑아 어느 bssplit
+ * 엔트리에 속하는지 선형/이분 탐색으로 매핑한다. 퍼센트 오름차순 정렬이 되어 있으면
+ * 누적 합을 만들며 첫 번째 cumperc >= 난수 인 엔트리를 바로 선택할 수 있어 로직이 간결.
+ *
+ * 호출 체인: bssplit_ddir() → qsort(o->bssplit[ddir], nr, sizeof(bssplit), [bs_cmp]).
+ */
 static int bs_cmp(const void *p1, const void *p2)
 {
-	const struct bssplit *bsp1 = p1;
+	const struct bssplit *bsp1 = p1;               /* [한국어] void* → struct bssplit* 재해석. */
 	const struct bssplit *bsp2 = p2;
 
-	return (int) bsp1->perc - (int) bsp2->perc;
+	return (int) bsp1->perc - (int) bsp2->perc;    /* [한국어] 단순 차이 — perc가 작은 unsigned라 int 캐스팅. */
 }
 
 /*
- * [한국어] "값/퍼센트:값/퍼센트:..." 형식의 분할 문자열 파싱
- * bssplit, cmdprio_bssplit 등에서 사용된다.
- * 예: "4k/50:8k/30:16k/20" → 4K 50%, 8K 30%, 16K 20%
+ * [한국어]
+ * split_parse_ddir() — "값/퍼센트:값/퍼센트:..." 형식의 범용 분할 문자열 파서.
  *
- * @absolute: true이면 퍼센트 대신 절대값으로 해석
- * @max_splits: 최대 분할 항목 수
+ * @o:          thread_options 포인터 (str_to_decimal이 kb_base 같은 맥락을 참조하기 위함).
+ * @split:      [out] struct split{ nr, val1[], val2[] } 채울 구조체. val1=주값(bs),
+ *              val2=퍼센트 또는 절대값. nr=파싱된 엔트리 수.
+ * @str:        원본 문자열(수정됨 — strsep이 NUL을 삽입하므로 호출자가 strdup 필요).
+ * @absolute:   true → "/" 뒤를 절대값(바이트 등)으로 파싱. false → 0~100 퍼센트로 해석.
+ * @max_splits: BSSPLIT_MAX 등 배열 상한. 초과 시 경고 후 중단.
+ * @return:     0=성공, 1=실패 (str_to_decimal 에러 등).
+ *
+ * 왜 필요한가: bssplit("4k/50:8k/30:16k/20"), zonesplit, cmdprio_bssplit 등 여러 옵션이
+ * 동일한 "토큰/파라미터:토큰/파라미터:..." 문법을 공유한다. 공통 파서로 코드 중복 방지.
+ *
+ * 문법 규칙:
+ * - ':' 가 엔트리 구분자. 빈 엔트리는 종료 신호.
+ * - '/' 뒤가 없으면 퍼센트 미지정(-1U 마커) — 호출자가 나머지 퍼센트를 균등 분배.
+ * - 퍼센트 0이면 -1U로 마킹 (이후 "미지정"으로 재해석됨).
+ * - 퍼센트 >100 은 100으로 클램프.
+ *
+ * 동작 단계:
+ * 1) strsep(&str, ":") 로 엔트리 하나씩 꺼냄.
+ * 2) 엔트리 내 "/" 위치 찾아 앞=주값, 뒤=퍼센트/절대값 분리.
+ * 3) str_to_decimal 로 크기 단위(k/m/g) 포함 숫자 파싱.
+ * 4) split->val1[i]=주값, split->val2[i]=퍼센트 저장.
+ * 5) max_splits 도달 시 경고 후 중단.
+ *
+ * 호출 체인: bssplit_ddir / zone_split_ddir → [split_parse_ddir] → strsep / str_to_decimal.
+ *
+ * 에러 경로: str_to_decimal 실패 → log_err + return 1. 호출자가 전체 파싱을 중단.
  */
 int split_parse_ddir(struct thread_options *o, struct split *split,
 			    char *str, bool absolute, unsigned int max_splits)
@@ -2164,27 +2418,103 @@ static int gtod_cpu_verify(const struct fio_option *o, void *data)
 }
 
 /*
- * [한국어] fio_options[] — fio의 모든 옵션 정의 배열
+ * [한국어] ====== fio_options[] 공통 규약 블록 (모든 엔트리에 적용) ======
  *
- * 이 배열은 약 300개 이상의 fio 옵션을 정의한다.
- * 각 항목은 fio_option 구조체로, 다음 정보를 포함한다:
- *   - name/lname: 옵션 이름 (잡 파일 및 커맨드라인에서 사용)
- *   - type: 값의 타입 (문자열, 정수, 불린, 범위 등)
- *   - off1~off6: thread_options 구조체 내 대상 변수의 오프셋
- *   - def: 기본값
- *   - cb: 커스텀 파싱 콜백 (위에서 정의된 str_*_cb 함수들)
- *   - posval[]: 허용 가능한 문자열 값 목록
- *   - category/group: 옵션 분류 (도움말/GUI용)
+ * 이 배열은 약 300여 개의 fio 옵션을 순서대로 정의하는 fio 파싱의 핵심 **데이터베이스**다.
+ * 각 엔트리는 struct fio_option (parse.h 정의) 이며, 공통 필드 의미는 다음과 같다.
+ * 개별 엔트리의 주석은 필드 고유 의미(특히 posval/cb/parent/hide/minval/maxval/def)에 집중한다.
  *
- * 주요 옵션 카테고리:
- *   FIO_OPT_C_GENERAL  — 일반 (name, description, wait_for 등)
- *   FIO_OPT_C_FILE     — 파일 (filename, directory, filesize 등)
- *   FIO_OPT_C_IO       — I/O (rw, bs, iodepth, ioengine 등)
- *   FIO_OPT_C_STAT     — 통계 (write_bw_log, percentile_list 등)
- *   FIO_OPT_C_LOG      — 로깅
- *   FIO_OPT_C_VERIFY   — 검증 (verify, verify_pattern 등)
- *   FIO_OPT_C_ENGINE   — 엔진별 옵션
- *   FIO_OPT_C_PROFILE  — 프로파일별 옵션
+ * [필드 의미 — 파일 전체에 공통 적용, 각 엔트리에서 반복 설명하지 않음]
+ *
+ *   .name       CLI/INI 옵션 이름 (필수). 예: "rw", "bs", "iodepth". 첫 번째 매칭 키.
+ *   .lname      긴 설명 라벨 (fio --cmdhelp 및 GUI 출력에 사용).
+ *   .alias      옵션 별칭. 예: rw 의 alias="readwrite". 둘 다 동일 엔트리로 매칭.
+ *   .type       파싱 타입 — 파서가 값을 어떻게 해석할지 결정:
+ *                 FIO_OPT_STR        ─ 미리 정의된 posval 중 하나 매칭 (예: rw=randread).
+ *                 FIO_OPT_STR_STORE  ─ 임의 문자열을 strdup해서 보관 (예: filename).
+ *                 FIO_OPT_STR_SET    ─ 값 없이 플래그로 활성화 (예: --readonly).
+ *                 FIO_OPT_STR_VAL    ─ 단위(k/m/g) 포함 숫자를 uint64_t로. 예: size=4M.
+ *                 FIO_OPT_STR_VAL_INT ─ 위와 동일하나 int.
+ *                 FIO_OPT_STR_VAL_TIME ─ 시간 단위(us/ms/s/m/h) 포함. 예: runtime=30s.
+ *                 FIO_OPT_STR_VAL_ZONE ─ 바이트 or 존 단위 (z 접미사).
+ *                 FIO_OPT_INT        ─ 일반 정수. minval/maxval 클램프.
+ *                 FIO_OPT_ULL        ─ unsigned long long.
+ *                 FIO_OPT_BOOL       ─ 0/1 또는 true/false/yes/no.
+ *                 FIO_OPT_FLOAT_LIST ─ 콤마 구분 부동소수점 목록 (percentile 등).
+ *                 FIO_OPT_RANGE      ─ "min-max" 범위 파싱.
+ *                 FIO_OPT_STR_MULTI  ─ 여러 posval의 조합 (비트마스크).
+ *                 FIO_OPT_STR_ULL    ─ posval인데 unsigned long long 저장.
+ *                 FIO_OPT_DEPRECATED ─ 옵션은 유지하되 경고 출력 후 무시.
+ *                 FIO_OPT_UNSUPPORTED ─ 현재 빌드에서 사용 불가 (configure에서 비활성).
+ *                 FIO_OPT_INVALID    ─ 사용 금지 (프로파일 unload 시 마킹).
+ *   .off1~.off6  thread_options 내 저장 대상 필드 오프셋 (offsetof로 지정).
+ *                최대 6개 필드에 분산 저장 (예: 범위 옵션은 min=off1, max=off2).
+ *                off1=0 이면서 .cb가 있으면 "콜백에서 직접 처리" 의미 (패치 저장 없음).
+ *   .def        기본값 문자열. parse.c 가 잡 생성 시 자동 적용.
+ *   .help       --cmdhelp=<opt> 출력 텍스트.
+ *   .cb         커스텀 파싱 콜백 (위에서 정의된 str_*_cb 함수들).
+ *                시그니처: int (*)(void *data, const char *str|long long *val|unsigned long long *il|int *il).
+ *                data는 &td->o 이며 cb_data_to_td(data) 로 td 역산.
+ *   .verify     파싱 후 사후 검증 콜백. 실패 시 잡 전체 거부.
+ *                예: rw_verify → read_only 모드에서 write/trim 거부.
+ *   .minval/.maxval  INT/ULL 타입의 허용 범위. 초과 시 parse.c 가 에러.
+ *   .minlen/.maxlen  STR_STORE 타입의 문자열 길이 제한.
+ *   .interval   GUI 슬라이더 단계 (단위별 증감).
+ *   .posval[PARSE_MAX_VP=32]  STR/STR_MULTI 타입의 허용 값 테이블:
+ *                  { .ival="문자열", .oval=정수값, .help="설명", .cb=선택적 콜백 }.
+ *                  ioengine 같은 동적 엔트리는 engines/*.c 등록 시점에 add_opt_posval 로 추가됨.
+ *   .parent     종속 부모 옵션 이름. 이 옵션은 parent가 활성일 때만 유효.
+ *                예: iodepth_batch.parent="iodepth" → iodepth 설정 없으면 의미 없음.
+ *   .hide       이 옵션을 `fio --help` 출력에서 숨김 (내부용 / 드물게 쓰는 옵션).
+ *   .hide_on_set  다른 옵션 설정 시 자동 숨김 (상호배제 UX).
+ *   .exclusive_group  같은 그룹의 옵션들은 상호배타.
+ *   .prio       파싱 우선순위. 음수=나중, 양수=먼저. filename.prio=-1 → directory 먼저.
+ *   .category   FIO_OPT_C_{GENERAL,FILE,IO,ENGINE,STAT,LOG,VERIFY,PROFILE} — 대분류.
+ *   .group      FIO_OPT_G_* — 세부 그룹 (IO_BASIC/IO_BUF/FILENAME/RANDOM/ZONE/VERIFY/...).
+ *   .prof_name  이 옵션이 프로파일 전용일 때 프로파일명 기록 (profile unload 시 무효화 대상).
+ *   .inverse    불린의 반대 의미 옵션 (예: fallocate=none ↔ nofallocate=1).
+ *   .is_seconds 숫자를 초 단위로 해석 (runtime 등).
+ *   .is_time    시간 값 여부 (us/ms/s 파싱 힌트).
+ *
+ * [섹션 구성 — 아래 엔트리들은 대략 이 순서로 배치됨]
+ *   1) 일반(General): name, description, wait_for
+ *   2) 파일(File): filename, filetype, directory, filename_format, lockfile, opendir
+ *   3) I/O 패턴 및 엔진: rw, rw_sequencer, ioengine, ioengine_external
+ *   4) I/O 깊이: iodepth, iodepth_batch, iodepth_low, serialize_overlap, io_submit_mode
+ *   5) 블록 크기: bs, bs_unaligned, bssplit, bsrange, ba(blockalign)
+ *   6) 버퍼링/캐시: direct, atomic, buffered, sync, fadvise_hint
+ *   7) 실행 제어: size, io_size, fill_device, offset, offset_increment, numjobs, loops
+ *   8) 데이터 검증: verify, verify_interval, verify_pattern, verify_fatal, verify_async
+ *   9) 존(Zone): zonemode, zonesize, zonecapacity, zoneskip, zone_split, recovery_mode
+ *   10) FDP: fdp, fdp_pli, fdp_pli_select, dataplacement, dp_scheme
+ *   11) 속도 제한: rate, rate_min, rate_cycle, rate_process, rate_ignore_thinktime
+ *   12) 레이턴시 목표: latency_target, latency_window, latency_percentile, max_latency
+ *   13) CPU/NUMA: cpumask, cpus_allowed, cpus_allowed_policy, numa_cpu_nodes, numa_mem_policy
+ *   14) 로깅/통계: write_bw_log, write_lat_log, write_iops_log, log_avg_msec, ...
+ *
+ * [엔트리 해석 예시]
+ *   {
+ *     .name = "rw",                            → 이 이름으로 잡 파일/CLI에서 매칭
+ *     .lname = "Read/write",                   → --cmdhelp 출력 레이블
+ *     .alias = "readwrite",                    → 별칭
+ *     .type = FIO_OPT_STR,                     → posval 중 하나 매칭
+ *     .cb = str_rw_cb,                         → ",시퀀스" 후위 처리를 위한 커스텀 파서
+ *     .off1 = offsetof(thread_options, td_ddir), → 기본 매칭 결과 저장 위치
+ *     .def = "read",                           → 잡 파일에서 rw 미지정 시 순차 읽기
+ *     .verify = rw_verify,                     → readonly 모드 호환성 사후 검증
+ *     .category = FIO_OPT_C_IO,                → I/O 카테고리
+ *     .group = FIO_OPT_G_IO_BASIC,             → 기본 I/O 그룹
+ *     .posval = {                              → 허용 값 목록
+ *       { .ival = "read",      .oval = TD_DDIR_READ,      .help = "Sequential read" },
+ *       { .ival = "randread",  .oval = TD_DDIR_RANDREAD,  .help = "Random read" },
+ *       ...
+ *     },
+ *   }
+ *
+ * [sentinel]  배열 끝에는 { .name = NULL } 를 두어 parse.c 가 순회 종료를 감지한다.
+ *             FIO_MAX_OPTS 는 런타임에 add_option() 으로 동적 엔진 옵션을 추가할 때의 상한.
+ *
+ * ==================================================================
  */
 struct fio_option fio_options[FIO_MAX_OPTS] = {
 	/* ===== [한국어] 일반 옵션 (General) ===== */
