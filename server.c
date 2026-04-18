@@ -555,110 +555,217 @@ static const char *fio_server_ops[FIO_NET_CMD_NR] = {
 	"JOB_OPT",
 };
 
-/* [한국어] sk_out 락 획득 - 세마포어를 뮤텍스처럼 사용 */
+/*
+ * [한국어]
+ * sk_lock - sk_out 의 리스트 보호 세마포어 획득 (뮤텍스 역할)
+ *
+ * @sk_out: 보호 대상 연결 상태 컨텍스트.
+ * @return: 없음. 실패(데드락) 시 fio_sem_down 내부에서 abort.
+ *
+ * 왜 필요한가: sk_out->list 는 잡 스레드(결과 큐잉) 와 handle_xmits(flush)
+ * 양쪽에서 접근하므로 리스트 조작을 직렬화해야 한다. FIO_SEM 은 내부적으로
+ * pthread_mutex 와 동등 역할로 쓰인다.
+ * 호출 체인: fio_net_queue_entry / handle_xmits / sk_out_assign / __sk_out_drop
+ *           → sk_lock → fio_sem_down(&sk_out->lock).
+ * 컨텍스트: 어떤 스레드/프로세스에서든 호출 가능 — sk_out 이 멀티 owner 이기 때문.
+ */
 static void sk_lock(struct sk_out *sk_out)
 {
-	fio_sem_down(&sk_out->lock);
+	fio_sem_down(&sk_out->lock);  /* [한국어] FIO_SEM_UNLOCKED → LOCKED; 이미 LOCKED 면 대기 */
 }
 
-/* [한국어] sk_out 락 해제 */
+/*
+ * [한국어]
+ * sk_unlock - sk_lock() 으로 획득한 세마포어를 해제
+ *
+ * @sk_out: 락 소유 컨텍스트.
+ * @return: 없음.
+ *
+ * 호출 체인: 모든 sk_lock() 호출 사이트의 페어. 균형 맞지 않으면 다른 스레드가
+ *           영원히 대기.
+ */
 static void sk_unlock(struct sk_out *sk_out)
 {
-	fio_sem_up(&sk_out->lock);
+	fio_sem_up(&sk_out->lock);  /* [한국어] LOCKED → UNLOCKED; 대기 중 스레드 1개 깨움 */
 }
 
-/* [한국어] sk_out을 현재 스레드에 할당하고 참조 카운트 증가 */
+/*
+ * [한국어]
+ * sk_out_assign - 현재 스레드(잡/연결 처리)에 sk_out 을 바인딩하고 참조 카운트++
+ *
+ * @sk_out: 소유권을 얻을 소켓 상태 구조체 (NULL 가능 — 무시).
+ * @return: 없음.
+ *
+ * 왜 필요한가: fio_server_text_output / fio_server_send_ts 등의 결과 스트리밍 API 는
+ * pthread_getspecific(sk_out_key) 로 "현재 스레드가 어느 소켓에 속하는지" 찾는다.
+ * 잡 스레드가 생성될 때 이 함수를 호출해 TLS 에 등록해야 한다.
+ * 호출 체인: handle_run_cmd(fork 부모+자식) / handle_connection / fio_backend_thread
+ *           → sk_out_assign → pthread_setspecific.
+ * 컨텍스트: 새 잡/연결 스레드의 초기화 시점 — 부모와 자식이 각각 카운트를
+ *           1 씩 증가시켜 race-free 해제를 보장한다.
+ */
 void sk_out_assign(struct sk_out *sk_out)
 {
 	if (!sk_out)
-		return;
+		return;  /* [한국어] sk_out 이 없는 모드(로컬 실행 등) 에서는 no-op */
 
-	sk_lock(sk_out);
-	sk_out->refs++;
+	sk_lock(sk_out);                        /* [한국어] refs 원자적 증가 보호 */
+	sk_out->refs++;                         /* [한국어] 참조 카운트 +1 */
 	sk_unlock(sk_out);
-	pthread_setspecific(sk_out_key, sk_out);  /* [한국어] TLS에 sk_out 저장 */
+	pthread_setspecific(sk_out_key, sk_out); /* [한국어] 현재 스레드 TLS 에 저장 — 이후 queue/send 함수가 조회 */
 }
 
-/* [한국어] sk_out의 세마포어들을 제거하고 공유 메모리 해제 */
+/*
+ * [한국어]
+ * sk_out_free - sk_out 내부 세마포어 3개를 해제하고 공유 메모리 회수
+ *
+ * @sk_out: 참조 카운트가 0 이 된 sk_out.
+ * @return: 없음.
+ *
+ * 호출 체인: __sk_out_drop 이 refs==0 시점에 호출.
+ * 컨텍스트: "마지막" 참조자만 호출 — 다른 스레드가 sk_out 을 만지지 않음이 보장됨.
+ */
 static void sk_out_free(struct sk_out *sk_out)
 {
-	__fio_sem_remove(&sk_out->lock);
-	__fio_sem_remove(&sk_out->wait);
-	__fio_sem_remove(&sk_out->xmit);
-	sfree(sk_out);
+	__fio_sem_remove(&sk_out->lock);  /* [한국어] 리스트 보호 세마포어 파괴 */
+	__fio_sem_remove(&sk_out->wait);  /* [한국어] 작업 대기 세마포어 파괴 */
+	__fio_sem_remove(&sk_out->xmit);  /* [한국어] 전송 직렬화 세마포어 파괴 */
+	sfree(sk_out);                    /* [한국어] smalloc 공유메모리 힙으로 반환 */
 }
 
-/* [한국어] sk_out 참조 카운트 감소. 0이 되면 해제하고 0 반환, 아니면 1 반환 */
+/*
+ * [한국어]
+ * __sk_out_drop - sk_out 참조 카운트 1 감소; 0 이 되면 해제
+ *
+ * @sk_out: 참조 해제 대상 (NULL 허용).
+ * @return: 0 = 해제 완료(마지막 참조였음), 1 = 아직 남은 참조 존재 또는 NULL.
+ *
+ * 왜 필요한가: sk_out 은 부모-자식 프로세스 간 공유되므로 양측이 완료 시점을
+ * 알 수 없다 → 참조 카운트로 안전 해제.
+ * 호출 체인: handle_connection(_exit 직전) / sk_out_drop(잡 스레드 종료) → __sk_out_drop.
+ * 에러 경로: assert(sk_out->refs != 0) — 언더플로 감지 시 abort.
+ */
 static int __sk_out_drop(struct sk_out *sk_out)
 {
 	if (sk_out) {
 		int refs;
 
-		sk_lock(sk_out);
-		assert(sk_out->refs != 0);
-		refs = --sk_out->refs;
+		sk_lock(sk_out);                 /* [한국어] refs 조작 직렬화 */
+		assert(sk_out->refs != 0);       /* [한국어] 음수 방지 — drop 불균형 감지 */
+		refs = --sk_out->refs;           /* [한국어] 참조 카운트 -1, 지역 복사 */
 		sk_unlock(sk_out);
 
-		if (!refs) {
-			sk_out_free(sk_out);
-			pthread_setspecific(sk_out_key, NULL);
+		if (!refs) {                     /* [한국어] 마지막 참조였으면 */
+			sk_out_free(sk_out);     /* [한국어] 세마포어+힙 회수 */
+			pthread_setspecific(sk_out_key, NULL);  /* [한국어] TLS 도 클리어 */
 			return 0;
 		}
 	}
 
-	return 1;
+	return 1;  /* [한국어] 해제 안 됨(참조 남음) 또는 NULL 입력 */
 }
 
-/* [한국어] 현재 스레드의 sk_out 참조를 해제 (TLS에서 가져와서 drop) */
+/*
+ * [한국어]
+ * sk_out_drop - 현재 스레드의 sk_out 참조 해제 (TLS 에서 조회 → __sk_out_drop)
+ *
+ * @return: 없음.
+ *
+ * 호출 체인: fio_backend_thread / 잡 스레드 종료 직전 → sk_out_drop → __sk_out_drop.
+ */
 void sk_out_drop(void)
 {
 	struct sk_out *sk_out;
 
-	sk_out = pthread_getspecific(sk_out_key);
+	sk_out = pthread_getspecific(sk_out_key);  /* [한국어] 현재 스레드 TLS 에서 조회 */
 	__sk_out_drop(sk_out);
 }
 
-/* [한국어] 네트워크 명령 헤더 초기화 (페이로드 복사 없이 헤더만 설정) */
+/*
+ * [한국어]
+ * __fio_init_net_cmd - fio_net_cmd 헤더를 0 으로 초기화하고 필수 필드를 LE 로 채움
+ *
+ * @cmd: 채울 헤더 구조체(호출자 제공 버퍼).
+ * @opcode: FIO_NET_CMD_* 중 하나 (QUIT/EXIT/JOB/...).
+ * @pdu_len: 페이로드 바이트 수 (payload 필드 제외).
+ * @tag: 요청-응답 매칭 태그 (클라이언트 reply 포인터의 비트 캐스트 또는 0).
+ * @return: 없음. cmd 의 version/opcode/tag/pdu_len 채움; flags/crc 는 후속 단계.
+ *
+ * 왜 LE 로 변환하는가: fio 서버/클라이언트는 이기종(x86 vs ARM vs PPC) 간에도 동작해야
+ * 하므로 와이어 포맷을 리틀엔디안으로 고정하고 수신 측이 le*_to_cpu 로 역변환한다.
+ * 호출 체인: fio_init_net_cmd / fio_send_cmd_ext_pdu 가 호출 → CRC 계산 전에 사용.
+ */
 static void __fio_init_net_cmd(struct fio_net_cmd *cmd, uint16_t opcode,
 			       uint32_t pdu_len, uint64_t tag)
 {
-	memset(cmd, 0, sizeof(*cmd));
+	memset(cmd, 0, sizeof(*cmd));  /* [한국어] 모든 필드 0 — flags/cmd_crc16/pdu_crc16 기본값 */
 
-	cmd->version	= __cpu_to_le16(FIO_SERVER_VER);  /* [한국어] 프로토콜 버전을 리틀 엔디안으로 */
-	cmd->opcode	= cpu_to_le16(opcode);
-	cmd->tag	= cpu_to_le64(tag);
-	cmd->pdu_len	= cpu_to_le32(pdu_len);
+	cmd->version	= __cpu_to_le16(FIO_SERVER_VER);  /* [한국어] 프로토콜 버전 고정(수신 측 mismatch 거부) */
+	cmd->opcode	= cpu_to_le16(opcode);             /* [한국어] FIO_NET_CMD_* enum을 LE 16비트로 직렬화 */
+	cmd->tag	= cpu_to_le64(tag);                /* [한국어] 요청자 reply 포인터 또는 0 */
+	cmd->pdu_len	= cpu_to_le32(pdu_len);            /* [한국어] 뒤따르는 페이로드 길이 */
 }
 
-/* [한국어] 네트워크 명령 초기화 (헤더 + 페이로드 복사) */
+/*
+ * [한국어]
+ * fio_init_net_cmd - 헤더 초기화 + 페이로드를 cmd->payload 뒤쪽에 복사
+ *
+ * @cmd: 헤더 + 페이로드 공간을 포함한 버퍼(sizeof(fio_net_cmd) + pdu_len 바이트 이상).
+ * @opcode: FIO_NET_CMD_* opcode.
+ * @pdu: 복사할 페이로드 소스 (NULL 가능 — SIMPLE 명령).
+ * @pdu_len: 페이로드 바이트 수.
+ * @tag: 요청 태그.
+ * @return: 없음.
+ *
+ * 호출 체인: fio_net_send_cmd 가 매 프래그먼트마다 호출.
+ * 주의: 호출자는 cmd 가 충분히 크도록 사전에 malloc 해야 한다(flexible array 성격).
+ */
 static void fio_init_net_cmd(struct fio_net_cmd *cmd, uint16_t opcode,
 			     const void *pdu, uint32_t pdu_len, uint64_t tag)
 {
-	__fio_init_net_cmd(cmd, opcode, pdu_len, tag);
+	__fio_init_net_cmd(cmd, opcode, pdu_len, tag);  /* [한국어] 헤더 필드 세팅 */
 
 	if (pdu)
-		memcpy(&cmd->payload, pdu, pdu_len);  /* [한국어] 페이로드를 cmd 뒤에 복사 */
+		memcpy(&cmd->payload, pdu, pdu_len);  /* [한국어] payload[] 배열에 소스 복사 */
 }
 
-/* [한국어] opcode를 문자열로 변환 (디버그 로그용) */
+/*
+ * [한국어]
+ * fio_server_op - opcode 숫자를 사람이 읽는 문자열로 변환 (디버그/로그)
+ *
+ * @op: FIO_NET_CMD_* 값 (0..FIO_NET_CMD_NR-1 유효).
+ * @return: 정적 문자열 포인터 (범위 밖이면 "UNKNOWN/<n>" 형태 정적 버퍼).
+ *
+ * 주의: "UNKNOWN" 경로는 정적 버퍼를 재사용하므로 멀티스레드 안전하지 않으나,
+ *       디버그 경로라 실용상 문제 없음.
+ */
 const char *fio_server_op(unsigned int op)
 {
-	static char buf[32];
+	static char buf[32];  /* [한국어] "UNKNOWN/%d" 포매팅용 — 재진입 안전 아님 */
 
 	if (op < FIO_NET_CMD_NR)
-		return fio_server_ops[op];
+		return fio_server_ops[op];  /* [한국어] 알려진 opcode — 정적 문자열 반환 */
 
-	sprintf(buf, "UNKNOWN/%d", op);
+	sprintf(buf, "UNKNOWN/%d", op);   /* [한국어] 범위 밖 — 숫자 표시 */
 	return buf;
 }
 
-/* [한국어] iovec 배열의 총 데이터 길이 계산 */
+/*
+ * [한국어]
+ * iov_total_len - iovec 배열의 총 바이트 수 합산
+ *
+ * @iov: iovec 배열 시작.
+ * @count: 엔트리 수.
+ * @return: 전체 합계(바이트).
+ *
+ * 호출 체인: fio_sendv_data 가 전송 성공 시 차감 대상 총량 계산에 사용.
+ */
 static ssize_t iov_total_len(const struct iovec *iov, int count)
 {
 	ssize_t ret = 0;
 
-	while (count--) {
-		ret += iov->iov_len;
+	while (count--) {            /* [한국어] count 개 엔트리 순회 */
+		ret += iov->iov_len; /* [한국어] 각 iovec 의 바이트 누적 */
 		iov++;
 	}
 
@@ -666,57 +773,91 @@ static ssize_t iov_total_len(const struct iovec *iov, int count)
 }
 
 /*
- * [한국어] scatter/gather 방식으로 데이터를 소켓에 전송
- * writev()로 여러 버퍼를 한 번에 전송. 부분 전송 시 iov를 조정하여 재시도.
- * exit_backend가 true가 되면 전송 중단.
+ * [한국어]
+ * fio_sendv_data - scatter/gather 로 소켓 전송, 부분 전송 시 iov 전진
+ *
+ * @sk: 전송할 소켓 fd (TCP/Unix/IPv6 공통 — 스트림 소켓).
+ * @iov: iovec 배열 (내부에서 전진시키므로 호출자 측 변경 주의).
+ * @count: iovec 엔트리 수.
+ * @return: 0 = 전체 전송 완료, 1 = 실패(연결 종료/errno).
+ *
+ * 왜 writev 인가: fio_net_cmd 헤더 24B + PDU 를 한 syscall 로 묶어 TCP_NODELAY 미사용
+ * 환경에서 작은 패킷 분할을 방지한다. EAGAIN/EINTR 은 재시도(SA_RESTART 만으로 부족).
+ * 호출 체인: fio_send_data / fio_send_cmd_ext_pdu → fio_sendv_data →
+ *           writev(2) → 커널 TCP 송신 큐.
+ * 에러 경로: writev 반환 0 = peer close(EOF), 음수 = errno (EAGAIN/EINTR 제외 시 즉시 탈출).
+ * exit_backend: 시그널로 false→true 되면 루프 재진입 차단 (연결 강제 종료).
  */
 static int fio_sendv_data(int sk, struct iovec *iov, int count)
 {
-	ssize_t total_len = iov_total_len(iov, count);
+	ssize_t total_len = iov_total_len(iov, count);  /* [한국어] 전체 전송해야 할 총 바이트 */
 	ssize_t ret;
 
 	do {
-		ret = writev(sk, iov, count);
+		ret = writev(sk, iov, count);  /* [한국어] scatter-gather 쓰기 — 부분/전체/실패 3-way */
 		if (ret > 0) {
-			total_len -= ret;
+			total_len -= ret;  /* [한국어] 성공 바이트 만큼 잔여 감소 */
 			if (!total_len)
-				break;
+				break;     /* [한국어] 모두 전송 완료 */
 
+			/* [한국어] 부분 전송: iov 앞쪽 엔트리 소진 + 중간 엔트리는 오프셋 전진 */
 			while (ret) {
 				if (ret >= iov->iov_len) {
-					ret -= iov->iov_len;
-					iov++;
+					ret -= iov->iov_len; /* [한국어] 이 엔트리 완전히 송신됨 */
+					iov++;               /* [한국어] 다음 엔트리로 이동 */
 					continue;
 				}
-				iov->iov_base += ret;
-				iov->iov_len -= ret;
-				ret = 0;
+				iov->iov_base += ret;   /* [한국어] 중간 엔트리 — 버퍼 내부 전진 */
+				iov->iov_len -= ret;    /* [한국어] 남은 길이 감소 */
+				ret = 0;                /* [한국어] 정산 종료 */
 			}
 		} else if (!ret)
-			break;
+			break;  /* [한국어] writev 0 = peer 가 연결 닫음(FIN) */
 		else if (errno == EAGAIN || errno == EINTR)
-			continue;
+			continue;  /* [한국어] 비치명 에러 — 재시도 */
 		else
-			break;
-	} while (!exit_backend);
+			break;     /* [한국어] 치명 에러 (ECONNRESET/EPIPE 등) */
+	} while (!exit_backend);  /* [한국어] 시그널로 종료 요청 시 루프 탈출 */
 
 	if (!total_len)
-		return 0;
+		return 0;  /* [한국어] 전체 완료 */
 
-	return 1;
+	return 1;  /* [한국어] 미완료 — 호출자가 연결 종료 또는 실패 처리 */
 }
 
-/* [한국어] 단일 버퍼를 소켓에 전송 (fio_sendv_data의 래퍼) */
+/*
+ * [한국어]
+ * fio_send_data - 단일 버퍼 전송 (내부적으로 iovec 1개로 fio_sendv_data 호출)
+ *
+ * @sk: 소켓 fd.
+ * @p: 전송 버퍼.
+ * @len: 바이트 수 (MAX_FRAGMENT_PDU + 헤더 이하여야 함).
+ * @return: 0 성공, 1 실패.
+ *
+ * assert: 단일 프래그먼트 크기 이내를 보장 — 호출자는 이미 분할 처리를 했어야 함.
+ */
 static int fio_send_data(int sk, const void *p, unsigned int len)
 {
 	struct iovec iov = { .iov_base = (void *) p, .iov_len = len };
 
 	assert(len <= sizeof(struct fio_net_cmd) + FIO_SERVER_MAX_FRAGMENT_PDU);
+	/* [한국어] 단일 프래그먼트 상한 초과 방지 — 상위에서 분할 책임. */
 
 	return fio_sendv_data(sk, &iov, 1);
 }
 
-/* [한국어] 파일 디스크립터의 이벤트를 poll()로 확인. 타임아웃(ms) 내 이벤트 발생 시 true */
+/*
+ * [한국어]
+ * fio_server_poll_fd - 단일 fd 를 timeout ms 동안 이벤트 대기
+ *
+ * @fd: 감시할 파일 디스크립터.
+ * @events: 감시 이벤트(POLLIN/POLLOUT/POLLERR 등의 OR).
+ * @timeout: 밀리초 단위 대기 시간. -1 무한, 0 논블록 폴링.
+ * @return: true = 요청한 이벤트 발생, false = 타임아웃/에러/EINTR.
+ *
+ * 호출 체인: 클라이언트 측 커넥션 상태 조회용 유틸 (client.c 에서 주로 사용).
+ * 에러 경로: EINTR = 시그널 — false 반환으로 재시도는 호출자 몫.
+ */
 bool fio_server_poll_fd(int fd, short events, int timeout)
 {
 	struct pollfd pfd = {
@@ -725,24 +866,35 @@ bool fio_server_poll_fd(int fd, short events, int timeout)
 	};
 	int ret;
 
-	ret = poll(&pfd, 1, timeout);
+	ret = poll(&pfd, 1, timeout);  /* [한국어] nfds=1 단일 fd 폴. timeout=ms, -1 은 무한 */
 	if (ret < 0) {
 		if (errno == EINTR)
-			return false;
+			return false;  /* [한국어] 시그널로 인한 조기 반환 — 재시도는 호출자 몫 */
 		log_err("fio: poll: %s\n", strerror(errno));
 		return false;
 	} else if (!ret) {
-		return false;
+		return false;  /* [한국어] 타임아웃 — 이벤트 없음 */
 	}
 	if (pfd.revents & events)
-		return true;
-	return false;
+		return true;   /* [한국어] 요청한 비트가 revents 에 들어옴 — 정상 이벤트 */
+	return false;          /* [한국어] POLLERR/POLLHUP 만 발생 — 요청한 이벤트는 아님 */
 }
 
 /*
- * [한국어] 소켓에서 데이터 수신
- * wait=true면 MSG_WAITALL로 요청한 길이만큼 완전 수신 대기.
- * wait=false면 비블로킹으로 현재 가능한 만큼만 수신.
+ * [한국어]
+ * fio_recv_data - 소켓에서 len 바이트 수신
+ *
+ * @sk: 스트림 소켓 fd.
+ * @buf: 수신 버퍼(호출자 소유).
+ * @len: 수신할 바이트 수.
+ * @wait: true 면 MSG_WAITALL 로 정확히 len 바이트 대기(블로킹);
+ *        false 면 OS_MSG_DONTWAIT 로 현재 가능한 만큼만 수신 후 재시도.
+ * @return: 0 성공, -1 실패(연결 종료 또는 에러).
+ *
+ * MSG_WAITALL 주의: 시그널 EINTR 가 오면 부분 수신 상태로 반환될 수 있어
+ *                 내부에서 EINTR/EAGAIN 을 재시도한다.
+ * 호출 체인: fio_net_recv_cmd → fio_recv_data (헤더 1회 + PDU 1회) → recv(2).
+ * 에러 경로: recv 0 = peer close (EOF). 단, 완전 수신 성공 직후 len=0 → 정상 return 0.
  */
 static int fio_recv_data(int sk, void *buf, unsigned int len, bool wait)
 {
@@ -750,48 +902,60 @@ static int fio_recv_data(int sk, void *buf, unsigned int len, bool wait)
 	char *p = buf;
 
 	if (wait)
-		flags = MSG_WAITALL;
+		flags = MSG_WAITALL;  /* [한국어] 전체 len 도달까지 블로킹 — 짧은 수신 방지 */
 	else
-		flags = OS_MSG_DONTWAIT;
+		flags = OS_MSG_DONTWAIT;  /* [한국어] 비블로킹 — 현재 가능한 만큼만 */
 
 	do {
 		int ret = recv(sk, p, len, flags);
 
 		if (ret > 0) {
-			len -= ret;
+			len -= ret;    /* [한국어] 수신 바이트 만큼 남은 길이 감소 */
 			if (!len)
-				break;
-			p += ret;
+				break; /* [한국어] 전체 수신 완료 */
+			p += ret;      /* [한국어] 버퍼 포인터 전진 */
 			continue;
 		} else if (!ret)
-			break;
+			break;  /* [한국어] recv 0 = peer EOF */
 		else if (errno == EAGAIN || errno == EINTR) {
 			if (wait)
-				continue;
-			break;
+				continue;  /* [한국어] wait 모드 — 재시도 */
+			break;             /* [한국어] 비동기 모드 — 포기 */
 		} else
-			break;
+			break;  /* [한국어] 치명적 에러 */
 	} while (!exit_backend);
 
 	if (!len)
-		return 0;
+		return 0;  /* [한국어] 완전 수신 성공 */
 
-	return -1;
+	return -1;  /* [한국어] 부분/실패 — 호출자가 에러 처리 */
 }
 
 /*
- * [한국어] 수신된 명령의 CRC를 검증하고 네트워크 바이트 오더에서 호스트 바이트 오더로 변환
- * 버전 확인과 PDU 크기 검증도 수행한다.
+ * [한국어]
+ * verify_convert_cmd - 수신한 fio_net_cmd 헤더의 CRC16 를 검증하고 LE→CPU 변환
+ *
+ * @cmd: 수신한 헤더 버퍼(내용이 in-place 로 변환됨).
+ * @return: 0 성공, 1 실패(CRC 불일치/버전 mismatch/PDU 크기 초과).
+ *
+ * CRC 범위: FIO_NET_CMD_CRC_SZ = offsetof(pdu_crc16) + sizeof(pdu_crc16) 이전 영역.
+ *           즉 payload 제외한 헤더 전체. pdu_crc16/cmd_crc16 필드는 CRC 계산 시 0 취급.
+ * 에러 경로:
+ *   - CRC mismatch → log_err + fprintf(f_err) → 호출자(fio_net_recv_cmd) 가 연결 종료.
+ *   - version != FIO_SERVER_VER → 동일 처리 + "client/server version mismatch".
+ *   - pdu_len > FIO_SERVER_MAX_FRAGMENT_PDU → 단일 조각 상한 초과 거부 (재조립 필요).
+ * 호출 체인: fio_net_recv_cmd → verify_convert_cmd → fio_crc16 (CCITT 다항식).
  */
 static int verify_convert_cmd(struct fio_net_cmd *cmd)
 {
 	uint16_t crc;
 
-	cmd->cmd_crc16 = le16_to_cpu(cmd->cmd_crc16);
-	cmd->pdu_crc16 = le16_to_cpu(cmd->pdu_crc16);
+	cmd->cmd_crc16 = le16_to_cpu(cmd->cmd_crc16);  /* [한국어] CRC 필드 먼저 호스트 바이트 오더로 복원 */
+	cmd->pdu_crc16 = le16_to_cpu(cmd->pdu_crc16);  /* [한국어] 페이로드 CRC 비교용 */
 
-	crc = fio_crc16(cmd, FIO_NET_CMD_CRC_SZ);
+	crc = fio_crc16(cmd, FIO_NET_CMD_CRC_SZ);  /* [한국어] 헤더만 CRC 재계산 — cmd_crc16 필드는 직전에 복원된 상태(LE 상 0이어도 보관값 기준 검증 대상 외) */
 	if (crc != cmd->cmd_crc16) {
+		/* [한국어] 헤더 CRC 불일치 — 회선 손상 또는 버전 mismatch 가능성 */
 		log_err("fio: server bad crc on command (got %x, wanted %x)\n",
 				cmd->cmd_crc16, crc);
 		fprintf(f_err, "fio: server bad crc on command (got %x, wanted %x)\n",
@@ -799,6 +963,7 @@ static int verify_convert_cmd(struct fio_net_cmd *cmd)
 		return 1;
 	}
 
+	/* [한국어] 나머지 필드도 일괄 복원 — CRC 검증 통과했으므로 내용 신뢰 가능 */
 	cmd->version	= le16_to_cpu(cmd->version);
 	cmd->opcode	= le16_to_cpu(cmd->opcode);
 	cmd->flags	= le32_to_cpu(cmd->flags);
@@ -807,8 +972,9 @@ static int verify_convert_cmd(struct fio_net_cmd *cmd)
 
 	switch (cmd->version) {
 	case FIO_SERVER_VER:
-		break;
+		break;  /* [한국어] 현재 버전 — 정상 */
 	default:
+		/* [한국어] 버전 불일치 — 클라/서버 fio 버전 호환 안 됨 */
 		log_err("fio: bad server cmd version %d\n", cmd->version);
 		fprintf(f_err, "fio: client/server version mismatch (%d != %d)\n",
 				cmd->version, FIO_SERVER_VER);
@@ -816,21 +982,41 @@ static int verify_convert_cmd(struct fio_net_cmd *cmd)
 	}
 
 	if (cmd->pdu_len > FIO_SERVER_MAX_FRAGMENT_PDU) {
+		/* [한국어] 단일 프래그먼트 상한 초과 — 악의적 또는 프로토콜 버그 */
 		log_err("fio: command payload too large: %u\n", cmd->pdu_len);
 		return 1;
 	}
 
-	return 0;
+	return 0;  /* [한국어] 검증 통과 */
 }
 
 /*
  * Read (and defragment, if necessary) incoming commands
  */
 /*
- * [한국어] 네트워크에서 명령을 수신하고 필요시 프래그먼트를 재조립
- * FIO_NET_CMD_F_MORE 플래그가 설정된 프래그먼트들을 연속 수신하여
- * 하나의 완전한 명령으로 합친다. 텍스트/잡 명령은 NULL 종결 추가.
- * 반환된 메모리는 호출자가 free()해야 한다.
+ * [한국어]
+ * fio_net_recv_cmd - 소켓에서 1개의 완전한 fio_net_cmd 를 수신(필요 시 재조립)
+ *
+ * @sk: 수신 소켓 fd.
+ * @wait: true 면 MSG_WAITALL 블로킹 수신.
+ * @return: 성공 시 malloc 한 fio_net_cmd* (호출자가 free), 실패 시 NULL.
+ *
+ * 프래그먼트 처리: 첫 헤더 수신 후 FIO_NET_CMD_F_MORE 가 세트이면 동일 opcode 의
+ * 조각이 계속 이어진다. 각 조각마다 (a) 헤더 수신+검증 (b) 버퍼 realloc (c) PDU 수신
+ * (d) PDU CRC 검증 → pdu_len 누적. 마지막 조각(F_MORE 없음)에서 루프 탈출.
+ *
+ * NUL 종결: opcode 가 TEXT/JOB 이면 호출자가 strlen/문자열 처리하기 좋도록
+ * malloc 시 +1 하여 끝에 '\0' 을 기록.
+ *
+ * 에러 경로:
+ *   - fio_recv_data 실패 → free(cmdret) → NULL 반환.
+ *   - CRC mismatch → 동일.
+ *   - 조각 opcode 불일치(fragment opcode mismatch) → 동일.
+ *   - cmd_size > FIO_SERVER_MAX_CMD_MB → 동일.
+ *
+ * 호출 체인: handle_connection(서버) / handle_client_fd(클라이언트) → fio_net_recv_cmd
+ *           → fio_recv_data → recv(2).
+ * 컨텍스트: 서버는 fork 자식 프로세스의 main thread, 클라이언트는 메인 스레드.
  */
 struct fio_net_cmd *fio_net_recv_cmd(int sk, bool wait)
 {
@@ -932,59 +1118,125 @@ struct fio_net_cmd *fio_net_recv_cmd(int sk, bool wait)
 	return cmdret;
 }
 
-/* [한국어] 응답 추적 항목을 대기 리스트에 추가 (태그로 응답 매칭) */
+/*
+ * [한국어]
+ * add_reply - 전송한 명령에 대한 응답 추적 엔트리를 대기 리스트에 추가
+ *
+ * @tag: alloc_reply 가 반환한 포인터를 비트 캐스트한 값.
+ * @list: 응답 대기 리스트(클라이언트 측 fio_client->cmd_list).
+ * @return: 없음.
+ *
+ * 왜 포인터 인코딩인가: 프로토콜 tag 필드는 64비트 불투명 값 — 클라이언트는 포인터를
+ * 그대로 심어두고 서버 응답이 돌아올 때 자기 reply 구조체를 찾는 용도로 사용.
+ * 네트워크를 넘어도 변하지 않으므로 OK.
+ * 호출 체인: fio_net_send_cmd / fio_net_send_simple_cmd → add_reply → flist_add_tail.
+ */
 static void add_reply(uint64_t tag, struct flist_head *list)
 {
 	struct fio_net_cmd_reply *reply;
 
-	reply = (struct fio_net_cmd_reply *) (uintptr_t) tag;
-	flist_add_tail(&reply->list, list);
+	reply = (struct fio_net_cmd_reply *) (uintptr_t) tag;  /* [한국어] 비트 캐스트로 포인터 복원 */
+	flist_add_tail(&reply->list, list);                    /* [한국어] 응답 대기 리스트에 연결 */
 }
 
-/* [한국어] 응답 추적 구조체 할당. 태그에 포인터를 인코딩하여 반환 */
+/*
+ * [한국어]
+ * alloc_reply - 응답 추적 구조체 할당 후 포인터를 비트 캐스트로 tag 로 반환
+ *
+ * @tag: 상위에서 전달된 원본 태그(saved_tag 로 보존 — 응답 식별에 활용).
+ * @opcode: 이 요청의 FIO_NET_CMD_* — 응답 매칭 검증에 사용.
+ * @return: (uintptr_t) reply 포인터를 uint64_t 로 비트 캐스트한 값.
+ *
+ * 생명주기: 대기 리스트(flist)에 들어간 채로 응답 도착을 기다림 → 응답 처리 후
+ *          호출자가 free_reply 로 해제. 실패 경로에선 송신 실패 시 free_reply 로 회수.
+ */
 static uint64_t alloc_reply(uint64_t tag, uint16_t opcode)
 {
 	struct fio_net_cmd_reply *reply;
 
-	reply = calloc(1, sizeof(*reply));
-	INIT_FLIST_HEAD(&reply->list);
-	fio_gettime(&reply->ts, NULL);
-	reply->saved_tag = tag;
-	reply->opcode = opcode;
+	reply = calloc(1, sizeof(*reply));        /* [한국어] 0 초기화된 reply 할당 */
+	INIT_FLIST_HEAD(&reply->list);            /* [한국어] intrusive 리스트 노드 초기화 */
+	fio_gettime(&reply->ts, NULL);            /* [한국어] 요청 시각 기록 — ETA/RTT 측정 */
+	reply->saved_tag = tag;                   /* [한국어] 원본 태그 보존 */
+	reply->opcode = opcode;                   /* [한국어] 응답 opcode 매칭용 */
 
-	return (uintptr_t) reply;
+	return (uintptr_t) reply;  /* [한국어] 포인터를 wire tag 로 전송 */
 }
 
-/* [한국어] 응답 추적 구조체 해제. 태그에서 포인터를 디코딩하여 free */
+/*
+ * [한국어]
+ * free_reply - tag 에 인코딩된 reply 포인터를 디코딩하여 free
+ *
+ * @tag: alloc_reply 가 반환했던 값.
+ * @return: 없음.
+ *
+ * 호출 경로: (a) 송신 실패 시 즉시 회수, (b) 응답 수신 후 클라이언트 측에서 회수.
+ */
 static void free_reply(uint64_t tag)
 {
 	struct fio_net_cmd_reply *reply;
 
-	reply = (struct fio_net_cmd_reply *) (uintptr_t) tag;
+	reply = (struct fio_net_cmd_reply *) (uintptr_t) tag;  /* [한국어] 비트 캐스트로 포인터 복원 */
 	free(reply);
 }
 
-/* [한국어] 명령 헤더와 별도 PDU 버퍼에 대해 CRC16 계산 후 설정 */
+/*
+ * [한국어]
+ * fio_net_cmd_crc_pdu - 헤더 CRC 와 외부 PDU 버퍼에 대한 CRC 를 계산하여 헤더에 세트
+ *
+ * @cmd: 헤더 구조체 (cmd_crc16/pdu_crc16 필드가 LE 로 채워짐).
+ * @pdu: 별도 할당된 페이로드 버퍼(cmd->payload 와 분리된 경우).
+ * @return: 없음.
+ *
+ * 두 CRC 분리 계산 이유: 프래그먼트 전송 시 헤더는 매번 재계산되지만 페이로드 버퍼는
+ * 위치가 다를 수 있다. writev iov[0]=cmd + iov[1]=buf 형태(fio_send_cmd_ext_pdu) 에서 사용.
+ */
 static void fio_net_cmd_crc_pdu(struct fio_net_cmd *cmd, const void *pdu)
 {
 	uint32_t pdu_len;
 
 	cmd->cmd_crc16 = __cpu_to_le16(fio_crc16(cmd, FIO_NET_CMD_CRC_SZ));
+	/* [한국어] 헤더 부분(FIO_NET_CMD_CRC_SZ = pdu_crc16 이전까지) CRC → LE 로 저장.
+	 *         cmd_crc16 자체는 필드 값 0 기준으로 계산하도록 fio_crc16 설계.
+	 */
 
-	pdu_len = le32_to_cpu(cmd->pdu_len);
+	pdu_len = le32_to_cpu(cmd->pdu_len);  /* [한국어] LE 로 저장된 길이를 CPU 해석 */
 	cmd->pdu_crc16 = __cpu_to_le16(fio_crc16(pdu, pdu_len));
-}
-
-/* [한국어] 인라인 페이로드(cmd->payload)에 대해 CRC16 계산 */
-static void fio_net_cmd_crc(struct fio_net_cmd *cmd)
-{
-	fio_net_cmd_crc_pdu(cmd, cmd->payload);
+	/* [한국어] 별도 버퍼 pdu 의 CRC — 수신 측 fio_net_recv_cmd 가 비교. */
 }
 
 /*
- * [한국어] 페이로드 포함 명령을 소켓으로 직접 전송
- * 큰 페이로드는 FIO_SERVER_MAX_FRAGMENT_PDU 단위로 프래그먼트 분할 전송.
- * list가 non-NULL이면 응답 추적 항목을 할당하여 리스트에 추가한다.
+ * [한국어]
+ * fio_net_cmd_crc - cmd->payload 인라인 페이로드에 대해 CRC16 계산(wrapper)
+ *
+ * @cmd: 헤더+인라인 페이로드가 연속된 버퍼.
+ * @return: 없음.
+ *
+ * 인라인 페이로드 경로: fio_net_send_cmd 가 malloc(sizeof(cmd)+pdu_len) 한 후
+ *                     payload[] flexible array 로 접근할 때 사용.
+ */
+static void fio_net_cmd_crc(struct fio_net_cmd *cmd)
+{
+	fio_net_cmd_crc_pdu(cmd, cmd->payload);  /* [한국어] cmd 연속 영역의 payload 시작점 사용 */
+}
+
+/*
+ * [한국어]
+ * fio_net_send_cmd - 인라인 페이로드 버전의 완전한 명령 전송 (프래그먼트 자동 분할)
+ *
+ * @fd: 전송 소켓 fd.
+ * @opcode: FIO_NET_CMD_* opcode.
+ * @buf: 페이로드 버퍼 (NULL 이면 SIMPLE 명령과 유사).
+ * @size: 페이로드 바이트 수.
+ * @tagptr: In/Out. NULL=태그 없음. list 가 있으면 이 위치에 alloc_reply 결과가 저장됨.
+ * @list: non-NULL 이면 alloc_reply + add_reply 로 응답 대기 리스트에 등록.
+ * @return: 0 성공, 1 실패.
+ *
+ * 프래그먼트 전송: size > FIO_SERVER_MAX_FRAGMENT_PDU 이면 조각으로 나눠
+ * 각 조각에 FIO_NET_CMD_F_MORE 를 세트(마지막 조각 제외)하고 연속 전송.
+ * 버퍼 재사용: cur_len 이 this_len 보다 작거나 cmd==NULL 이면 realloc 대신 free+malloc.
+ * 호출 체인: fio_net_send_simple_cmd 등 상위 편의 함수에서 호출 → fio_init_net_cmd +
+ *           fio_net_cmd_crc + fio_send_data → 커널 TCP 송신.
  */
 int fio_net_send_cmd(int fd, uint16_t opcode, const void *buf, off_t size,
 		     uint64_t *tagptr, struct flist_head *list)
@@ -995,36 +1247,39 @@ int fio_net_send_cmd(int fd, uint16_t opcode, const void *buf, off_t size,
 	int ret;
 
 	if (list) {
-		assert(tagptr);
-		tag = *tagptr = alloc_reply(*tagptr, opcode);
+		assert(tagptr);                           /* [한국어] 응답 추적 요청 시 tagptr 필수 */
+		tag = *tagptr = alloc_reply(*tagptr, opcode); /* [한국어] reply 할당 + tagptr 갱신 */
 	} else
-		tag = tagptr ? *tagptr : 0;
+		tag = tagptr ? *tagptr : 0;   /* [한국어] 호출자 지정 태그 또는 0 */
 
 	do {
 		this_len = size;
 		if (this_len > FIO_SERVER_MAX_FRAGMENT_PDU)
-			this_len = FIO_SERVER_MAX_FRAGMENT_PDU;
+			this_len = FIO_SERVER_MAX_FRAGMENT_PDU;  /* [한국어] 한 조각의 상한으로 클램프 */
 
+		/* [한국어] 버퍼 재사용: cur_len 이 부족하면 재할당 */
 		if (!cmd || cur_len < sizeof(*cmd) + this_len) {
 			if (cmd)
-				free(cmd);
+				free(cmd);  /* [한국어] 기존 작은 버퍼 해제 */
 
 			cur_len = sizeof(*cmd) + this_len;
 			cmd = malloc(cur_len);
 		}
 
-		fio_init_net_cmd(cmd, opcode, buf, this_len, tag);
+		fio_init_net_cmd(cmd, opcode, buf, this_len, tag);  /* [한국어] 헤더+페이로드 세팅 */
 
 		if (this_len < size)
 			cmd->flags = __cpu_to_le32(FIO_NET_CMD_F_MORE);
+			/* [한국어] 뒤에 조각이 더 있음 — 수신 측이 재조립 */
 
-		fio_net_cmd_crc(cmd);
+		fio_net_cmd_crc(cmd);  /* [한국어] cmd_crc16 + pdu_crc16 계산·세트 */
 
-		ret = fio_send_data(fd, cmd, sizeof(*cmd) + this_len);
-		size -= this_len;
-		buf += this_len;
-	} while (!ret && size);
+		ret = fio_send_data(fd, cmd, sizeof(*cmd) + this_len);  /* [한국어] writev 단일 호출 */
+		size -= this_len;  /* [한국어] 남은 크기 감소 */
+		buf += this_len;   /* [한국어] 버퍼 포인터 전진 */
+	} while (!ret && size);  /* [한국어] 성공 & 남은 데이터 있으면 계속 */
 
+	/* [한국어] 응답 추적 — 실패 시 reply 회수, 성공 시 대기 리스트에 등록 */
 	if (list) {
 		if (ret)
 			free_reply(tag);
@@ -1033,14 +1288,24 @@ int fio_net_send_cmd(int fd, uint16_t opcode, const void *buf, off_t size,
 	}
 
 	if (cmd)
-		free(cmd);
+		free(cmd);  /* [한국어] 임시 버퍼 해제 (응답 추적과 무관) */
 
 	return ret;
 }
 
 /*
- * [한국어] 전송 큐 엔트리(sk_entry) 준비
- * SK_F_COPY 플래그 시 buf를 smalloc으로 복사. 아니면 buf 포인터만 저장.
+ * [한국어]
+ * fio_net_prep_cmd - sk_entry 하나를 SHM 힙에 할당해 채움(큐에 넣기 직전 상태)
+ *
+ * @opcode: FIO_NET_CMD_*.
+ * @buf: 페이로드 포인터. SK_F_COPY 면 smalloc 힙으로 복사, 아니면 그대로 저장.
+ * @size: 페이로드 크기.
+ * @tagptr: 요청-응답 매칭 태그 포인터(NULL 허용).
+ * @flags: SK_F_* 비트 OR.
+ * @return: 성공 시 sk_entry*, 실패(smalloc 실패) 시 NULL.
+ *
+ * 호출 체인: fio_net_queue_cmd / fio_send_iolog 등 → fio_net_prep_cmd →
+ *           fio_net_queue_entry → handle_xmits.
  */
 static struct sk_entry *fio_net_prep_cmd(uint16_t opcode, void *buf,
 					 size_t size, uint64_t *tagptr,
@@ -1048,17 +1313,17 @@ static struct sk_entry *fio_net_prep_cmd(uint16_t opcode, void *buf,
 {
 	struct sk_entry *entry;
 
-	entry = smalloc(sizeof(*entry));
+	entry = smalloc(sizeof(*entry));  /* [한국어] SHM 힙에 엔트리 할당 — fork 자식도 접근 가능 */
 	if (!entry)
 		return NULL;
 
-	INIT_FLIST_HEAD(&entry->next);
+	INIT_FLIST_HEAD(&entry->next);  /* [한국어] VEC 체인 헤드 — 빈 리스트로 초기화 */
 	entry->opcode = opcode;
 	if (flags & SK_F_COPY) {
-		entry->buf = smalloc(size);
+		entry->buf = smalloc(size);   /* [한국어] 호출자 버퍼를 SHM 복사 — 생명주기 독립 */
 		memcpy(entry->buf, buf, size);
 	} else
-		entry->buf = buf;
+		entry->buf = buf;  /* [한국어] 포인터만 보관 — SK_F_FREE/기타 소유권 */
 
 	entry->size = size;
 	if (tagptr)
@@ -1072,25 +1337,38 @@ static struct sk_entry *fio_net_prep_cmd(uint16_t opcode, void *buf,
 static int handle_sk_entry(struct sk_out *sk_out, struct sk_entry *entry);
 
 /*
- * [한국어] 전송 큐에 엔트리를 추가
- * SK_F_INLINE이면 큐잉 없이 즉시 전송. 아니면 sk_out->list에 추가 후 wait 세마포어 시그널.
+ * [한국어]
+ * fio_net_queue_entry - sk_entry 를 현재 스레드의 sk_out 전송 큐에 추가
+ *
+ * @entry: 이미 prep 된 sk_entry.
+ * @return: 없음.
+ *
+ * SK_F_INLINE 분기: 큐잉 지연 없이 즉시 handle_sk_entry 로 전송 (VTRIGGER 등 시급한 응답).
+ * 일반 경로: sk_out->lock 으로 리스트 보호하며 꼬리에 추가 → sk_out->wait 올려
+ *           handle_xmits/handle_connection 을 깨움.
  */
 static void fio_net_queue_entry(struct sk_entry *entry)
 {
-	struct sk_out *sk_out = pthread_getspecific(sk_out_key);
+	struct sk_out *sk_out = pthread_getspecific(sk_out_key);  /* [한국어] 현재 스레드의 소켓 컨텍스트 */
 
 	if (entry->flags & SK_F_INLINE)
-		handle_sk_entry(sk_out, entry);
+		handle_sk_entry(sk_out, entry);  /* [한국어] 지연 없이 즉시 전송 */
 	else {
-		sk_lock(sk_out);
-		flist_add_tail(&entry->list, &sk_out->list);
+		sk_lock(sk_out);                                     /* [한국어] 리스트 보호 */
+		flist_add_tail(&entry->list, &sk_out->list);         /* [한국어] FIFO 꼬리에 추가 */
 		sk_unlock(sk_out);
 
-		fio_sem_up(&sk_out->wait);
+		fio_sem_up(&sk_out->wait);  /* [한국어] handle_connection poll 루프 깨움(절전 탈출) */
 	}
 }
 
-/* [한국어] 명령을 전송 큐에 추가 (prep + queue) */
+/*
+ * [한국어]
+ * fio_net_queue_cmd - prep + queue 를 한 번에 (상위 편의 함수)
+ *
+ * @opcode/@buf/@size/@tagptr/@flags: fio_net_prep_cmd 참조.
+ * @return: 0 성공, 1 실패(smalloc 실패).
+ */
 static int fio_net_queue_cmd(uint16_t opcode, void *buf, off_t size,
 			     uint64_t *tagptr, int flags)
 {
@@ -1105,15 +1383,26 @@ static int fio_net_queue_cmd(uint16_t opcode, void *buf, off_t size,
 	return 1;
 }
 
-/* [한국어] 페이로드 없는 단순 명령을 스택 변수로 직접 전송 */
+/*
+ * [한국어]
+ * fio_net_send_simple_stack_cmd - 페이로드 없는 명령을 스택 변수로 즉시 직송
+ *
+ * @sk: 소켓 fd.
+ * @opcode: FIO_NET_CMD_*.
+ * @tag: 태그.
+ * @return: 0 성공, 1 실패.
+ *
+ * 왜 스택 변수인가: 페이로드 없는 24B 헤더만 전송하므로 heap 할당 불필요.
+ * 호출 체인: fio_net_send_simple_cmd → fio_net_send_simple_stack_cmd → fio_send_data.
+ */
 static int fio_net_send_simple_stack_cmd(int sk, uint16_t opcode, uint64_t tag)
 {
-	struct fio_net_cmd cmd;
+	struct fio_net_cmd cmd;  /* [한국어] 스택에 24B 헤더 */
 
-	fio_init_net_cmd(&cmd, opcode, NULL, 0, tag);
-	fio_net_cmd_crc(&cmd);
+	fio_init_net_cmd(&cmd, opcode, NULL, 0, tag);  /* [한국어] 페이로드 0 */
+	fio_net_cmd_crc(&cmd);                         /* [한국어] 헤더 CRC 계산 */
 
-	return fio_send_data(sk, &cmd, sizeof(cmd));
+	return fio_send_data(sk, &cmd, sizeof(cmd));   /* [한국어] writev 단일 호출 */
 }
 
 /*
@@ -1121,8 +1410,16 @@ static int fio_net_send_simple_stack_cmd(int sk, uint16_t opcode, uint64_t tag)
  * later verification.
  */
 /*
- * [한국어] 단순 명령 전송. list가 non-NULL이면 응답 추적 항목도 관리.
- * 전송 실패 시 응답 추적 항목을 해제한다.
+ * [한국어]
+ * fio_net_send_simple_cmd - 페이로드 없는 명령의 외부용 API (응답 추적 옵션 포함)
+ *
+ * @sk: 소켓 fd.
+ * @opcode: FIO_NET_CMD_*.
+ * @tag: 원본 태그. list 있으면 내부적으로 alloc_reply 결과로 대체.
+ * @list: non-NULL 이면 응답 대기 리스트 등록.
+ * @return: 0 성공, 송신 실패 시 errno 또는 음수.
+ *
+ * 에러 경로: 송신 실패 시 alloc_reply 로 생성된 reply 를 free_reply 로 회수.
  */
 int fio_net_send_simple_cmd(int sk, uint16_t opcode, uint64_t tag,
 			    struct flist_head *list)
@@ -1130,31 +1427,47 @@ int fio_net_send_simple_cmd(int sk, uint16_t opcode, uint64_t tag,
 	int ret;
 
 	if (list)
-		tag = alloc_reply(tag, opcode);
+		tag = alloc_reply(tag, opcode);  /* [한국어] 응답 대기 엔트리 할당 */
 
 	ret = fio_net_send_simple_stack_cmd(sk, opcode, tag);
 	if (ret) {
 		if (list)
-			free_reply(tag);
+			free_reply(tag);  /* [한국어] 송신 실패 — reply 회수 */
 
 		return ret;
 	}
 
 	if (list)
-		add_reply(tag, list);
+		add_reply(tag, list);  /* [한국어] 송신 성공 — 대기 리스트에 등록 */
 
 	return 0;
 }
 
-/* [한국어] QUIT 명령을 전송 큐에 추가 (현재 잡 종료 요청) */
+/*
+ * [한국어]
+ * fio_net_queue_quit - QUIT 명령을 현재 스레드 전송 큐에 추가
+ *
+ * @return: 0 성공, 1 실패.
+ *
+ * 의미: "현재 잡을 종료하시오" — 연결은 유지. handle_xmits 가 비동기 flush.
+ */
 static int fio_net_queue_quit(void)
 {
 	dprint(FD_NET, "server: sending quit\n");
 
 	return fio_net_queue_cmd(FIO_NET_CMD_QUIT, NULL, 0, NULL, SK_F_SIMPLE);
+	/* [한국어] SK_F_SIMPLE — 페이로드 없는 명령 */
 }
 
-/* [한국어] QUIT 명령을 소켓으로 직접 전송 */
+/*
+ * [한국어]
+ * fio_net_send_quit - QUIT 을 소켓에 직접 전송 (큐 경유 X)
+ *
+ * @sk: 소켓 fd.
+ * @return: 0 성공, 1 실패.
+ *
+ * 주로 클라이언트 측이 서버에 종료 요청을 보낼 때 사용.
+ */
 int fio_net_send_quit(int sk)
 {
 	dprint(FD_NET, "server: sending quit\n");
@@ -1162,30 +1475,60 @@ int fio_net_send_quit(int sk)
 	return fio_net_send_simple_cmd(sk, FIO_NET_CMD_QUIT, 0, NULL);
 }
 
-/* [한국어] STOP 명령 전송 (에러 코드와 시그널 정보를 ACK로 전송) */
+/*
+ * [한국어]
+ * fio_net_send_ack - STOP 명령(잡 종료 상태 + 시그널)을 큐에 추가
+ *
+ * @cmd: 요청 측 cmd (NULL 가능 — 자발적 STOP).
+ * @error: 잡 exit status.
+ * @signal: 시그널로 죽었을 때 시그널 번호, 아니면 0.
+ * @return: 0 성공, 1 실패.
+ */
 static int fio_net_send_ack(struct fio_net_cmd *cmd, int error, int signal)
 {
 	struct cmd_end_pdu epdu;
 	uint64_t tag = 0;
 
 	if (cmd)
-		tag = cmd->tag;
+		tag = cmd->tag;  /* [한국어] 요청 태그 보존 — 클라 측에서 원 요청과 매칭 */
 
-	epdu.error = __cpu_to_le32(error);
+	epdu.error = __cpu_to_le32(error);    /* [한국어] 32비트 LE 로 직렬화 */
 	epdu.signal = __cpu_to_le32(signal);
 	return fio_net_queue_cmd(FIO_NET_CMD_STOP, &epdu, sizeof(epdu), &tag, SK_F_COPY);
+	/* [한국어] SK_F_COPY — 스택 변수 epdu 를 smalloc 복사 */
 }
 
-/* [한국어] STOP 명령을 큐에 추가 (잡 종료 알림) */
+/*
+ * [한국어]
+ * fio_net_queue_stop - 잡 종료를 클라에 알리는 STOP 명령 큐잉(간편 래퍼)
+ *
+ * @error: exit status. @signal: 시그널 번호(없으면 0).
+ * @return: 0 성공, 1 실패.
+ *
+ * 호출 체인: fio_server_fork_item_done(자식 잡 종료 감지 시) → fio_net_queue_stop →
+ *           fio_net_send_ack → fio_net_queue_cmd.
+ */
 static int fio_net_queue_stop(int error, int signal)
 {
 	dprint(FD_NET, "server: sending stop (%d, %d)\n", error, signal);
 	return fio_net_send_ack(NULL, error, signal);
 }
 
-/* [한국어] 포크된 프로세스/스레드를 추적 리스트에 추가하고 상태를 관리하는 함수들 */
+/*
+ * [한국어] === 포크 아이템 추적/종료 회수 함수군 ===
+ * conn_list(연결 처리 프로세스) 와 job_list(잡 실행 프로세스/스레드) 각각에 엔트리
+ * 추가, 비블로킹 waitpid/GetExitCodeProcess 로 종료 감지, 회수 시 필요에 따라
+ * STOP/QUIT 클라 전송. POSIX 와 Windows 경로 분리.
+ */
 #ifdef WIN32
-/* [한국어] Windows: 포크 아이템 추가 */
+/*
+ * [한국어]
+ * fio_server_add_fork_item (Windows) - fio_fork_item 을 할당해 리스트에 꼬리 추가
+ *
+ * @element: thread/hProcess 유니온.
+ * @list: conn_list 또는 job_list.
+ * @return: 없음.
+ */
 static void fio_server_add_fork_item(struct ffi_element *element, struct flist_head *list)
 {
 	struct fio_fork_item *ffi;
@@ -1198,7 +1541,14 @@ static void fio_server_add_fork_item(struct ffi_element *element, struct flist_h
 	flist_add_tail(&ffi->list, list);
 }
 
-/* [한국어] Windows: 연결 처리 프로세스를 추적 리스트에 추가 */
+/*
+ * [한국어]
+ * fio_server_add_conn_pid (Windows) - 연결 처리 자식 프로세스 HANDLE 을 conn_list 에 등록
+ *
+ * @conn_list: 연결 처리 프로세스 리스트.
+ * @hProcess: CreateProcess 반환 프로세스 핸들.
+ * @return: 없음.
+ */
 static void fio_server_add_conn_pid(struct flist_head *conn_list, HANDLE hProcess)
 {
 	struct ffi_element element = {.hProcess = hProcess, .is_thread=FALSE};
@@ -1207,7 +1557,16 @@ static void fio_server_add_conn_pid(struct flist_head *conn_list, HANDLE hProces
 	fio_server_add_fork_item(&element, conn_list);
 }
 
-/* [한국어] Windows: 잡 실행 스레드를 추적 리스트에 추가 */
+/*
+ * [한국어]
+ * fio_server_add_job_pid (Windows) - 잡 실행 pthread 핸들을 job_list 에 등록
+ *
+ * @job_list: 잡 실행 스레드 리스트.
+ * @thread: pthread_create 반환 스레드 핸들.
+ * @return: 없음.
+ *
+ * is_thread=TRUE 로 유니온 판별자 세트.
+ */
 static void fio_server_add_job_pid(struct flist_head *job_list, pthread_t thread)
 {
 	struct ffi_element element = {.thread = thread, .is_thread=TRUE};
@@ -1215,7 +1574,18 @@ static void fio_server_add_job_pid(struct flist_head *job_list, pthread_t thread
 	fio_server_add_fork_item(&element, job_list);
 }
 
-/* [한국어] Windows: 포크 아이템의 종료 상태 확인 (스레드/프로세스 구분) */
+/*
+ * [한국어]
+ * fio_server_check_fork_item (Windows) - 스레드/프로세스 종료 상태 비블로킹 확인
+ *
+ * @ffi: 체크 대상.
+ * @return: 없음. ffi->exited/exitval 업데이트.
+ *
+ * 분기:
+ *   is_thread=true → pthread_kill(thread, 0) 로 존재 확인. 죽었으면 pthread_join 으로
+ *                   exit code 수거(POSIX 스레드의 "status" = void* 반환값).
+ *   is_thread=false → GetExitCodeProcess 로 STILL_ACTIVE 확인. STILL_ACTIVE 아니면 종료.
+ */
 static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 {
 	int ret;
@@ -1245,7 +1615,14 @@ static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 	}
 }
 #else
-/* [한국어] POSIX: 포크 아이템을 추적 리스트에 추가 */
+/*
+ * [한국어]
+ * fio_server_add_fork_item (POSIX) - fio_fork_item 할당 후 리스트 꼬리 추가
+ *
+ * @pid: 자식 PID (fork 반환값).
+ * @list: conn_list 또는 job_list.
+ * @return: 없음.
+ */
 static void fio_server_add_fork_item(pid_t pid, struct flist_head *list)
 {
 	struct fio_fork_item *ffi;
@@ -1254,44 +1631,64 @@ static void fio_server_add_fork_item(pid_t pid, struct flist_head *list)
 	ffi->exitval = 0;
 	ffi->signal = 0;
 	ffi->exited = 0;
-	ffi->pid = pid;
+	ffi->pid = pid;                        /* [한국어] waitpid 대상 */
 	flist_add_tail(&ffi->list, list);
 }
 
-/* [한국어] POSIX: 연결 처리 프로세스를 추적 리스트에 추가 */
+/*
+ * [한국어]
+ * fio_server_add_conn_pid (POSIX) - 연결 처리 자식 PID 를 conn_list 에 등록
+ */
 static void fio_server_add_conn_pid(struct flist_head *conn_list, pid_t pid)
 {
 	dprint(FD_NET, "server: forked off connection job (pid=%u)\n", (int) pid);
 	fio_server_add_fork_item(pid, conn_list);
 }
 
-/* [한국어] POSIX: 잡 실행 프로세스를 추적 리스트에 추가 */
+/*
+ * [한국어]
+ * fio_server_add_job_pid (POSIX) - 잡 실행 자식 PID 를 job_list 에 등록
+ */
 static void fio_server_add_job_pid(struct flist_head *job_list, pid_t pid)
 {
 	dprint(FD_NET, "server: forked off job job (pid=%u)\n", (int) pid);
 	fio_server_add_fork_item(pid, job_list);
 }
 
-/* [한국어] POSIX: waitpid()로 자식 프로세스 종료 상태를 비블로킹 확인 */
+/*
+ * [한국어]
+ * fio_server_check_fork_item (POSIX) - waitpid(WNOHANG) 로 자식 종료 비블로킹 확인
+ *
+ * @ffi: 체크 대상 fork item.
+ * @return: 없음. ffi->exited/signal/exitval 업데이트.
+ *
+ * waitpid 반환 규약:
+ *   0 = 자식 아직 살아있음 (WNOHANG). ffi->exited 변경 없음.
+ *   >0 = pid 반환 = 종료 감지. status 를 WIFSIGNALED/WIFEXITED 로 해석.
+ *   <0 + ECHILD = 자식이 이미 회수됨 또는 존재하지 않음 → 분실 경고 + exited=1.
+ *   기타 에러 = 로그만 남기고 다음 루프 대기.
+ */
 static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 {
 	int ret, status;
 
-	ret = waitpid(ffi->pid, &status, WNOHANG);
+	ret = waitpid(ffi->pid, &status, WNOHANG);  /* [한국어] 블로킹 없이 즉시 상태 조회 */
 	if (ret < 0) {
 		if (errno == ECHILD) {
+			/* [한국어] 자식이 이미 reap 되었거나 존재하지 않음 */
 			log_err("fio: connection pid %u disappeared\n", (int) ffi->pid);
 			ffi->exited = 1;
 		} else
 			log_err("fio: waitpid: %s\n", strerror(errno));
 	} else if (ret == ffi->pid) {
+		/* [한국어] 자식이 종료됨 — status 해석 */
 		if (WIFSIGNALED(status)) {
-			ffi->signal = WTERMSIG(status);
+			ffi->signal = WTERMSIG(status);  /* [한국어] 시그널로 종료 */
 			ffi->exited = 1;
 		}
 		if (WIFEXITED(status)) {
 			if (WEXITSTATUS(status))
-				ffi->exitval = WEXITSTATUS(status);
+				ffi->exitval = WEXITSTATUS(status);  /* [한국어] exit(n) 의 n */
 			ffi->exited = 1;
 		}
 	}
@@ -1299,9 +1696,17 @@ static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 #endif
 
 /*
- * [한국어] 포크 아이템 종료 처리
- * stop=true면 STOP/QUIT 명령을 클라이언트에 전송 (잡 실행 완료 알림).
- * 리스트에서 제거하고 메모리 해제.
+ * [한국어]
+ * fio_server_fork_item_done - 종료된 자식(잡/연결) 회수: 리스트 제거 + 필요시 STOP/QUIT
+ *
+ * @ffi: 종료 확인된 fork item.
+ * @stop: true 면 잡 실행 자식 — STOP(exitval/signal)+QUIT 를 클라에 큐잉.
+ *        false 면 연결 처리 자식 — STOP 보내지 않음 (연결 자체가 이미 닫힘).
+ * @return: 없음.
+ *
+ * Windows: HANDLE 닫기. POSIX: 별도 리소스 없음(waitpid 가 이미 해제).
+ * 호출 체인: fio_server_check_fork_items → fio_server_fork_item_done →
+ *           fio_net_queue_stop+fio_net_queue_quit + flist_del + free.
  */
 static void fio_server_fork_item_done(struct fio_fork_item *ffi, bool stop)
 {
@@ -1329,7 +1734,16 @@ static void fio_server_fork_item_done(struct fio_fork_item *ffi, bool stop)
 	free(ffi);
 }
 
-/* [한국어] 포크 아이템 리스트의 모든 항목에 대해 종료 상태 확인 및 정리 */
+/*
+ * [한국어]
+ * fio_server_check_fork_items - 리스트 순회하며 각 자식 상태 점검 + 정리
+ *
+ * @list: conn_list 또는 job_list.
+ * @stop: fio_server_fork_item_done 의 stop 인자.
+ * @return: 없음.
+ *
+ * flist_for_each_safe 이디엄: 순회 중 리스트 원소 제거 가능(tmp 포인터로 안전 진행).
+ */
 static void fio_server_check_fork_items(struct flist_head *list, bool stop)
 {
 	struct flist_head *entry, *tmp;
@@ -1345,46 +1759,81 @@ static void fio_server_check_fork_items(struct flist_head *list, bool stop)
 	}
 }
 
-/* [한국어] 잡 프로세스 목록의 종료 상태 확인 (종료 시 STOP/QUIT 전송) */
+/*
+ * [한국어]
+ * fio_server_check_jobs - 잡 프로세스 리스트의 종료 확인 (+ STOP/QUIT 송신)
+ *
+ * @job_list: handle_connection 보유 잡 프로세스 리스트.
+ * @return: 없음.
+ *
+ * stop=true — 잡 종료 시 클라에 종료 상태 통보.
+ */
 static void fio_server_check_jobs(struct flist_head *job_list)
 {
 	fio_server_check_fork_items(job_list, true);
 }
 
-/* [한국어] 연결 프로세스 목록의 종료 상태 확인 (STOP/QUIT 전송 안 함) */
+/*
+ * [한국어]
+ * fio_server_check_conns - 연결 프로세스 리스트 종료 확인 (STOP 송신 없음)
+ *
+ * @conn_list: accept_loop 의 연결 자식 리스트.
+ * @return: 없음.
+ *
+ * stop=false — 연결 자식 종료는 연결 자체가 이미 끊긴 상태라 통보 불필요/불가.
+ */
 static void fio_server_check_conns(struct flist_head *conn_list)
 {
 	fio_server_check_fork_items(conn_list, false);
 }
 
 /*
- * [한국어] LOAD_FILE 명령 처리 - 서버 로컬 파일에서 잡 설정을 로드
- * 파일을 parse_jobs_ini()로 파싱 후 성공하면 START 응답을 전송한다.
+ * [한국어]
+ * handle_load_file_cmd - LOAD_FILE 명령 처리: 서버 로컬 ini 파일로부터 잡 로드
+ *
+ * @cmd: 수신 fio_net_cmd. payload = cmd_load_file_pdu{name_len, client_type, file[]}.
+ * @return: 0 성공(START 응답 큐잉), -1 실패(QUIT 큐잉).
+ *
+ * 클라이언트가 "서버 측 로컬 경로에서 잡 파일을 읽어라" 요청할 때 사용.
+ * parse_jobs_ini(name, is_buf=0, stdin=0, client_type) — is_buf=0 → 경로로 취급.
+ * 성공 시 FIO_NET_CMD_START PDU(thread_number, stat_outputs) 로 응답.
+ * 호출 체인: handle_command(LOAD_FILE case) → handle_load_file_cmd → parse_jobs_ini.
  */
 static int handle_load_file_cmd(struct fio_net_cmd *cmd)
 {
 	struct cmd_load_file_pdu *pdu = (struct cmd_load_file_pdu *) cmd->payload;
-	void *file_name = pdu->file;
+	void *file_name = pdu->file;  /* [한국어] flexible array — payload 끝에 경로 문자열 */
 	struct cmd_start_pdu spdu;
 
 	dprint(FD_NET, "server: loading local file %s\n", (char *) file_name);
 
-	pdu->name_len = le16_to_cpu(pdu->name_len);
+	pdu->name_len = le16_to_cpu(pdu->name_len);         /* [한국어] LE → CPU */
 	pdu->client_type = le16_to_cpu(pdu->client_type);
 
+	/* [한국어] parse_jobs_ini(name, is_buf=0, stdin=0, client_type) — 파일 경로로 열어 파싱 */
 	if (parse_jobs_ini(file_name, 0, 0, pdu->client_type)) {
-		fio_net_queue_quit();
+		fio_net_queue_quit();  /* [한국어] 파싱 실패 — 클라에 QUIT 통보 */
 		return -1;
 	}
 
-	spdu.jobs = cpu_to_le32(thread_number);
-	spdu.stat_outputs = cpu_to_le32(stat_number);
+	spdu.jobs = cpu_to_le32(thread_number);       /* [한국어] 파싱된 잡 수 */
+	spdu.stat_outputs = cpu_to_le32(stat_number); /* [한국어] 통계 출력 엔트리 수 */
 	fio_net_queue_cmd(FIO_NET_CMD_START, &spdu, sizeof(spdu), NULL, SK_F_COPY);
 	return 0;
 }
 
 #ifdef WIN32
-/* [한국어] Windows: 백엔드를 별도 스레드에서 실행하는 래퍼 함수 */
+/*
+ * [한국어]
+ * fio_backend_thread (Windows) - pthread_create 엔트리 포인트 (fork 대체)
+ *
+ * @data: sk_out 포인터.
+ * @return: pthread_exit 으로 반환 — ret 을 void* 로 인코딩.
+ *
+ * POSIX 는 fork 로 주소공간을 분리하지만 Windows 는 pthread_create 로 스레드만 분리.
+ * sk_out_assign 을 이 스레드에서 다시 호출해 refs 를 2 로 유지 — 호출자(부모)와
+ * 자식 스레드 양쪽이 완료해야 안전하게 해제.
+ */
 static void *fio_backend_thread(void *data)
 {
 	int ret;
@@ -1401,18 +1850,28 @@ static void *fio_backend_thread(void *data)
 #endif
 
 /*
- * [한국어] RUN 명령 처리 - 잡 실행 시작
- * POSIX: fork()하여 자식에서 fio_backend() 실행
- * Windows: pthread_create()로 별도 스레드에서 실행
- * 부모/메인 스레드는 잡 프로세스를 추적 리스트에 추가한다.
+ * [한국어]
+ * handle_run_cmd - RUN 명령 처리: 실제 I/O 잡 실행 시작
+ *
+ * @sk_out: 연결 소켓 컨텍스트 (자식도 공유 — refs 2 증가).
+ * @job_list: 잡 프로세스/스레드 추적 리스트.
+ * @cmd: FIO_NET_CMD_RUN (페이로드 없음 — 태그만 사용 가능).
+ * @return: 0 성공, 음수 실패(pthread_create 에러 등).
+ *
+ * POSIX: fork() 하여 자식에서 fio_backend(sk_out) 실행 → 자식이 STOP 큐잉 후 _exit.
+ * Windows: fork 없음 → pthread_create(fio_backend_thread) 로 별도 스레드 시작.
+ * 두 경우 모두 부모/자식이 sk_out_assign 을 각각 호출해 refs++ → 자식 종료 시에만
+ * 자기 참조 드롭으로 안전한 해제.
+ * fio_time_init + set_genesis_time 을 호출해 이 잡 실행 시작 시간 기준 세팅.
+ * 호출 체인: handle_command(RUN case) → handle_run_cmd → fork → fio_backend.
  */
 static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list,
 			  struct fio_net_cmd *cmd)
 {
 	int ret;
 
-	fio_time_init();
-	set_genesis_time();
+	fio_time_init();      /* [한국어] 타임베이스 정렬 (TSC 또는 clock_gettime 백엔드) */
+	set_genesis_time();   /* [한국어] 잡 실행 시작 기준 시각 저장 */
 
 #ifdef WIN32
 	{
@@ -1420,47 +1879,56 @@ static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list,
 		/* both this thread and backend_thread call sk_out_assign() to double increment
 		 * the ref count.  This ensures struct is valid until both threads are done with it
 		 */
-		sk_out_assign(sk_out);
+		sk_out_assign(sk_out);  /* [한국어] 부모측 refs++ */
 		ret = pthread_create(&thread, NULL,	fio_backend_thread, sk_out);
 		if (ret) {
 			log_err("pthread_create: %s\n", strerror(ret));
 			return ret;
 		}
 
-		fio_server_add_job_pid(job_list, thread);
+		fio_server_add_job_pid(job_list, thread);  /* [한국어] 스레드 핸들 추적 */
 		return ret;
 	}
 #else
     {
 		pid_t pid;
-		sk_out_assign(sk_out);
+		sk_out_assign(sk_out);  /* [한국어] 부모 측 refs++ (fork 전이라 자식도 상속) */
 		pid = fork();
 		if (pid) {
+			/* [한국어] 부모 경로: 잡 PID 추적 리스트에 추가 */
 			fio_server_add_job_pid(job_list, pid);
 			return 0;
 		}
 
-		ret = fio_backend(sk_out);
-		free_threads_shm();
-		sk_out_drop();
-		_exit(ret);
+		/* [한국어] 자식 경로: 실제 I/O 잡 실행 */
+		ret = fio_backend(sk_out);  /* [한국어] 잡 스레드 생성 + I/O 루프 + 통계 수집 */
+		free_threads_shm();         /* [한국어] SHM 에 잡 구조체 회수 */
+		sk_out_drop();              /* [한국어] 자식측 refs-- */
+		_exit(ret);                 /* [한국어] 자식 즉시 종료 — atexit/stdio 생략 */
 	}
 #endif
 }
 
 /*
- * [한국어] JOB 명령 처리 - 클라이언트가 전송한 잡 설정(ini 형식 버퍼)을 파싱
- * 성공하면 잡 수와 통계 출력 수를 START 응답으로 전송한다.
+ * [한국어]
+ * handle_job_cmd - JOB 명령 처리: 클라가 보낸 ini 버퍼를 서버가 파싱
+ *
+ * @cmd: payload = cmd_job_pdu{buf_len, client_type, buf[]}.
+ * @return: 0 성공(START 큐잉), -1 실패(QUIT 큐잉).
+ *
+ * LOAD_FILE 과 다른 점: buf 는 파일 경로가 아니라 ini 내용 자체. parse_jobs_ini 의
+ * 두 번째 인자 is_buf=1 로 호출해 내부에서 경로 대신 버퍼로 취급.
  */
 static int handle_job_cmd(struct fio_net_cmd *cmd)
 {
 	struct cmd_job_pdu *pdu = (struct cmd_job_pdu *) cmd->payload;
-	void *buf = pdu->buf;
+	void *buf = pdu->buf;       /* [한국어] flexible array — ini 문자열 */
 	struct cmd_start_pdu spdu;
 
 	pdu->buf_len = le32_to_cpu(pdu->buf_len);
 	pdu->client_type = le32_to_cpu(pdu->client_type);
 
+	/* [한국어] is_buf=1 → parse_jobs_ini 가 buf 를 메모리 버퍼로 해석 */
 	if (parse_jobs_ini(buf, 1, 0, pdu->client_type)) {
 		fio_net_queue_quit();
 		return -1;
@@ -1474,8 +1942,15 @@ static int handle_job_cmd(struct fio_net_cmd *cmd)
 }
 
 /*
- * [한국어] JOBLINE 명령 처리 - 클라이언트가 전송한 커맨드라인 인자들을 파싱
- * 여러 줄의 인자를 argv 배열로 변환 후 parse_cmd_line()으로 처리한다.
+ * [한국어]
+ * handle_jobline_cmd - JOBLINE 명령 처리: 클라가 보낸 CLI argv 를 재구성해 parse_cmd_line
+ *
+ * @cmd: payload = cmd_line_pdu{lines, client_type} + 이어서 lines 개의
+ *       cmd_single_line_pdu{len, text[]} 가 연속 배치.
+ * @return: 0 성공(START 큐잉), -1 실패(QUIT 큐잉).
+ *
+ * 직렬화 형식: PDU 는 가변 길이 문자열 배열을 담으므로 오프셋 계산으로 각 인자를 분리.
+ * argv[] 배열을 malloc 후 parse_cmd_line 호출.
  */
 static int handle_jobline_cmd(struct fio_net_cmd *cmd)
 {
@@ -1519,9 +1994,16 @@ static int handle_jobline_cmd(struct fio_net_cmd *cmd)
 }
 
 /*
- * [한국어] PROBE 명령 처리 - 서버 시스템 정보를 클라이언트에 응답
- * 호스트명, OS, 아키텍처, CPU 수, fio 버전, zlib 지원 여부 등을 전송.
- * 클라이언트와 서버 모두 zlib을 지원하면 압축 전송을 활성화한다.
+ * [한국어]
+ * handle_probe_cmd - PROBE 명령 처리: 서버 식별 정보 응답 + zlib 네고
+ *
+ * @cmd: payload = cmd_client_probe_pdu{flags, server[]}. 클라가 서버를 식별하는
+ *       이름(me[]) 과 자신의 flags(FIO_PROBE_FLAG_ZLIB) 를 전송.
+ * @return: 0 성공(PROBE 응답 큐잉), 1 실패.
+ *
+ * 응답 내용: hostname(gethostname), fio_version, OS, arch, bpp(포인터 크기),
+ *          cpus_configured(_SC_NPROCESSORS), bigendian 플래그, zlib 지원 여부.
+ * zlib 양측 지원 시 use_zlib=1 → fio_send_iolog 가 IOLOG 를 XMIT_COMPRESSED 로 전송.
  */
 static int handle_probe_cmd(struct fio_net_cmd *cmd)
 {
@@ -1560,9 +2042,16 @@ static int handle_probe_cmd(struct fio_net_cmd *cmd)
 }
 
 /*
- * [한국어] SEND_ETA 명령 처리 - 현재 잡의 진행 상태(ETA) 정보를 클라이언트에 응답
- * 로컬 ETA가 없으면 빈 응답을 보내서 클라이언트 타임아웃을 방지한다.
- * 모든 필드를 네트워크 바이트 오더로 변환 후 전송.
+ * [한국어]
+ * handle_send_eta_cmd - SEND_ETA 명령 처리: 현재 잡 진행률(ETA) 를 ETA 응답으로 전송
+ *
+ * @cmd: payload 없음. cmd->tag 를 응답 태그로 보존.
+ * @return: 0 (항상 성공 취급 — 로컬 ETA 없으면 zero-filled 응답).
+ *
+ * 왜 zero-filled 응답인가: 클라가 ETA 요청 후 응답 타임아웃을 돌리고 있으므로
+ * 서버 쪽에 잡이 없어도 반드시 응답해야 함.
+ * get_jobs_eta(true, &size) 가 활성 잡 집계. 모든 필드를 LE 로 변환.
+ * DDIR_RWDIR_CNT = 3 (READ/WRITE/TRIM) 방향별 rate/iops 4종 세트 변환.
  */
 static int handle_send_eta_cmd(struct fio_net_cmd *cmd)
 {
@@ -1608,7 +2097,14 @@ static int handle_send_eta_cmd(struct fio_net_cmd *cmd)
 	return 0;
 }
 
-/* [한국어] UPDATE_JOB 명령에 대한 응답 전송 (에러 코드 포함) */
+/*
+ * [한국어]
+ * send_update_job_reply - UPDATE_JOB 응답 (성공/실패 에러 코드) 전송
+ *
+ * @__tag: 요청자의 태그(응답 매칭용).
+ * @error: 0 성공 또는 errno.
+ * @return: 0 성공, 1 실패.
+ */
 static int send_update_job_reply(uint64_t __tag, int error)
 {
 	uint64_t tag = __tag;
@@ -1619,8 +2115,14 @@ static int send_update_job_reply(uint64_t __tag, int error)
 }
 
 /*
- * [한국어] UPDATE_JOB 명령 처리 - 실행 중인 잡의 옵션을 업데이트
- * 스레드 번호로 thread_data를 찾아 옵션을 변환 적용한다.
+ * [한국어]
+ * handle_update_job_cmd - UPDATE_JOB 처리: 실행 중 잡의 옵션을 변경
+ *
+ * @cmd: payload = cmd_add_job_pdu{thread_number, top(직렬화 옵션)}.
+ * @return: 0 (응답 송신까지 항상 성공 취급 — 실제 결과는 UPDATE_JOB 응답의 에러 필드).
+ *
+ * tnumber 가 유효 범위를 벗어나면 ENODEV 응답. 아니면 tnumber_to_td 로 td 조회 후
+ * convert_thread_options_to_cpu 로 네트워크 직렬화된 옵션을 CPU 구조체에 복사.
  */
 static int handle_update_job_cmd(struct fio_net_cmd *cmd)
 {
@@ -1646,9 +2148,21 @@ static int handle_update_job_cmd(struct fio_net_cmd *cmd)
 }
 
 /*
- * [한국어] VTRIGGER 명령 처리 - verify 트리거 실행
- * 현재 I/O 상태를 수집하여 클라이언트에 전송한 뒤,
- * 모든 스레드를 종료하고 트리거 명령을 실행한다.
+ * [한국어]
+ * handle_trigger_cmd - VTRIGGER 처리: 현재 I/O 상태 수집 후 트리거 명령 실행
+ *
+ * @cmd: payload = cmd_vtrigger_pdu{len, cmd[]} — 실행할 셸 명령.
+ * @job_list: 현재 연결의 잡 프로세스 추적 리스트.
+ * @return: 0.
+ *
+ * 동작:
+ *   1) get_all_io_list(IO_LIST_ALL, &sz) — 모든 잡의 io_history 수집.
+ *   2) VTRIGGER 응답 큐잉(SK_F_INLINE — 지연 없이 즉시 전송). 실패 시 빈 응답.
+ *   3) fio_terminate_threads(TERMINATE_ALL, TERMINATE_ALL) — 모든 잡 종료 예약.
+ *   4) fio_server_check_jobs — STOP/QUIT 송신 기회 부여.
+ *   5) exec_trigger(buf) — fork+execvp 로 셸 명령 실행.
+ *
+ * 사용 목적: 재부팅/전원 차단 전에 I/O 상태를 저장해 재기동 후 검증.
  */
 static int handle_trigger_cmd(struct fio_net_cmd *cmd, struct flist_head *job_list)
 {
@@ -1676,9 +2190,32 @@ static int handle_trigger_cmd(struct fio_net_cmd *cmd, struct flist_head *job_li
 }
 
 /*
- * [한국어] 수신된 명령을 opcode별로 분기 처리하는 메인 디스패처
- * 각 opcode에 대응하는 handle_*_cmd() 함수를 호출한다.
- * EXIT 명령 수신 시 exit_backend를 설정하고 -1을 반환하여 연결 루프를 종료.
+ * [한국어]
+ * handle_command - 수신 fio_net_cmd 를 opcode 별로 분기하는 메인 디스패처
+ *
+ * @sk_out: 이 연결의 소켓 상태 컨텍스트.
+ * @job_list: 현재 연결에서 실행 중인 잡 프로세스 추적 리스트.
+ * @cmd: 수신/검증 완료된 명령 (verify_convert_cmd 통과).
+ * @return: 0 = 정상 처리 후 다음 명령 수신, >0 = 처리 실패(연결 유지),
+ *          -1 = EXIT 수신(루프 탈출).
+ *
+ * 각 case 별 의미:
+ *   QUIT        → fio_terminate_threads(TERMINATE_ALL) — 현재 잡만 종료(연결은 유지).
+ *   EXIT        → exit_backend=true + -1 반환 — 서버 데몬 완전 종료 예약.
+ *   LOAD_FILE   → handle_load_file_cmd — 서버 로컬 ini 경로 수신 → parse_jobs_ini.
+ *   JOB         → handle_job_cmd — 클라 전송 ini 버퍼 → parse_jobs_ini (buf 형태).
+ *   JOBLINE     → handle_jobline_cmd — CLI argv 재구성 → parse_cmd_line.
+ *   PROBE       → handle_probe_cmd — OS/arch/cpus/zlib 교환.
+ *   SEND_ETA    → handle_send_eta_cmd — jobs_eta 구조체 응답.
+ *   RUN         → handle_run_cmd — fork + fio_backend(실제 I/O 실행).
+ *   UPDATE_JOB  → handle_update_job_cmd — 실행 중 옵션 변경.
+ *   VTRIGGER    → handle_trigger_cmd — verify 트리거 + exec_trigger.
+ *   SENDFILE    → 인라인 처리 — verify state 파일 응답을 cmd_reply 세마포어로 전달.
+ *   default     → 알 수 없는 opcode — 에러 반환(연결 유지).
+ *
+ * 호출 체인: handle_connection → fio_net_recv_cmd → handle_command → handle_*_cmd.
+ * 컨텍스트: 서버 fork 자식 프로세스의 main thread. 단, RUN case 는 또 한 번 fork
+ *           하여 자손 프로세스에서 fio_backend 실행.
  */
 static int handle_command(struct sk_out *sk_out, struct flist_head *job_list,
 			  struct fio_net_cmd *cmd)
@@ -1691,63 +2228,76 @@ static int handle_command(struct sk_out *sk_out, struct flist_head *job_list,
 
 	switch (cmd->opcode) {
 	case FIO_NET_CMD_QUIT:
+		/* [한국어] 현재 실행 중인 모든 잡을 중단 — 연결은 유지(다음 명령 수신 가능) */
 		fio_terminate_threads(TERMINATE_ALL, TERMINATE_ALL);
 		ret = 0;
 		break;
 	case FIO_NET_CMD_EXIT:
+		/* [한국어] 서버 데몬 완전 종료 — 모든 accept/poll 루프 탈출. 응답 송신 없이 -1 반환 */
 		exit_backend = true;
 		return -1;
 	case FIO_NET_CMD_LOAD_FILE:
+		/* [한국어] 서버 로컬 파일명 — 서버가 자체 파일시스템에서 ini 읽음 */
 		ret = handle_load_file_cmd(cmd);
 		break;
 	case FIO_NET_CMD_JOB:
+		/* [한국어] 클라이언트가 보낸 ini 버퍼 — 서버가 buffer 파싱 */
 		ret = handle_job_cmd(cmd);
 		break;
 	case FIO_NET_CMD_JOBLINE:
+		/* [한국어] 클라가 보낸 CLI argv — 재구성 후 parse_cmd_line */
 		ret = handle_jobline_cmd(cmd);
 		break;
 	case FIO_NET_CMD_PROBE:
+		/* [한국어] 서버 식별/특성 교환 — zlib 네고, me[] 설정 */
 		ret = handle_probe_cmd(cmd);
 		break;
 	case FIO_NET_CMD_SEND_ETA:
+		/* [한국어] 클라가 ETA 요청 — 서버가 jobs_eta 응답 */
 		ret = handle_send_eta_cmd(cmd);
 		break;
 	case FIO_NET_CMD_RUN:
+		/* [한국어] 잡 실행 시작 — fork 자식에서 fio_backend 호출 */
 		ret = handle_run_cmd(sk_out, job_list, cmd);
 		break;
 	case FIO_NET_CMD_UPDATE_JOB:
+		/* [한국어] 실행 중 옵션 변경 — convert_thread_options_to_cpu 적용 */
 		ret = handle_update_job_cmd(cmd);
 		break;
 	case FIO_NET_CMD_VTRIGGER:
+		/* [한국어] verify trigger — all_io_list 반환 + 잡 종료 + exec_trigger */
 		ret = handle_trigger_cmd(cmd, job_list);
 		break;
 	case FIO_NET_CMD_SENDFILE: {
+		/* [한국어] verify state 파일 응답 — 원래 요청자가 cmd_reply 세마포어로 대기 중.
+		 *         cmd->tag 에 cmd_reply* 포인터가 인코딩되어 있음. */
 		struct cmd_sendfile_reply *in;
 		struct cmd_reply *rep;
 
-		rep = (struct cmd_reply *) (uintptr_t) cmd->tag;
+		rep = (struct cmd_reply *) (uintptr_t) cmd->tag;  /* [한국어] tag → 포인터 복원 */
 
 		in = (struct cmd_sendfile_reply *) cmd->payload;
-		in->size = le32_to_cpu(in->size);
-		in->error = le32_to_cpu(in->error);
+		in->size = le32_to_cpu(in->size);    /* [한국어] 페이로드 길이 LE→CPU */
+		in->error = le32_to_cpu(in->error);  /* [한국어] 에러 코드 LE→CPU */
 		if (in->error) {
 			ret = 1;
-			rep->error = in->error;
+			rep->error = in->error;  /* [한국어] 대기자에게 에러 전달 */
 		} else {
 			ret = 0;
-			rep->data = smalloc(in->size);
+			rep->data = smalloc(in->size);  /* [한국어] SHM 힙 할당 (대기자가 소비 후 sfree) */
 			if (!rep->data) {
 				ret = 1;
-				rep->error = ENOMEM;
+				rep->error = ENOMEM;  /* [한국어] 메모리 부족 */
 			} else {
 				rep->size = in->size;
-				memcpy(rep->data, in->data, in->size);
+				memcpy(rep->data, in->data, in->size);  /* [한국어] 파일 내용 복사 */
 			}
 		}
-		fio_sem_up(&rep->lock);
+		fio_sem_up(&rep->lock);  /* [한국어] 세마포어 올려 대기자 깨움 → fio_server_get_verify_state 복귀 */
 		break;
 		}
 	default:
+		/* [한국어] 알 수 없는 opcode — 버전 호환 문제 또는 프로토콜 버그 */
 		log_err("fio: unknown opcode: %s\n", fio_server_op(cmd->opcode));
 		ret = 1;
 	}
@@ -1759,9 +2309,19 @@ static int handle_command(struct sk_out *sk_out, struct flist_head *job_list,
  * Send a command with a separate PDU, not inlined in the command
  */
 /*
- * [한국어] 별도 PDU 버퍼를 사용한 명령 전송 (헤더와 PDU를 writev로 한 번에 전송)
- * fio_send_cmd_ext_pdu는 iov[0]=헤더, iov[1]=PDU로 scatter/gather 전송.
- * 큰 데이터는 프래그먼트로 분할하여 FIO_NET_CMD_F_MORE 플래그를 설정한다.
+ * [한국어]
+ * fio_send_cmd_ext_pdu - 외부 PDU 버퍼 버전 (헤더 + 별도 버퍼를 writev 2-way)
+ *
+ * @sk: 소켓 fd.
+ * @opcode: FIO_NET_CMD_*.
+ * @buf: 외부 페이로드(fio_net_send_cmd 와 달리 헤더와 분리).
+ * @size: 페이로드 바이트 수.
+ * @tag: 요청 태그.
+ * @flags: 추가 FIO_NET_CMD_F_* 비트(F_MORE 자동 부여됨).
+ * @return: 0 성공, 1 실패.
+ *
+ * writev iov[2]: iov[0]=헤더(스택), iov[1]=외부 버퍼 → zero-copy 로 하나의 writev 호출.
+ * VEC 체인 송신에 사용 — 헤더를 매번 복사하지 않아도 되는 이점.
  */
 static int fio_send_cmd_ext_pdu(int sk, uint16_t opcode, const void *buf,
 				off_t size, uint64_t tag, uint32_t flags)
@@ -1799,28 +2359,56 @@ static int fio_send_cmd_ext_pdu(int sk, uint16_t opcode, const void *buf,
 	return ret;
 }
 
-/* [한국어] 전송 완료된 sk_entry의 버퍼와 엔트리 자체를 해제 */
+/*
+ * [한국어]
+ * finish_entry - 전송 완료된 sk_entry 의 버퍼+엔트리 해제
+ *
+ * @entry: 완료된 엔트리.
+ * @return: 없음.
+ *
+ * 해제 방식 분기:
+ *   SK_F_FREE → 일반 free (malloc 한 버퍼).
+ *   SK_F_COPY → sfree (smalloc 힙).
+ *   둘 다 아님 → 버퍼는 호출자 소유이므로 건드리지 않음.
+ * entry 자체는 smalloc 으로 할당되었으므로 sfree.
+ */
 static void finish_entry(struct sk_entry *entry)
 {
 	if (entry->flags & SK_F_FREE)
-		free(entry->buf);
+		free(entry->buf);       /* [한국어] malloc 버퍼 */
 	else if (entry->flags & SK_F_COPY)
-		sfree(entry->buf);
+		sfree(entry->buf);      /* [한국어] smalloc 복사본 */
 
-	sfree(entry);
+	sfree(entry);  /* [한국어] 엔트리 자체도 smalloc 으로 할당됨 */
 }
 
-/* [한국어] 후속 엔트리가 있으면 FIO_NET_CMD_F_MORE 플래그 설정 */
+/*
+ * [한국어]
+ * entry_set_flags - 체인에 다음 엔트리가 있으면 FIO_NET_CMD_F_MORE 비트 세트
+ *
+ * @entry: 현재 엔트리(unused, 시그니처 유지).
+ * @list: 남은 엔트리 체크용.
+ * @flags: Out — 0 또는 F_MORE.
+ */
 static void entry_set_flags(struct sk_entry *entry, struct flist_head *list,
 			    unsigned int *flags)
 {
 	if (!flist_empty(list))
-		*flags = FIO_NET_CMD_F_MORE;
+		*flags = FIO_NET_CMD_F_MORE;  /* [한국어] 뒤에 더 있음 */
 	else
 		*flags = 0;
 }
 
-/* [한국어] 벡터 엔트리 체인을 순서대로 전송 (first -> first->next 리스트) */
+/*
+ * [한국어]
+ * send_vec_entry - SK_F_VEC 체인(first + first->next) 순차 전송
+ *
+ * @sk_out: 전송 대상.
+ * @first: 헤더 엔트리 — first->next FIFO 에 추가 엔트리 연결.
+ * @return: 전송 실패 엔트리 수 합산.
+ *
+ * 각 엔트리 송신 후 finish_entry 호출. 중간 실패해도 계속 진행해 free 는 보장.
+ */
 static int send_vec_entry(struct sk_out *sk_out, struct sk_entry *first)
 {
 	unsigned int flags;
@@ -1848,8 +2436,19 @@ static int send_vec_entry(struct sk_out *sk_out, struct sk_entry *first)
 }
 
 /*
- * [한국어] 단일 sk_entry 전송 처리
- * xmit 세마포어로 전송을 직렬화. 플래그에 따라 VEC/SIMPLE/일반 전송을 분기한다.
+ * [한국어]
+ * handle_sk_entry - 단일 sk_entry 를 소켓으로 전송 (xmit 세마포어로 직렬화)
+ *
+ * @sk_out: 소켓 상태.
+ * @entry: 전송할 엔트리 (호출자 소유 — 여기서 finish_entry 로 해제).
+ * @return: 0 성공, 1 실패.
+ *
+ * SK_F_VEC → send_vec_entry (헤더 + 체인 writev).
+ * SK_F_SIMPLE → fio_net_send_simple_cmd (페이로드 없는 24B 헤더만).
+ * 그 외 → fio_net_send_cmd (인라인 페이로드 버전).
+ *
+ * xmit 세마포어: 잡 스레드 다수가 동시에 writev 를 호출하면 헤더/페이로드 교차 섞임이
+ * 발생할 수 있음 → xmit 으로 소켓 출력 원자성 보장.
  */
 static int handle_sk_entry(struct sk_out *sk_out, struct sk_entry *entry)
 {
@@ -1858,60 +2457,83 @@ static int handle_sk_entry(struct sk_out *sk_out, struct sk_entry *entry)
 	fio_sem_down(&sk_out->xmit);  /* [한국어] 전송 직렬화 락 획득 */
 
 	if (entry->flags & SK_F_VEC)
-		ret = send_vec_entry(sk_out, entry);
+		ret = send_vec_entry(sk_out, entry);  /* [한국어] 헤더+체인 writev */
 	else if (entry->flags & SK_F_SIMPLE) {
 		ret = fio_net_send_simple_cmd(sk_out->sk, entry->opcode,
-						entry->tag, NULL);
+						entry->tag, NULL);  /* [한국어] 24B 헤더만 */
 	} else {
 		ret = fio_net_send_cmd(sk_out->sk, entry->opcode, entry->buf,
-					entry->size, &entry->tag, NULL);
+					entry->size, &entry->tag, NULL);  /* [한국어] 인라인 페이로드 */
 	}
 
-	fio_sem_up(&sk_out->xmit);
+	fio_sem_up(&sk_out->xmit);  /* [한국어] 전송 직렬화 락 해제 */
 
 	if (ret)
 		log_err("fio: failed handling cmd %s\n", fio_server_op(entry->opcode));
 
-	finish_entry(entry);
+	finish_entry(entry);  /* [한국어] SK_F_FREE/COPY 에 따라 버퍼 회수 + entry sfree */
 	return ret;
 }
 
 /*
- * [한국어] 전송 큐의 모든 대기 항목을 처리
- * sk_out->list에서 항목들을 로컬 리스트로 이동(splice)한 뒤 순서대로 전송.
+ * [한국어]
+ * handle_xmits - 전송 큐의 모든 대기 엔트리를 일괄 flush
+ *
+ * @sk_out: 전송 대상.
+ * @return: 누적 반환값 (각 엔트리 실패 개수의 합).
+ *
+ * flist_splice_init 이디엄: 리스트 헤드를 로컬로 이동시켜 락 최소 구간만 유지.
+ * 이후 로컬 리스트를 락 없이 순회하며 전송 — 다른 스레드의 동시 큐잉을 차단하지 않음.
+ * 호출 체인: handle_connection poll 루프 + fio_net_queue_entry(SK_F_INLINE 아닌 경우는
+ *           큐잉만 하고 flush 는 handle_xmits 에 위임) → handle_xmits → handle_sk_entry.
  */
 static int handle_xmits(struct sk_out *sk_out)
 {
 	struct sk_entry *entry;
-	FLIST_HEAD(list);
+	FLIST_HEAD(list);  /* [한국어] 로컬 리스트(락 밖에서 순회) */
 	int ret = 0;
 
 	sk_lock(sk_out);
 	if (flist_empty(&sk_out->list)) {
 		sk_unlock(sk_out);
-		return 0;
+		return 0;  /* [한국어] 빠른 경로 — 큐 비어 있음 */
 	}
 
-	flist_splice_init(&sk_out->list, &list);
+	flist_splice_init(&sk_out->list, &list);  /* [한국어] 헤드 교체 + 원 리스트 비우기 */
 	sk_unlock(sk_out);
 
 	while (!flist_empty(&list)) {
 		entry = flist_first_entry(&list, struct sk_entry, list);
 		flist_del(&entry->list);
-		ret += handle_sk_entry(sk_out, entry);
+		ret += handle_sk_entry(sk_out, entry);  /* [한국어] 개별 전송 */
 	}
 
 	return ret;
 }
 
 /*
- * [한국어] 단일 클라이언트 연결을 처리하는 메인 루프
- * fork된 자식 프로세스에서 실행된다.
- * 1) poll()로 소켓 이벤트 대기
- * 2) 대기 중 handle_xmits()로 큐잉된 전송 처리
- * 3) 명령 수신 시 handle_command()로 디스패치
- * 4) 잡 프로세스 종료 상태 주기적 확인
- * 종료 시 소켓을 닫고 _exit()으로 프로세스 종료.
+ * [한국어]
+ * handle_connection - 단일 클라이언트 연결의 메인 처리 루프 (fork 자식의 main)
+ *
+ * @sk_out: 이 연결에 바인딩된 소켓 상태 구조체 (accept_loop 가 scalloc 으로 준비).
+ * @return: _exit 으로 프로세스 종료하므로 의미 없음(반환 안 됨).
+ *
+ * 동작 단계:
+ *   1) reset_fio_state() — 부모로부터 상속받은 fio 전역 상태 초기화.
+ *   2) while (!exit_backend): 외부 루프 — 각 반복이 "1건 수신-처리".
+ *       a) 내부 do-while: poll(sk, POLLIN, 0)+fio_sem_down_timeout 의 2단 대기.
+ *          - poll 비블로킹 체크 + 이벤트 없으면 세마포어로 절전.
+ *          - handle_xmits() 를 매 반복마다 호출 → 잡 스레드가 큐잉한 결과 flush.
+ *          - 잡이 실행 중(job_list 비어있지 않음)이면 timeout 100ms 로 단축
+ *            → 잡 종료 감지 및 STOP/QUIT 전송 지연 최소화.
+ *       b) POLLIN 이벤트 → fio_net_recv_cmd (blocking, MSG_WAITALL) 로 완전 수신.
+ *       c) handle_command 로 dispatch → handle_*_cmd.
+ *       d) EXIT 수신(ret=-1) 또는 에러(ret>0) 이면 탈출.
+ *   3) 연결 종료 경로: 남은 xmit 플러시 + close(sk) + sk_out 참조 드롭 + _exit.
+ *
+ * POLLERR/POLLHUP: peer 가 TCP RST/FIN 보내거나 socket 에러 — 연결 종료 사유.
+ * 호출 체인: accept_loop fork 자식 → handle_connection → handle_command → 백엔드 → _exit.
+ * 컨텍스트: fork 자식 프로세스의 main thread — 부모 주소공간 COW 복사.
  */
 static int handle_connection(struct sk_out *sk_out)
 {
@@ -1919,77 +2541,88 @@ static int handle_connection(struct sk_out *sk_out)
 	FLIST_HEAD(job_list);   /* [한국어] 이 연결에서 실행 중인 잡 프로세스 리스트 */
 	int ret = 0;
 
-	reset_fio_state();
+	reset_fio_state();  /* [한국어] 부모에서 상속된 fio 전역 상태 클리어 */
 
 	/* read forever */
 	while (!exit_backend) {
 		struct pollfd pfd = {
 			.fd	= sk_out->sk,
-			.events	= POLLIN,
+			.events	= POLLIN,  /* [한국어] 읽기 이벤트 감시 — POLLERR/POLLHUP 는 항상 revents 로 올라옴 */
 		};
 
 		do {
-			int timeout = 1000;
+			int timeout = 1000;  /* [한국어] 기본 1초 — 잡 없을 때 절전 */
 
 			if (!flist_empty(&job_list))
-				timeout = 100;
+				timeout = 100;  /* [한국어] 잡 실행 중 — STOP/QUIT 지연 최소화 */
 
-			handle_xmits(sk_out);
+			handle_xmits(sk_out);  /* [한국어] 잡 스레드가 큐잉한 결과 flush */
 
-			ret = poll(&pfd, 1, 0);
+			ret = poll(&pfd, 1, 0);  /* [한국어] 논블록 폴 — 이벤트 즉시 확인 */
 			if (ret < 0) {
 				if (errno == EINTR)
-					break;
+					break;  /* [한국어] 시그널 수신 — 상위 while 재평가 */
 				log_err("fio: poll: %s\n", strerror(errno));
 				break;
 			} else if (!ret) {
+				/* [한국어] 이벤트 없음 — 잡 상태 확인 + 세마포어로 timeout 대기 */
 				fio_server_check_jobs(&job_list);
 				fio_sem_down_timeout(&sk_out->wait, timeout);
 				continue;
 			}
 
 			if (pfd.revents & POLLIN)
-				break;
+				break;  /* [한국어] 읽기 가능 — 상위에서 fio_net_recv_cmd 호출 */
 			if (pfd.revents & (POLLERR|POLLHUP)) {
+				/* [한국어] POLLERR = 소켓 에러, POLLHUP = peer 종료. 연결 재개 불가. */
 				ret = 1;
 				break;
 			}
 		} while (!exit_backend);
 
-		fio_server_check_jobs(&job_list);
+		fio_server_check_jobs(&job_list);  /* [한국어] 잡 종료 수거 + STOP/QUIT 큐잉 */
 
 		if (ret < 0)
-			break;
+			break;  /* [한국어] poll 에러 — 루프 탈출 */
 
 		if (pfd.revents & POLLIN)
-			cmd = fio_net_recv_cmd(sk_out->sk, true);
+			cmd = fio_net_recv_cmd(sk_out->sk, true);  /* [한국어] MSG_WAITALL 완전 수신 */
 		if (!cmd) {
-			ret = -1;
+			ret = -1;  /* [한국어] 수신 실패 — 연결 종료 */
 			break;
 		}
 
-		ret = handle_command(sk_out, &job_list, cmd);
+		ret = handle_command(sk_out, &job_list, cmd);  /* [한국어] opcode 디스패치 */
 		if (ret)
-			break;
+			break;  /* [한국어] EXIT(-1) 또는 에러(>0) — 탈출 */
 
-		free(cmd);
+		free(cmd);  /* [한국어] fio_net_recv_cmd 가 malloc 했음 */
 		cmd = NULL;
 	}
 
 	if (cmd)
-		free(cmd);
+		free(cmd);  /* [한국어] 에러 경로에서 남은 cmd 해제 */
 
-	handle_xmits(sk_out);
+	handle_xmits(sk_out);  /* [한국어] 마지막으로 큐에 남은 것 flush(베스트에포트) */
 
-	close(sk_out->sk);
-	sk_out->sk = -1;
-	__sk_out_drop(sk_out);
-	_exit(ret);
+	close(sk_out->sk);      /* [한국어] 소켓 fd 반환 — TCP FIN 전송 */
+	sk_out->sk = -1;        /* [한국어] 이후 송신 시도는 "이미 닫힘" 체크로 차단 */
+	__sk_out_drop(sk_out);  /* [한국어] 자식 측 참조 해제 — refs 0 이면 해제 */
+	_exit(ret);             /* [한국어] 자식 프로세스 즉시 종료 (atexit/stdio 플러시 생략) */
 }
 
 /* get the address on this host bound by the input socket,
  * whether it is ipv6 or ipv4 */
-/* [한국어] 소켓에 바인드된 로컬 주소를 문자열로 변환하여 client_sockaddr_str에 저장 */
+/*
+ * [한국어]
+ * get_my_addr_str - accept 된 소켓의 로컬 bind 주소를 문자열로 변환
+ *
+ * @sk: accept 로 받은 클라이언트 소켓.
+ * @return: 0 성공(client_sockaddr_str 전역에 저장), -1 실패.
+ *
+ * getsockname(2): 소켓이 바인드된 로컬 주소 조회 — 서버가 어느 인터페이스로
+ *                 연결을 받았는지 확인 (verify state gen_name 에 사용).
+ */
 static int get_my_addr_str(int sk)
 {
 	struct sockaddr_in6 myaddr6 = { 0, };
@@ -2026,9 +2659,19 @@ static int get_my_addr_str(int sk)
 
 #ifdef WIN32
 /*
- * [한국어] Windows: 자식 프로세스에서 연결을 처리하는 함수
- * 명명된 파이프를 통해 부모로부터 소켓 정보를 수신하고,
- * WSASocket()으로 소켓을 복제한 뒤 handle_connection()을 호출한다.
+ * [한국어]
+ * handle_connection_process (Windows) - 자식 프로세스 엔트리: 파이프로 소켓 복제 받고 연결 처리
+ *
+ * @return: handle_connection 반환값 또는 -1 실패.
+ *
+ * 동작:
+ *   1) 부모가 만든 명명된 파이프(fio_server_pipe_name) 에 CreateFile 로 연결.
+ *   2) ReadFile 로 WSAPROTOCOL_INFO 수신.
+ *   3) WSASocket 으로 부모 소켓 핸들을 자식에 복제.
+ *   4) sk_out 생성 후 handle_connection 진입.
+ *
+ * Windows 에서 fork 가 없어서 socket fd 를 자식으로 전달할 수 없으므로
+ * 명명된 파이프 + WSAPROTOCOL_INFO 조합으로 대체.
  */
 static int handle_connection_process(void)
 {
@@ -2097,11 +2740,30 @@ static int handle_connection_process(void)
 #endif
 
 /*
- * [한국어] 클라이언트 연결 수락 루프 (서버 메인 루프)
- * listen 소켓에서 poll()로 연결 요청을 대기하고, accept() 후:
- *   - POSIX: fork()하여 자식에서 handle_connection() 실행
- *   - Windows: 별도 프로세스 생성하여 연결 처리
- * 연결 프로세스를 conn_list로 추적하며 주기적으로 종료 상태를 확인한다.
+ * [한국어]
+ * accept_loop - 서버 리슨 소켓에서 클라이언트 연결을 수락하고 처리 프로세스 생성
+ *
+ * @listen_sk: listen(2) 완료된 소켓 fd.
+ * @return: 정상 종료 시 exitval (0 고정), 치명 에러 시 -1.
+ *
+ * 루프 구조:
+ *   1) listen_sk 를 O_NONBLOCK 으로 설정 — poll 과 accept 가 블록되지 않도록.
+ *   2) while (!exit_backend):
+ *      a) poll(listen_sk, POLLIN, timeout=1000ms 또는 conn 있으면 100ms).
+ *      b) 이벤트 없으면 fio_server_check_conns — 종료된 자식 프로세스 회수.
+ *      c) accept(listen_sk, &addr) → 클라이언트 소켓 sk 획득.
+ *      d) sk_out 구조체(scalloc — SHM 공유) 준비 + 세마포어 3개 초기화.
+ *      e) POSIX: fork() — 부모는 sk 닫고 conn_list 에 자식 PID 추가, 자식은
+ *         handle_connection(sk_out) 으로 진입(내부에서 _exit).
+ *         Windows: windows_handle_connection + 명명된 파이프로 socket 핸들 복제.
+ *
+ * conn_list 추적: 매 연결마다 자식 PID 를 저장 → 주기적으로 waitpid(WNOHANG) 로
+ *                회수해야 zombie 방지.
+ * 호출 체인: fio_server → fio_init_server_connection → accept_loop → accept →
+ *           fork → handle_connection.
+ * 컨텍스트: 서버 메인 프로세스의 메인 스레드.
+ * 에러 경로: accept 실패 시 즉시 -1 반환(서버 중단). sk_out 할당 실패 시
+ *           연결만 거절.
  */
 static int accept_loop(int listen_sk)
 {
@@ -2110,11 +2772,12 @@ static int accept_loop(int listen_sk)
 	socklen_t len = use_ipv6 ? sizeof(addr6) : sizeof(addr);
 	struct pollfd pfd;
 	int ret = 0, sk, exitval = 0;
-	FLIST_HEAD(conn_list);
+	FLIST_HEAD(conn_list);  /* [한국어] 연결 처리 자식 프로세스 추적 리스트 */
 
 	dprint(FD_NET, "server enter accept loop\n");
 
 	fio_set_fd_nonblocking(listen_sk, "server");
+	/* [한국어] O_NONBLOCK — poll 이벤트 없을 때 accept 가 블록 안 됨 */
 
 	while (!exit_backend) {
 		struct sk_out *sk_out;
@@ -2126,33 +2789,34 @@ static int accept_loop(int listen_sk)
 		pid_t pid;
 #endif
 		pfd.fd = listen_sk;
-		pfd.events = POLLIN;
+		pfd.events = POLLIN;  /* [한국어] 새 연결 요청 = 읽기 이벤트 */
 		do {
 			int timeout = 1000;
 
 			if (!flist_empty(&conn_list))
-				timeout = 100;
+				timeout = 100;  /* [한국어] 자식 프로세스 있으면 짧은 주기로 waitpid */
 
 			ret = poll(&pfd, 1, timeout);
 			if (ret < 0) {
 				if (errno == EINTR)
-					break;
+					break;  /* [한국어] 시그널 — 상위 while 재평가 */
 				log_err("fio: poll: %s\n", strerror(errno));
 				break;
 			} else if (!ret) {
-				fio_server_check_conns(&conn_list);
+				fio_server_check_conns(&conn_list);  /* [한국어] 타임아웃 — zombie 회수 */
 				continue;
 			}
 
 			if (pfd.revents & POLLIN)
-				break;
+				break;  /* [한국어] 새 연결 대기 — accept 진행 */
 		} while (!exit_backend);
 
-		fio_server_check_conns(&conn_list);
+		fio_server_check_conns(&conn_list);  /* [한국어] 연결 자식은 STOP/QUIT 안 보냄 */
 
 		if (exit_backend || ret < 0)
-			break;
+			break;  /* [한국어] 종료 신호 또는 poll 에러 */
 
+		/* [한국어] accept — 커널 3-way handshake 완료 소켓을 꺼냄 */
 		if (use_ipv6)
 			sk = accept(listen_sk, (struct sockaddr *) &addr6, &len);
 		else
@@ -2163,6 +2827,7 @@ static int accept_loop(int listen_sk)
 			return -1;
 		}
 
+		/* [한국어] 접속자 주소 문자열로 변환 — 디버그 로그용 */
 		if (use_ipv6)
 			from = inet_ntop(AF_INET6, (struct sockaddr *) &addr6.sin6_addr, buf, sizeof(buf));
 		else
@@ -2171,6 +2836,7 @@ static int accept_loop(int listen_sk)
 		dprint(FD_NET, "server: connect from %s\n", from);
 
 		sk_out = scalloc(1, sizeof(*sk_out));
+		/* [한국어] SHM 힙에 할당 — fork 자식과 공유 가능(참조 카운트 관리) */
 		if (!sk_out) {
 			close(sk);
 			return -1;
@@ -2178,24 +2844,27 @@ static int accept_loop(int listen_sk)
 
 		sk_out->sk = sk;
 		INIT_FLIST_HEAD(&sk_out->list);
-		__fio_sem_init(&sk_out->lock, FIO_SEM_UNLOCKED);
-		__fio_sem_init(&sk_out->wait, FIO_SEM_LOCKED);
-		__fio_sem_init(&sk_out->xmit, FIO_SEM_UNLOCKED);
+		__fio_sem_init(&sk_out->lock, FIO_SEM_UNLOCKED);  /* [한국어] 리스트 보호 (뮤텍스 역할) */
+		__fio_sem_init(&sk_out->wait, FIO_SEM_LOCKED);    /* [한국어] 대기 세마포어 — 잡업 도착 시 up */
+		__fio_sem_init(&sk_out->xmit, FIO_SEM_UNLOCKED);  /* [한국어] 전송 직렬화 세마포어 */
 
 #ifdef WIN32
+		/* [한국어] Windows: fork 대체 — CreateProcess + 명명된 파이프로 WSAPROTOCOL_INFO 전달 */
 		hProcess = windows_handle_connection(hjob, sk);
 		if (hProcess == INVALID_HANDLE_VALUE)
 			return -1;
 		sk_out->hProcess = hProcess;
 		fio_server_add_conn_pid(&conn_list, hProcess);
 #else
-		pid = fork();
+		pid = fork();  /* [한국어] POSIX: 자식 프로세스 생성 — 주소공간 COW */
 		if (pid) {
+			/* [한국어] 부모 경로: 자식이 처리하므로 sk 닫고 추적 리스트에 PID 추가 */
 			close(sk);
 			fio_server_add_conn_pid(&conn_list, pid);
 			continue;
 		}
 
+		/* [한국어] 자식 경로: sk_out 을 이 스레드에 바인딩 후 handle_connection 진입(_exit 로 종료) */
 		/* if error, it's already logged, non-fatal */
 		get_my_addr_str(sk);
 
@@ -2204,7 +2873,7 @@ static int accept_loop(int listen_sk)
 		 * since that function calls _exit() when done
 		 */
 		sk_out_assign(sk_out);
-		handle_connection(sk_out);
+		handle_connection(sk_out);  /* [한국어] 내부에서 _exit(ret) — 반환 안 됨 */
 #endif
 	}
 
@@ -2212,9 +2881,18 @@ static int accept_loop(int listen_sk)
 }
 
 /*
- * [한국어] 텍스트 로그 메시지를 클라이언트로 전송
- * 로그 레벨, 타임스탬프, 메시지 텍스트를 cmd_text_pdu에 담아 큐잉한다.
- * sk_out이 없거나 소켓이 닫혀있으면 -1 반환 (전송 불가).
+ * [한국어]
+ * fio_server_text_output - 서버→클라 텍스트 로그 전송 (log_info/log_err 리다이렉트)
+ *
+ * @level: 로그 레벨 (0=info, 1=err 등).
+ * @buf: 로그 문자열(널 종결 아닐 수 있음 — len 사용).
+ * @len: 바이트 수.
+ * @return: 성공 시 len, sk_out 없음/소켓 닫힘 시 -1.
+ *
+ * 호출 체인: 잡 스레드의 log_info/log_err 매크로 → fio_server_text_output →
+ *           fio_net_queue_cmd(TEXT, pdu, SK_F_COPY) → handle_xmits → writev.
+ * 실행 컨텍스트: 잡 스레드 — sk_out 이 pthread TLS 로 바인딩되어 있어야 함.
+ * 타임스탬프: gettimeofday 로 log_sec/log_usec 기록 — 클라 출력 시 정렬.
  */
 int fio_server_text_output(int level, const char *buf, size_t len)
 {
@@ -2243,7 +2921,17 @@ int fio_server_text_output(int level, const char *buf, size_t len)
 	return len;
 }
 
-/* [한국어] io_stat 구조체를 네트워크 바이트 오더로 변환 (IEEE 754 부동소수점 인코딩 포함) */
+/*
+ * [한국어]
+ * convert_io_stat - io_stat (max/min/samples/mean/S) 를 LE+IEEE754 로 직렬화
+ *
+ * @dst: 출력 — 네트워크 바이트 오더 결과.
+ * @src: 입력 — CPU 바이트 오더 원본.
+ * @return: 없음.
+ *
+ * mean/S 는 double 이므로 fio_double_to_uint64 로 비트 패턴 유지 후 LE64 변환.
+ * 이 방식은 FPU 구현 차이에 영향받지 않고 비트 수준에서 정확히 복원 가능.
+ */
 static void convert_io_stat(struct io_stat *dst, struct io_stat *src)
 {
 	dst->max_val	= cpu_to_le64(src->max_val);
@@ -2257,7 +2945,13 @@ static void convert_io_stat(struct io_stat *dst, struct io_stat *src)
 	dst->S.u.i	= cpu_to_le64(fio_double_to_uint64(src->S.u.f));
 }
 
-/* [한국어] group_run_stats 구조체를 네트워크 바이트 오더로 변환 */
+/*
+ * [한국어]
+ * convert_gs - group_run_stats 필드 전체를 LE 로 직렬화
+ *
+ * DDIR_RWDIR_CNT = 3 방향(READ/WRITE/TRIM) 각각의 max_run/min_run/max_bw/min_bw/
+ * iobytes/agg 배열을 LE64 로 세트. 스칼라는 LE32.
+ */
 static void convert_gs(struct group_run_stats *dst, struct group_run_stats *src)
 {
 	int i;
@@ -2283,9 +2977,18 @@ static void convert_gs(struct group_run_stats *dst, struct group_run_stats *src)
  * into a single payload.
  */
 /*
- * [한국어] 스레드 통계(thread_stat)와 그룹 통계(group_run_stats)를 클라이언트로 전송
- * 모든 필드를 네트워크 바이트 오더로 변환하고, 부동소수점은 IEEE 754로 인코딩한다.
- * clat_prio 통계나 steadystate 데이터가 있으면 확장 버퍼에 추가하여 전송한다.
+ * [한국어]
+ * fio_server_send_ts - 잡 종료 통계를 FIO_NET_CMD_TS 로 클라에 전송
+ *
+ * @ts: thread_stat — lat/bw/iops 히스토그램 + 누적 카운터.
+ * @rs: group_run_stats — 그룹 단위 집계.
+ * @return: 없음.
+ *
+ * 구조: cmd_ts_pdu{ts, rs} 단일 구조체로 기본 패킹.
+ *       + clat_prio 통계가 있으면 확장 버퍼 뒤쪽에 clat_prio_stat[] 배열 append.
+ *       + steadystate 활성화 시 iops/bw/lat 링버퍼 3개 (각 ss_dur 길이) append.
+ * 모든 정수 필드 LE 로 변환, double 은 fio_double_to_uint64 로 IEEE 754 비트 보존.
+ * 호출 체인: stat.c show_run_stats → fio_server_send_ts → fio_net_queue_cmd.
  */
 void fio_server_send_ts(struct thread_stat *ts, struct group_run_stats *rs)
 {
@@ -2503,21 +3206,37 @@ void fio_server_send_ts(struct thread_stat *ts, struct group_run_stats *rs)
 	free(extended_buf);
 }
 
-/* [한국어] 그룹 실행 통계를 네트워크 바이트 오더로 변환 후 클라이언트에 전송 */
+/*
+ * [한국어]
+ * fio_server_send_gs - 그룹 실행 통계(group_run_stats) 단독 전송
+ *
+ * @rs: 원본 통계 구조체.
+ * @return: 없음.
+ *
+ * 용도: fio_server_send_ts 가 ts 에 rs 를 내장해 전송하는 경우 외에, 그룹 단위
+ *       집계만 따로 전송해야 할 때 사용.
+ * 호출 체인: stat.c show_group_stats → fio_server_send_gs.
+ */
 void fio_server_send_gs(struct group_run_stats *rs)
 {
-	struct group_run_stats gs;
+	struct group_run_stats gs;  /* [한국어] 스택 변환 버퍼 — LE 직렬화 전 임시 저장 */
 
 	dprint(FD_NET, "server sending group run stats\n");
 
-	convert_gs(&gs, rs);
+	convert_gs(&gs, rs);  /* [한국어] 각 필드를 LE 로 직렬화 (min/max/agg/bw) */
 	fio_net_queue_cmd(FIO_NET_CMD_GS, &gs, sizeof(gs), NULL, SK_F_COPY);
 }
 
 /*
- * [한국어] 잡 옵션을 이름-값 쌍으로 클라이언트에 전송
- * 전역 옵션(gid == -1U)과 그룹별 옵션을 구분하여 전송한다.
- * 이름/값이 PDU 필드 크기를 초과하면 truncated 플래그를 설정한다.
+ * [한국어]
+ * fio_server_send_job_options - print_option 리스트를 (key, value) 쌍으로 전송
+ *
+ * @opt_list: print_option entries 리스트.
+ * @gid: 그룹 ID. -1U 면 전역 옵션, 그 외면 groupid.
+ * @return: 없음.
+ *
+ * 각 옵션마다 FIO_NET_CMD_JOB_OPT 큐잉. 이름/값이 cmd_job_option 버퍼 크기를 초과하면
+ * truncated 플래그로 표시 (클라가 사람이 볼 때만 사용하므로 허용).
  */
 void fio_server_send_job_options(struct flist_head *opt_list,
 				 unsigned int gid)
@@ -2560,7 +3279,13 @@ void fio_server_send_job_options(struct flist_head *opt_list,
 	}
 }
 
-/* [한국어] disk_util_agg 구조체를 네트워크 바이트 오더로 변환 */
+/*
+ * [한국어]
+ * convert_agg - disk_util_agg 를 LE 로 직렬화 (슬레이브 디스크 집계)
+ *
+ * [0]=read, [1]=write 2 원소 배열들의 ios/merges/sectors/ticks 각 LE64 저장.
+ * max_util(double) 은 IEEE 754 비트 패턴 유지.
+ */
 static void convert_agg(struct disk_util_agg *dst, struct disk_util_agg *src)
 {
 	int i;
@@ -2578,7 +3303,13 @@ static void convert_agg(struct disk_util_agg *dst, struct disk_util_agg *src)
 	dst->max_util.u.i	= cpu_to_le64(fio_double_to_uint64(src->max_util.u.f));
 }
 
-/* [한국어] disk_util_stat 구조체를 네트워크 바이트 오더로 변환 */
+/*
+ * [한국어]
+ * convert_dus - disk_util_stat(단일 디스크의 /proc/diskstats 기반 통계) LE 직렬화
+ *
+ * name 문자열 그대로 복사(문자열은 바이트 오더 무관). ios/merges/sectors/ticks/
+ * io_ticks/time_in_queue/msec 전부 LE64.
+ */
 static void convert_dus(struct disk_util_stat *dst, struct disk_util_stat *src)
 {
 	int i;
@@ -2597,7 +3328,16 @@ static void convert_dus(struct disk_util_stat *dst, struct disk_util_stat *src)
 	dst->s.msec		= cpu_to_le64(src->s.msec);
 }
 
-/* [한국어] 모든 디스크의 유틸리티 통계를 클라이언트에 전송 (disk_list 순회) */
+/*
+ * [한국어]
+ * fio_server_send_du - 모든 디스크의 유틸리티 통계(disk_util_stat+agg)를 클라로 전송
+ *
+ * @return: 없음.
+ *
+ * disk_list 전역 리스트(diskutil.c 관리) 를 순회하며 각 디스크 엔트리마다
+ * cmd_du_pdu{dus(통계), agg(슬레이브 합)} 를 FIO_NET_CMD_DU 로 큐잉.
+ * 호출 체인: stat.c show_disk_util → fio_server_send_du → flist_for_each(disk_list).
+ */
 void fio_server_send_du(void)
 {
 	struct disk_util *du;
@@ -2618,10 +3358,22 @@ void fio_server_send_du(void)
 	}
 }
 
-/* [한국어] === zlib 압축 전송 관련 함수들 (CONFIG_ZLIB 설정 시) === */
+/* [한국어] === zlib 압축 전송 함수군 (CONFIG_ZLIB) ===
+ * deflateInit → deflate(Z_BLOCK/Z_FINISH) 루프 → deflateEnd 의 zlib 3-단계 패턴.
+ * 각 조각마다 FIO_NET_CMD_IOLOG sk_entry 를 생성해 first->next 체인에 append.
+ */
 #ifdef CONFIG_ZLIB
 
-/* [한국어] 압축 출력 버퍼를 sk_entry로 감싸서 전송 체인에 추가 */
+/*
+ * [한국어]
+ * __fio_net_prep_tail - 현재 압축 출력 버퍼(out_pdu)를 엔트리로 포장해 체인 끝에 추가
+ *
+ * @stream: z_stream — avail_out 으로 실제 압축 바이트 계산.
+ * @out_pdu: malloc 된 FIO_SERVER_MAX_FRAGMENT_PDU 크기 버퍼.
+ * @last_entry: Out — 생성된 sk_entry 포인터(NULL 이면 실패).
+ * @first: 체인 헤더 엔트리 (first->next 에 연결).
+ * @return: 없음.
+ */
 static inline void __fio_net_prep_tail(z_stream *stream, void *out_pdu,
 					struct sk_entry **last_entry,
 					struct sk_entry *first)
@@ -2639,8 +3391,18 @@ static inline void __fio_net_prep_tail(z_stream *stream, void *out_pdu,
  * linked list as necessary.
  */
 /*
- * [한국어] 입력 데이터를 zlib deflate로 압축하여 전송 패킷 체인에 추가
- * 출력 버퍼가 가득 차면 새 패킷을 할당하여 체인에 연결한다.
+ * [한국어]
+ * __deflate_pdu_buffer - next_in 의 next_sz 바이트를 zlib 로 압축해 패킷 체인에 흘려보냄
+ *
+ * @next_in: 입력 데이터.
+ * @next_sz: 입력 바이트 수.
+ * @out_pdu: 현재 출력 버퍼(다 차면 새 버퍼 할당하여 치환).
+ * @last_entry: 최근 생성된 sk_entry (실패 판정 시 사용).
+ * @stream: z_stream (avail_in/out 유지).
+ * @first: 체인 헤더.
+ * @return: 0 성공, 1 실패.
+ *
+ * deflate(Z_BLOCK): 블록 단위 압축 — 스트림 전체 flush 하지 않고 다음 입력 허용.
  */
 static int __deflate_pdu_buffer(void *next_in, unsigned int next_sz, void **out_pdu,
 				struct sk_entry **last_entry, z_stream *stream,
@@ -2674,9 +3436,17 @@ static int __deflate_pdu_buffer(void *next_in, unsigned int next_sz, void **out_
 }
 
 /*
- * [한국어] 히스토그램 타입 I/O 로그를 압축하여 전송 체인에 추가
- * 각 샘플과 히스토그램 데이터를 순차적으로 압축. 이전 값과의 차이(delta)를
- * 서버 측에서 계산하여 클라이언트의 재구성 부담을 줄인다.
+ * [한국어]
+ * __fio_append_iolog_gz_hist - 히스토그램 I/O 로그 압축 (delta 계산 포함)
+ *
+ * @first: 체인 헤더.
+ * @log: 원본 io_log.
+ * @cur_log: 한 청크의 io_logs.
+ * @stream: z_stream.
+ * @return: 0 성공, 1 실패.
+ *
+ * 히스토그램 delta 최적화: 이전 샘플과의 차이만 저장하여 전송량 감소. 클라 측에서
+ * 재구성 부담이 줄어들도록 서버가 직접 뺄셈 수행.
  */
 static int __fio_append_iolog_gz_hist(struct sk_entry *first, struct io_log *log,
 				      struct io_logs *cur_log, z_stream *stream)
@@ -2727,9 +3497,17 @@ static int __fio_append_iolog_gz_hist(struct sk_entry *first, struct io_log *log
 }
 
 /*
- * [한국어] I/O 로그를 zlib으로 압축하여 전송 체인에 추가
- * 히스토그램 로그이면 __fio_append_iolog_gz_hist()로 분기.
- * 일반 로그는 전체를 FIO_SERVER_MAX_FRAGMENT_PDU 청크 단위로 압축 전송.
+ * [한국어]
+ * __fio_append_iolog_gz - 단일 io_logs 청크 압축 (히스토그램 분기 포함)
+ *
+ * @first: 체인 헤더.
+ * @log: 원본 io_log.
+ * @cur_log: 이 청크.
+ * @stream: z_stream.
+ * @return: 0 성공, 1 실패.
+ *
+ * log_type == IO_LOG_TYPE_HIST 이면 __fio_append_iolog_gz_hist 로 위임(delta 계산).
+ * 일반 로그는 cur_log->log 배열을 FIO_SERVER_MAX_FRAGMENT_PDU 조각으로 압축.
  */
 static int __fio_append_iolog_gz(struct sk_entry *first, struct io_log *log,
 				 struct io_logs *cur_log, z_stream *stream)
@@ -2778,8 +3556,18 @@ static int __fio_append_iolog_gz(struct sk_entry *first, struct io_log *log,
 }
 
 /*
- * [한국어] I/O 로그 전체를 zlib 압축하여 전송 체인에 추가하는 최상위 함수
- * deflateInit -> 각 io_logs 청크를 __fio_append_iolog_gz로 압축 -> deflate(Z_FINISH)
+ * [한국어]
+ * fio_append_iolog_gz - io_log 전체 zlib 압축 전송 (top-level)
+ *
+ * @first: 헤더 sk_entry.
+ * @log: 압축할 io_log.
+ * @return: 0 성공, 1 실패.
+ *
+ * 단계:
+ *   1) deflateInit(Z_DEFAULT_COMPRESSION) — zlib 스트림 초기화.
+ *   2) 모든 io_logs 청크를 순회하며 __fio_append_iolog_gz 호출(압축 + 체인 추가).
+ *   3) deflate(Z_FINISH) 루프 — 남은 출력 버퍼를 flush(Z_STREAM_END 까지).
+ *   4) deflateEnd 로 자원 회수.
  */
 static int fio_append_iolog_gz(struct sk_entry *first, struct io_log *log)
 {
@@ -2848,9 +3636,15 @@ static int fio_append_iolog_gz(struct sk_entry *first, struct io_log *log)
 #endif
 
 /*
- * [한국어] 사전 압축된 I/O 로그 청크를 전송 체인에 추가
- * 로그가 STORE_COMPRESSED 모드로 이미 압축되어 있을 때 사용.
- * chunk_list의 각 청크를 그대로 sk_entry로 감싸서 추가한다.
+ * [한국어]
+ * fio_append_gz_chunks - 사전 압축된 io_log 청크를 그대로 체인에 추가 (STORE_COMPRESSED)
+ *
+ * @first: 헤더 엔트리.
+ * @log: chunk_list 에 압축 청크 보유.
+ * @return: 0 성공, 1 실패.
+ *
+ * chunk_lock 뮤텍스 — 잡 스레드가 동시에 청크를 append 하는 경우 보호.
+ * 이미 압축된 데이터는 재압축하지 않음 (CPU 절약 + 클라 측 동일 포맷).
  */
 static int fio_append_gz_chunks(struct sk_entry *first, struct io_log *log)
 {
@@ -2875,7 +3669,17 @@ static int fio_append_gz_chunks(struct sk_entry *first, struct io_log *log)
 	return ret;
 }
 
-/* [한국어] 비압축 I/O 로그를 전송 체인에 추가 (평문 전송) */
+/*
+ * [한국어]
+ * fio_append_text_log - 평문 I/O 로그 엔트리들을 체인에 추가 (압축 없음)
+ *
+ * @first: 헤더 엔트리.
+ * @log: 원본 로그 (io_logs 체인 소비).
+ * @return: 0 성공, 1 실패.
+ *
+ * use_zlib=0 이고 chunk_list 도 비었을 때 경로. 각 io_logs 청크 전체를 하나의 sk_entry 로
+ * 묶어 체인에 추가. 실제 전송은 send_vec_entry 가 수행.
+ */
 static int fio_append_text_log(struct sk_entry *first, struct io_log *log)
 {
 	struct sk_entry *entry;
@@ -2903,14 +3707,26 @@ static int fio_append_text_log(struct sk_entry *first, struct io_log *log)
 }
 
 /*
- * [한국어] I/O 로그를 클라이언트에 전송하는 최상위 함수
- * 1) 헤더 PDU(cmd_iolog_pdu) 준비 - 샘플 수, 로그 타입, 압축 모드 등
- * 2) 모든 샘플을 네트워크 바이트 오더로 변환
- * 3) 압축 모드에 따라:
- *    - STORE_COMPRESSED: 사전 압축 청크 직접 전송
- *    - XMIT_COMPRESSED: 실시간 zlib 압축 후 전송
- *    - 비압축: 평문 전송
- * 4) 헤더 + 데이터 엔트리를 벡터 전송 체인으로 큐잉
+ * [한국어]
+ * fio_send_iolog - I/O 로그(BW/IOPS/LAT/CLAT/히스토그램) 전체를 FIO_NET_CMD_IOLOG 로 전송
+ *
+ * @td: 이 로그를 생성한 잡의 thread_data.
+ * @log: io_log — io_logs 체인 + (사전 압축 시) chunk_list.
+ * @name: 로그 이름 (클라 측 파일명 조합에 사용).
+ * @return: 0 성공, 1 실패.
+ *
+ * 4단계:
+ *   1) cmd_iolog_pdu 헤더 채움 — nr_samples, thread_number, log_type,
+ *      hist_coarseness, per_job_logs, compressed(STORE/XMIT/0).
+ *   2) 모든 io_sample 의 정수 필드를 LE 로 직렬화 (time/val0/val1/__ddir/bs/aux).
+ *   3) 헤더 엔트리(first, SK_F_VEC|SK_F_INLINE|SK_F_COPY) 준비.
+ *   4) 압축 모드별 함수 호출:
+ *      - chunk_list 비어있지 않음 → fio_append_gz_chunks (사전 압축 청크 그대로).
+ *      - use_zlib=1 → fio_append_iolog_gz (런타임 zlib deflate).
+ *      - 그 외 → fio_append_text_log (평문).
+ *   5) fio_net_queue_entry(first) 로 체인 통째로 큐잉.
+ *
+ * 호출 체인: iolog.c write_iolog / stat.c → fio_send_iolog → fio_append_*.
  */
 int fio_send_iolog(struct thread_data *td, struct io_log *log, const char *name)
 {
@@ -2989,7 +3805,17 @@ int fio_send_iolog(struct thread_data *td, struct io_log *log, const char *name)
 	return ret;
 }
 
-/* [한국어] 잡 추가 알림을 클라이언트에 전송 (thread_options를 직렬화하여 포함) */
+/*
+ * [한국어]
+ * fio_server_send_add_job - 잡이 추가되었음을 클라에 통보 (thread_options 스냅샷 포함)
+ *
+ * @td: 새로 추가된 잡의 thread_data.
+ * @return: 없음.
+ *
+ * 동작: cmd_add_job_pdu 헤더에 thread_number/groupid 세트 후 top 뒤쪽에
+ *       convert_thread_options_to_net 이 thread_options 를 네트워크 바이트 오더로 pack.
+ * 호출 체인: init.c add_job → fio_server_send_add_job → fio_net_queue_cmd(ADD_JOB).
+ */
 void fio_server_send_add_job(struct thread_data *td)
 {
 	struct cmd_add_job_pdu *pdu;
@@ -3006,7 +3832,17 @@ void fio_server_send_add_job(struct thread_data *td)
 	free(pdu);
 }
 
-/* [한국어] SERVER_START 알림을 클라이언트에 전송 (서버가 잡 실행을 시작함을 알림) */
+/*
+ * [한국어]
+ * fio_server_send_start - SERVER_START 통보 (fio_backend 준비 완료)
+ *
+ * @td: 신호 송신자 (컨벤션상 — 사용되지는 않음, 시그니처 일관성).
+ * @return: 없음.
+ *
+ * 호출 체인: backend.c 잡 스레드가 준비 완료 시점에 호출 → 클라는 이 시점부터
+ *           ETA 요청을 보내기 시작.
+ * abort 경로: sk_out 이 없으면 (pthread_getspecific 실패) abort — 치명 버그.
+ */
 void fio_server_send_start(struct thread_data *td)
 {
 	struct sk_out *sk_out = pthread_getspecific(sk_out_key);
@@ -3021,9 +3857,23 @@ void fio_server_send_start(struct thread_data *td)
 }
 
 /*
- * [한국어] 클라이언트에게 verify state 파일을 요청하고 수신 대기
- * SENDFILE 명령을 전송한 뒤 세마포어로 응답을 동기 대기한다 (10초 타임아웃).
- * 수신된 데이터에서 verify_state_hdr를 검증하고 thread_io_list를 추출하여 반환.
+ * [한국어]
+ * fio_server_get_verify_state - 클라이언트에게 verify-state 파일 요청 + 세마포어 동기 대기
+ *
+ * @name: 잡/파일 식별자(verify_state_gen_name 의 입력).
+ * @threadnumber: 잡 스레드 번호.
+ * @datap: 출력 — 성공 시 malloc 한 thread_io_list 버퍼 포인터.
+ * @return: 0 성공, errno (ETIMEDOUT/EILSEQ/ENOMEM 등) 실패.
+ *
+ * 동기 프로토콜:
+ *   1) cmd_reply 구조체를 FIO_SEM_LOCKED 로 초기화 (smalloc — SHM 공유).
+ *   2) FIO_NET_CMD_SENDFILE 을 큐잉 — tag 에 cmd_reply* 포인터 인코딩.
+ *   3) fio_sem_down_timeout(&rep->lock, 10000) — 10초 블로킹 대기.
+ *   4) handle_command(SENDFILE case) 가 응답 도착 시 rep->data/size/error 채우고
+ *      fio_sem_up(&rep->lock) 으로 깨움.
+ *   5) verify_state_hdr 체크섬 검증 → thread_io_list 만 추출해 반환.
+ *
+ * 에러 경로: 타임아웃/error/EILSEQ 모두 fail: 라벨로 갱신 후 QUIT 큐잉.
  */
 int fio_server_get_verify_state(const char *name, int threadnumber,
 				void **datap)
@@ -3097,9 +3947,15 @@ fail:
 }
 
 /*
- * [한국어] IP 기반 서버 소켓 초기화
- * IPv4/IPv6에 따라 소켓 생성, SO_REUSEADDR 설정, bind 수행.
- * 성공 시 소켓 fd 반환, 실패 시 -1 반환.
+ * [한국어]
+ * fio_init_server_ip - IPv4/IPv6 서버 소켓 생성 + SO_REUSEADDR/REUSEPORT + bind
+ *
+ * @return: 성공 시 소켓 fd, 실패 시 -1.
+ *
+ * socket(AF_INET or AF_INET6, SOCK_STREAM, 0): 스트림 TCP 소켓.
+ * SO_REUSEADDR: TIME_WAIT 중인 주소 재사용 허용 (서버 재시작 용이).
+ * SO_REUSEPORT: 여러 프로세스가 같은 포트에 bind 가능 — 실패해도 치명적 아님.
+ * bind(saddr_in 또는 saddr_in6): fio_handle_server_arg 가 채운 주소로 바인드.
  */
 static int fio_init_server_ip(void)
 {
@@ -3115,12 +3971,13 @@ static int fio_init_server_ip(void)
 		sk = socket(AF_INET, SOCK_STREAM, 0);
 
 	if (sk < 0) {
-		log_err("fio: socket: %s\n", strerror(errno));
+		log_err("fio: socket: %s\n", strerror(errno));  /* [한국어] 소켓 생성 실패(리소스 한계) */
 		return -1;
 	}
 
 	opt = 1;
 	if (setsockopt(sk, SOL_SOCKET, SO_REUSEADDR, (void *)&opt, sizeof(opt)) < 0) {
+		/* [한국어] SO_REUSEADDR — 서버 재시작 시 "Address already in use" 회피 */
 		log_err("fio: setsockopt(REUSEADDR): %s\n", strerror(errno));
 		close(sk);
 		return -1;
@@ -3130,6 +3987,8 @@ static int fio_init_server_ip(void)
 	 * Not fatal if fails, so just ignore it if that happens
 	 */
 	if (setsockopt(sk, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt))) {
+		/* [한국어] SO_REUSEPORT — 같은 포트에 여러 프로세스가 bind 가능(부하 분산).
+		 *         구형 커널/다른 OS 에선 미지원 — 실패 무시. */
 	}
 #endif
 
@@ -3138,8 +3997,8 @@ static int fio_init_server_ip(void)
 
 		addr = (struct sockaddr *) &saddr_in6;
 		socklen = sizeof(saddr_in6);
-		saddr_in6.sin6_family = AF_INET6;
-		str = inet_ntop(AF_INET6, src, buf, sizeof(buf));
+		saddr_in6.sin6_family = AF_INET6;        /* [한국어] AF 계열 세트 */
+		str = inet_ntop(AF_INET6, src, buf, sizeof(buf));  /* [한국어] 로그용 문자열화 */
 	} else {
 		void *src = &saddr_in.sin_addr;
 
@@ -3150,6 +4009,7 @@ static int fio_init_server_ip(void)
 	}
 
 	if (bind(sk, addr, socklen) < 0) {
+		/* [한국어] bind 실패 — 포트 점유 또는 권한 부족 */
 		log_err("fio: bind: %s\n", strerror(errno));
 		log_info("fio: failed with IPv%c %s\n", use_ipv6 ? '6' : '4', str);
 		close(sk);
@@ -3160,8 +4020,15 @@ static int fio_init_server_ip(void)
 }
 
 /*
- * [한국어] Unix 도메인 소켓 기반 서버 소켓 초기화
- * bind_sock 경로에 소켓을 생성하고 바인드한다. umask를 000으로 설정하여 접근 허용.
+ * [한국어]
+ * fio_init_server_sock - Unix 도메인 소켓 기반 서버 소켓 생성 + bind
+ *
+ * @return: 성공 시 소켓 fd, 실패 시 -1.
+ *
+ * AF_UNIX + SOCK_STREAM: 같은 호스트 내 파일 시스템 경로 기반 통신.
+ * umask(000): sun_path 에 생성되는 소켓 파일의 권한을 666 으로 하여 접근 제한 해제
+ *            (이후 원래 umask 복원).
+ * sun_path 길이: 보통 108B 제한. snprintf 로 안전 복사.
  */
 static int fio_init_server_sock(void)
 {
@@ -3170,32 +4037,40 @@ static int fio_init_server_sock(void)
 	mode_t mode;
 	int sk;
 
-	sk = socket(AF_UNIX, SOCK_STREAM, 0);
+	sk = socket(AF_UNIX, SOCK_STREAM, 0);  /* [한국어] Unix 도메인 스트림 소켓 */
 	if (sk < 0) {
 		log_err("fio: socket: %s\n", strerror(errno));
 		return -1;
 	}
 
-	mode = umask(000);
+	mode = umask(000);  /* [한국어] umask 0 으로 세트 — 소켓 파일 권한 제한 해제 */
 
 	addr.sun_family = AF_UNIX;
 	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", bind_sock);
+	/* [한국어] 경로 복사 (길이 초과 시 자르고 NUL 종결) */
 
 	len = sizeof(addr.sun_family) + strlen(bind_sock) + 1;
+	/* [한국어] bind len 은 family + 경로(+ NUL) 합 */
 
 	if (bind(sk, (struct sockaddr *) &addr, len) < 0) {
+		/* [한국어] bind 실패 — 같은 경로 이미 존재 또는 권한 부족 */
 		log_err("fio: bind: %s\n", strerror(errno));
 		close(sk);
 		return -1;
 	}
 
-	umask(mode);
+	umask(mode);  /* [한국어] 원래 umask 복원 */
 	return sk;
 }
 
 /*
- * [한국어] 서버 소켓 초기화 및 리스닝 시작
- * IP 또는 Unix 소켓을 초기화하고, 바인드 주소를 로그 출력한 뒤 listen() 호출.
+ * [한국어]
+ * fio_init_server_connection - 서버 소켓 초기화 + 주소 로그 출력 + listen 시작
+ *
+ * @return: 성공 시 listen 완료된 fd, 실패 시 -1.
+ *
+ * bind_sock 이 세트되어 있으면 Unix 도메인, 아니면 IP 소켓.
+ * listen(sk, 4): backlog=4 — 다수 클라이언트가 동시 접속하는 드문 경우 대비.
  */
 static int fio_init_server_connection(void)
 {
@@ -3240,6 +4115,7 @@ static int fio_init_server_connection(void)
 	log_info("fio: server listening on %s\n", bind_str);
 
 	if (listen(sk, 4) < 0) {
+		/* [한국어] listen(backlog=4) — accept 대기 큐 크기. 동시 접속 드물어 소형. */
 		log_err("fio: listen: %s\n", strerror(errno));
 		close(sk);
 		return -1;
@@ -3249,8 +4125,17 @@ static int fio_init_server_connection(void)
 }
 
 /*
- * [한국어] 호스트명/IP 문자열을 주소 구조체로 변환
- * 먼저 inet_pton()으로 시도하고, 실패하면 getaddrinfo()로 DNS 해석.
+ * [한국어]
+ * fio_server_parse_host - 호스트명/IP 문자열을 binary 주소 구조체로 변환
+ *
+ * @host: "1.2.3.4" / "::1" / "example.com" 등.
+ * @ipv6: 0=IPv4, 1=IPv6.
+ * @inp: IPv4 결과 저장 위치.
+ * @inp6: IPv6 결과 저장 위치.
+ * @return: 0 성공, 1 실패.
+ *
+ * 2단계 접근: inet_pton 으로 numeric 시도 → 실패 시 getaddrinfo 로 DNS 해석.
+ * DNS 실패 시 gai_strerror 로 에러 메시지 출력.
  */
 int fio_server_parse_host(const char *host, int ipv6, struct in_addr *inp,
 			  struct in6_addr *inp6)
@@ -3301,13 +4186,27 @@ int fio_server_parse_host(const char *host, int ipv6, struct in_addr *inp,
  *	*ptr is the filename, *is_sock is 1.
  */
 /*
- * [한국어] 서버 주소 문자열을 파싱하여 각 구성 요소로 분리
+ * [한국어]
+ * fio_server_parse_string - 서버 --server 인자 문자열을 각 구성 요소로 분리
+ *
+ * @str: 입력 문자열.
+ * @ptr: Out — 호스트 문자열 strdup (is_sock 이면 Unix 경로).
+ * @is_sock: Out — true 이면 "sock:" 접두.
+ * @port: Out — 포트 번호.
+ * @inp/@inp6: Out — IPv4/IPv6 바이너리 주소.
+ * @ipv6: Out — 1 이면 IPv6 사용.
+ * @return: 0 성공, 1 실패.
+ *
  * 지원 형식:
- *   - "sock:/path"     -> Unix 도메인 소켓
- *   - "ip:1.2.3.4"     -> IPv4 주소
- *   - "ip6:::1"        -> IPv6 주소
- *   - "1.2.3.4,8765"   -> IP + 포트
- *   - ":8765"          -> 포트만 지정
+ *   - "sock:/path"     → Unix 도메인 소켓.
+ *   - "ip:1.2.3.4"     → IPv4 (ip: 접두 스트립).
+ *   - "ip4:..."        → 동일.
+ *   - "ip6:::1"        → IPv6.
+ *   - "host,port"      → IP/호스트 + 포트 (',' 구분자).
+ *   - ":8765"          → 포트만.
+ *
+ * 호출 체인: fio_handle_server_arg / client.c → fio_server_parse_string →
+ *           fio_server_parse_host.
  */
 int fio_server_parse_string(const char *str, char **ptr, bool *is_sock,
 			    int *port, struct in_addr *inp,
@@ -3401,8 +4300,13 @@ int fio_server_parse_string(const char *str, char **ptr, bool *is_sock,
  *
  */
 /*
- * [한국어] 서버 인자를 파싱하여 바인드 주소와 포트를 설정
- * 인자가 없으면 INADDR_ANY (0.0.0.0)에 기본 포트로 바인드한다.
+ * [한국어]
+ * fio_handle_server_arg - --server 인자 처리 → saddr_in/saddr_in6/bind_sock/use_ipv6 세팅
+ *
+ * @return: 0 성공, 1 실패.
+ *
+ * 인자 없음 → INADDR_ANY(0.0.0.0) + 기본 포트 FIO_NET_PORT(8765).
+ * sock 문자열이 세트되었지만 is_sock 이 false 이면 bind_sock 해제.
  */
 static int fio_handle_server_arg(void)
 {
@@ -3431,14 +4335,31 @@ out:
 	return ret;
 }
 
-/* [한국어] SIGINT 시그널 핸들러 - Unix 소켓 파일 정리 */
+/*
+ * [한국어]
+ * sig_int - SIGINT(Ctrl+C) 시그널 핸들러 — Unix 소켓 파일 정리
+ *
+ * @sig: 받은 시그널 번호(SIGINT 또는 Windows SIGBREAK).
+ * @return: 없음.
+ *
+ * async-signal-safe 함수만 사용 허용 — unlink(2) 는 safe.
+ * exit_backend 세트는 상위 fio_server_got_signal 에서 처리하며, 여기는 소켓 파일만 제거.
+ */
 static void sig_int(int sig)
 {
 	if (bind_sock)
-		unlink(bind_sock);
+		unlink(bind_sock);  /* [한국어] Unix 도메인 소켓 파일 제거 — 다음 bind 가 "이미 존재" 에러를 피함 */
 }
 
-/* [한국어] 시그널 핸들러 등록 (SIGINT, Windows에서는 SIGBREAK도) */
+/*
+ * [한국어]
+ * set_sig_handlers - SIGINT/SIGBREAK 시그널 핸들러 등록
+ *
+ * @return: 없음.
+ *
+ * SA_RESTART: 시그널로 끊긴 syscall 을 자동 재시작(accept/poll 등이 EINTR 으로 깨지는 빈도 감소).
+ * Windows SIGBREAK: Ctrl+Break (POSIX SIGINT 와 대응).
+ */
 static void set_sig_handlers(void)
 {
 	struct sigaction act = {
@@ -3446,21 +4367,36 @@ static void set_sig_handlers(void)
 		.sa_flags = SA_RESTART,
 	};
 
-	sigaction(SIGINT, &act, NULL);
+	sigaction(SIGINT, &act, NULL);  /* [한국어] Ctrl+C 처리 */
 
 	/* Windows uses SIGBREAK as a quit signal from other applications */
 #ifdef WIN32
-	sigaction(SIGBREAK, &act, NULL);
+	sigaction(SIGBREAK, &act, NULL);  /* [한국어] Windows Ctrl+Break — SIGINT 와 동일 처리 */
 #endif
 }
 
-/* [한국어] 스레드별 sk_out 저장 키 삭제 */
+/*
+ * [한국어]
+ * fio_server_destroy_sk_key - pthread TLS 키 제거 (프로세스 종료 직전)
+ *
+ * @return: 없음.
+ *
+ * 호출 체인: main → deinitialize_fio → fio_server_destroy_sk_key.
+ */
 void fio_server_destroy_sk_key(void)
 {
 	pthread_key_delete(sk_out_key);
 }
 
-/* [한국어] 스레드별 sk_out 저장 키 생성 (pthread_key_create) */
+/*
+ * [한국어]
+ * fio_server_create_sk_key - pthread TLS 키 생성 (main 직후 1회)
+ *
+ * @return: 0 성공, 1 실패.
+ *
+ * sk_out_key 는 모듈 전역 — 이 키 하나로 여러 스레드가 각자의 sk_out* 을 TLS 에 저장.
+ * 소멸자 NULL: 스레드 종료 시 TLS 값 자동 해제하지 않음(sk_out_drop 가 수동 처리).
+ */
 int fio_server_create_sk_key(void)
 {
 	if (pthread_key_create(&sk_out_key, NULL)) {
@@ -3468,17 +4404,23 @@ int fio_server_create_sk_key(void)
 		return 1;
 	}
 
-	pthread_setspecific(sk_out_key, NULL);
+	pthread_setspecific(sk_out_key, NULL);  /* [한국어] 메인 스레드 초기값 NULL */
 	return 0;
 }
 
 /*
- * [한국어] 서버 메인 함수
- * 1) fio_handle_server_arg()로 바인드 주소/포트 설정
- * 2) 시그널 핸들러 등록
- * 3) fio_init_server_connection()으로 소켓 초기화 및 리스닝 시작
- * 4) accept_loop()로 클라이언트 연결 수락 루프 진입
- * Windows에서는 자식 프로세스인 경우 바로 handle_connection_process()를 호출한다.
+ * [한국어]
+ * fio_server - 서버 메인 함수 (소켓 준비 + accept_loop 진입)
+ *
+ * @return: accept_loop 반환값 또는 -1 실패.
+ *
+ * 단계:
+ *   1) fio_handle_server_arg — --server 인자 파싱 → saddr_in[6], bind_sock, use_ipv6.
+ *   2) set_sig_handlers — SIGINT/SIGBREAK 등록.
+ *   3) (Windows 자식) handle_connection_process 바로 호출 — 부모로부터 파이프 수신.
+ *   4) fio_init_server_connection — socket+bind+listen.
+ *   5) accept_loop — 연결 수락 루프.
+ *   6) 종료 정리: close(listen_sk), fio_server_arg/bind_sock 해제.
  */
 static int fio_server(void)
 {
@@ -3523,9 +4465,17 @@ static int fio_server(void)
 }
 
 /*
- * [한국어] 시그널 수신 처리
- * SIGPIPE: 소켓 fd를 -1로 설정 (쓰기 불가 상태로 전환)
- * 기타 시그널: exit_backend를 true로 설정하여 서버 종료 유도
+ * [한국어]
+ * fio_server_got_signal - 시그널 수신 시 서버 상태 플래그 갱신
+ *
+ * @signal: 받은 시그널 번호.
+ * @return: 없음.
+ *
+ * SIGPIPE: writev/send 가 실패 반환 후 이 핸들러가 호출됨 → sk 를 -1 로 세트해
+ *          이후 전송 시도를 모두 차단.
+ * 기타: exit_backend=true → 모든 poll/accept 루프가 다음 반복에서 탈출.
+ * 주의: 이 함수는 시그널 핸들러가 아니라 상위에서 호출되는 "시그널 이벤트 처리" 함수
+ *       (main thread context) — async-signal-safety 제약 없음.
  */
 void fio_server_got_signal(int signal)
 {
@@ -3542,8 +4492,15 @@ void fio_server_got_signal(int signal)
 }
 
 /*
- * [한국어] 기존 PID 파일을 확인하여 서버가 이미 실행 중인지 검사
- * PID 파일의 PID에 SIGCONT를 보내 프로세스 존재 여부를 확인한다.
+ * [한국어]
+ * check_existing_pidfile - 기존 pidfile 검사 → 서버가 이미 돌고 있는지 판별
+ *
+ * @pidfile: 파일 경로.
+ * @return: 0 = 파일 없음 또는 대상 프로세스 죽음(재시작 가능),
+ *          1 = 살아있음 또는 파일 읽기 실패(중복 기동 차단).
+ *
+ * kill(pid, SIGCONT): SIGCONT=continue 는 "NOP"에 가까움 — 프로세스 존재 여부만 확인.
+ * ESRCH 반환 = 해당 PID 없음 → 재기동 허용.
  */
 static int check_existing_pidfile(const char *pidfile)
 {
@@ -3572,7 +4529,14 @@ static int check_existing_pidfile(const char *pidfile)
 	return 1;
 }
 
-/* [한국어] PID를 파일에 기록 (데몬 모드에서 사용) */
+/*
+ * [한국어]
+ * write_pid - 데몬 모드에서 자식 PID 를 pidfile 에 기록
+ *
+ * @pid: 기록할 PID.
+ * @pidfile: 경로.
+ * @return: 0 성공, 1 실패.
+ */
 static int write_pid(pid_t pid, const char *pidfile)
 {
 	FILE *fpid;
@@ -3592,14 +4556,22 @@ static int write_pid(pid_t pid, const char *pidfile)
  * If pidfile is specified, background us.
  */
 /*
- * [한국어] 서버 시작 진입점
- * pidfile이 NULL이면 포그라운드로 fio_server() 직접 실행.
- * pidfile이 지정되면:
- *   1) 기존 서버 실행 여부 확인
- *   2) fork()하여 자식을 데몬으로 실행
- *   3) 부모는 PID 파일을 기록하고 종료
- *   4) 자식은 setsid(), stdin/stdout/stderr를 /dev/null로 리다이렉트,
- *      syslog 개시 후 fio_server() 실행
+ * [한국어]
+ * fio_start_server - 서버 기동 진입점 (main() 에서 is_backend 시 호출)
+ *
+ * @pidfile: 데몬화 요청 시 pidfile 경로, NULL 이면 포그라운드 실행.
+ * @return: 서버 종료 코드.
+ *
+ * 데몬화 단계(pidfile != NULL):
+ *   1) check_existing_pidfile — 기존 PID 살아있는지 검사 → 중복 기동 방지.
+ *   2) fork() 로 데몬 자식 분리. 부모는 write_pid 후 _exit.
+ *   3) 자식: setsid — 새 세션 리더 → 제어터미널 분리.
+ *   4) openlog — stderr 대신 syslog 사용.
+ *   5) stdin/stdout/stderr → /dev/null (파일 디스크립터 0/1/2 재활용 방지 + tty 연결 끊기).
+ *   6) fio_server() 실행.
+ *   7) 종료 시 closelog + unlink(pidfile).
+ *
+ * WSAStartup: Windows 소켓 라이브러리 초기화 (MAKEWORD(2,2) = WinSock 2.2).
  */
 int fio_start_server(char *pidfile)
 {
@@ -3628,14 +4600,16 @@ int fio_start_server(char *pidfile)
 		free(pidfile);
 		return -1;
 	} else if (pid) {
+		/* [한국어] 부모 경로: PID 기록 후 즉시 종료 (데몬 완료) */
 		ret = write_pid(pid, pidfile);
 		free(pidfile);
 		_exit(ret);
 	}
 
-	setsid();
+	setsid();  /* [한국어] 새 세션 리더 — tty 분리, SIGHUP 격리 */
 	openlog("fio", LOG_NDELAY|LOG_NOWAIT|LOG_PID, LOG_USER);
-	log_syslog = true;
+	/* [한국어] LOG_NDELAY=즉시 연결, LOG_PID=로그에 PID 첨부, LOG_USER=일반 유저 시설 */
+	log_syslog = true;  /* [한국어] stderr 대신 syslog 로 리다이렉트 지시 */
 
 	file = freopen("/dev/null", "r", stdin);
 	if (!file)
@@ -3664,14 +4638,30 @@ int fio_start_server(char *pidfile)
 	return ret;
 }
 
-/* [한국어] 서버 주소/포트 인자를 설정 (문자열 복사 저장) */
+/*
+ * [한국어]
+ * fio_server_set_arg - 외부(init.c)에서 --server=<arg> 원본 문자열 전달받아 저장
+ *
+ * @arg: 사용자 지정 서버 인자.
+ * @return: 없음.
+ *
+ * strdup 복제 → fio_server() 말미에서 free.
+ */
 void fio_server_set_arg(const char *arg)
 {
 	fio_server_arg = strdup(arg);
 }
 
 #ifdef WIN32
-/* [한국어] Windows: 내부 파이프 이름을 설정 (자식 프로세스 간 소켓 전달용) */
+/*
+ * [한국어]
+ * fio_server_internal_set (Windows) - 내부 명명된 파이프 이름 설정
+ *
+ * @arg: 부모가 생성한 파이프 이름 (CreateProcess 인자로 자식에 전달).
+ * @return: 없음.
+ *
+ * 자식 프로세스가 handle_connection_process 에서 이 이름으로 파이프를 열어 부모와 통신.
+ */
 void fio_server_internal_set(const char *arg)
 {
 	fio_server_pipe_name = strdup(arg);

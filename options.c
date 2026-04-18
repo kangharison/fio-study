@@ -439,10 +439,28 @@ int split_parse_ddir(struct thread_options *o, struct split *split,
 }
 
 /*
- * [한국어] 특정 방향(읽기/쓰기/트림)에 대한 bssplit 파싱
- * split_parse_ddir()로 파싱 후 퍼센트 합계를 검증하고,
- * 미지정 항목에 나머지 퍼센트를 균등 분배한다.
- * 최종적으로 퍼센트 기준으로 정렬하여 런타임 조회를 최적화한다.
+ * [한국어]
+ * bssplit_ddir() — 특정 방향(DDIR_READ/WRITE/TRIM) 에 대한 bssplit 배열 구축.
+ *
+ * @o:    thread_options (결과를 o->bssplit[ddir] 에 저장).
+ * @eo:   unused.
+ * @ddir: DDIR_READ / DDIR_WRITE / DDIR_TRIM.
+ * @str:  방향별 문자열. 예: "4k/50:8k/30:16k/20". str_split_parse 가 쉼표로 분리한 결과.
+ * @data: unused (str_split_parse 시그니처 준수).
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: "bs" 옵션은 단일 값이지만 bssplit 은 여러 블록 크기의 확률 분포. 예: 50% 확률로 4K,
+ * 30%로 8K, 20%로 16K. 런타임에 io_u.c::get_next_buflen 이 난수 뽑아 이 분포에서 블록 크기 추첨.
+ *
+ * 동작 단계:
+ * 1) split_parse_ddir 로 "값/퍼센트" 리스트 파싱 (일반 헬퍼 재사용).
+ * 2) o->bssplit[ddir] 에 struct bssplit[.nr] 할당.
+ * 3) 각 엔트리를 .bs/.perc 로 복사 + max_bs/min_bs 추적.
+ * 4) 퍼센트 합계 검증 (>100% 거부) + 미지정(-1U) 엔트리에 나머지 균등 분배.
+ * 5) o->min_bs[ddir]/max_bs[ddir] 세팅 — io_u.c 버퍼 크기 결정에 사용.
+ * 6) qsort(bs_cmp) — 퍼센트 오름차순 정렬. 런타임 누적합 탐색 간소화.
+ *
+ * 호출 체인: str_bssplit_cb → str_split_parse → [bssplit_ddir] → split_parse_ddir → qsort.
  */
 static int bssplit_ddir(struct thread_options *o, void *eo,
 			enum fio_ddir ddir, char *str, bool data)
@@ -518,14 +536,34 @@ static int bssplit_ddir(struct thread_options *o, void *eo,
 }
 
 /*
- * [한국어] 읽기/쓰기/트림 방향별 분할 파싱 드라이버
+ * [한국어]
+ * str_split_parse() — 읽기/쓰기/트림 방향 3-way 분할 파싱 드라이버.
  *
- * "읽기값,쓰기값,트림값" 형식의 문자열을 분리하여
- * 각 방향(DDIR_READ, DDIR_WRITE, DDIR_TRIM)에 대해 fn 콜백을 호출한다.
- * 콤마가 없으면 동일한 값을 세 방향 모두에 적용한다.
+ * @td:   thread_data.
+ * @str:  "읽기값,쓰기값,트림값" 형식의 문자열 (수정됨).
+ * @fn:   각 방향별로 호출될 콜백 (bssplit_ddir 또는 zone_split_ddir).
+ * @eo:   unused (콜백 시그니처 유지용).
+ * @data: fn 에 그대로 전달 (예: zone_split에서 absolute 여부 flag).
+ * @return: fn 의 반환값 (하나라도 실패하면 1).
+ *
+ * 왜 필요한가: bssplit/zonesplit 같은 옵션은 3-way 쉼표 분리 후 각 방향별로 내부에 ":" 기반
+ * 분포 문법을 가진다. 공통 패턴을 이 드라이버가 캡슐화.
+ *
+ * 문법 규칙:
+ *   "읽기부분"                     → 3방향 모두에 동일 적용.
+ *   "읽기부분,쓰기부분"             → 트림은 쓰기와 동일.
+ *   "읽기부분,쓰기부분,트림부분"    → 3방향 명시.
  *
  * 예: bssplit=4k/50:8k/50,16k/100
- *     → READ: 4k(50%)+8k(50%), WRITE: 16k(100%), TRIM: 16k(100%)
+ *     → READ: 4k(50%)+8k(50%), WRITE: 16k(100%), TRIM: 16k(100%).
+ *
+ * 동작 단계:
+ * 1) 첫 ',' 위치 찾기. 없으면 strdup 복사본을 3방향 모두에 적용.
+ * 2) ',' 있으면 두 번째 ',' 도 검색 → 1개 또는 2개에 따라 2/3 분리.
+ * 3) 역순 호출: TRIM → WRITE → READ (nested NULL 삽입 편의).
+ * 4) strdup 복사본 사용하여 strsep 이 원본 훼손하지 않도록.
+ *
+ * 호출 체인: str_bssplit_cb / parse_zoned_distribution → [str_split_parse] → bssplit_ddir | zone_split_ddir.
  */
 int str_split_parse(struct thread_data *td, char *str,
 		    split_parse_fn *fn, void *eo, bool data)
@@ -573,7 +611,16 @@ int str_split_parse(struct thread_data *td, char *str,
 	return ret;
 }
 
-/* [한국어] FDP(Flexible Data Placement) ID 정렬 비교 함수 */
+/*
+ * [한국어]
+ * fio_fdp_cmp() — qsort 비교자: uint16_t FDP Placement ID 오름차순 정렬.
+ *
+ * @p1, @p2: uint16_t* (void*로 전달).
+ * @return: 차이값.
+ *
+ * 왜 필요한가: str_fdp_pli_cb 가 "1,2,5-7" 같은 입력을 ID 배열로 확장한 후 이 비교자로 정렬.
+ * 런타임에 fio가 FDP write 시 라운드로빈 또는 랜덤 선택 시 일관된 순서 보장.
+ */
 static int fio_fdp_cmp(const void *p1, const void *p2)
 {
 	const uint16_t *t1 = p1;
@@ -583,9 +630,28 @@ static int fio_fdp_cmp(const void *p1, const void *p2)
 }
 
 /*
- * [한국어] FDP placement ID 리스트 파싱 콜백
- * "1,2,3-5" 형식으로 단일 ID와 범위를 모두 지원한다.
- * 최대 FIO_MAX_DP_IDS개까지 허용, 파싱 후 오름차순 정렬한다.
+ * [한국어]
+ * str_fdp_pli_cb() — fdp_pli (Flexible Data Placement — Placement Identifier List) 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @input: "1,2,3-5" 형식. 콤마 구분 ID와 '-' 범위 혼용 허용.
+ * @return: 0=성공, 1=실패(범위 초과, 잘못된 순서).
+ *
+ * 왜 필요한가: NVMe FDP (TP 4146) 는 SSD 내부의 Reclaim Unit Handle (RUH) 에 대응되는 Placement ID
+ * (PI) 를 호스트가 명시 제공하여 쓰기 데이터를 특정 NAND 블록 그룹에 배치. Data Placement 제어로
+ * GC 효율/수명 향상. 이 옵션으로 사용할 PI 집합 지정.
+ *
+ * 동작 단계:
+ * 1) 입력 복제 + 공백 스트립.
+ * 2) strsep(',') 로 항목 분리.
+ * 3) 각 항목을 strsep('-') 로 시작/끝 ID 분리 (단일 ID는 끝=-1).
+ * 4) strtoull 로 정수 변환. start>end 검증.
+ * 5) FIO_MAX_DP_IDS / 0xFFFF 상한 검사.
+ * 6) td->o.dp_ids[] 에 평탄화해 저장.
+ * 7) 정렬: qsort(fio_fdp_cmp) — 런타임 선택 시 결정적 순서.
+ *
+ * 호출 체인: parse.c → [str_fdp_pli_cb] → strtoull/qsort.
+ * 읽는 자: engines/io_uring.c / xnvme.c 등이 FDP 쓰기 SQE 작성 시 dp_ids[] 참조.
  */
 static int str_fdp_pli_cb(void *data, const char *input)
 {
@@ -651,8 +717,21 @@ static int str_fdp_pli_cb(void *data, const char *input)
 }
 
 /*
- * [한국어] FDP scheme 파일 검증 콜백
- * dp_scheme_file 옵션으로 지정된 파일이 실제로 존재하는 일반 파일인지 확인한다.
+ * [한국어]
+ * str_dp_scheme_cb() — dp_scheme 옵션의 파일 경로 유효성 검증.
+ *
+ * @data:  &td->o. dp_scheme_file 은 이미 FIO_OPT_STR_STORE 로 저장됨.
+ * @input: 원본 옵션 문자열 (사용하지 않음 — td->o.dp_scheme_file 직접 접근).
+ * @return: 0=성공, errno=lstat 실패 또는 정규 파일 아님.
+ *
+ * 왜 필요한가: Data Placement scheme 을 JSON 파일로 전달받아 복잡한 placement 정책을 기술.
+ * 파싱 단계에서 파일 존재+정규파일임을 조기 검증해 나중에 I/O 중 실패하지 않도록.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun 방어.
+ * 2) dp_scheme_file 복사 후 공백 스트립 → 원본 덮어쓰기 (strcpy 는 같은 길이라 안전).
+ * 3) lstat 실패 → td_verror 반영.
+ * 4) S_ISREG 아님 → 에러 (디렉토리/심볼릭 거부).
  */
 static int str_dp_scheme_cb(void *data, const char *input)
 {
@@ -690,9 +769,21 @@ out:
 }
 
 /*
- * [한국어] bssplit 옵션 파싱 콜백
- * "4k/50:8k/50,16k/100" 같은 블록 크기 분포를 파싱한다.
- * str_split_parse()를 통해 읽기/쓰기/트림 방향별로 분리 처리한다.
+ * [한국어]
+ * str_bssplit_cb() — bssplit 옵션 콜백: 블록 크기 확률 분포 파싱 진입점.
+ *
+ * @data:  &td->o.
+ * @input: "4k/50:8k/30:16k/20" 형식의 ":" 구분 분포 또는 "읽기분포,쓰기분포,트림분포" 3-way.
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: 실제 워크로드는 단일 블록 크기가 아니라 여러 크기의 혼합. bssplit 은
+ * "50% 확률로 4K, 30%로 8K, 20%로 16K" 같은 분포를 지정. io_u.c::get_next_buflen 이 매 I/O
+ * 마다 이 분포에서 난수 뽑아 블록 크기 결정.
+ *
+ * 동작: str_split_parse 로 3-way 분리 → 각 방향은 bssplit_ddir 으로 위임.
+ * dryrun 시 결과 배열 해제 (부수효과 제거).
+ *
+ * 호출 체인: parse.c → [str_bssplit_cb] → str_split_parse → bssplit_ddir → split_parse_ddir.
  */
 static int str_bssplit_cb(void *data, const char *input)
 {
@@ -722,9 +813,35 @@ static int str_bssplit_cb(void *data, const char *input)
 }
 
 /*
- * [한국어] cmdprio_bssplit 개별 항목 파싱
- * "bs/perc/class/level/hint" 형식을 파싱한다.
- * 예: "4k/50/1/2/0" → 4K 블록의 50%에 대해 class=1, level=2, hint=0 우선순위 적용
+ * [한국어]
+ * parse_cmdprio_bssplit_entry() — cmdprio_bssplit 의 개별 엔트리 파싱.
+ *
+ * @o:     thread_options (str_to_decimal 컨텍스트).
+ * @entry: [out] 결과 채워짐. {bs, perc, prio}.
+ * @str:   "bs/perc/class/level/hint" 형식. 뒤쪽 필드는 선택적.
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: libaio/io_uring/sg 엔진에서 블록 크기별로 다른 I/O 우선순위 적용. 예: "4k/50/1/2/0"
+ * 는 4K 블록의 50%에 대해 IOPRIO_CLASS=1(RT), level=2, hint=0 으로 ioprio_set.
+ *
+ * 입력 형식 (%m[^/]/%u/%u/%u/%u):
+ *   bs/                        (perc=0, prio=-1)
+ *   bs/perc                    (prio=-1)
+ *   bs/perc/class/level
+ *   bs/perc/class/level/hint
+ *
+ * 동작 단계:
+ * 1) sscanf 로 bs_str / perc / class / level / hint 추출. matches 변수로 파싱된 필드 수 확인.
+ * 2) bs_str → str_to_decimal (k/m/g 단위 처리).
+ * 3) perc min(perc, 100) 으로 클램프.
+ * 4) matches 에 따라 class/level/hint 해석:
+ *    - matches=1 or 2: prio=-1 (우선순위 미적용).
+ *    - matches=4: class+level만. hint=0.
+ *    - matches=5: class+level+hint.
+ *    - 기타: 형식 오류.
+ * 5) ioprio_value(class, level, hint) 로 16비트 ioprio 값 인코딩.
+ *
+ * 호출 체인: split_parse_prio_ddir → [parse_cmdprio_bssplit_entry] → str_to_decimal / ioprio_value.
  */
 static int parse_cmdprio_bssplit_entry(struct thread_options *o,
 				       struct split_prio *entry, char *str)
@@ -785,6 +902,12 @@ static int parse_cmdprio_bssplit_entry(struct thread_options *o,
  * argument in the sorted list. A positive integer if the first argument should
  * be after the second argument in the sorted list. A zero if they are equal.
  */
+/*
+ * [한국어]
+ * fio_split_prio_cmp() — qsort 비교자: split_prio.bs 오름차순.
+ *
+ * 왜 필요한가: split_parse_prio_ddir 결과 정렬에 사용. 런타임에 block size → priority 이진 탐색 가능.
+ */
 static int fio_split_prio_cmp(const void *p1, const void *p2)
 {
 	const struct split_prio *tmp1 = p1;
@@ -798,8 +921,26 @@ static int fio_split_prio_cmp(const void *p1, const void *p2)
 }
 
 /*
- * [한국어] cmdprio_bssplit 방향별 파싱 — 콜론 구분 항목들을 순회하며
- * parse_cmdprio_bssplit_entry()로 각 항목을 파싱하고 정렬한다.
+ * [한국어]
+ * split_parse_prio_ddir() — cmdprio_bssplit 의 방향별 파싱 드라이버.
+ *
+ * @o:          thread_options.
+ * @entries:    [out] calloc 된 split_prio 배열.
+ * @nr_entries: [out] 엔트리 수.
+ * @str:        ":" 구분 엔트리 리스트.
+ * @return:     0=성공, 1=실패 (parse_cmdprio_bssplit_entry 실패 또는 OOM).
+ *
+ * 왜 필요한가: cmdprio_bssplit=4k/50/1/2:8k/30/2/1 의 "4k/50/1/2", "8k/30/2/1" 각 엔트리를
+ * parse_cmdprio_bssplit_entry 로 파싱하고 bs 오름차순 정렬.
+ *
+ * 동작 단계 (2-pass):
+ * 1) 1st pass (복제본 소모) — 엔트리 개수 세기 (BSSPLIT_MAX 상한 검증).
+ * 2) calloc 으로 배열 할당.
+ * 3) 2nd pass — 실제 파싱. perc=0 엔트리는 무의미하므로 skip.
+ * 4) qsort(fio_split_prio_cmp) — bs 오름차순.
+ *
+ * 호출 체인: cmdprio.c::fio_cmdprio_parse_and_gen_bssplit → [split_parse_prio_ddir] →
+ *            parse_cmdprio_bssplit_entry.
  */
 int split_parse_prio_ddir(struct thread_options *o, struct split_prio **entries,
 			  int *nr_entries, char *str)
@@ -860,9 +1001,20 @@ int split_parse_prio_ddir(struct thread_options *o, struct split_prio **entries,
 }
 
 /*
- * [한국어] errno 이름 문자열을 숫자로 변환
- * 예: "EINVAL" → 22, "ENOENT" → 2
- * ignore_error, continue_on_error 옵션에서 사용된다.
+ * [한국어]
+ * str2error() — POSIX/Linux errno 이름 문자열을 정수 errno 값으로 변환.
+ *
+ * @str: "EINVAL" / "ENOENT" / "EWOULDBLOCK" 등의 심볼 이름.
+ * @return: 해당 errno 정수 (1..134). 미매칭 시 0.
+ *
+ * 왜 필요한가: ignore_error 옵션이 "EIO,EAGAIN" 처럼 errno 이름을 받게 하려면 이름→숫자 매핑 필요.
+ * <errno.h> 는 심볼 이름→번호 런타임 매핑을 제공하지 않으므로 직접 테이블 유지.
+ *
+ * 동작: err[] 배열 선형 탐색 (약 130개). 매칭되면 인덱스+1 이 errno 값 (POSIX/Linux 번호 순서 일치 가정).
+ *       2개 별칭 예외: EWOULDBLOCK → EAGAIN, EDEADLOCK → EDEADLK.
+ *
+ * 주의: 테이블 순서가 Linux <asm-generic/errno.h> / <asm-generic/errno-base.h> 의 번호 순서와 일치해야 함.
+ *       플랫폼 간 번호가 다를 수 있지만 fio는 주로 Linux 타겟.
  */
 static int str2error(char *str)
 {
@@ -912,6 +1064,28 @@ static int str2error(char *str)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * ignore_error_type() — str_ignore_error_cb 의 방향별 errno 리스트 파싱 헬퍼.
+ *
+ * @td:    thread_data.
+ * @etype: 방향 enum (ERROR_TYPE_READ_BIT/WRITE_BIT/TRIM_BIT).
+ * @str:   ":" 구분 errno 리스트 문자열 (수정됨).
+ * @return: 0=성공, 1=알 수 없는 토큰/범위 초과.
+ *
+ * 왜 필요한가: "EIO:EAGAIN:EINVAL" 같은 리스트를 파싱해 td->o.ignore_error[etype] 정수 배열 구축.
+ * "E" 접두사 문자열은 str2error로 변환, 그 외는 decimal/hex 정수로 해석 (0x 접두사 지원).
+ *
+ * 동작 단계:
+ * 1) 초기 배열 크기 4 할당 (calloc). 4 초과 시 동적으로 << 1 (배가) 재할당.
+ * 2) strsep(':') 로 토큰화.
+ * 3) 토큰 첫 문자 'E' 면 str2error → errno 번호, 아니면 strtol (base 10 or 16).
+ * 4) 음수는 절대값으로 정규화.
+ * 5) 0 (알 수 없음) 은 에러.
+ * 6) 성공하면 continue_on_error 비트마스크에 1<<etype 비트 세팅.
+ *
+ * 호출 체인: str_ignore_error_cb → [ignore_error_type] → str2error / strtol.
+ */
 static int ignore_error_type(struct thread_data *td, enum error_type_bit etype,
 				char *str)
 {
@@ -974,7 +1148,29 @@ static int ignore_error_type(struct thread_data *td, enum error_type_bit etype,
 
 }
 
-/* [한국어] replay_skip 옵션 콜백: blktrace 재생 시 건너뛸 I/O 방향 지정 */
+/*
+ * [한국어]
+ * str_replay_skip_cb() — replay_skip 옵션 콜백.
+ *
+ * @data:  parse.c 가 전달한 &td->o (cb_data_to_td 로 td 역산).
+ * @input: 콤마 구분 방향 리스트. 예: "read", "write,trim", "read,write,trim,sync".
+ * @return: 0=성공, 1=알 수 없는 토큰 또는 NULL input.
+ *
+ * 왜 필요한가: blktrace 재생(read_iolog_file) 모드에서 특정 방향의 I/O 이벤트를
+ * 건너뛸 때 사용한다. 디바이스 특성상 TRIM 을 지원하지 않거나 READ 만 측정하려는
+ * 경우, 원본 trace의 해당 방향 엔트리를 무시하도록 마킹한다.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 이면 부수효과 없이 0 반환.
+ * 2) input 복제 후 공백 스트립.
+ * 3) strchr(',') 로 한 토큰씩 분리.
+ * 4) read/write/trim/sync 매칭 시 td->o.replay_skip 비트마스크에 1u<<DDIR_* 설정.
+ * 5) 알 수 없는 토큰이면 에러 후 break.
+ *
+ * 호출 체인: parse.c::parse_option → [str_replay_skip_cb] → iolog.c::read_iolog_get()
+ *            가 이 마스크를 보고 해당 ddir 을 스킵.
+ * 읽는 자: iolog.c 의 replay 루프.
+ */
 static int str_replay_skip_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1015,8 +1211,26 @@ static int str_replay_skip_cb(void *data, const char *input)
 }
 
 /*
- * [한국어] ignore_error 옵션 콜백: 무시할 errno 목록 파싱
- * 방향별(읽기/쓰기/트림)로 콤마 구분된 errno 이름/번호를 파싱한다.
+ * [한국어]
+ * str_ignore_error_cb() — ignore_error 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @input: "읽기errno:...,쓰기errno:...,트림errno:..." 형식. 쉼표 3-way 분리.
+ *         예: "EIO:EAGAIN,ENOSPC,ENODEV" — READ는 EIO/EAGAIN, WRITE는 ENOSPC, TRIM은 ENODEV 무시.
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: 벤치마크 진행 중 특정 errno를 만나도 잡을 중단하지 않고 계속 진행할 때
+ * 사용. 예: 용량 초과(ENOSPC) 시 에러 대신 재시도, 또는 간헐 장애 시 통계 누적만.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 방어.
+ * 2) input 복제+공백 스트립.
+ * 3) strchr(',') 로 방향 단위 분리 — type 카운터로 DDIR_READ→WRITE→TRIM 매핑.
+ * 4) 각 방향 토큰을 ignore_error_type() 에 넘겨 ":" 내부 errno 이름/번호 파싱.
+ * 5) ignore_error_type 이 td->o.ignore_error[type]/nr 채움 + continue_on_error 비트 세팅.
+ *
+ * 호출 체인: parse.c → [str_ignore_error_cb] → ignore_error_type → str2error.
+ * 읽는 자: backend.c::do_io()가 I/O 에러 시 td->o.ignore_error[ddir] 검사.
  */
 static int str_ignore_error_cb(void *data, const char *input)
 {
@@ -1050,10 +1264,29 @@ static int str_ignore_error_cb(void *data, const char *input)
 }
 
 /*
- * [한국어] rw(readwrite) 옵션 콜백
- * "read", "write", "randread", "randrw" 등의 I/O 패턴 설정.
- * 콤마 뒤에 시퀀셜 I/O의 시작 오프셋을 지정할 수 있다.
- * 예: "rw=write,4k" → 순차 쓰기를 4K 오프셋부터 시작
+ * [한국어]
+ * str_rw_cb() — rw(readwrite) 옵션의 ",후위 파라미터" 처리 콜백.
+ *
+ * @data: &td->o. parse.c 는 이미 `rw=randread` 의 주값(posval)을 td_ddir 에 매핑 완료.
+ * @str:  원본 전체 옵션 문자열. 예: "rw=write,4k" 또는 "rw=randrw,16" 또는 단순 "rw=read".
+ * @return: 0=성공, 1=후위 파싱 실패.
+ *
+ * 왜 필요한가: fio rw 옵션은 주값 뒤에 콤마로 2가지 파라미터를 더 받는다:
+ *   (a) 순차(read/write/rw) 잡: offset — 각 I/O 사이의 고정 오프셋 증분(ddir_seq_add).
+ *       예: "rw=write,4k" → 오프셋 0, 4K, 8K, 12K 순으로 blk 단위 +4K 점프.
+ *   (b) 랜덤(randread/randwrite/randrw) 잡: nr — 같은 블록을 몇 번 반복 I/O 할지(ddir_seq_nr).
+ *       예: "rw=randrw,16" → 랜덤 위치 하나 뽑고 16번 반복 후 다음 랜덤 위치.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 방어 — 부수효과 없이 0 반환.
+ * 2) ddir_seq_nr=1, ddir_seq_add=0 기본값 설정.
+ * 3) get_opt_postfix(str) 로 ':' 뒤의 후위 문자열 추출(실제로는 get_opt_postfix가 콜론 기반이지만
+ *    여기서는 parse.c 가 "rw=" 제거 후 콤마로 재변환한 결과를 받는다).
+ * 4) td_random(td)이면 nr(반복 횟수)로 해석, 아니면 add(오프셋 증분)로 해석.
+ * 5) str_to_decimal 로 k/m/g 단위 처리.
+ *
+ * 호출 체인: parse.c::parse_option(rw posval 매핑 후) → [str_rw_cb] → str_to_decimal.
+ * 읽는 자: io_u.c::get_next_offset() 가 ddir_seq_add/nr 을 사용해 다음 I/O 위치 계산.
  */
 static int str_rw_cb(void *data, const char *str)
 {
@@ -1102,8 +1335,23 @@ static int str_rw_cb(void *data, const char *str)
 }
 
 /*
- * [한국어] mem(iomem) 옵션 콜백: 메모리 할당 방법 설정
- * "mmap:/path" 형식에서 ":"뒤의 파일 경로를 추출한다.
+ * [한국어]
+ * str_mem_cb() — iomem(mem) 옵션의 ":경로" 후위 처리 콜백.
+ *
+ * @data: &td->o. mem_type 은 이미 parse.c 가 posval(malloc/shm/shmhuge/mmap/mmaphuge/mmapshared/cudamalloc)
+ *        매핑으로 설정 완료.
+ * @mem:  원본 옵션 문자열. 예: "iomem=mmap:/mnt/huge/fio.mem", "iomem=malloc".
+ * @return: 항상 0.
+ *
+ * 왜 필요한가: mmap 계열 iomem(MMAPHUGE, MMAP, MMAPSHARED)은 특정 파일을 백엔드로 사용할 수 있다.
+ * 예: hugetlbfs에 생성된 파일(/mnt/huge/fio)이나 공유 메모리 파일. 이 콜백은 ":뒤" 경로를 추출해
+ * td->o.mmapfile에 strdup으로 저장. init.c::init_io_u() 에서 io_u 버퍼 할당 시 이 경로를 mmap 한다.
+ *
+ * 동작: MMAPHUGE/MMAP/MMAPSHARED 면 get_opt_postfix()로 콜론 뒤 경로 복제 저장.
+ *       다른 mem_type(malloc/shm/shmhuge)은 mmapfile 의미 없음 — NULL 유지.
+ *
+ * 호출 체인: parse.c → [str_mem_cb] → get_opt_postfix → strdup.
+ * 읽는 자: io_u.c::fio_iomem_*, init.c::init_io_u_buffers 에서 mmap(fd, ...) 경로로 사용.
  */
 static int str_mem_cb(void *data, const char *mem)
 {
@@ -1116,7 +1364,26 @@ static int str_mem_cb(void *data, const char *mem)
 	return 0;
 }
 
-/* [한국어] clocksource 옵션 콜백: 시간 소스 설정 후 시간 보정 수행 */
+/*
+ * [한국어]
+ * fio_clock_source_cb() — clocksource 옵션 콜백. 파싱 즉시 전역 시계 재초기화.
+ *
+ * @data: &td->o. clocksource 는 이미 posval 매핑으로 설정 (gettimeofday/clock_gettime/cpu).
+ * @str:  원본 "clocksource=cpu" 문자열 (사용하지 않음).
+ * @return: 0.
+ *
+ * 왜 필요한가: 잡이 시작되기 전에 전역 fio_clock_source 를 바꿔야 fio_gettime() 이후 호출이
+ * 새 클록으로 작동한다. 특히 CPU(TSC) 클록은 초기 보정(fio_clock_init)이 필요 — ns/tick 변환
+ * 상수 측정을 위한 1회성 벤치마크 루프를 돈다.
+ *
+ * 동작 단계:
+ * 1) td->o.clocksource 값을 전역 fio_clock_source 에 복사.
+ * 2) fio_clock_source_set = 1 마킹 (후속 잡이 덮어쓰지 않도록).
+ * 3) fio_clock_init() — TSC 보정 또는 clock_gettime 해상도 측정.
+ *
+ * 호출 체인: parse.c → [fio_clock_source_cb] → fio_clock_init (gettime.c).
+ * 실행 컨텍스트: 메인 프로세스의 옵션 파싱 단계. 잡 스레드 생성 전.
+ */
 static int fio_clock_source_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1127,7 +1394,20 @@ static int fio_clock_source_cb(void *data, const char *str)
 	return 0;
 }
 
-/* [한국어] rwmixread 콜백: 읽기 비율 설정 시 쓰기 비율 자동 계산 (100-val) */
+/*
+ * [한국어]
+ * str_rwmix_read_cb() — rwmixread 콜백: 읽기 비율 설정 시 쓰기 비율을 자동 보완.
+ *
+ * @data: &td->o.
+ * @val:  [in] 파싱된 정수값 (0~100, 읽기 퍼센트).
+ * @return: 0.
+ *
+ * 왜 필요한가: rwmixread 와 rwmixwrite 는 같은 것을 다르게 표현 (한쪽 설정 시 나머지는 100-x).
+ * 사용자가 둘 중 하나만 지정해도 자동으로 쌍이 완성되도록 cb가 양쪽을 한번에 채운다.
+ *
+ * 호출 체인: parse.c → [str_rwmix_read_cb] — td->o.rwmix[DDIR_READ/WRITE] 채움.
+ * 읽는 자: io_u.c::get_rand_ddir() 가 rwmix[] 로 매 io_u 의 ddir 추첨.
+ */
 static int str_rwmix_read_cb(void *data, long long *val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1137,7 +1417,17 @@ static int str_rwmix_read_cb(void *data, long long *val)
 	return 0;
 }
 
-/* [한국어] rwmixwrite 콜백: 쓰기 비율 설정 시 읽기 비율 자동 계산 (100-val) */
+/*
+ * [한국어]
+ * str_rwmix_write_cb() — rwmixwrite 콜백: str_rwmix_read_cb 의 대칭 쌍.
+ *
+ * @data: &td->o.
+ * @val:  [in] 쓰기 퍼센트(0~100).
+ * @return: 0.
+ *
+ * 동일 로직의 대칭 버전. 둘 다 지정되면 나중에 파싱된 쪽의 cb가 양쪽을 덮어쓴다.
+ * 우선순위 규칙은 없으며, parse.c 가 옵션 등장 순서대로 호출한다.
+ */
 static int str_rwmix_write_cb(void *data, long long *val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1147,7 +1437,22 @@ static int str_rwmix_write_cb(void *data, long long *val)
 	return 0;
 }
 
-/* [한국어] exitall 콜백: 하나의 잡이 끝나면 모든 잡을 종료하는 플래그 설정 */
+/*
+ * [한국어]
+ * str_exitall_cb() — exitall CLI/잡 옵션 콜백.
+ *
+ * @return: 0.
+ *
+ * 왜 필요한가: fio는 여러 잡을 병렬 실행할 수 있다. 기본적으로 각 잡은 runtime/size/loops
+ * 조건에 따라 독립적으로 종료한다. 이 플래그를 켜면 가장 먼저 끝난 잡 하나를 신호로
+ * 모든 잡이 즉시 종료된다(terminate_threads 전파). 복합 벤치마크에서 "먼저 끝내는 자가 기준"
+ * 같은 조건 테스트에 유용.
+ *
+ * 호출 체인: parse.c → [str_exitall_cb] (인자 없는 STR_SET 타입).
+ * 읽는 자: backend.c::reap_threads() 가 exitall_on_terminate 플래그로 전역 종료 결정.
+ *
+ * 특이점: 인자가 없는(void) 콜백 — FIO_OPT_STR_SET 타입 전용 시그니처.
+ */
 static int str_exitall_cb(void)
 {
 	exitall_on_terminate = true;
@@ -1155,6 +1460,24 @@ static int str_exitall_cb(void)
 }
 
 #ifdef FIO_HAVE_CPU_AFFINITY
+/*
+ * [한국어]
+ * fio_cpus_split() — CPU 마스크에서 cpu_index 번째 비트만 남기고 나머지 클리어.
+ *
+ * @mask:      [in, out] CPU 마스크. 수정됨.
+ * @cpu_index: 남길 CPU의 인덱스 (마스크 내 순서, 모듈로 순환).
+ * @return: 최종 마스크의 set 비트 수 (항상 0 또는 1).
+ *
+ * 왜 필요한가: cpus_allowed_policy=split 모드에서 numjobs 잡이 각각 다른 CPU 하나만 사용하도록.
+ * 예: cpus_allowed=0-3, numjobs=4, split → 잡0=CPU0, 잡1=CPU1, 잡2=CPU2, 잡3=CPU3.
+ *
+ * 동작 단계:
+ * 1) 마스크의 set 비트 수 조회.
+ * 2) cpu_index %= 비트수 (모듈로 순환).
+ * 3) 선형 스캔 — cpu_index 번째 set 비트를 제외한 나머지 모두 clear.
+ *
+ * 호출 체인: backend.c::thread_main → [fio_cpus_split] → sched_setaffinity.
+ */
 int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu_index)
 {
 	unsigned int i, index, cpus_in_mask;
@@ -1180,7 +1503,29 @@ int fio_cpus_split(os_cpu_mask_t *mask, unsigned int cpu_index)
 	return fio_cpu_count(mask);
 }
 
-/* [한국어] cpumask 콜백: CPU 친화성 마스크를 비트맵으로 설정 */
+/*
+ * [한국어]
+ * str_cpumask_cb() — cpumask 옵션 콜백: 비트 마스크 형식의 CPU 친화성 설정.
+ *
+ * @data: &td->o.
+ * @val:  [in] 정수로 파싱된 비트마스크. 각 비트 i → CPU i 허용. 예: 0x5 → CPU 0,2.
+ * @return: 0=성공, 1=범위 초과/cpuset_init 실패.
+ *
+ * 왜 필요한가: cpumask 는 cpus_allowed ("0,2-4" 범위 표기) 의 이진 표현 변종. 32비트 정수라
+ * CPU 0~31 만 표현 가능 — 그 이상은 cpus_allowed 옵션을 써야 한다.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 방어.
+ * 2) fio_cpuset_init() — sched_setaffinity(2) 호환 os_cpu_mask_t 준비 (Linux: cpu_set_t).
+ * 3) cpus_configured() 로 현재 시스템 최대 CPU 수 조회.
+ * 4) 32비트 루프 — val의 비트 i가 1이면 i >= max_cpu 검사 후 fio_cpu_set(&mask, i).
+ * 5) td->o.cpumask 에 완성된 마스크 저장.
+ *
+ * 호출 체인: parse.c → [str_cpumask_cb] → fio_cpuset_init/fio_cpu_set (os/os.h 매크로).
+ * 읽는 자: backend.c::thread_main() 가 sched_setaffinity(2) 로 잡 스레드 고정.
+ * 실행 컨텍스트: CONFIG_HAVE_CPU_AFFINITY 빌드 시에만 제공. 미지원 플랫폼에서는 엔트리 자체가
+ *                 UNSUPPORTED로 마킹되어 이 cb 호출되지 않음.
+ */
 static int str_cpumask_cb(void *data, unsigned long long *val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1215,6 +1560,33 @@ static int str_cpumask_cb(void *data, unsigned long long *val)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * set_cpus_allowed() — "0,2-4,6" 형식의 CPU 리스트를 os_cpu_mask_t 에 반영.
+ *
+ * @td:    thread_data (에러 보고용).
+ * @mask:  [out] 대상 CPU 마스크 (&td->o.cpumask 또는 verify_cpumask 또는 log_gz_cpumask).
+ * @input: CPU 리스트 문자열.
+ * @return: 0=성공, 1=실패 (잘못된 CPU 번호, cpuset_init 실패).
+ *
+ * 왜 필요한가: str_cpus_allowed_cb / str_verify_cpus_allowed_cb / str_log_cpus_allowed_cb 세
+ * 콜백이 공통으로 사용. 마스크 대상만 다르고 파싱 로직은 동일.
+ *
+ * 문법:
+ *   "0"            → CPU 0만.
+ *   "0,2,4"        → CPU 0, 2, 4.
+ *   "0-3"          → CPU 0, 1, 2, 3.
+ *   "0-3,7,10-12"  → 혼합 범위와 단일.
+ *
+ * 동작 단계:
+ * 1) fio_cpuset_init — 마스크를 zero 로 초기화 (CPU_ZERO).
+ * 2) strsep(',') 로 토큰 분리.
+ * 3) 각 토큰을 strsep('-') 로 시작/끝 분리 (단일은 끝=-1).
+ * 4) atoi 로 정수 변환.
+ * 5) 범위 [icpu..icpu2] 를 순회하며 FIO_MAX_CPUS / cpus_configured() 상한 검사 후 fio_cpu_set.
+ *
+ * 호출 체인: str_cpus_allowed_cb / 유사 → [set_cpus_allowed] → fio_cpu_set.
+ */
 static int set_cpus_allowed(struct thread_data *td, os_cpu_mask_t *mask,
 			    const char *input)
 {
@@ -1281,7 +1653,19 @@ static int set_cpus_allowed(struct thread_data *td, os_cpu_mask_t *mask,
 	return ret;
 }
 
-/* [한국어] cpus_allowed 콜백: "0,2-4,6" 형식의 CPU 목록을 CPU 마스크로 변환 */
+/*
+ * [한국어]
+ * str_cpus_allowed_cb() — cpus_allowed 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @input: "0,2-4,6" 형식의 CPU 리스트 문자열.
+ * @return: set_cpus_allowed() 의 반환값 (0=성공, 1=실패).
+ *
+ * 왜 필요한가: cpumask의 32비트 제약을 넘어 임의 CPU 조합을 지정. 최신 서버(수백 코어)에서 필수.
+ *
+ * 동작: set_cpus_allowed() 헬퍼에 td->o.cpumask 전달하여 파싱 및 세팅 위임.
+ * 호출 체인: parse.c → [str_cpus_allowed_cb] → set_cpus_allowed → fio_cpuset_init/fio_cpu_set.
+ */
 static int str_cpus_allowed_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1294,7 +1678,20 @@ static int str_cpus_allowed_cb(void *data, const char *input)
 	return set_cpus_allowed(td, &td->o.cpumask, input);
 }
 
-/* [한국어] verify_cpus_allowed 콜백: 검증 스레드의 CPU 친화성 설정 */
+/*
+ * [한국어]
+ * str_verify_cpus_allowed_cb() — verify_cpus_allowed 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @input: "0-3" 등 CPU 리스트.
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: verify_async>0 으로 별도 검증 스레드가 생성되면 그 스레드를 I/O 스레드와
+ * 다른 CPU 에 고정할 수 있다. 메인 I/O 스레드와 캐시 경쟁을 피하거나 특정 NUMA 노드에 격리.
+ *
+ * 호출 체인: parse.c → [str_verify_cpus_allowed_cb] → set_cpus_allowed(td, &verify_cpumask, ...).
+ * 읽는 자: verify.c::verify_async_thread 가 sched_setaffinity 로 사용.
+ */
 static int str_verify_cpus_allowed_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1308,7 +1705,20 @@ static int str_verify_cpus_allowed_cb(void *data, const char *input)
 }
 
 #ifdef CONFIG_ZLIB
-/* [한국어] log_cpus_allowed 콜백: 로그 스레드의 CPU 친화성 설정 */
+/*
+ * [한국어]
+ * str_log_cpus_allowed_cb() — log_compression_cpus 옵션 콜백 (CONFIG_ZLIB 한정).
+ *
+ * @data:  &td->o.
+ * @input: CPU 리스트.
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: log_compression > 0 이면 iolog.c::gz_work 압축 스레드가 zlib deflate를 돌린다.
+ * CPU 소모가 커서 잡 스레드와 별 CPU 에 고정해야 I/O 측정 오염을 줄인다.
+ *
+ * 호출 체인: parse.c → [str_log_cpus_allowed_cb] → set_cpus_allowed(td, &log_gz_cpumask, ...).
+ * 읽는 자: iolog.c::gz_init_worker 가 압축 스레드 생성 시 affinity 적용.
+ */
 static int str_log_cpus_allowed_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1325,7 +1735,27 @@ static int str_log_cpus_allowed_cb(void *data, const char *input)
 #endif /* FIO_HAVE_CPU_AFFINITY */
 
 #ifdef CONFIG_LIBNUMA
-/* [한국어] numa_cpu_nodes 콜백: NUMA CPU 노드 설정 (libnuma 사용) */
+/*
+ * [한국어]
+ * str_numa_cpunodes_cb() — numa_cpu_nodes 옵션 콜백 (CONFIG_LIBNUMA 한정).
+ *
+ * @data:  &td->o.
+ * @input: NUMA 노드 문자열. 예: "0", "0-1", "0,2". libnuma가 해석.
+ * @return: 0=성공, 1=파싱 실패.
+ *
+ * 왜 필요한가: 다중 소켓 NUMA 시스템에서 잡 스레드를 특정 메모리 노드와 짝지어 실행.
+ * cpus_allowed 가 CPU 친화성이라면 이 옵션은 NUMA 메모리 친화성. 둘을 함께 쓰면 CPU 와
+ * 메모리 양쪽이 한 NUMA 노드에 고정되어 원격 노드 접근 지연을 제거.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 방어.
+ * 2) numa_parse_nodestring(input) — libnuma가 "0-1,3" 같은 리스트를 bitmask로 변환.
+ * 3) bitmask 즉시 free (검증만 목적 — 실제 적용은 strdup된 문자열로).
+ * 4) td->o.numa_cpunodes = strdup(input) — 실제 적용은 post_init 단계에서.
+ *
+ * 호출 체인: parse.c → [str_numa_cpunodes_cb] → numa_parse_nodestring.
+ * 읽는 자: backend.c::thread_main() 이 numa_run_on_node_mask() 호출.
+ */
 static int str_numa_cpunodes_cb(void *data, char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -1352,9 +1782,31 @@ static int str_numa_cpunodes_cb(void *data, char *input)
 }
 
 /*
- * [한국어] numa_mem_policy 콜백: NUMA 메모리 정책 설정
- * "interleave:0-1", "bind:2", "prefer:1" 등의 형식을 파싱하여
- * 메모리 할당 시 NUMA 정책을 적용한다.
+ * [한국어]
+ * str_numa_mpol_cb() — numa_mem_policy 옵션 콜백 (CONFIG_LIBNUMA 한정).
+ *
+ * @data:  &td->o.
+ * @input: "정책:노드리스트" 형식. 예: "interleave:0-1", "bind:2", "prefer:1", "local", "default".
+ * @return: 0=성공, 1=잘못된 정책/노드리스트.
+ *
+ * 왜 필요한가: NUMA 메모리 할당 정책은 mbind(2)/set_mempolicy(2) 로 매핑되는 5가지 모드가 있다:
+ *   - MPOL_DEFAULT:    커널 기본 (로컬 우선, 실패시 다른 노드) — 노드리스트 금지.
+ *   - MPOL_PREFERRED:  지정 노드 우선, 부족하면 다른 노드 — 노드 1개만 허용.
+ *   - MPOL_BIND:       지정 노드에만 할당, 부족하면 OOM — 리스트 필수.
+ *   - MPOL_INTERLEAVE: 리스트 노드들에 라운드로빈 분배 — 리스트 없으면 "all".
+ *   - MPOL_LOCAL:      실행 중인 CPU의 로컬 노드 — 노드리스트 금지.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 방어.
+ * 2) strchr(':')로 정책 vs 노드리스트 분리, 분리자 자리에 NUL 삽입.
+ * 3) policy_types[] 루프로 정책 문자열을 MPOL_* enum에 매핑.
+ * 4) 정책별 노드리스트 유효성 검사 (위 5가지 규칙).
+ * 5) PREFERRED → atoi(nodelist) 로 numa_mem_prefer_node 저장.
+ *    INTERLEAVE/BIND → numa_parse_nodestring 으로 검증 후 strdup.
+ *    LOCAL/DEFAULT → 노드리스트 없음 확인만.
+ *
+ * 호출 체인: parse.c → [str_numa_mpol_cb] → numa_parse_nodestring (libnuma).
+ * 읽는 자: backend.c::thread_main() 이 set_mempolicy(2) 호출.
  */
 static int str_numa_mpol_cb(void *data, char *input)
 {
@@ -1468,9 +1920,34 @@ out:
 #endif
 
 /*
- * [한국어] file_service_type 콜백: 파일 서비스 순서 설정
- * "random", "roundrobin", "sequential", "gauss", "zipf" 등
- * 콜론 뒤에 분포 파라미터를 지정할 수 있다.
+ * [한국어]
+ * str_fst_cb() — file_service_type 옵션 콜백.
+ *
+ * @data: &td->o. file_service_type 은 이미 parse.c posval 매핑 완료 (RANDOM/RR/SEQ/ZIPF/PARETO/GAUSS).
+ * @str:  원본 "file_service_type=random:16" 또는 "zipf:1.2:0.5" 형식. 콜론 뒤 파라미터 추출.
+ * @return: 0=성공, 1=파라미터 범위 오류.
+ *
+ * 왜 필요한가: 다중 파일(filename=f1:f2:f3)에서 I/O가 어느 파일을 쓸지 결정. RR(round robin)과
+ * SEQUENTIAL 은 "한 파일에서 몇 번 I/O 후 다음" 의 반복 횟수(file_service_nr) 를 받는다.
+ * 분포형(ZIPF/PARETO/GAUSS)은 파일 인덱스를 분포 함수로 추첨 — 파라미터는 분포 모양을 결정.
+ *
+ * 파라미터 의미:
+ *   - RANDOM/RR/SEQ:     nr = 같은 파일에서 연속 I/O 횟수 (기본 1).
+ *   - ZIPF:              theta = 지프 분포의 편향. theta→0 균등, theta↑ 편향 심함. 1.0 금지(수학적 특이점).
+ *   - PARETO:            input ∈ (0, 1). 분포 tail 특성.
+ *   - GAUSS:             dev = 표준편차 (0~100). 0이면 중앙 결정론적.
+ *   - 추가 ":center"     분포 중심 위치 ∈ [0, 1]. 기본 0.5 (전체 파일 수의 절반 지점).
+ *
+ * 동작 단계:
+ * 1) td->file_service_nr = 1 기본값.
+ * 2) switch(file_service_type): RANDOM/RR/SEQ는 get_opt_postfix + atoi(nr).
+ *    ZIPF/PARETO/GAUSS는 FIO_DEF_* 로 val 초기화 후 공통 경로로 진입.
+ * 3) split_parse_distr(nr, &val, &center) 로 "파라미터:중심" 2-way 분리.
+ * 4) center 범위 [0, 1] 검증 → td->random_center 저장.
+ * 5) 분포별 val 범위 검증 → td->zipf_theta / pareto_h / gauss_dev 저장.
+ *
+ * 호출 체인: parse.c → [str_fst_cb] → split_parse_distr → str_to_float.
+ * 읽는 자: io_u.c::get_next_file() 이 분포별 함수로 파일 인덱스 추첨.
  */
 static int str_fst_cb(void *data, const char *str)
 {
@@ -1560,8 +2037,19 @@ static int str_fst_cb(void *data, const char *str)
 
 #ifdef CONFIG_SYNC_FILE_RANGE
 /*
- * [한국어] server_file_remove 콜백: 서버 모드에서 파일 삭제 정책 설정
- * 대기, 완료 후 삭제 등의 정책을 파싱한다.
+ * [한국어]
+ * str_sfr_cb() — sync_file_range 옵션 콜백 (CONFIG_SYNC_FILE_RANGE 한정).
+ *
+ * @data: &td->o. sync_file_range mode(WAIT_BEFORE/WRITE/WAIT_AFTER) 는 이미 posval로 설정.
+ * @str:  원본 옵션 문자열. 콜론 뒤에 "매 몇 번 I/O 마다 sync_file_range 호출" 주기 지정.
+ *        예: "sync_file_range=wait_before,write:8" → 매 8 I/O마다 호출.
+ * @return: 0.
+ *
+ * 왜 필요한가: sync_file_range(2) 는 Linux 전용 — 파일 특정 범위만 디스크 동기화(fsync보다 세밀).
+ * 이를 매 I/O마다 호출하면 오버헤드가 크므로 주기(nr) 를 받아 "nr 번에 한 번" 호출하도록 제어.
+ *
+ * 호출 체인: parse.c → [str_sfr_cb] → get_opt_postfix → atoi.
+ * 읽는 자: backend.c::do_io() 가 sync_file_range_nr 을 카운터로 사용.
  */
 static int str_sfr_cb(void *data, const char *str)
 {
@@ -1578,6 +2066,31 @@ static int str_sfr_cb(void *data, const char *str)
 }
 #endif
 
+/*
+ * [한국어]
+ * zone_split_ddir() — zoned / zoned_abs random_distribution의 영역별 분할 파싱.
+ *
+ * @o:        thread_options.
+ * @eo:       unused.
+ * @ddir:     방향.
+ * @str:      "접근퍼센트/영역퍼센트:..." 또는 "접근퍼센트/영역크기:..." 포맷.
+ * @absolute: false=영역을 파일 전체의 퍼센트로, true=절대 바이트 수로.
+ * @return:   0=성공, 1=실패.
+ *
+ * 왜 필요한가: zoned 분포는 "파일을 N 영역으로 나누어 각 영역에 X% 확률로 접근". 예:
+ *   random_distribution=zoned:60/10:30/20:10/70
+ *   → 첫 번째 영역(전체의 10%)에 60% 접근, 두 번째(20%)에 30%, 세 번째(70%)에 10%.
+ * 실제 워크로드의 "핫/콜드" 분리(자주 쓰는 10%에 90% 접근) 모사.
+ *
+ * 동작 단계:
+ * 1) split_parse_ddir로 val1=접근퍼센트, val2=영역퍼센트|크기 리스트화.
+ * 2) o->zone_split[ddir] 에 struct zone_split[] 할당 후 필드 복사.
+ * 3) 접근퍼센트 합 == 100 검증 (접근은 반드시 완전 분배).
+ * 4) 영역퍼센트 합 ≤ 100 검증 (<100 이면 나머지는 접근 불가 영역).
+ * 5) 미지정(-1U) 엔트리에 나머지 균등 분배.
+ *
+ * 호출 체인: parse_zoned_distribution → str_split_parse → [zone_split_ddir].
+ */
 static int zone_split_ddir(struct thread_options *o, void *eo,
 			   enum fio_ddir ddir, char *str, bool absolute)
 {
@@ -1664,6 +2177,27 @@ static int zone_split_ddir(struct thread_options *o, void *eo,
 	return 0;
 }
 
+/*
+ * [한국어]
+ * parse_zoned_distribution() — random_distribution=zoned 또는 zoned_abs 전체 파싱 진입점.
+ *
+ * @td:       thread_data.
+ * @input:    원본 옵션 문자열 (prefix "zoned:" 또는 "zoned_abs:" 포함).
+ * @absolute: false=퍼센트 해석, true=절대 바이트 해석.
+ * @return:   0=성공, 1=실패.
+ *
+ * 왜 필요한가: str_random_distribution_cb 가 FIO_RAND_DIST_ZONED/ZONED_ABS 선택 시 이 함수에 위임.
+ * zoned 는 다른 분포와 달리 내부에 추가 문법(영역/퍼센트 리스트)을 갖는다.
+ *
+ * 동작 단계:
+ * 1) 접두사 "zoned:" / "zoned_abs:" 검증 후 스킵.
+ * 2) str_split_parse 로 3-way 방향 분할 → 각 방향별 zone_split_ddir 호출.
+ * 3) dprint(FD_PARSE) 로 파싱 결과 덤프 (디버그 편의).
+ * 4) parse_dryrun 이면 부수효과 제거.
+ * 5) ret != 0 이면 zone_split_nr 리셋.
+ *
+ * 호출 체인: str_random_distribution_cb → [parse_zoned_distribution] → str_split_parse → zone_split_ddir.
+ */
 static int parse_zoned_distribution(struct thread_data *td, const char *input,
 				    bool absolute)
 {
@@ -1727,14 +2261,34 @@ static int parse_zoned_distribution(struct thread_data *td, const char *input,
 }
 
 /*
- * [한국어] random_distribution 콜백: 랜덤 I/O 오프셋의 분포 설정
+ * [한국어]
+ * str_random_distribution_cb() — random_distribution 옵션 콜백.
  *
- * 지원 분포: random(균등), zipf, pareto, gauss(정규), zoned, zoned_abs
- * 각 분포별 파라미터를 콜론 뒤에 지정한다:
- *   - zipf:theta (예: zipf:1.2) — 지프 분포, theta가 클수록 편향
- *   - pareto:input (예: pareto:0.5) — 파레토 분포
- *   - gauss:dev (예: gauss:4.0) — 정규 분포, dev는 표준편차
- *   - zoned:ratio/size (예: zoned:60/10:30/20:10/70)
+ * @data: &td->o. random_distribution 은 이미 posval로 FIO_RAND_DIST_* enum 설정 완료.
+ * @str:  원본 "random_distribution=zipf:1.2:0.5" 형식.
+ * @return: 0=성공, 1=파라미터 범위 오류.
+ *
+ * 왜 필요한가: 랜덤 I/O 오프셋 선택의 **확률 분포**를 결정. 실제 워크로드 모방의 핵심:
+ *   - random(기본): 균등 분포 (uniform) — 모든 블록 동등 확률. LFSR 기반.
+ *   - zipf(theta):  지프 분포 — 핫 스폿 편향(소수 블록이 대부분 접근). 웹/DB 워크로드 모사.
+ *                    theta → 0 균등, theta ↑ 편향 심함. theta=1.0 수학적 특이점(금지).
+ *   - pareto(input): 파레토 분포 — 80/20 법칙 변종. input ∈ (0, 1).
+ *   - gauss(dev):    정규 분포 — 중심 주변 집중. dev = 표준편차 퍼센트 (0~100).
+ *   - zoned:         영역별 비율. "60/10:30/20:10/70" → 영역의 60% 접근이 전체 10%에 집중 등.
+ *   - zoned_abs:     zoned와 동일하나 크기를 바이트 절대값으로.
+ *
+ * 선택적 ":center" 파라미터 (zipf/pareto/gauss 공통): 분포 중심 위치 ∈ [0, 1].
+ * 기본 0.5 (전체의 절반 지점이 핫 스폿 중심). 0 → 파일 시작, 1 → 파일 끝.
+ *
+ * 동작 단계:
+ * 1) random_distribution enum 에 따라 val 기본값 세팅 (ZIPF=FIO_DEF_ZIPF 등).
+ * 2) ZONED/ZONED_ABS 는 parse_zoned_distribution 으로 위임 (복잡한 영역 파싱).
+ * 3) get_opt_postfix → split_parse_distr 로 "val:center" 2-way 분리.
+ * 4) center 범위 [0, 1] 검증 → td->o.random_center.u.f 저장 (fio_fp64_t 사용).
+ * 5) 분포별 val 범위 검증 → zipf_theta/pareto_h/gauss_dev fio_fp64_t 저장.
+ *
+ * 호출 체인: parse.c → [str_random_distribution_cb] → split_parse_distr | parse_zoned_distribution.
+ * 읽는 자: io_u.c::__get_next_rand_offset_{zipf,pareto,gauss,zoned,zoned_abs}().
  */
 static int str_random_distribution_cb(void *data, const char *str)
 {
@@ -1800,6 +2354,15 @@ static int str_random_distribution_cb(void *data, const char *str)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * is_valid_steadystate() — ss_state enum 이 유효한 FIO_SS_* 값 중 하나인지 검증.
+ *
+ * @state: 검증 대상.
+ * @return: true=유효, false=비유효 (파싱 실패 또는 버그).
+ *
+ * 왜 필요한가: str_steadystate_cb 진입 시 방어적 검증. parse.c posval 매핑이 정상이면 항상 유효해야 함.
+ */
 static bool is_valid_steadystate(unsigned int state)
 {
 	return (state == FIO_SS_IOPS || state == FIO_SS_IOPS_SLOPE ||
@@ -1808,10 +2371,39 @@ static bool is_valid_steadystate(unsigned int state)
 }
 
 /*
- * [한국어] steadystate 콜백: Steady State 감지 기준 파싱
- * "iops:10%" — IOPS 변동이 10% 이내면 안정 상태로 판단
- * "bw:5%" — 대역폭 변동이 5% 이내면 안정 상태
- * "iops_slope:0.1%" — IOPS 기울기 기준
+ * [한국어]
+ * str_steadystate_cb() — steadystate 옵션 콜백.
+ *
+ * @data: &td->o. ss_state 는 이미 posval로 FIO_SS_{IOPS,IOPS_SLOPE,BW,BW_SLOPE,LAT,LAT_SLOPE} 설정.
+ * @str:  원본 "steadystate=iops:10%" 또는 "iops_slope:0.1%" 또는 "bw:5M" 등.
+ * @return: 0=성공, 1=파싱 실패.
+ *
+ * 왜 필요한가: Steady State(정상 상태) 모드는 측정치가 충분히 안정화 되었는지 판단하고
+ * 지정 기간(ss_dur) 동안 유지되면 잡을 자동 종료. SSD preconditioning 같은 산업 표준
+ * 벤치마크(SNIA SSS)에서 필수. 시간 기반 런타임 대신 "안정화될 때까지" 조건부 종료.
+ *
+ * 기준 종류(6가지):
+ *   - iops:          IOPS 평균 대비 표준편차 (절대/퍼센트).
+ *   - iops_slope:    IOPS의 선형 회귀 기울기 (변동이 아닌 추세).
+ *   - bw, bw_slope:  대역폭 버전.
+ *   - lat, lat_slope: 레이턴시 버전.
+ *
+ * 값 형식:
+ *   - "기준:X%" → 퍼센트 편차 (FIO_SS_PCT 플래그 세팅, ss_limit에 % 수치).
+ *   - "기준:숫자" → 절대값 (IOPS는 float, BW는 k/m/g 포함 bytes/s, LAT는 시간 단위 ns/us/ms).
+ *
+ * 동작 단계:
+ * 1) is_valid_steadystate() 로 ss_state enum 확인.
+ * 2) get_opt_postfix(str) 로 ":뒤" 파라미터 추출.
+ * 3) "%" 감지 → FIO_SS_PCT 비트 세팅, str_to_float 로 퍼센트.
+ *    "%" 없음 + IOPS → str_to_float 로 절대 IOPS 값.
+ *    "%" 없음 + LAT → check_str_time 로 ns 변환.
+ *    "%" 없음 + BW → str_to_decimal 로 bytes/s.
+ * 4) td->o.ss_limit.u.f (fio_fp64_t) 에 저장.
+ * 5) td->ss.state 에 복사 — steadystate.c 가 주기적 검사 시 사용.
+ *
+ * 호출 체인: parse.c → [str_steadystate_cb] → str_to_float/check_str_time/str_to_decimal.
+ * 읽는 자: steadystate.c::steadystate_check() 가 ss_limit/ss_state 로 수렴 판정.
  */
 static int str_steadystate_cb(void *data, const char *str)
 {
@@ -1904,6 +2496,26 @@ static int str_steadystate_cb(void *data, const char *str)
  * is escaped with a '\', then that ':' is part of the filename and does not
  * indicate a new file.
  */
+/*
+ * [한국어]
+ * get_next_str() — 콜론 구분 문자열에서 다음 토큰 추출 (이스케이프 '\:' 지원).
+ *
+ * @ptr: [in, out] 진행 포인터. 호출 후 다음 토큰 시작 또는 NULL.
+ * @return: 현재 토큰 시작 (NUL 종단). NULL이면 끝.
+ *
+ * 왜 필요한가: filename 옵션에 "/dev/sda:/dev/sdb" 형식으로 여러 대상 지정. Windows 드라이브
+ * 문자 "C:\path" 같이 콜론이 이름 일부인 경우도 지원 위해 '\:' 이스케이프. 일반 strsep 과 달리
+ * 이스케이프를 인식하고 제거한다.
+ *
+ * 동작 단계:
+ * 1) 현재 위치에서 ':' 탐색.
+ * 2) 없으면 전체 나머지를 토큰으로 반환, *ptr=NULL.
+ * 3) ':' 가 시작 위치면 스킵 (연속 ':' 처리).
+ * 4) ':' 앞 문자가 '\'이면 이스케이프 — memmove로 '\'제거 후 ':'뒤에서 다시 탐색.
+ * 5) 순수 ':' 발견 시 그 자리에 NUL 삽입, *ptr 을 다음으로.
+ *
+ * 호출 체인: str_filename_cb / str_directory_cb / set_name_idx → [get_next_str].
+ */
 char *get_next_str(char **ptr)
 {
 	char *str = *ptr;
@@ -1946,6 +2558,18 @@ char *get_next_str(char **ptr)
 }
 
 
+/*
+ * [한국어]
+ * get_max_str_idx() — 입력 문자열의 콜론 구분 토큰 개수 반환.
+ *
+ * @input: "/a:/b:/c" 같은 리스트.
+ * @return: 토큰 수 (예: 3).
+ *
+ * 왜 필요한가: filename_format 등에서 여러 디렉토리를 잡 번호 모듈로로 라운드로빈할 때
+ * 총 개수를 알아야 % 연산 가능.
+ *
+ * 동작: 복제본에 get_next_str 반복 호출해 NULL까지 카운팅.
+ */
 int get_max_str_idx(char *input)
 {
 	unsigned int cur_idx;
@@ -1963,6 +2587,21 @@ int get_max_str_idx(char *input)
 /*
  * Returns the directory at the index, indexes > entries will be
  * assigned via modulo division of the index
+ */
+/*
+ * [한국어]
+ * set_name_idx() — 콜론 구분 리스트에서 index 번째 항목 + 경로 구분자 조합해 target에 저장.
+ *
+ * @target:          [out] 결과 문자열 버퍼.
+ * @tlen:            버퍼 크기.
+ * @input:           "/dir1:/dir2:/dir3" 등 디렉토리 리스트.
+ * @index:           조회 인덱스. 항목 수 초과 시 모듈로 순환.
+ * @unique_filename: true이고 client_sockaddr_str 세팅됨 → "<dir>/<client_addr>." 형식.
+ *                   false → "<dir>/" (플랫폼 경로 구분자 포함).
+ * @return:          snprintf 결과 길이.
+ *
+ * 왜 필요한가: numjobs 와 directory 리스트가 같이 있을 때 각 잡이 다른 디렉토리를 쓰도록.
+ * 서버 모드에서는 클라이언트 주소를 파일명에 포함해 서버가 여러 클라 동시 처리 시 충돌 방지.
  */
 int set_name_idx(char *target, size_t tlen, char *input, int index,
 		 bool unique_filename)
@@ -1990,6 +2629,14 @@ int set_name_idx(char *target, size_t tlen, char *input, int index,
 	return len;
 }
 
+/*
+ * [한국어]
+ * get_name_by_idx() — set_name_idx 의 단순 버전: 토큰만 strdup으로 반환.
+ *
+ * @input: 콜론 구분 리스트.
+ * @index: 인덱스 (모듈로 순환).
+ * @return: strdup된 토큰. 호출자가 free 책임.
+ */
 char* get_name_by_idx(char *input, int index)
 {
 	unsigned int cur_idx;
@@ -2008,9 +2655,26 @@ char* get_name_by_idx(char *input, int index)
 }
 
 /*
- * [한국어] filename 옵션 콜백: 대상 파일/디바이스 경로 설정
- * 콜론으로 여러 파일을 지정할 수 있다: filename=/dev/sda:/dev/sdb
- * nrfiles를 자동 설정한다.
+ * [한국어]
+ * str_filename_cb() — filename 옵션 콜백.
+ *
+ * @data:  &td->o. directory 는 이미 str_directory_cb 로 처리됨 (prio=-1).
+ * @input: 콜론 구분 파일/디바이스 리스트. 예: "/dev/sda:/dev/sdb", "/mnt/f1:/mnt/f2".
+ *         이스케이프 '\:' 는 파일명 일부로 해석 (Windows 드라이브 문자 "C\:\path" 지원).
+ * @return: 0.
+ *
+ * 왜 필요한가: fio 잡은 여러 대상을 동시 타격할 수 있다 (nrfiles 이상은 fio가 가상 파일 자동 생성).
+ * filename 옵션으로 명시 리스트를 주면 fio가 각 항목을 add_file() 로 td->files[] 에 등록.
+ *
+ * 동작 단계:
+ * 1) input 복제 + 공백 스트립.
+ * 2) td->files_index==0 이면 이전에 nrfiles 옵션으로 세팅된 nr_files 를 리셋 — 명시 파일 리스트가 우선.
+ * 3) get_next_str() 로 '\:' 이스케이프 고려한 콜론 분리.
+ * 4) 각 파일명 add_file(td, fname, 0, 1) — filesetup.c 가 fio_file 할당+stat.
+ *
+ * 호출 체인: parse.c → [str_filename_cb] → get_next_str → filesetup.c::add_file.
+ * 읽는 자: 이후 td->files[] 를 backend.c::thread_main → setup_files → open_files 가 소비.
+ * 우선순위: .prio = -1 (directory 등 다른 옵션 파싱 완료 후 실행 — directory/filename 조합 지원).
  */
 static int str_filename_cb(void *data, const char *input)
 {
@@ -2041,7 +2705,26 @@ static int str_filename_cb(void *data, const char *input)
 	return 0;
 }
 
-/* [한국어] directory 콜백: 작업 디렉토리 검증 (존재 여부 확인) */
+/*
+ * [한국어]
+ * str_directory_cb() — directory 옵션 콜백 (경로 유효성 검증 전용).
+ *
+ * @data:   &td->o.
+ * @unused: parse.c 가 전달한 문자열 — 무시 (td->o.directory 를 직접 읽음).
+ * @return: 0=성공, 1=lstat 실패/디렉토리 아님.
+ *
+ * 왜 필요한가: filename 없이 directory 만 지정 시 fio는 "$jobname.$jobnum.$filenum" 형식으로
+ * 파일을 자동 생성. 경로가 유효한 디렉토리인지 lstat + S_ISDIR 로 조기 검증 — 나중에 잡
+ * 실행 중 실패하는 대신 파싱 단계에서 즉시 에러.
+ *
+ * 동작 단계:
+ * 1) parse_dryrun() 방어.
+ * 2) td->o.directory 복제 후 get_next_str() 로 콜론 구분 여러 디렉토리 순회 지원.
+ * 3) 각 경로에 lstat → S_ISDIR 검사.
+ * 4) 실패 시 td_verror로 errno 이관.
+ *
+ * 호출 체인: parse.c → [str_directory_cb] → lstat(2) → td_verror.
+ */
 static int str_directory_cb(void *data, const char fio_unused *unused)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2073,7 +2756,20 @@ out:
 	return ret;
 }
 
-/* [한국어] opendir 콜백: 디렉토리 내 모든 파일을 재귀적으로 대상에 추가 */
+/*
+ * [한국어]
+ * str_opendir_cb() — opendir 옵션 콜백: 디렉토리의 모든 파일을 I/O 대상으로 등록.
+ *
+ * @data: &td->o.
+ * @str:  사용 안 함 (td->o.opendir 을 직접 읽음).
+ * @return: add_dir_files 의 반환값.
+ *
+ * 왜 필요한가: 많은 파일이 있는 디렉토리 전체를 대상으로 할 때 일일이 filename=에 나열하는 대신
+ * opendir=/path 로 재귀 등록. filesetup.c::add_dir_files 가 readdir(3) 로 순회하며 S_ISREG만 추가.
+ *
+ * 동작: parse_dryrun 방어 → nr_files 리셋 → add_dir_files 위임.
+ * 호출 체인: parse.c → [str_opendir_cb] → filesetup.c::add_dir_files → readdir(3) → add_file().
+ */
 static int str_opendir_cb(void *data, const char fio_unused *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2088,8 +2784,30 @@ static int str_opendir_cb(void *data, const char fio_unused *str)
 }
 
 /*
- * [한국어] buffer_pattern 콜백: I/O 버퍼에 채울 패턴 설정
- * 문자열, 16진수, "%o"(오프셋 삽입) 등 다양한 형식을 지원한다.
+ * [한국어]
+ * str_buffer_pattern_cb() — buffer_pattern 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @input: 패턴 문자열. 형식:
+ *         - 리터럴 문자열: "ABCD" — 각 블록을 ABCD 반복으로 채움.
+ *         - 16진수: "0xdeadbeef" — 4바이트 패턴.
+ *         - 빈 문자열 금지.
+ *         (%o 포맷 미지원 — verify_pattern 과 달리 주석에 FIXME).
+ * @return: 0=성공, 1=파싱 실패.
+ *
+ * 왜 필요한가: 쓰기 I/O 버퍼를 특정 패턴으로 채워 디스크에 기록. verify_pattern 과 달리
+ * 검증 목적이 아니라 **압축률 제어**(dedupe/compression 테스트)에 주로 사용. 예: 0x00
+ * 반복은 SSD 내부 압축에 의해 실제 쓰기량이 크게 감소하는 것을 확인.
+ *
+ * 동작 단계:
+ * 1) parse_and_fill_pattern_alloc 로 패턴 바이트 배열 할당+채움.
+ * 2) buffer_pattern_bytes 에 결과 크기 저장.
+ * 3) compress_percentage 또는 read 잡이면 refill_buffers=1 (매번 재채움 필요).
+ *    그 외(pure write + no compress)는 refill 생략 — 한번 채운 버퍼 재사용으로 CPU 절약.
+ * 4) scramble_buffers=0, zero_buffers=0 — 패턴이 우선되므로 스크램블/제로 필.
+ *
+ * 호출 체인: parse.c → [str_buffer_pattern_cb] → lib/pattern.c::parse_and_fill_pattern_alloc.
+ * 읽는 자: io_u.c::fill_io_buffer 가 td->o.buffer_pattern 으로 io_u->buf 채움.
  */
 static int str_buffer_pattern_cb(void *data, const char *input)
 {
@@ -2124,7 +2842,24 @@ static int str_buffer_pattern_cb(void *data, const char *input)
 	return 0;
 }
 
-/* [한국어] buffer_compress_percentage 콜백: 압축 가능한 데이터 비율 설정 */
+/*
+ * [한국어]
+ * str_buffer_compress_cb() — buffer_compress_percentage 옵션 콜백.
+ *
+ * @data: &td->o.
+ * @il:   [in] 압축 가능 퍼센트 (0~100). 버퍼의 몇 %가 압축 가능한 패턴이어야 하는지.
+ * @return: 0.
+ *
+ * 왜 필요한가: 실제 워크로드의 압축률을 시뮬레이션. 압축 SSD/스토리지에서 쓰기 bandwidth
+ * 효율을 측정. fio는 지정 퍼센트만큼 "압축 가능"(반복 바이트)으로 채우고 나머지는 랜덤.
+ *
+ * 효과:
+ * - TD_F_COMPRESS 플래그 세팅 → io_u.c 버퍼 채우기 경로가 compress-aware 모드로 전환.
+ * - compress_percentage 저장 → io_u.c::fill_random_buf_percentage 에서 참조.
+ *
+ * 호출 체인: parse.c → [str_buffer_compress_cb].
+ * 읽는 자: io_u.c::fill_io_buffer → fill_random_buf_percentage.
+ */
 static int str_buffer_compress_cb(void *data, unsigned long long *il)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2134,7 +2869,25 @@ static int str_buffer_compress_cb(void *data, unsigned long long *il)
 	return 0;
 }
 
-/* [한국어] dedupe_percentage 콜백: 중복 제거 가능 데이터 비율 설정 */
+/*
+ * [한국어]
+ * str_dedupe_cb() — dedupe_percentage 옵션 콜백.
+ *
+ * @data: &td->o.
+ * @il:   [in] 중복 퍼센트 (0~100). 전체 쓰기 블록 중 몇 %가 이전 블록과 동일해야 하는지.
+ * @return: 0.
+ *
+ * 왜 필요한가: 중복 제거(deduplication) SSD/스토리지의 실질 용량 절감 효과 측정.
+ * fio는 내부적으로 소수의 seed 블록을 유지하고 지정 퍼센트는 그 seed를 재사용.
+ *
+ * 효과:
+ * - TD_F_COMPRESS 플래그 (dedupe도 압축 범주로 분류됨).
+ * - dedupe_percentage 저장.
+ * - refill_buffers=1 강제 — 매 I/O마다 버퍼 재생성 필요 (이전 버퍼와 의도적 중복 생성).
+ *
+ * 호출 체인: parse.c → [str_dedupe_cb].
+ * 읽는 자: io_u.c::fill_io_buffer 의 dedupe 경로.
+ */
 static int str_dedupe_cb(void *data, unsigned long long *il)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2145,7 +2898,30 @@ static int str_dedupe_cb(void *data, unsigned long long *il)
 	return 0;
 }
 
-/* [한국어] verify_pattern 콜백: 데이터 검증에 사용할 패턴 설정 */
+/*
+ * [한국어]
+ * str_verify_pattern_cb() — verify_pattern 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @input: 패턴 문자열. buffer_pattern과 달리 "%o"(오프셋 8바이트) 포맷 지원.
+ *         예: "%o" — 각 블록 첫 8바이트에 해당 블록의 offset 기록. 오쓰기 탐지.
+ * @return: 0=성공, 1=실패.
+ *
+ * 왜 필요한가: 쓰기/읽기 왕복 후 데이터 무결성 검증. CRC/해시는 계산 오버헤드가 있는데
+ * 패턴 비교는 단순 memcmp — 빠르다. "%o" 포맷은 잘못된 위치로 매핑된 쓰기를 잡아냄
+ * (드라이브 펌웨어 버그, 잘못된 섹터 원격 매핑 등).
+ *
+ * 동작 단계:
+ * 1) verify_fmt_sz 에 포맷 슬롯 최대값 설정.
+ * 2) parse_and_fill_pattern_alloc(input, fmt_desc, verify_fmt, &sz) —
+ *    fmt_desc 는 "%o" → paste_blockoff 콜백 매핑. 런타임에 각 블록 offset 자동 삽입.
+ * 3) verify_pattern_bytes 에 결과 크기 저장.
+ * 4) verify 가 아직 미설정이면 VERIFY_PATTERN 으로 기본 세팅 — verify 옵션 없이
+ *    verify_pattern 만 줘도 자동 활성화.
+ *
+ * 호출 체인: parse.c → [str_verify_pattern_cb] → lib/pattern.c::parse_and_fill_pattern_alloc.
+ * 읽는 자: verify.c::verify_io_u_pattern() 이 저장된 패턴으로 읽은 데이터 검증.
+ */
 static int str_verify_pattern_cb(void *data, const char *input)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2173,8 +2949,26 @@ static int str_verify_pattern_cb(void *data, const char *input)
 }
 
 /*
- * [한국어] gtod_reduce 콜백: gettimeofday 호출 최소화 모드
- * 활성화하면 상세 레이턴시 통계를 비활성화하여 오버헤드를 줄인다.
+ * [한국어]
+ * str_gtod_reduce_cb() — gtod_reduce 옵션 콜백: 고성능 I/O 측정용 통계 축소 모드.
+ *
+ * @data: &td->o.
+ * @il:   [in] 1=활성화, 0=무변경 (비활성화 효과 없음 — 켜려면 1).
+ * @return: 0.
+ *
+ * 왜 필요한가: 초고성능 I/O (예: NVMe io_uring 수백만 IOPS)에서 매 I/O마다 clock_gettime/gettimeofday
+ * 호출이 병목이 된다. 상세 레이턴시 통계(slat/clat/lat 분리, percentile 히스토그램)는 각 I/O에서
+ * 수 번의 시간 측정을 요구 — 이를 일괄 비활성화하여 순수 IOPS/BW 측정에 집중.
+ *
+ * 효과 (val != 0 일 때):
+ * - disable_lat = disable_clat = disable_slat = disable_bw = 1.
+ * - clat_percentiles = lat_percentiles = slat_percentiles = 0 (히스토그램 비활성).
+ * - ts_cache_mask = 63 — 타임스탬프 캐시 64회 재사용 (매번 아니라 매 64 I/O마다 갱신).
+ *
+ * 주의: 일반적으로는 상세 통계가 필요하므로 벤치마크 튜닝 이후 최종 측정 단계에서만 사용.
+ *
+ * 호출 체인: parse.c → [str_gtod_reduce_cb].
+ * 읽는 자: io_u.c/stat.c 의 통계 경로가 disable_* 플래그로 skip 여부 판정.
  */
 static int str_gtod_reduce_cb(void *data, int *il)
 {
@@ -2199,7 +2993,28 @@ static int str_gtod_reduce_cb(void *data, int *il)
 	return 0;
 }
 
-/* [한국어] offset 콜백: I/O 시작 오프셋을 읽기/쓰기/트림 방향별로 설정 */
+/*
+ * [한국어]
+ * str_offset_cb() — offset 옵션 콜백: 파일 내 시작 오프셋의 3-way 인코딩.
+ *
+ * @data:  &td->o.
+ * @__val: [in] 파싱된 값. parse.c 의 FIO_OPT_STR_VAL_ZONE 이 아래 3가지 중 하나로 인코딩:
+ *         (a) 일반 바이트 수 (예: 1048576).
+ *         (b) 퍼센트 — -1ULL 근처 상위 비트 (parse_is_percent). 0~100%.
+ *         (c) 존 단위 — ZONE_BASE_VAL 오프셋 (parse_is_zone). "1z" 등.
+ * @return: 0.
+ *
+ * 왜 필요한가: offset 은 단일 숫자가 아니라 의미가 달라지는 3가지 표현:
+ *   - "offset=1M" → 절대 바이트 (start_offset 에 저장).
+ *   - "offset=10%" → 파일 크기의 10% 위치 (start_offset_percent에 저장, 실제값은 setup_files에서 해석).
+ *   - "offset=3z" → 존 3개 건너뛴 위치 (ZBD 용, start_offset_nz).
+ * parse.c 가 어떤 형식인지 마커 비트로 구분해 전달. 이 cb가 분기해 적절한 필드에 저장.
+ *
+ * 동작: parse_is_percent / parse_is_zone 판정 후 start_offset / _percent / _nz 3필드 중 하나 세팅.
+ *
+ * 호출 체인: parse.c → [str_offset_cb].
+ * 읽는 자: filesetup.c::setup_files 가 파일 크기 확정 후 3필드 중 설정된 값을 바이트로 해석.
+ */
 static int str_offset_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2221,7 +3036,20 @@ static int str_offset_cb(void *data, long long *__val)
 	return 0;
 }
 
-/* [한국어] offset_increment 콜백: 다중 스레드 시 각 스레드의 오프셋 증분 */
+/*
+ * [한국어]
+ * str_offset_increment_cb() — offset_increment 옵션 콜백. str_offset_cb 와 동일한 3-way 인코딩.
+ *
+ * @data: &td->o.
+ * @__val: [in] 바이트/퍼센트/존 단위 인코딩.
+ * @return: 0.
+ *
+ * 왜 필요한가: numjobs>1 일 때 각 잡의 시작 위치를 자동 분배. 예: numjobs=4, offset_increment=1G
+ * → 잡 0은 0, 잡 1은 1G, 잡 2는 2G, 잡 3은 3G. 파일 겹침 없이 병렬 벤치.
+ *
+ * 동작: str_offset_cb 와 동일 패턴 — 3필드 중 하나(offset_increment/_percent/_nz) 세팅.
+ * 읽는 자: init.c::fixup_options 에서 잡 번호에 곱해 실제 start_offset 계산.
+ */
 static int str_offset_increment_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2243,7 +3071,20 @@ static int str_offset_increment_cb(void *data, long long *__val)
 	return 0;
 }
 
-/* [한국어] size 콜백: 각 스레드의 총 I/O 크기 설정 (퍼센트 지원) */
+/*
+ * [한국어]
+ * str_size_cb() — size 옵션 콜백. str_offset_cb 와 동일한 3-way 인코딩.
+ *
+ * @data: &td->o.
+ * @__val: [in] 바이트/퍼센트/존 인코딩.
+ * @return: 0.
+ *
+ * 왜 필요한가: 잡이 처리할 총 데이터 양. 파일 크기보다 작을 수 있고 (일부만 I/O)
+ * 절대 바이트 또는 파일 크기 대비 퍼센트 또는 존 개수로 표현.
+ *
+ * 동작: size / size_percent / size_nz 3필드 중 하나 세팅.
+ * 읽는 자: filesetup.c가 파일 크기 확정 후 해석. io_u.c::keep_running이 진행 상황 비교.
+ */
 static int str_size_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2264,7 +3105,24 @@ static int str_size_cb(void *data, long long *__val)
 	return 0;
 }
 
-/* [한국어] io_size 콜백: 실제 수행할 I/O 양 설정 (size와 독립) */
+/*
+ * [한국어]
+ * str_io_size_cb() — io_size 옵션 콜백.
+ *
+ * @data:  &td->o.
+ * @__val: [in] 바이트/퍼센트/존 인코딩.
+ *         size 와 차이: size는 "파일에서 접근할 범위"를, io_size는 "실제 수행할 총 I/O 바이트"를 의미.
+ * @return: 0=성공, 1=io_size_percent > 100 (랜덤 I/O는 같은 블록 반복 가능해서 100%+도 유효할 때가 있으나
+ *          이 콜백에서는 100% 초과 거부 — uncapped 비트로 미리 걸러짐).
+ *
+ * 왜 필요한가: 파일이 10G 일 때 size=10G 로 두고 io_size=30G 하면 같은 10G 범위를 3번 반복 I/O.
+ * loops=3 과 유사하지만 io_size는 바이트 기준이라 더 정밀.
+ *
+ * 특이점: parse_is_percent_uncapped 를 사용 — 100% 초과도 파싱 단계에서는 허용 (io_size=200%는
+ * size의 2배 의미). 다만 이 함수 내부에서 100% 초과 시 명시적으로 거부.
+ *
+ * 동작: io_size / io_size_percent / io_size_nz 3필드 중 하나 세팅.
+ */
 static int str_io_size_cb(void *data, unsigned long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2289,7 +3147,20 @@ static int str_io_size_cb(void *data, unsigned long long *__val)
 	return 0;
 }
 
-/* [한국어] zoneskip 콜백: 존(zone) 경계에서 건너뛸 바이트 수 설정 */
+/*
+ * [한국어]
+ * str_zoneskip_cb() — zoneskip 옵션 콜백. 2-way 인코딩 (바이트 or 존 단위).
+ *
+ * @data: &td->o.
+ * @__val: [in] 바이트 수 또는 ZONE_BASE_VAL+n (n 개 존).
+ * @return: 0.
+ *
+ * 왜 필요한가: zonemode 에서 한 존을 다 쓴 후 다음 존으로 점프. zoneskip=Nz 면 "N 개 존 건너뛰기".
+ * 이는 SMR(Shingled Magnetic Recording) 존 간섭 방지 테스트나 ZNS SSD 의 동시 쓰기 존 수 조절에 사용.
+ *
+ * 동작: zone_skip (바이트) 또는 zone_skip_nz (존 개수) 중 하나 세팅.
+ * 읽는 자: io_u.c::setup_strided_zone_mode / zone_boundary() 가 사용.
+ */
 static int str_zoneskip_cb(void *data, long long *__val)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2304,7 +3175,20 @@ static int str_zoneskip_cb(void *data, long long *__val)
 	return 0;
 }
 
-/* [한국어] write_bw_log 콜백: 대역폭 로그 파일명 설정 */
+/*
+ * [한국어]
+ * str_write_bw_log_cb() — write_bw_log 옵션 콜백.
+ *
+ * @data: &td->o.
+ * @str:  로그 파일명 또는 NULL (stdout). NULL이면 기본 파일명 사용.
+ * @return: 0.
+ *
+ * 왜 필요한가: 시계열 성능 분석을 위해 매 log_avg_msec 주기로 대역폭을 파일에 기록. fio_generate_plots
+ * 가 이 로그로 그래프 생성. 형식: "<msec> <KB/s> <ddir> <bs> <offset>".
+ *
+ * 동작: str이 있으면 bw_log_file에 strdup, write_bw_log=1 플래그 세팅.
+ * 읽는 자: stat.c::add_bw_sample/finalize_logs → iolog.c::write_bandw_log.
+ */
 static int str_write_bw_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2316,7 +3200,17 @@ static int str_write_bw_log_cb(void *data, const char *str)
 	return 0;
 }
 
-/* [한국어] write_lat_log 콜백: 레이턴시 로그 파일명 설정 */
+/*
+ * [한국어]
+ * str_write_lat_log_cb() — write_lat_log 옵션 콜백.
+ *
+ * @data: &td->o.
+ * @str:  기본 이름. 실제 파일명은 "<name>_slat/clat/lat.log" 3개로 확장됨.
+ * @return: 0.
+ *
+ * 왜 필요한가: 레이턴시는 submission latency(slat), completion latency(clat), total latency(lat) 3분리.
+ * 각 항목별로 시계열 로그 생성. 레이턴시 분포 분석, tail latency 추적, CDF 작성에 필수.
+ */
 static int str_write_lat_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2328,7 +3222,17 @@ static int str_write_lat_log_cb(void *data, const char *str)
 	return 0;
 }
 
-/* [한국어] write_iops_log 콜백: IOPS 로그 파일명 설정 */
+/*
+ * [한국어]
+ * str_write_iops_log_cb() — write_iops_log 옵션 콜백.
+ *
+ * @data: &td->o.
+ * @str:  로그 파일명.
+ * @return: 0.
+ *
+ * 왜 필요한가: 초당 I/O 수를 시계열로 기록. IOPS 변동, 전력 상태 전환, SSD GC 영향 분석에 필수.
+ * 읽는 자: stat.c::add_iops_sample → iolog.c::write_iops_log.
+ */
 static int str_write_iops_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2340,7 +3244,18 @@ static int str_write_iops_log_cb(void *data, const char *str)
 	return 0;
 }
 
-/* [한국어] write_hist_log 콜백: 히스토그램 로그 파일명 설정 */
+/*
+ * [한국어]
+ * str_write_hist_log_cb() — write_hist_log 옵션 콜백.
+ *
+ * @data: &td->o.
+ * @str:  히스토그램 로그 파일명.
+ * @return: 0.
+ *
+ * 왜 필요한가: 일반 lat_log 는 평균/퍼센타일만 기록하지만 hist_log 는 log_hist_msec 주기마다
+ * 전체 plat_bucket[] 히스토그램 배열 전체를 덤프. 세부 분포 분석(HDR 히스토그램 재구성)에 사용.
+ * 파일 크기가 크므로 통상 특수 분석 시에만 활성화.
+ */
 static int str_write_hist_log_cb(void *data, const char *str)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2353,15 +3268,29 @@ static int str_write_hist_log_cb(void *data, const char *str)
 }
 
 /*
- * [한국어] 외부 I/O 엔진 콜백: "external:/path/to/engine.so" 파싱
+ * [한국어]
+ * str_ioengine_external_cb() — ioengine=external:/path/to/engine.so 콜백.
  *
- * ioengine=external:/path/to/so 형식에서 공유 라이브러리 경로를 추출하여
- * ioengine_so_path에 저장한다. dlopen()으로 런타임에 로드된다.
+ * @data: &td->o.
+ * @str:  콜론 뒤 경로 부분. parse.c 가 "external" posval 매칭 후 ":뒤"를 cb 로 전달.
+ *        예: "/opt/custom_fio_engine.so".
+ * @return: 0=성공, 1=NULL/잘못된 경로.
  *
- * 메모리 레이아웃:
- *   "external:/path/to/so\0" ← strdup된 원본
- *   "external\0"             ← parse 후 ->ioengine
- *            "/path/to/so\0" ← str 인자 = ->ioengine_so_path
+ * 왜 필요한가: 외부 .so 엔진을 동적으로 로드 가능 — 사용자 정의 엔진을 fio 재빌드 없이 사용.
+ * engines/skeleton_external.c 가 템플릿. dlopen(3) 으로 로드되고 "ioengine" 심볼 찾아 등록.
+ *
+ * 메모리 레이아웃 (파싱 중 변환):
+ *   "external:/path/to/so\0"  ← strdup된 원본
+ *   "external\0"              ← parse 후 td->o.ioengine (주값)
+ *            "/path/to/so\0"  ← str 인자 = 이 함수가 ioengine_so_path 에 저장
+ *
+ * 동작 단계:
+ * 1) 공백 스트립.
+ * 2) stat(2) + S_ISREG — 파일 존재 + 정규 파일 확인 (.so 기대).
+ * 3) 기존 ioengine_so_path 해제 후 strdup 으로 저장.
+ *
+ * 호출 체인: parse.c (posval "external" 매칭) → [str_ioengine_external_cb] → stat(2).
+ * 읽는 자: ioengines.c::dlopen_ioengine 이 이 경로로 dlopen(3).
  */
 static int str_ioengine_external_cb(void *data, const char *str)
 {
@@ -2389,6 +3318,21 @@ static int str_ioengine_external_cb(void *data, const char *str)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * rw_verify() — rw 옵션의 .verify 콜백: readonly 모드에서 write/trim 잡 거부.
+ *
+ * @o:    fio_option 자기 자신 (사용하지 않음).
+ * @data: &td->o.
+ * @return: 0=통과, 1=거부 (잡 전체 실패).
+ *
+ * 왜 필요한가: fio 전역 read_only 플래그(--readonly CLI)는 "어떤 잡도 쓰기를 해서는 안 됨"을
+ * 강제한다. 실수로 운영 디스크에 쓰기 테스트를 돌리는 것을 방지. 잡 파일에 rw=randwrite가
+ * 있더라도 --readonly 가 우선 — 파싱 단계에서 에러로 중단.
+ *
+ * 호출 시점: parse.c 가 rw 옵션 파싱 완료 후 .verify 콜백을 호출 (파싱과 검증 분리 메커니즘).
+ * 호출 체인: parse.c::parse_option → [rw_verify] → log_err + 반환 1.
+ */
 static int rw_verify(const struct fio_option *o, void *data)
 {
 	struct thread_data *td = cb_data_to_td(data);
@@ -2402,6 +3346,22 @@ static int rw_verify(const struct fio_option *o, void *data)
 	return 0;
 }
 
+/*
+ * [한국어]
+ * gtod_cpu_verify() — gtod_cpu 옵션의 .verify 콜백: CPU affinity 지원 확인.
+ *
+ * @o:    fio_option 자기 자신 (사용하지 않음).
+ * @data: &td->o.
+ * @return: 0=통과, 1=거부.
+ *
+ * 왜 필요한가: gtod_cpu 는 gettimeofday() 오프로드 — 별도 CPU에 전용 스레드를 두고 그 스레드가
+ * 계속 시간을 갱신하면 잡 스레드는 rdtsc 캐시만 읽어 clock syscall 회피. 단, 전용 CPU에 스레드를
+ * 고정해야 하므로 sched_setaffinity 가 필수. FIO_HAVE_CPU_AFFINITY 미지원 플랫폼에서는 거부.
+ *
+ * 동작 분기:
+ * - #ifdef FIO_HAVE_CPU_AFFINITY: 항상 0 반환 (통과).
+ * - 미지원 빌드: gtod_cpu 이 0이 아니면 에러 + 1 반환.
+ */
 static int gtod_cpu_verify(const struct fio_option *o, void *data)
 {
 #ifndef FIO_HAVE_CPU_AFFINITY
@@ -6267,7 +7227,22 @@ struct fio_option fio_options[FIO_MAX_OPTS] = {
  * [한국어] ===== Part 3: API 함수들 =====
  */
 
-/* [한국어] fio 옵션을 getopt_long의 option 구조체로 변환 */
+/*
+ * [한국어]
+ * add_to_lopt() — 단일 fio_option 을 getopt_long 의 struct option 으로 매핑.
+ *
+ * @lopt: [out] glibc struct option 슬롯 (name/has_arg/flag/val 필드).
+ * @o:    원본 fio_option. type 을 보고 has_arg 결정.
+ * @name: 옵션 이름 (주 name 또는 alias).
+ * @val:  getopt_long 이 매칭 시 반환할 정수 — FIO_GETOPT_JOB 또는 FIO_GETOPT_IOENGINE.
+ *
+ * 왜 필요한가: fio 는 --옵션=값 과 잡 파일 양쪽을 지원. 전자는 glibc getopt_long(3) 이 파싱하며
+ * struct option 배열을 요구한다. 이 헬퍼가 fio_option 의 타입 정보를 getopt_long 의 has_arg
+ * (required_argument / optional_argument) 로 변환.
+ *
+ * 동작: STR_SET 타입만 optional_argument (값 없이 플래그만도 가능 — 예: --readonly).
+ *       나머지는 required_argument (값 필수 — 예: --rw=read).
+ */
 static void add_to_lopt(struct option *lopt, struct fio_option *o,
 			const char *name, int val)
 {
@@ -6279,7 +7254,22 @@ static void add_to_lopt(struct option *lopt, struct fio_option *o,
 		lopt->has_arg = required_argument;
 }
 
-/* [한국어] fio_option 배열 전체를 getopt_long 옵션 배열로 변환 */
+/*
+ * [한국어]
+ * options_to_lopts() — fio_option 배열 전체를 getopt_long 포맷으로 일괄 변환.
+ *
+ * @opts:         원본 fio_option[] (fio_options 또는 엔진 전용 options).
+ * @long_options: [out] glibc struct option 배열. 기존 엔트리 뒤에 append.
+ * @i:            현재 append 시작 인덱스 (append 위치).
+ * @option_type:  FIO_GETOPT_JOB 또는 FIO_GETOPT_IOENGINE — getopt_long 반환값으로 구분.
+ *
+ * 왜 필요한가: fio_options[] 는 수백 개 — 각각을 getopt_long 엔트리로 확장. alias도 별도 엔트리로.
+ *
+ * 동작: name 이 NULL (sentinel) 까지 순회하며 add_to_lopt. alias 있으면 추가 슬롯 사용.
+ *       FIO_NR_OPTIONS 상한 assert.
+ *
+ * 호출 체인: fio_options_dup_and_init / fio_options_set_ioengine_opts → [options_to_lopts] → add_to_lopt.
+ */
 static void options_to_lopts(struct fio_option *opts,
 			      struct option *long_options,
 			      int i, int option_type)
@@ -6299,8 +7289,22 @@ static void options_to_lopts(struct fio_option *opts,
 }
 
 /*
- * [한국어] I/O 엔진 전용 옵션을 getopt_long 배열에 설정
- * 엔진이 변경되면 이전 엔진 옵션을 지우고 새 엔진 옵션을 추가한다.
+ * [한국어]
+ * fio_options_set_ioengine_opts() — 엔진별 CLI 옵션을 getopt_long 배열에 교체 등록.
+ *
+ * @long_options: 기존 getopt_long 배열. FIO_GETOPT_IOENGINE 슬롯부터 덮어씀.
+ * @td:           현재 잡 (td->io_ops->options = 엔진 전용 fio_option[]).
+ *
+ * 왜 필요한가: ioengine=libaio vs ioengine=io_uring 등 엔진별로 CLI 노출 옵션이 다르다
+ * (예: libaio의 userspace_reap, io_uring의 sqthread_poll). 엔진이 선택되면 해당 엔진의
+ * 옵션 테이블을 getopt_long 엔트리로 노출하여 --<engine-opt>=val 로 CLI 지정 가능.
+ *
+ * 동작 단계:
+ * 1) long_options 에서 FIO_GETOPT_IOENGINE 표시된 첫 슬롯 찾기 (이전 엔진 옵션 시작점).
+ * 2) 그 자리에 NUL memset — 이전 엔진 옵션 제거.
+ * 3) td->eo 있으면 options_to_lopts 로 새 엔진 옵션 append.
+ *
+ * 호출 체인: init.c::ioengine_load → [fio_options_set_ioengine_opts] → options_to_lopts.
  */
 void fio_options_set_ioengine_opts(struct option *long_options,
 				   struct thread_data *td)
@@ -6326,7 +7330,24 @@ void fio_options_set_ioengine_opts(struct option *long_options,
 			 FIO_GETOPT_IOENGINE);
 }
 
-/* [한국어] fio_options 초기화 후 getopt_long 배열에 추가 */
+/*
+ * [한국어]
+ * fio_options_dup_and_init() — fio_options[] 전역 옵션 테이블을 getopt_long 배열에 등록.
+ *
+ * @long_options: [in,out] 글로벌 CLI 옵션 배열 (main에서 선언). 기존 엔트리(--help/--version 등)
+ *                뒤에 fio_options[] 엔트리 append.
+ *
+ * 왜 필요한가: main()의 parse_cmd_line()이 getopt_long 을 호출하려면 먼저 전체 옵션 배열을 준비.
+ * 이 함수가 호출되면 fio_options[] 의 모든 옵션이 CLI --name=val 형식으로 사용 가능해진다.
+ *
+ * 동작:
+ * 1) options_init(fio_options) — parse.c 의 내부 초기화 (def 값 파싱 검증 등).
+ * 2) long_options 배열의 기존 마지막 엔트리 위치 i 탐색.
+ * 3) options_to_lopts 로 fio_options 전부를 i 뒤에 FIO_GETOPT_JOB 타입으로 추가.
+ *
+ * 호출 체인: init.c::parse_cmd_line → [fio_options_dup_and_init] → options_to_lopts.
+ * 실행 컨텍스트: main() 초기 단계. 1회 호출.
+ */
 void fio_options_dup_and_init(struct option *long_options)
 {
 	unsigned int i;
@@ -6341,17 +7362,44 @@ void fio_options_dup_and_init(struct option *long_options)
 }
 
 /*
- * [한국어] 키워드 치환 시스템
- * 잡 파일에서 $pagesize, $mb_memory, $ncpus 등의 변수를
- * 실제 시스템 값으로 치환한다.
- * 예: size=$mb_memory → size=16384 (16GB 시스템에서)
+ * [한국어]
+ * struct fio_keyword — 잡 파일 예약 키워드 치환 테이블 엔트리.
+ *
+ * 왜 필요한가: 잡 파일(INI/CLI)에서 시스템 종속 값을 하드코딩하지 않고 "$pagesize" 같은
+ * 심볼로 표기하면 런타임에 현재 시스템의 실제 값으로 치환. 이식성 높은 잡 파일 작성.
+ *
+ * 사용 예:
+ *   size=$mb_memory    → size=16384 (16GB 시스템에서, MB 단위)
+ *   blocksize=$pagesize → blocksize=4096 (x86_64에서)
+ *   numjobs=$ncpus     → numjobs=16 (16코어에서)
+ *
+ * 치환 흐름: fio_options_parse → dup_and_sub_options → fio_keyword_replace(opt)
+ *            → 각 키워드 word를 replace로 문자열 치환 → 산술 연산 있으면 bc_calc.
  */
 struct fio_keyword {
-	const char *word;      /* 키워드 (예: "$pagesize") */
-	const char *desc;      /* 설명 */
-	char *replace;         /* 치환될 실제 값 문자열 */
+	const char *word;
+	/* [한국어] 치환 대상 키워드 문자열. 항상 '$'로 시작. 순회 종료는 NULL sentinel.
+	 * 설정자: 정적 테이블 fio_keywords[] 초기화.
+	 * 읽는 자: fio_keyword_replace() 가 strstr(opt, kw->word) 로 매칭.
+	 * 값 범위: "$pagesize" / "$mb_memory" / "$ncpus" / NULL.
+	 * 동기화: 읽기 전용 정적 데이터. */
+
+	const char *desc;
+	/* [한국어] 사용자용 설명 (도움말/디버그 출력용). 현재 코드에서는 직접 사용 안 함.
+	 * 값 범위: 인간 읽기용 영문 설명. */
+
+	char *replace;
+	/* [한국어] 런타임에 fio_keywords_init() 가 계산해 sprintf한 실제 값의 strdup 복사본.
+	 * 설정자: fio_keywords_init() 가 1회 세팅 (프로세스 시작 시).
+	 * 읽는 자: fio_keyword_replace() 가 이 문자열로 치환.
+	 * 해제: fio_keywords_exit() 가 free 후 NULL.
+	 * 동기화: 초기화 완료 후 읽기 전용 — 단일 메인 스레드가 파싱하므로 락 불요. */
 };
 
+/*
+ * [한국어] 정적 키워드 테이블. NULL sentinel 로 순회 종료.
+ * 새 키워드 추가 시 fio_keywords_init() 에도 해당 인덱스의 .replace 계산 추가 필요.
+ */
 static struct fio_keyword fio_keywords[] = {
 	{
 		.word	= "$pagesize",
@@ -6370,7 +7418,13 @@ static struct fio_keyword fio_keywords[] = {
 	},
 };
 
-/* [한국어] 키워드 치환 문자열 메모리 해제 */
+/*
+ * [한국어]
+ * fio_keywords_exit() — fio_keywords_init() 가 strdup한 replace 문자열 해제.
+ *
+ * 호출 시점: fio 프로세스 종료 단계 (deinitialize_fio).
+ * 왜 필요한가: Valgrind/leak sanitizer 청결. fio_keywords_init() 은 세 엔트리에 strdup 함.
+ */
 void fio_keywords_exit(void)
 {
 	struct fio_keyword *kw;
@@ -6383,7 +7437,20 @@ void fio_keywords_exit(void)
 	}
 }
 
-/* [한국어] 키워드 치환 값 초기화: 페이지 크기, 메모리 용량, CPU 수 */
+/*
+ * [한국어]
+ * fio_keywords_init() — $pagesize / $mb_memory / $ncpus 실제 값 계산 & 문자열화.
+ *
+ * 왜 필요한가: 런타임에 시스템 정보를 조회해 치환 문자열 준비. 잡 파일 파싱 전에 호출되어야 함.
+ *
+ * 동작 단계:
+ * 1) page_size (os/os.h 가 제공하는 sysconf(_SC_PAGESIZE) 결과) → "4096" 등 → strdup.
+ * 2) os_phys_mem() / (1024*1024) = 전체 물리 메모리 MB → "16384" 등 → strdup.
+ * 3) cpus_configured() = sysconf(_SC_NPROCESSORS_CONF) = 구성된 CPU 수 → "16" → strdup.
+ *
+ * 호출 체인: init.c::main → initialize_fio → [fio_keywords_init] → sysconf.
+ * 주의: fio_keywords[] 인덱스와 대응 필드 순서가 고정 — 배열 재배치 시 함수도 수정 필수.
+ */
 void fio_keywords_init(void)
 {
 	unsigned long long mb_memory;
@@ -6402,12 +7469,31 @@ void fio_keywords_init(void)
 	fio_keywords[2].replace = strdup(buf);
 }
 
-#define BC_APP		"bc"
+#define BC_APP		"bc"   /* [한국어] POSIX "bc(1)" 임의정밀도 계산기 실행파일 이름. PATH 상에서 탐색. */
 
 /*
- * [한국어] bc(1) 계산기를 사용한 산술 표현식 계산
- * 옵션 값에 +, -, *, / 연산자가 포함되면 bc로 계산한다.
- * 예: size=1024*1024 → bc가 1048576으로 계산
+ * [한국어]
+ * bc_calc() — 옵션 값 문자열에 산술 연산자 있으면 bc(1) 서브프로세스로 계산.
+ *
+ * @str: "옵션=수식" 전체 문자열 (수정 가능 — 계산 성공 시 free 후 새 strdup 반환).
+ * @return: "옵션=결과값" 새 문자열 (실패 시 원본 str 또는 NULL).
+ *
+ * 왜 필요한가: 사용자가 "size=1024*1024" 처럼 리터럴 수식을 쓰면 parse.c 의 str_to_decimal 은
+ * 연산자를 모른다. 이 함수가 수식을 외부 bc(1) 프로세스에 위임해 실제 숫자로 교체.
+ *
+ * 동작 단계:
+ * 1) '+', '-', '*', '/' 중 하나도 없거나 작은따옴표(이미 인용됨)가 있으면 원본 그대로 반환.
+ * 2) '=' 위치 찾아 옵션명/값 분리.
+ * 3) 버퍼 오버플로 방어 — 128/100 바이트 상한.
+ * 4) `which bc` 실행하여 bc 설치 확인. 없으면 에러 로그 + NULL.
+ * 5) popen("echo '값' | bc", "r") 로 서브프로세스 출력 읽기.
+ * 6) "옵션=" 프리픽스 복구 후 strdup. 원본 free.
+ *
+ * 보안 주의: popen 은 쉘 인터프리트 — 값에 '; rm -rf /' 넣으면 실행됨. 그래서 `strchr(str, '\'')`
+ * 로 작은따옴표 있는 경우를 거부 (이미 인용된 경우는 그대로 통과 의미지만 추가 이스케이프 방어).
+ * fio 는 일반적으로 신뢰된 잡 파일을 가정하므로 이정도가 허용.
+ *
+ * 호출 체인: fio_keyword_replace → [bc_calc] → popen/fread/pclose.
  */
 static char *bc_calc(char *str)
 {
@@ -6462,9 +7548,25 @@ static char *bc_calc(char *str)
 }
 
 /*
- * [한국어] 환경 변수 치환: ${VARNAME} → 환경 변수 값으로 대체
- * 예: filename=${FIO_DEVICE} → filename=/dev/nvme0n1
- * VARNAME이 미정의면 빈 문자열로 치환된다.
+ * [한국어]
+ * fio_option_dup_subs() — 환경 변수 ${VAR} 치환 및 옵션 복제.
+ *
+ * @opt: 원본 옵션 문자열 (수정 안 됨).
+ * @return: 치환된 새 문자열 strdup. 호출자가 free 책임. 실패 시 NULL.
+ *
+ * 왜 필요한가: 잡 파일에서 환경 변수 참조를 허용해 외부 설정과 결합. 예:
+ *   filename=${FIO_DEVICE}    → /etc/fio/mytest.fio 를 여러 환경에서 재사용 가능.
+ *   directory=${HOME}/fiodata → 사용자별 데이터 위치.
+ * 미정의 환경 변수는 빈 문자열로 치환 (에러 아님).
+ *
+ * 동작 단계:
+ * 1) 입력 길이 OPT_LEN_MAX 초과 검사.
+ * 2) "in" 버퍼에 opt 복사. "out" 버퍼에 결과 축적.
+ * 3) 순회하며 "${" 패턴 감지 → "}" 위치 찾기 → 그 사이 이름을 getenv(). 값을 out에 복사.
+ * 4) 패턴이 아닌 일반 문자는 out에 1:1 복사.
+ * 5) 최종 out을 strdup.
+ *
+ * 호출 체인: dup_and_sub_options → [fio_option_dup_subs] → getenv(3).
  */
 char *fio_option_dup_subs(const char *opt)
 {
@@ -6514,8 +7616,22 @@ char *fio_option_dup_subs(const char *opt)
 }
 
 /*
- * [한국어] 예약 키워드 치환: $pagesize, $mb_memory, $ncpus → 실제 값
- * 치환 후 산술 연산이 포함되었으면 bc로 계산한다.
+ * [한국어]
+ * fio_keyword_replace() — 예약 키워드 치환 + 산술 연산 처리.
+ *
+ * @opt: 입력 문자열 (소유권 이동 — 이 함수가 free 하고 새 문자열 반환).
+ * @return: 치환 후 새 문자열. 실패 시 NULL.
+ *
+ * 왜 필요한가: fio_option_dup_subs 가 환경 변수를 처리했다면, 이 함수는 fio 예약 키워드
+ * ($pagesize/$mb_memory/$ncpus) 를 처리. 치환 후 계산식이 나타나면 bc_calc 로 평가.
+ *
+ * 동작 단계:
+ * 1) fio_keywords[] 순회 — 각 word가 opt에 있으면:
+ *    a) word 앞부분 복사, b) replace 삽입, c) word 뒤 나머지 복사 → 새 버퍼 완성.
+ *    d) 원본 free, opt = 새 버퍼. docalc = 1.
+ * 2) 치환이 한 번이라도 있었으면 bc_calc(opt) 호출 — "size=1024*1024" 같은 연산 평가.
+ *
+ * 호출 체인: dup_and_sub_options → [fio_keyword_replace] → bc_calc.
  */
 static char *fio_keyword_replace(char *opt)
 {
@@ -6567,7 +7683,21 @@ static char *fio_keyword_replace(char *opt)
 	return opt;
 }
 
-/* [한국어] 옵션 배열을 복사하면서 환경 변수 및 키워드 치환 적용 */
+/*
+ * [한국어]
+ * dup_and_sub_options() — opts[] 배열 각 엔트리에 환경변수 + 키워드 치환 적용.
+ *
+ * @opts:     원본 옵션 문자열 배열.
+ * @num_opts: 엔트리 개수.
+ * @return:   새로 할당된 char** 배열. 각 엔트리는 치환 완료된 strdup.
+ *
+ * 왜 필요한가: fio_options_parse 진입 시 모든 옵션에 일괄 치환 수행 — 이후 실제 파싱 단계는
+ * 치환된 최종 문자열만 다루면 됨. 단일 경로로 단순화.
+ *
+ * 동작: opts 각 엔트리에 대해 fio_option_dup_subs(환경변수) → fio_keyword_replace(키워드+연산).
+ *
+ * 호출 체인: fio_options_parse → [dup_and_sub_options] → fio_option_dup_subs → fio_keyword_replace.
+ */
 static char **dup_and_sub_options(char **opts, int num_opts)
 {
 	int i;
@@ -6581,7 +7711,23 @@ static char **dup_and_sub_options(char **opts, int num_opts)
 	return opts_copy;
 }
 
-/* [한국어] 알 수 없는 옵션에 대해 가장 유사한 옵션명을 추천 (레벤슈타인 거리) */
+/*
+ * [한국어]
+ * show_closest_option() — 오타 추천: 가장 가까운 옵션 이름 안내.
+ *
+ * @opt: 인식 실패한 옵션 문자열 (예: "randomgenerator=tausworth", "blocksize=4k" 의 앞부분).
+ *
+ * 왜 필요한가: UX 개선 — 사용자가 옵션명 오타("threads" vs "thread")를 쳤을 때
+ * 단순히 "Bad option" 만 출력하지 않고 "Did you mean ...?" 로 가장 유사한 것을 제안.
+ *
+ * 동작 단계:
+ * 1) '=' 앞 부분만 이름으로 추출 (strdup 후 '='에 NUL 삽입).
+ * 2) fio_options[] 전부 순회하며 string_distance() (parse.c, Levenshtein) 계산.
+ * 3) 최소 거리 엔트리 선택.
+ * 4) string_distance_ok (거리 임계값 이내) 이고 UNSUPPORTED 아니면 "Did you mean X?" 출력.
+ *
+ * 호출 체인: fio_options_parse (엔진 옵션 재시도 후에도 못 찾음) → [show_closest_option].
+ */
 static void show_closest_option(const char *opt)
 {
 	int best_option, best_distance;
@@ -6617,13 +7763,27 @@ static void show_closest_option(const char *opt)
 }
 
 /*
- * [한국어] 잡 파일의 옵션 목록 전체 파싱 — 메인 파싱 드라이버
+ * [한국어]
+ * fio_options_parse() — 잡의 모든 옵션 파싱 메인 드라이버 (init.c::add_job의 핵심 호출).
  *
- * 1) 옵션을 우선순위(prio)로 정렬
- * 2) 환경 변수/키워드 치환 적용
- * 3) 각 옵션을 parse_option()으로 파싱
- * 4) 인식 못한 옵션은 I/O 엔진 옵션으로 재시도
- * 5) 여전히 인식 못하면 유사 옵션 추천 후 에러
+ * @td:       대상 thread_data (파싱 결과가 td->o 에 채워짐).
+ * @opts:     옵션 문자열 배열 ("name=value" 형식).
+ * @num_opts: 개수.
+ * @return:   0=모두 성공, 비트 OR된 오류 코드 (하나라도 실패하면 0이 아님).
+ *
+ * 왜 필요한가: fio의 옵션 소스(CLI/INI)를 통일된 인터페이스로 파싱. add_job 이 잡 별로 1회 호출.
+ *
+ * 동작 단계 (5단계):
+ *   1) sort_options(): .prio 필드 기준 정렬 — 예: directory(.prio=1) 가 filename(.prio=-1) 보다 먼저.
+ *   2) dup_and_sub_options(): 각 문자열에 ${ENV}/$keyword 치환 + bc 계산 적용된 복사본 생성.
+ *   3) 메인 루프: 각 opts_copy[i] 를 parse_option(parse.c)에 넘김. 매칭된 fio_option 은 o에,
+ *      파싱 성공시 fio_option_mark_set 으로 설정 비트맵 갱신. 인식 실패 시 unknown++.
+ *   4) unknown > 0 이면 ioengine_load(td) — ioengine 옵션이 먼저 파싱돼야 엔진 ops 로드 가능.
+ *      이후 td->io_ops->options 로 재시도 — 엔진 전용 옵션을 매칭.
+ *   5) 그래도 인식 실패한 건들에 대해 show_closest_option() 으로 오타 추천.
+ *
+ * 실행 컨텍스트: 메인 프로세스 init 단계, 잡 1개씩 순차. 잡 스레드 생성 이전.
+ * 호출 체인: init.c::add_job → [fio_options_parse] → sort_options/parse_option/ioengine_load.
  */
 int fio_options_parse(struct thread_data *td, char **opts, int num_opts)
 {
@@ -6685,7 +7845,21 @@ int fio_options_parse(struct thread_data *td, char **opts, int num_opts)
 	return ret;
 }
 
-/* [한국어] 커맨드라인 옵션 파싱 (--name val) */
+/*
+ * [한국어]
+ * fio_cmd_option_parse() — CLI 단일 옵션 파싱 (--name=val 형식 1개).
+ *
+ * @td:  대상 잡. td->o에 저장.
+ * @opt: 옵션 이름 (예: "rw").
+ * @val: 값 (예: "randread").
+ * @return: 0=성공, 음수=실패.
+ *
+ * 왜 필요한가: init.c::parse_cmd_line 이 getopt_long 루프에서 매 옵션마다 호출.
+ * fio_options_parse 는 배열 일괄 처리용이고, 이 함수는 개별 CLI 옵션용.
+ *
+ * 호출 체인: init.c::parse_cmd_line → [fio_cmd_option_parse] → parse.c::parse_cmd_option.
+ * 파싱 성공 시 fio_option_mark_set 으로 설정 비트맵 갱신.
+ */
 int fio_cmd_option_parse(struct thread_data *td, const char *opt, char *val)
 {
 	int ret;
@@ -6702,7 +7876,20 @@ int fio_cmd_option_parse(struct thread_data *td, const char *opt, char *val)
 	return ret;
 }
 
-/* [한국어] I/O 엔진 전용 커맨드라인 옵션 파싱 */
+/*
+ * [한국어]
+ * fio_cmd_ioengine_option_parse() — 엔진 전용 CLI 옵션 파싱.
+ *
+ * @td:  잡 (td->io_ops->options 에 엔진 옵션 배열, td->eo 에 저장 대상 구조체).
+ * @opt: 엔진 옵션 이름 (예: libaio의 "userspace_reap", io_uring의 "sqthread_poll").
+ * @val: 값.
+ * @return: 0=성공.
+ *
+ * 왜 필요한가: CLI에서 --userspace_reap 같은 엔진별 옵션은 fio_options[]에 없다. 이 함수가
+ * 엔진의 고유 옵션 테이블을 참조해 td->eo 에 직접 저장.
+ *
+ * 호출 체인: init.c → getopt_long → val=FIO_GETOPT_IOENGINE → [fio_cmd_ioengine_option_parse].
+ */
 int fio_cmd_ioengine_option_parse(struct thread_data *td, const char *opt,
 				char *val)
 {
@@ -6710,23 +7897,57 @@ int fio_cmd_ioengine_option_parse(struct thread_data *td, const char *opt,
 					&td->opt_list);
 }
 
-/* [한국어] thread_data에 모든 옵션의 기본값 적용 */
+/*
+ * [한국어]
+ * fio_fill_default_options() — 잡의 모든 옵션에 .def 기본값 적용.
+ *
+ * @td: 초기화 대상. td->o.magic 을 OPT_MAGIC 으로 세팅 (cb_data_to_td/kb_base 검증용).
+ *
+ * 왜 필요한가: fio_options_parse 전에 기본값을 먼저 채우고, 사용자 지정값이 덮어쓰는 방식.
+ * 이렇게 해야 사용자가 일부만 지정해도 나머지는 자동으로 합리적 기본값을 가진다.
+ *
+ * 호출 체인: init.c::add_job 시작 시 → [fio_fill_default_options] → parse.c::fill_default_options.
+ */
 void fio_fill_default_options(struct thread_data *td)
 {
 	td->o.magic = OPT_MAGIC;
 	fill_default_options(&td->o, fio_options);
 }
 
-/* [한국어] 옵션 도움말 표시 (fio --cmdhelp=옵션명) */
+/*
+ * [한국어]
+ * fio_show_option_help() — `fio --cmdhelp=<opt>` 출력.
+ *
+ * @opt: 도움말을 볼 옵션 이름. NULL/빈 문자열이면 전체 목록.
+ * @return: 0=성공.
+ *
+ * 왜 필요한가: 사용자가 특정 옵션 의미를 빠르게 조회. fio --cmdhelp=bssplit → bssplit 옵션의
+ * .help/.type/.posval 등을 표시.
+ *
+ * 호출 체인: init.c::parse_cmd_line --cmdhelp 처리 → [fio_show_option_help] → parse.c::show_cmd_help.
+ */
 int fio_show_option_help(const char *opt)
 {
 	return show_cmd_help(fio_options, opt);
 }
 
 /*
- * [한국어] 문자열 옵션 메모리 복제
- * fork/clone 시 자식이 독립적인 문자열 복사본을 가지도록 한다.
- * I/O 엔진 옵션(eo)도 함께 복제한다.
+ * [한국어]
+ * fio_options_mem_dupe() — 잡의 모든 문자열 옵션을 deep-copy (fork 전 안전성 보장).
+ *
+ * @td: 대상 잡.
+ *
+ * 왜 필요한가: 기본 잡(def_thread)에서 각 잡(new thread_data)으로 옵션을 memcpy 하면 문자열
+ * 포인터는 공유 상태. 잡별로 독립적인 strdup 사본이 필요 — 한 잡이 free 하면 다른 잡이
+ * 댕글링. 특히 use_thread=0 (fork) 경우 프로세스 간에도 공유 금지.
+ *
+ * 동작 단계:
+ * 1) options_mem_dupe(fio_options, &td->o) — parse.c 헬퍼가 FIO_OPT_STR_STORE 타입
+ *    필드들을 순회하며 strdup으로 대체.
+ * 2) ioengine_so_path 가 있으면 별도 strdup (parse.c 미관리).
+ * 3) td->eo (엔진 옵션 구조체) 전체를 새로 malloc + memcpy + 그 안의 문자열들 dupe.
+ *
+ * 호출 체인: init.c::add_job 마지막 → [fio_options_mem_dupe].
  */
 void fio_options_mem_dupe(struct thread_data *td)
 {
@@ -6745,9 +7966,21 @@ void fio_options_mem_dupe(struct thread_data *td)
 }
 
 /*
- * [한국어] kb_base 값 조회: 1024(이진) 또는 1000(십진)
- * 옵션 파싱 시 k/m/g 접미사의 배수를 결정한다.
- * data가 유효한 thread_options가 아닐 수 있어 magic 검사를 한다.
+ * [한국어]
+ * fio_get_kb_base() — k/m/g 접미사 해석 시 배수 조회 (1024 vs 1000).
+ *
+ * @data: parse.c 가 전달한 값. 일반적으로 &td->o 이지만 엔진 전용 옵션에서는 td->eo일 수 있음.
+ * @return: 1024 (이진, 기본) 또는 1000 (십진, kb_base=1000 지정 시).
+ *
+ * 왜 필요한가: "size=1k" 가 1024 인지 1000 인지 옵션에 따라 달라진다 (kb_base 옵션). parse.c 의
+ * str_to_decimal 이 이 함수를 콜백으로 호출해 결정.
+ *
+ * 특이점 (HACK): 엔진 전용 옵션은 data 가 thread_options 가 아니라 엔진 내부 구조체를 가리킨다.
+ * 안전하게 역참조 불가. 그래서 o->magic == OPT_MAGIC 검사 — thread_options 는 첫 필드가 magic
+ * 이므로 메모리상 첫 4바이트로 구분 가능. 매치 안되면 전역 기본 1024 반환 (엔진 옵션은 잡 kb_base
+ * 지정 무시 — 드물고 사용자도 거의 영향 없음).
+ *
+ * 호출 체인: parse.c::str_to_decimal (kb_base가 콜백 필드로 전달됨) → [fio_get_kb_base].
  */
 unsigned int fio_get_kb_base(void *data)
 {
@@ -6773,8 +8006,17 @@ unsigned int fio_get_kb_base(void *data)
 }
 
 /*
- * [한국어] fio_options[] 배열에 옵션을 동적으로 추가
- * I/O 엔진이 자체 옵션을 등록할 때 사용한다.
+ * [한국어]
+ * add_option() — fio_options[] 전역 테이블에 엔트리 동적 추가.
+ *
+ * @o: 추가할 fio_option 템플릿 (memcpy 로 복제됨).
+ * @return: 0=성공, 1=FIO_MAX_OPTS 도달 (용량 초과).
+ *
+ * 왜 필요한가: 프로파일(tio-pmem 같은)이나 동적 모듈이 fio_options 에 자체 옵션을 추가.
+ * 정적 배열이지만 FIO_MAX_OPTS 상한까지 남은 슬롯에 append. sentinel(.name=NULL) 를 뒤로 이동.
+ *
+ * 호출 체인: profile.c::register_profile → [add_option] 여러 번.
+ * 읽는 자: parse.c 가 fio_options 를 순회할 때 동적 추가된 옵션도 매칭 대상.
  */
 int add_option(const struct fio_option *o)
 {
@@ -6797,7 +8039,19 @@ int add_option(const struct fio_option *o)
 	return 0;
 }
 
-/* [한국어] 지정된 프로파일의 옵션을 INVALID로 무효화 */
+/*
+ * [한국어]
+ * invalidate_profile_options() — 프로파일 unload 시 해당 프로파일의 옵션을 무효화.
+ *
+ * @prof_name: 프로파일 이름 (예: "tiobench").
+ *
+ * 왜 필요한가: 한 fio 실행 내에서 여러 프로파일을 순차 사용 가능. 이전 프로파일의 옵션이
+ * 남아있으면 다음 잡에서 의도치 않게 매칭될 수 있어 FIO_OPT_INVALID 로 타입 바꿔 사용 금지 처리.
+ *
+ * 동작: fio_options 순회 → prof_name 일치하면 type=INVALID, prof_name=NULL 로 무력화.
+ *
+ * 호출 체인: profile.c::unregister_profile → [invalidate_profile_options].
+ */
 void invalidate_profile_options(const char *prof_name)
 {
 	struct fio_option *o;
@@ -6812,7 +8066,23 @@ void invalidate_profile_options(const char *prof_name)
 	}
 }
 
-/* [한국어] 옵션의 posval에 새로운 허용 값을 동적 추가 (엔진 등록용) */
+/*
+ * [한국어]
+ * add_opt_posval() — 기존 옵션의 posval 목록에 새 허용 값 동적 추가.
+ *
+ * @optname: 대상 옵션 이름 (예: "ioengine").
+ * @ival:    추가할 허용 문자열 (예: "libaio"). oval=0 (정수값 미사용 — ioengine 경우 이름만 매칭).
+ * @help:    도움말.
+ *
+ * 왜 필요한가: ioengine 옵션의 posval 은 정적으로 모든 엔진 이름을 포함할 수 없다 (동적 .so
+ * 엔진 등). 각 엔진이 자신의 constructor(__attribute__((constructor))) 에서 register_ioengine
+ * 을 호출할 때, 간접적으로 add_opt_posval("ioengine", 엔진이름, help) 을 호출해 자기를 등록.
+ *
+ * 동작: find_option 으로 옵션 찾고, PARSE_MAX_VP=32 슬롯 중 빈 자리에 삽입.
+ *
+ * 호출 체인: engines/*.c constructor → register_ioengine → ioengines.c::add_ioengine_ops →
+ *            [add_opt_posval("ioengine", ops->name, help)].
+ */
 void add_opt_posval(const char *optname, const char *ival, const char *help)
 {
 	struct fio_option *o;
@@ -6832,7 +8102,18 @@ void add_opt_posval(const char *optname, const char *ival, const char *help)
 	}
 }
 
-/* [한국어] 옵션의 posval에서 특정 허용 값을 삭제 */
+/*
+ * [한국어]
+ * del_opt_posval() — 옵션의 posval 에서 특정 허용 값 제거.
+ *
+ * @optname: 옵션 이름.
+ * @ival:    제거할 허용 문자열.
+ *
+ * 왜 필요한가: 엔진 dlclose 또는 동적 엔진 언로드 시 posval 에서 해당 엔진 제거. 메모리 해제가
+ * 아니라 슬롯을 NULL 로 비우는 방식 (다른 엔트리는 배열 상 고정 위치 유지).
+ *
+ * 호출 체인: engines/*.c destructor → unregister_ioengine → ioengines.c → [del_opt_posval].
+ */
 void del_opt_posval(const char *optname, const char *ival)
 {
 	struct fio_option *o;
@@ -6853,7 +8134,21 @@ void del_opt_posval(const char *optname, const char *ival)
 	}
 }
 
-/* [한국어] 스레드의 모든 옵션 문자열 및 엔진 옵션 메모리 해제 */
+/*
+ * [한국어]
+ * fio_options_free() — 잡의 옵션 관련 동적 메모리 전체 해제.
+ *
+ * @td: 대상 잡 (잡 종료 시 reap_threads 단계에서 호출).
+ *
+ * 왜 필요한가: fio_options_mem_dupe 로 strdup/malloc 한 모든 리소스를 해제. 누수 방지.
+ *
+ * 해제 대상:
+ * - fio_options 기반 문자열 필드들 (options_free 헬퍼).
+ * - td->o.ioengine_so_path (별도 strdup).
+ * - td->eo 본체 및 그 안의 문자열들 (엔진 옵션).
+ *
+ * 호출 체인: backend.c::reap_threads → [fio_options_free] → parse.c::options_free.
+ */
 void fio_options_free(struct thread_data *td)
 {
 	options_free(fio_options, &td->o);
@@ -6869,7 +8164,17 @@ void fio_options_free(struct thread_data *td)
 	}
 }
 
-/* [한국어] 옵션 덤프 리스트(print_option) 메모리 해제 */
+/*
+ * [한국어]
+ * fio_dump_options_free() — td->opt_list (파싱된 옵션의 원본 텍스트 리스트) 해제.
+ *
+ * @td: 대상 잡.
+ *
+ * 왜 필요한가: parse_option 이 성공 시 추가한 print_option 엔트리(name/value strdup)들을 free.
+ * 이 리스트는 --showcmd / dump 등 사용자 출력에 사용된다.
+ *
+ * 동작: flist_empty 될 때까지 flist_first_entry 로 하나씩 떼어내 각 필드 free.
+ */
 void fio_dump_options_free(struct thread_data *td)
 {
 	while (!flist_empty(&td->opt_list)) {
@@ -6883,13 +8188,32 @@ void fio_dump_options_free(struct thread_data *td)
 	}
 }
 
-/* [한국어] 이름으로 fio_options[]에서 옵션 검색 */
+/*
+ * [한국어]
+ * fio_option_find() — fio_options[] 에서 이름으로 fio_option 찾기.
+ *
+ * @name: 옵션 이름.
+ * @return: 매칭된 엔트리 포인터 또는 NULL.
+ *
+ * 왜 필요한가: 외부 모듈(프로파일, server.c 등)이 특정 옵션 메타데이터에 접근할 때.
+ * 예: server.c 가 세션 옵션 직렬화 시 fio_option 구조에서 type/off1 조회.
+ */
 struct fio_option *fio_option_find(const char *name)
 {
 	return find_option(fio_options, name);
 }
 
-/* [한국어] 동일한 off1을 가진 다음 옵션을 찾는다 (여러 옵션이 같은 변수를 가리킬 수 있음) */
+/*
+ * [한국어]
+ * find_next_opt() — 특정 off1 offset 을 공유하는 다음 옵션 탐색 (alias 지원용).
+ *
+ * @from: 검색 시작점 (NULL이면 처음부터).
+ * @off1: 찾을 offsetof 값.
+ * @return: 매칭 옵션 또는 NULL.
+ *
+ * 왜 필요한가: 한 thread_options 필드에 여러 옵션이 저장 가능 (예: bs와 blocksize 둘 다 bs 필드 가리킴).
+ * __fio_option_is_set 이 "같은 필드를 쓰는 옵션들 중 하나라도 명시 설정되었는가" 확인 때 루프.
+ */
 static struct fio_option *find_next_opt(struct fio_option *from,
 					unsigned int off1)
 {
@@ -6913,8 +8237,17 @@ static struct fio_option *find_next_opt(struct fio_option *from,
 }
 
 /*
- * [한국어] 특정 옵션이 설정되었는지 비트맵에서 확인
- * set_options[]는 uint64_t 배열로, 각 비트가 fio_options[] 인덱스에 대응한다.
+ * [한국어]
+ * opt_is_set() — set_options 비트맵에서 해당 옵션의 설정 비트 조회.
+ *
+ * @o:   thread_options.
+ * @opt: fio_option 엔트리.
+ * @return: 0=미설정(기본값), !0=사용자가 명시 설정.
+ *
+ * 왜 필요한가: 잡 파일/CLI에서 명시 지정된 옵션과 기본값을 구분. 예: verify가 기본 VERIFY_NONE
+ * 인지 사용자가 의도적으로 verify=none 으로 지정한 것인지 구분 필요한 케이스 (str_verify_pattern_cb).
+ *
+ * 동작: opt - fio_options[0] = 인덱스 오프셋. 64비트 워드 배열에서 해당 비트 추출.
  */
 static int opt_is_set(struct thread_options *o, struct fio_option *opt)
 {
@@ -6927,8 +8260,18 @@ static int opt_is_set(struct thread_options *o, struct fio_option *opt)
 }
 
 /*
- * [한국어] 특정 오프셋에 해당하는 옵션이 사용자에 의해 명시적으로 설정되었는지 확인
- * 같은 off1을 가진 모든 옵션을 순회하여 하나라도 설정되었으면 true 반환.
+ * [한국어]
+ * __fio_option_is_set() — 특정 thread_options 필드를 명시 설정한 옵션이 하나라도 있는지 확인.
+ *
+ * @o:    thread_options.
+ * @off1: thread_options 내 필드 오프셋 (offsetof).
+ * @return: true=어떤 옵션이든 이 필드를 명시 설정, false=모두 기본값.
+ *
+ * 왜 필요한가: fio_option_is_set(&td->o, verify) 매크로 뒤편 구현. 예를 들어 "verify" 와
+ * "verify_hdr_only" 가 같은 필드를 공유할 수 있으므로 한 이름만 체크하면 안되고 같은 off1 을
+ * 공유하는 모든 옵션을 순회해 하나라도 세팅되었으면 true.
+ *
+ * 동작: find_next_opt 루프 돌며 opt_is_set 확인. 발견 즉시 true.
  */
 bool __fio_option_is_set(struct thread_options *o, unsigned int off1)
 {
@@ -6945,7 +8288,18 @@ bool __fio_option_is_set(struct thread_options *o, unsigned int off1)
 	return false;
 }
 
-/* [한국어] 옵션이 설정되었음을 비트맵에 마킹 — 파싱 성공 후 호출 */
+/*
+ * [한국어]
+ * fio_option_mark_set() — 옵션 파싱 성공 시 set_options 비트맵에 설정 비트 기록.
+ *
+ * @o:   thread_options.
+ * @opt: 방금 파싱 성공한 fio_option.
+ *
+ * 왜 필요한가: 나중에 __fio_option_is_set 이 질의할 수 있도록 마킹. 이 비트맵은 fio_options[]
+ * 인덱스 기반 (opt - &fio_options[0] 로 계산) — 옵션 수가 FIO_MAX_OPTS 이내라 uint64_t 배열 몇 개로 표현.
+ *
+ * 호출 체인: fio_options_parse 의 파싱 성공 브랜치 → [fio_option_mark_set].
+ */
 void fio_option_mark_set(struct thread_options *o, const struct fio_option *opt)
 {
 	unsigned int opt_off, index, offset;
